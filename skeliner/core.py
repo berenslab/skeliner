@@ -106,31 +106,31 @@ class Skeleton:
 
 
 def _soma_surface_vertices(mesh: trimesh.Trimesh,
-                           probe_mult: float = 8.0,
-                           density_frac: float = 0.5,
-                           grow_steps: int = 1) -> set[int]:
+                           soma_probe_radius_mult: float = 8.0,
+                           soma_density_threshold: float = 0.5,
+                           soma_dilation_steps: int = 1) -> set[int]:
     """
     Return the *indices* of mesh vertices that belong to the soma surface.
 
     Parameters
     ----------
-    probe_mult     ∝ how large a ball is used for the neighbour count
-    density_frac   keep all vertices whose local neighbour count is
-                   at least `density_frac * max_count`
-    grow_steps     how many geodesic steps to dilate the patch
+    soma_probe_radius_mult     ∝ how large a ball is used for the neighbour count
+    soma_density_threshold   keep all vertices whose local neighbour count is
+                   at least `soma_density_threshold * max_count`
+    soma_dilation_steps     how many geodesic steps to dilate the patch
     """
     v     = mesh.vertices.view(np.ndarray)
     gsurf = _surface_graph(mesh)     
 
     edge_m  = mesh.edges_unique_length.mean()
-    probe_r = probe_mult * edge_m
+    probe_r = soma_probe_radius_mult * edge_m
 
     kdt     = cKDTree(v)
     counts  = np.asarray(kdt.query_ball_point(v, probe_r,
                                               return_length=True))
 
     # ---- 1a  keep everything above a relative threshold ----------------
-    dense_mask = counts >= counts.max() * density_frac
+    dense_mask = counts >= counts.max() * soma_density_threshold
     dense_vids = np.where(dense_mask)[0]
 
     # ---- 1b  pick the largest connected component ----------------------
@@ -139,7 +139,7 @@ def _soma_surface_vertices(mesh: trimesh.Trimesh,
     soma_set = set(soma_cc)
 
     # ---- 1c  (optional) geodesic dilation to fill tiny gaps ------------
-    for _ in range(grow_steps):
+    for _ in range(soma_dilation_steps):
         boundary = {nb
                     for v_ in soma_set
                     for nb in gsurf.neighbors(v_)
@@ -149,15 +149,15 @@ def _soma_surface_vertices(mesh: trimesh.Trimesh,
     return soma_set
 
 def find_soma(mesh: trimesh.Trimesh,
-                   probe_mult: float = 8.0,
-                   density_frac: float = 0.30,
-                   grow_steps: int = 1,
-                   lam: float = 1.15) -> tuple[np.ndarray, float, set[int]]:
+                   soma_probe_radius_mult: float = 8.0,
+                   soma_density_threshold: float = 0.30,
+                   soma_dilation_steps: int = 1,
+) -> tuple[np.ndarray, float, set[int]]:
 
     soma_verts = _soma_surface_vertices(mesh,
-                                        probe_mult=probe_mult,
-                                        density_frac=density_frac,
-                                        grow_steps=grow_steps)
+                                        soma_probe_radius_mult=soma_probe_radius_mult,
+                                        soma_density_threshold=soma_density_threshold,
+                                        soma_dilation_steps=soma_dilation_steps)
 
     v       = mesh.vertices.view(np.ndarray)
     pts     = v[list(soma_verts)]
@@ -191,29 +191,107 @@ def find_soma_with_seed(mesh: "trimesh.Trimesh", seed: np.ndarray, *, seed_r: fl
 
 def skeletonize(
     mesh: "trimesh.Trimesh",
-    probe_mult: float = 10.0,
-    density_frac: float = 0.30,
-    grow_steps: int = 1,
-    seed: np.ndarray | None = None,
-    seed_r: float = 7_500.0,
-    lam: float = 1.15,
-    target_bins: int = 500,
-    min_bin_sz: int = 1,
-    max_bin_fac: int = 50,
-    collapse_dist: float = 1.,
-    collapse_rad: float = 0.25,
-    radius_eps: float = 0.5,
+    # --- soma detection ---
+    soma_probe_radius_mult: float = 10.0,
+    soma_density_threshold: float = 0.30,
+    soma_dilation_steps: int = 1,
+    soma_seed_point: np.ndarray | None = None,
+    soma_seed_radius: float = 7_500.0,
+    path_len_relax: float = 1.15,
+    # --- geodesic sampling ---
+    target_shell_count: int = 500,
+    min_cluster_vertices: int = 1,
+    max_shell_width_factor: int = 50,
+    # --- post-processing ---
+    soma_merge_dist_factor: float = 1.,
+    soma_merge_radius_factor: float = 0.25,
+    tiny_radius_threshold: float = 0.5,
 ) -> Skeleton:
-    """Extract a centre‑line skeleton from *mesh* starting at *seed*.
+    """
+    Extract a centre-line skeleton from a neuronal surface mesh.
 
-    Parameters mirror the original prototype script.
+    The algorithm
+
+    1. identifies the soma patch by a local-density test (or uses a
+       user-supplied seed);
+    2. partitions the remaining surface into geodesic “shells”,
+       collapsing each sufficiently large shell component into a graph
+       node positioned at its centroid;
+    3. connects nodes via the underlying triangle connectivity;
+    4. prunes nodes that are soma-like, over-fat, or tiny; and
+    5. removes any residual cycles to return a pure tree.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Triangle mesh of the neuron surface (world units).
+    # --- soma detection -------------------------------------------------
+    soma_probe_radius_mult : float, default 10.0
+        Multiplier for the radius of the neighbour-count ball used to
+        detect dense soma vertices.  Larger ⇒ a coarser density test and
+        a bigger candidate patch.
+    soma_density_threshold : float, default 0.30
+        Keep vertices whose neighbour count is at least
+        ``soma_density_threshold * max(counts)``.
+    soma_dilation_steps : int, default 1
+        Number of geodesic dilations to close tiny gaps in the initial
+        soma patch.
+    soma_seed_point : (3,) array_like, optional
+        Pre-defined soma centre.  If *None* (default) the soma is
+        detected automatically.
+    soma_seed_radius : float, default 7500.0
+        Radius of the seed sphere when *soma_seed_point* is given.
+    path_len_relax : float, default 1.15
+        Relaxation factor applied to geodesic path-length cut-offs when
+        expanding from the seed.
+
+    # --- geodesic sampling ---------------------------------------------
+    target_shell_count : int, default 500
+        Desired number of geodesic shells (bins) into which the surface
+        is partitioned.
+    min_cluster_vertices : int, default 1
+        Smallest vertex cluster that may become a skeleton node.
+    max_shell_width_factor : int, default 50
+        Upper bound on adaptive shell width, expressed as a multiple of
+        the mean edge length of *mesh*.
+
+    # --- post-processing ------------------------------------------------
+    soma_merge_dist_factor : float, default 1.0
+        Collapse any node whose centre lies closer than
+        ``soma_merge_dist_factor × soma_radius`` to the soma centre.
+    soma_merge_radius_factor : float, default 0.25
+        Collapse nodes whose radius exceeds
+        ``soma_merge_radius_factor × soma_radius`` (catches fat initial
+        dendrite stumps).
+    tiny_radius_threshold : float, default 0.5
+        Discard nodes with radius below this absolute threshold.
+
+    Returns
+    -------
+    Skeleton
+        Skeleton with radii.  Node 0 is the soma; the
+        edge list forms an undirected tree.
+
+    Examples
+    --------
+    >>> skel = skeletonize(mesh,             # automatic soma detection
+    ...                    soma_probe_radius_mult=10.0,
+    ...                    soma_density_threshold=0.30,
+    ...                    soma_dilation_steps=1,
+    ...)           
+    >>> skel.to_swc("neuron.swc")          # write in SWC format
+
+    >>> # With a known soma centre (in mesh units):
+    >>> skel = skeletonize(mesh,
+    ...                    soma_seed_point=[0, 0, 0],
+    ...                    soma_seed_radius=5000)
     """
     # 0. soma vertices ----------------------------------------------------
-    if seed is None:
-        c_soma, r_soma, soma_verts = find_soma(mesh, probe_mult=probe_mult,
-                                            density_frac=density_frac, grow_steps=grow_steps)
+    if soma_seed_point is None:
+        c_soma, r_soma, soma_verts = find_soma(mesh, soma_probe_radius_mult=soma_probe_radius_mult,
+                                            soma_density_threshold=soma_density_threshold, soma_dilation_steps=soma_dilation_steps)
     else:
-        c_soma, r_soma, soma_verts = find_soma_with_seed(mesh, seed=seed, seed_r=seed_r, lam=lam)
+        c_soma, r_soma, soma_verts = find_soma_with_seed(mesh, seed=soma_seed_point, seed_r=soma_seed_radius, lam=path_len_relax)
 
     # 1. binning along geodesic shells ----------------------------------
     v = mesh.vertices.view(np.ndarray)
@@ -227,10 +305,10 @@ def skeletonize(
     
     arc_len = max(dist_all.values(), default=0.0)
     edge_m = mesh.edges_unique_length.mean()
-    step = max(edge_m * 2.0, arc_len / target_bins)
+    step = max(edge_m * 2.0, arc_len / target_shell_count)
 
     bins: list[list[int]] = []
-    while not any(bins) and step < edge_m * max_bin_fac:
+    while not any(bins) and step < edge_m * max_shell_width_factor:
         bins = _geodesic_bins(dist_all, step)
         step *= 1.5
 
@@ -241,12 +319,12 @@ def skeletonize(
 
     for verts in bins:
         inner = [v_ for v_ in verts if v_ not in soma_verts]
-        if len(inner) < min_bin_sz:
+        if len(inner) < min_cluster_vertices:
             continue
         sub = gsurf.subgraph(inner)
         for comp in nx.connected_components(sub):
             comp = list(comp)
-            if len(comp) < min_bin_sz:
+            if len(comp) < min_cluster_vertices:
                 continue
             pts = v[comp]
             centre = pts.mean(axis=0)
@@ -269,12 +347,12 @@ def skeletonize(
     }
 
     # 3. collapse soma‑like / drop tiny nodes -----------------------------
-    if collapse_dist > 0.0:
+    if soma_merge_dist_factor > 0.0:
         keep = np.ones(len(nodes_arr), bool)
         for i in range(1, len(nodes_arr)):
-            close = np.linalg.norm(nodes_arr[i] - c_soma) < collapse_dist * r_soma
-            fat = radii_arr[i] >= collapse_rad * r_soma
-            tiny = radii_arr[i] < radius_eps
+            close = np.linalg.norm(nodes_arr[i] - c_soma) < soma_merge_dist_factor * r_soma
+            fat = radii_arr[i] >= soma_merge_radius_factor * r_soma
+            tiny = radii_arr[i] < tiny_radius_threshold
             if close or fat or tiny:
                 keep[i] = False
         old2new = {old: new for new, old in enumerate(np.where(keep)[0])}
@@ -380,7 +458,9 @@ def load_swc(
     Parameters
     ----------
     scale
-        Divide the coordinates and radii **after** reading.
+        Scale factor for the coordinates and radii.
+        If you set scale=1e-3 in `to_swc()`, you should set it to 
+        scale=1e3 here.
     keep_types
         Optional whitelist of SWC *type* codes to keep.  By default all nodes
         are imported.

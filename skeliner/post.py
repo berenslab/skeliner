@@ -9,35 +9,6 @@ from scipy.spatial import cKDTree as _KDTree
 from skeliner.core import Skeleton, _surface_graph, skeletonize
 
 
-def coverage_fraction(
-    mesh: trimesh.Trimesh,
-    skel: Skeleton | Sequence[Skeleton],
-    *,
-    cover_mult: float = 1.5,
-) -> float:
-    """
-    Return the fraction of mesh vertices already explained by *skel*.
-
-    A vertex is “covered” when it lies within
-    `cover_mult × node_radius` of **any** skeleton node.
-    """
-    if isinstance(skel, Skeleton):
-        skels = [skel]
-    else:
-        skels = list(skel)
-
-    verts = mesh.vertices.view(np.ndarray)
-    kdt   = _KDTree(verts)
-    covered = np.zeros(len(verts), bool)
-
-    for s in skels:
-        reach = s.radii * cover_mult
-        for c, r in zip(s.nodes, reach, strict=True):
-            covered[kdt.query_ball_point(c, r)] = True
-
-    return covered.mean()        # ∈ [0, 1]
-
-
 def _closest_pair(a: np.ndarray, b: np.ndarray) -> tuple[int, int, float]:
     """
     Return indices (ia, ib) of the closest points in *a* and *b* plus distance.
@@ -159,8 +130,8 @@ def merge(
 def find_path_seeds(
     mesh: trimesh.Trimesh,
     traced: list[Skeleton] | None = None,
-    cover_mult: float = 1.5,
-    min_component_size: int = 1000,
+    coverage_radius_mult: float = 1.5,
+    min_surface_component_vertices: int = 1000,
 ) -> list[np.ndarray]:
     """
     Return one seed point for every mesh component that is **not**
@@ -172,10 +143,10 @@ def find_path_seeds(
         The full neuronal mesh.
     traced
         Skeletons that have been extracted so far (may be an empty list).
-    cover_mult
+    coverage_radius_mult
         A vertex is considered “covered” when it lies inside
-        `cover_mult * node_radius` of **any** traced skeleton node.
-    min_component_size
+        `coverage_radius_mult * node_radius` of **any** traced skeleton node.
+    min_surface_component_vertices
         Discard very small leftover islands (noise / debris).
 
     Notes
@@ -194,7 +165,7 @@ def find_path_seeds(
         kdt = _KDTree(verts)
         for sk in traced:
             # grow every node into a sphere and mark the vertices inside
-            reach = sk.radii * cover_mult
+            reach = sk.radii * coverage_radius_mult
             for c, r in zip(sk.nodes, reach, strict=True):
                 covered[kdt.query_ball_point(c, r)] = True
 
@@ -217,7 +188,7 @@ def find_path_seeds(
 
     seeds: list[np.ndarray] = []
     for comp in nx.connected_components(sub):
-        if comp is main_cc or len(comp) < min_component_size:
+        if comp is main_cc or len(comp) < min_surface_component_vertices:
             continue
 
         comp_vids = np.fromiter(comp, dtype=np.int64)
@@ -230,11 +201,13 @@ def find_path_seeds(
 def complete(
     mesh: trimesh.Trimesh,
     skel0: Skeleton,
-    cover_mult: float = 1.5,
-    min_component_size: int = 800,
-    seed_r: float = 200.0,
-    lam: float = 1.0,
-    collapse_dist: float = 0.0,
+    # --- seed-coverage search ---
+    coverage_radius_mult: float = 1.5,
+    min_surface_component_vertices: int = 800,
+    # --- parameters forwarded to skeletonize() ---
+    branch_seed_radius: float = 200.0,
+    path_len_relax: float = 1.0,
+    merge_dist_factor: float = 0.0,
     verbose: bool = True,
 ) -> Skeleton:
     """
@@ -244,9 +217,9 @@ def complete(
     ----------
     mesh
         Full neuronal surface mesh.
-    cover_mult, min_component_size
+    coverage_radius_mult, min_surface_component_vertices
         Passed straight to :pyfunc:`find_path_seeds`.
-    seed_r, lam, collapse_dist
+    branch_seed_radius, path_len_relax, merge_dist_factor
         Defaults fed into :pyfunc:`sk.skeletonize` for the *extra* branches.
     verbose
         ``True`` → print a short progress log.
@@ -262,8 +235,8 @@ def complete(
     while True:
         seeds = find_path_seeds(
             mesh, parts,
-            cover_mult=cover_mult,
-            min_component_size=min_component_size,
+            coverage_radius_mult=coverage_radius_mult,
+            min_surface_component_vertices=min_surface_component_vertices,
         )
         if not seeds:
             break
@@ -278,10 +251,10 @@ def complete(
             try:
                 skel = skeletonize(
                     mesh,
-                    seed=seed,
-                    seed_r=seed_r,
-                    lam=lam,
-                    collapse_dist=collapse_dist,
+                    soma_seed_point=seed,
+                    soma_seed_radius=branch_seed_radius,
+                    path_len_relax=path_len_relax,
+                    soma_merge_dist_factor=merge_dist_factor,
                 )
             except ValueError:
                 if verbose:
