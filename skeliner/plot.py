@@ -16,6 +16,26 @@ def _project(arr: np.ndarray, ix: int, iy: int, /) -> np.ndarray:
     """Return 2-column slice (arr[:, (ix, iy)])."""
     return arr[:, (ix, iy)].copy()
 
+def _radii_to_scatter_size(rr: np.ndarray, ax: plt.Axes) -> np.ndarray:
+    """
+    Convert radii in *data units* to matplotlib scatter sizes (points²)
+    *for the current axis limits*.
+    """
+    fig = ax.figure
+    dpi = fig.dpi
+
+    # axis length (data units) and its extent on the canvas (pixels)
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    bbox   = ax.get_window_extent()          # pixels
+
+    # for 'equal' aspect the x and y scales are identical – pick one
+    ppd = bbox.width  / abs(x1 - x0)         # pixels per data-unit
+    r_px = rr * ppd                          # radius in pixels
+    r_pt = r_px * 72.0 / dpi                 # … in points
+    return np.pi * r_pt**2                   # area in points²
+
+
 def plot_projection(
     skel: Skeleton,
     mesh: "trimesh.Trimesh",
@@ -120,16 +140,16 @@ def plot_projection(
     )
 
     # ─────────────────── circles ──────────────────────────────────────────
-    for (x, y), r in zip(xy_skel, rr):
-        circ = Circle(
-            (x, y),
-            r,
-            facecolor="none",
-            edgecolor="red",
-            linewidth=1.0,
-            alpha=circle_alpha,
-        )
-        ax.add_patch(circ)
+    sizes = _radii_to_scatter_size(rr, ax)
+    ax.scatter(
+        xy_skel[:, 0],
+        xy_skel[:, 1],
+        s=sizes,
+        facecolors="none",
+        edgecolors="red",
+        linewidths=1.0,
+        alpha=circle_alpha,
+    )
 
     # ─────────────────── optional edges ───────────────────────────────────
     if draw_edges:

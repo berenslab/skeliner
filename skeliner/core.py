@@ -1,4 +1,4 @@
-
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Set, Tuple
@@ -132,19 +132,20 @@ def _find_cycle_edges(g: ig.Graph) -> List[Tuple[int, int]]:
 
 def _soma_surface_vertices(
     mesh: trimesh.Trimesh,
-    *,
     soma_probe_radius_mult: float = 8.0,
     soma_density_threshold: float = 0.5,
     soma_dilation_steps: int = 1,
+    gsurf: ig.Graph | None = None,
 ) -> Set[int]:
     """Return indices of soma‑surface vertices via density filter + dilation."""
     v = mesh.vertices.view(np.ndarray)
-    gsurf = _surface_graph(mesh)
+    if gsurf is None:
+        gsurf = _surface_graph(mesh)
 
     edge_m = mesh.edges_unique_length.mean()
     probe_r = soma_probe_radius_mult * edge_m
 
-    counts = np.asarray(_KDTree(v).query_ball_point(v, probe_r, return_length=True))
+    counts = np.asarray(_KDTree(v).query_ball_point(v, probe_r, return_length=True, workers=-1))
 
     dense_mask = counts >= counts.max() * soma_density_threshold
     dense_vids = np.where(dense_mask)[0]
@@ -169,13 +170,14 @@ def _soma_surface_vertices(
 
 def find_soma(
     mesh: trimesh.Trimesh,
-    *,
     soma_probe_radius_mult: float = 8.0,
     soma_density_threshold: float = 0.30,
     soma_dilation_steps: int = 1,
+    gsurf: ig.Graph | None = None,
 ):
     soma_verts = _soma_surface_vertices(
         mesh,
+        gsurf=gsurf,
         soma_probe_radius_mult=soma_probe_radius_mult,
         soma_density_threshold=soma_density_threshold,
         soma_dilation_steps=soma_dilation_steps,
@@ -189,14 +191,15 @@ def find_soma(
 def find_soma_with_seed(
     mesh: trimesh.Trimesh,
     seed: np.ndarray,
-    *,
     seed_r: float,
     lam: float = 1.15,
+    gsurf: ig.Graph | None = None,
 ):
     v = mesh.vertices.view(np.ndarray)
     seed_vid = int(np.argmin(np.linalg.norm(v - seed, axis=1)))
     cutoff = seed_r * lam
-    gsurf = _surface_graph(mesh)
+    if gsurf is None:
+        gsurf = _surface_graph(mesh)
     dists = gsurf.shortest_paths_dijkstra(source=seed_vid, weights="weight")[0]
     soma_verts = {vid for vid, d in enumerate(dists) if d <= cutoff}
     pts = v[list(soma_verts)]
@@ -209,11 +212,34 @@ def find_soma_with_seed(
 # -----------------------------------------------------------------------------
 
 def _geodesic_bins(dist_dict: Dict[int, float], step: float) -> List[List[int]]:
+    """
+    Vectorised distance-to-bins helper.
+    Keeps the original semantics: bins are half-open [a, b)
+    so a vertex sitting exactly on the global max distance
+    joins the *previous* shell.
+    """
     if not dist_dict:
         return []
-    edges = np.arange(0.0, max(dist_dict.values()) + step, step)
-    return [[vid for vid, d in dist_dict.items() if a <= d < b] for a, b in zip(edges[:-1], edges[1:])]
 
+    # --- vectorise keys & distances ------------------------------------
+    vids  = np.fromiter(dist_dict.keys(),   dtype=np.int64)
+    dists = np.fromiter(dist_dict.values(), dtype=np.float64)
+
+    # --- construct right-open bin edges --------------------------------
+    edges = np.arange(0.0, dists.max() + step, step, dtype=np.float64)
+    if edges[-1] <= dists.max():            # ensure last edge is strictly greater
+        edges = np.append(edges, edges[-1] + step)
+
+    # --- assign each vertex to a shell ---------------------------------
+    idx = np.digitize(dists, edges) - 1     # 0-based indices
+    idx[idx == len(edges) - 1] -= 1         # clip the “equal-max” case
+
+    # --- build the bins -------------------------------------------------
+    bins = [[] for _ in range(len(edges) - 1)]
+    for vid, b in zip(vids, idx):
+        bins[b].append(int(vid))
+
+    return bins
 
 def bfs_parents(edges: np.ndarray, n_nodes: int, *, root: int = 0) -> List[int]:
     """Return parent[] array of BFS tree from *root* given undirected edge list."""
@@ -222,9 +248,10 @@ def bfs_parents(edges: np.ndarray, n_nodes: int, *, root: int = 0) -> List[int]:
         adj[int(a)].append(int(b))
         adj[int(b)].append(int(a))
     parent = [-1] * n_nodes
-    q: List[int] = [root]
+    # q: List[int] = [root]
+    q = deque([root])
     while q:
-        u = q.pop(0)
+        u = q.popleft()
         for v in adj[u]:
             if v != root and parent[v] == -1:
                 parent[v] = u
@@ -272,9 +299,11 @@ def skeletonize(
     """
 
     # 0. soma vertices ---------------------------------------------------
+    gsurf = _surface_graph(mesh)
     if soma_seed_point is None:
         c_soma, r_soma, soma_verts = find_soma(
             mesh,
+            gsurf=gsurf,
             soma_probe_radius_mult=soma_probe_radius_mult,
             soma_density_threshold=soma_density_threshold,
             soma_dilation_steps=soma_dilation_steps,
@@ -282,6 +311,7 @@ def skeletonize(
     else:
         c_soma, r_soma, soma_verts = find_soma_with_seed(
             mesh,
+            gsurf=gsurf,
             seed=soma_seed_point,
             seed_r=soma_seed_radius,
             lam=path_len_relax,
@@ -289,46 +319,89 @@ def skeletonize(
 
     # 1. binning along geodesic shells ----------------------------------
     v = mesh.vertices.view(np.ndarray)
-    gsurf = _surface_graph(mesh)
+    
+    # # split the surface graph into connected components once
+    # components = gsurf.components()
 
-    # split the surface graph into connected components once
-    components = gsurf.components()
+    # # We will collect a global list of bins across all components
+    # all_bins: List[List[int]] = []
+    # soma_vids = np.fromiter(soma_verts, dtype=np.int64)
+    # for comp_id, comp_vertices in enumerate(components):
+    #     comp_vertices = np.asarray(comp_vertices, dtype=np.int64)
 
-    # We will collect a global list of bins across all components
-    all_bins: List[List[int]] = []
+    #     # pick seed: soma furthest-out for soma-component, otherwise a stable pseudo-random one
+    #     if np.intersect1d(comp_vertices, soma_vids).size:
+    #         # this is the soma component
+    #         seed = int(
+    #             soma_vids[np.argmax(np.linalg.norm(v[soma_vids] - c_soma, axis=1))]
+    #         )
+    #     else:
+    #         # deterministic but pseudo-random pick for reproducibility
+    #         seed = int(comp_vertices[(hash(comp_id) % len(comp_vertices))])
+
+    #     # geodesic distances inside *this* component
+    #     dist_vec = gsurf.shortest_paths_dijkstra(
+    #         source=seed, target=comp_vertices, weights="weight"
+    #     )[0]
+    #     dist_sub = {int(vid): float(d) for vid, d in zip(comp_vertices, dist_vec)}
+
+    #     # adaptive shell width as before
+    #     if dist_sub:
+    #         edge_m  = float(mesh.edges_unique_length.mean())
+    #         arc_len = max(dist_sub.values())
+    #         step    = max(edge_m * 2.0, arc_len / target_shell_count)
+
+    #         bins: List[List[int]] = []
+    #         while not any(bins) and step < edge_m * max_shell_width_factor:
+    #             bins = _geodesic_bins(dist_sub, step)
+    #             step *= 1.5
+
+    #         all_bins.extend(bins)
+    # -----------------------------------------------------------
+    # 1-b)  Geodesic distances –   C-batch inside each component
+    # -----------------------------------------------------------
+    components    = gsurf.components()
+    comp_vertices = [np.asarray(c, dtype=np.int64) for c in components]
+
     soma_vids = np.fromiter(soma_verts, dtype=np.int64)
-    for comp_id, comp_vertices in enumerate(components):
-        comp_vertices = np.asarray(comp_vertices, dtype=np.int64)
+    all_bins  : list[list[int]] = []
+    edge_m    = float(mesh.edges_unique_length.mean())
 
-        # pick seed: soma furthest-out for soma-component, otherwise a stable pseudo-random one
-        if np.intersect1d(comp_vertices, soma_vids).size:
-            # this is the soma component
-            seed = int(
-                soma_vids[np.argmax(np.linalg.norm(v[soma_vids] - c_soma, axis=1))]
-            )
+    for cid, verts in enumerate(comp_vertices):
+
+        # -------- choose the *one* seed you used before ----------
+        if np.intersect1d(verts, soma_vids).size:
+            seeds = [
+                int(
+                    soma_vids[
+                        np.argmax(np.linalg.norm(v[soma_vids] - c_soma, axis=1))
+                    ]
+                )
+            ]
         else:
-            # deterministic but pseudo-random pick for reproducibility
-            seed = int(comp_vertices[(hash(comp_id) % len(comp_vertices))])
+            seeds = [int(verts[(hash(cid) % len(verts))])]
 
-        # geodesic distances inside *this* component
+        # -------- single C call for this component ---------------
         dist_vec = gsurf.shortest_paths_dijkstra(
-            source=seed, target=comp_vertices, weights="weight"
-        )[0]
-        dist_sub = {int(vid): float(d) for vid, d in zip(comp_vertices, dist_vec)}
+            source=seeds,
+            target=verts,
+            weights="weight",
+        )[0]                                            # shape = (1, |verts|)
 
-        # adaptive shell width as before
-        if dist_sub:
-            edge_m  = float(mesh.edges_unique_length.mean())
-            arc_len = max(dist_sub.values())
-            step    = max(edge_m * 2.0, arc_len / target_shell_count)
+        dist_sub = {int(v): float(d) for v, d in zip(verts, dist_vec)}
 
-            bins: List[List[int]] = []
-            while not any(bins) and step < edge_m * max_shell_width_factor:
-                bins = _geodesic_bins(dist_sub, step)
-                step *= 1.5
+        # -------- adaptive shell binning (unchanged) -------------
+        if not dist_sub:
+            continue
+        arc_len = max(dist_sub.values())
+        step    = max(edge_m * 2.0, arc_len / target_shell_count)
 
-            all_bins.extend(bins)
+        bins: list[list[int]] = []
+        while not any(bins) and step < edge_m * max_shell_width_factor:
+            bins = _geodesic_bins(dist_sub, step)
+            step *= 1.5
 
+        all_bins.extend(bins)
     # 2. create skeleton nodes ------------------------------------------
     nodes: List[np.ndarray] = [c_soma]
     radii: List[float] = [r_soma]
@@ -369,13 +442,14 @@ def skeletonize(
 
     # 4. collapse soma‑like / tiny / fat nodes ---------------------------
     if soma_merge_dist_factor > 0.0:
-        keep = np.ones(len(nodes_arr), bool)
-        for i in range(1, len(nodes_arr)):
-            close = np.linalg.norm(nodes_arr[i] - c_soma) < soma_merge_dist_factor * r_soma
-            fat   = radii_arr[i] >= soma_merge_radius_factor * r_soma
-            tiny  = radii_arr[i] <  tiny_radius_threshold
-            if close or fat or tiny:
-                keep[i] = False
+
+        dist  = np.linalg.norm(nodes_arr - c_soma, axis=1)
+        close = dist  < soma_merge_dist_factor * r_soma
+        fat   = radii_arr >= soma_merge_radius_factor * r_soma
+        tiny  = radii_arr <  tiny_radius_threshold
+
+        keep        = ~(close | fat | tiny)
+        keep[0]     = True      # never drop the soma
 
         old2new = {old: new for new, old in enumerate(np.where(keep)[0])}
         nodes_arr  = nodes_arr[keep]
@@ -444,7 +518,7 @@ def skeletonize(
                 pts   = nodes_arr[list(vids)]
 
                 # nearest neighbours *from that component* to the current island
-                dists, island_idx = island_tree.query(pts, k=1)
+                dists, island_idx = island_tree.query(pts, k=1, workers=-1)
                 order = np.argsort(dists)
                 u_candidates = np.fromiter(vids, dtype=np.int64)
                 island_list  = np.fromiter(main_island, dtype=np.int64)
