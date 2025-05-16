@@ -10,7 +10,6 @@ from scipy.spatial import cKDTree
 
 __all__ = [
     "Skeleton",
-    "find_seed",
     "find_soma",
     "skeletonize",
 ]
@@ -382,8 +381,6 @@ def load_swc(
     ----------
     scale
         Divide the coordinates and radii **after** reading.
-        If you saved with ``to_swc(..., scale=1e-3)`` you’ll usually call
-        ``load_swc(..., scale=1e-3)`` to get back to the original units.
     keep_types
         Optional whitelist of SWC *type* codes to keep.  By default all nodes
         are imported.
