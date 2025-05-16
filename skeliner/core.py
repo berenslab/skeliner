@@ -1,15 +1,4 @@
-# -*- coding: utf-8 -*-
-"""Skeliner skeletonization using **python‑igraph** instead of NetworkX.
 
-This is a line‑for‑line port of the original implementation; the public API
-(`Skeleton`, `find_soma`, `skeletonize`, `load_swc`) and all numerical outputs
-remain identical.  Only the graph backend has changed – every operation now uses
-`igraph`, yielding faster runtimes and lower memory usage.
-"""
-
-from __future__ import annotations
-
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Set, Tuple
@@ -17,7 +6,7 @@ from typing import Dict, Iterable, List, Set, Tuple
 import igraph as ig
 import numpy as np
 import trimesh
-from scipy.spatial import cKDTree
+from scipy.spatial import cKDTree as _KDTree
 
 __all__ = [
     "Skeleton",
@@ -78,16 +67,24 @@ class Skeleton:
             return [i for i in range(len(self.nodes)) if i not in reachable]
         return len(reachable) == len(self.nodes)
 
-    def check_acyclic(self, *, return_cycle: bool = False):
-        g = self._igraph()
-        # A forest with *c* components has |E| == |V| − c  ⇔ acyclic
-        num_comp = g.components().nc
-        acyclic = g.ecount() == g.vcount() - num_comp
-        if not return_cycle:
+    def check_acyclic(self, *, return_cycle: bool = False) -> bool | list[tuple[int, int]]:
+        """
+        Verify that **no cycles** are present (i.e. the skeleton is a forest).
+
+        Returns ``True`` when the edge count obeys |E| = |V| − C
+        where *C* is the number of connected components.  When
+        *return_cycle=True* one representative cycle is returned
+        (empty list ⇒ acyclic).
+        """
+        g = self._igraph()                        # helper that builds igraph
+        num_comp = len(g.components())            # instead of .nc
+        acyclic  = g.ecount() == g.vcount() - num_comp
+        if acyclic or not return_cycle:
             return acyclic
-        if acyclic:
-            return []
-        return _find_cycle_edges(g)
+
+        # -- find a concrete cycle (slow but rare) -----------------------
+        cyc = g.cycle_basis()[0]                  # list of vertex ids
+        return [(cyc[i], cyc[(i + 1) % len(cyc)]) for i in range(len(cyc))]
 
 # -----------------------------------------------------------------------------
 #  Graph helpers (igraph)
@@ -147,7 +144,7 @@ def _soma_surface_vertices(
     edge_m = mesh.edges_unique_length.mean()
     probe_r = soma_probe_radius_mult * edge_m
 
-    counts = np.asarray(cKDTree(v).query_ball_point(v, probe_r, return_length=True))
+    counts = np.asarray(_KDTree(v).query_ball_point(v, probe_r, return_length=True))
 
     dense_mask = counts >= counts.max() * soma_density_threshold
     dense_vids = np.where(dense_mask)[0]
@@ -257,7 +254,7 @@ def skeletonize(
     tiny_radius_threshold: float = 0.5,
     # --- bridging disconnected patches ---
     bridge_components: bool = True,
-    bridge_k: int = 3,
+    bridge_k: int = 1,
 ) -> Skeleton:
     """Extract a centre‑line skeleton **and optionally bridge disconnected mesh patches**.
 
@@ -294,19 +291,43 @@ def skeletonize(
     v = mesh.vertices.view(np.ndarray)
     gsurf = _surface_graph(mesh)
 
+    # split the surface graph into connected components once
+    components = gsurf.components()
+
+    # We will collect a global list of bins across all components
+    all_bins: List[List[int]] = []
     soma_vids = np.fromiter(soma_verts, dtype=np.int64)
-    seed_vid = soma_vids[np.argmax(np.linalg.norm(v[soma_vids] - c_soma, axis=1))]
-    dist_vec = gsurf.shortest_paths_dijkstra(source=seed_vid, weights="weight")[0]
-    dist_all = {vid: d for vid, d in enumerate(dist_vec) if np.isfinite(d)}
+    for comp_id, comp_vertices in enumerate(components):
+        comp_vertices = np.asarray(comp_vertices, dtype=np.int64)
 
-    arc_len = max(dist_all.values(), default=0.0)
-    edge_m = mesh.edges_unique_length.mean()
-    step = max(edge_m * 2.0, arc_len / target_shell_count)
+        # pick seed: soma furthest-out for soma-component, otherwise a stable pseudo-random one
+        if np.intersect1d(comp_vertices, soma_vids).size:
+            # this is the soma component
+            seed = int(
+                soma_vids[np.argmax(np.linalg.norm(v[soma_vids] - c_soma, axis=1))]
+            )
+        else:
+            # deterministic but pseudo-random pick for reproducibility
+            seed = int(comp_vertices[(hash(comp_id) % len(comp_vertices))])
 
-    bins: List[List[int]] = []
-    while not any(bins) and step < edge_m * max_shell_width_factor:
-        bins = _geodesic_bins(dist_all, step)
-        step *= 1.5
+        # geodesic distances inside *this* component
+        dist_vec = gsurf.shortest_paths_dijkstra(
+            source=seed, target=comp_vertices, weights="weight"
+        )[0]
+        dist_sub = {int(vid): float(d) for vid, d in zip(comp_vertices, dist_vec)}
+
+        # adaptive shell width as before
+        if dist_sub:
+            edge_m  = float(mesh.edges_unique_length.mean())
+            arc_len = max(dist_sub.values())
+            step    = max(edge_m * 2.0, arc_len / target_shell_count)
+
+            bins: List[List[int]] = []
+            while not any(bins) and step < edge_m * max_shell_width_factor:
+                bins = _geodesic_bins(dist_sub, step)
+                step *= 1.5
+
+            all_bins.extend(bins)
 
     # 2. create skeleton nodes ------------------------------------------
     nodes: List[np.ndarray] = [c_soma]
@@ -314,7 +335,7 @@ def skeletonize(
     v2n: Dict[int, int] = {v: 0 for v in soma_verts}
     next_id = 1
 
-    for verts in bins:
+    for verts in all_bins:
         inner = [vid for vid in verts if vid not in soma_verts]
         if len(inner) < min_cluster_vertices:
             continue
@@ -322,15 +343,18 @@ def skeletonize(
         for comp in sub.components():
             if len(comp) < min_cluster_vertices:
                 continue
-            pts = v[np.fromiter((inner[i] for i in comp), dtype=np.int64)]
-            centre = pts.mean(axis=0)
-            radius = float(np.mean(np.linalg.norm(pts - centre, axis=1)))
+            comp_idx = np.fromiter((inner[i] for i in comp), dtype=np.int64)
+            pts      = v[comp_idx]
+            centre   = pts.mean(axis=0)
+            radius   = float(np.linalg.norm(pts - centre, axis=1).mean())
+
             node_id = next_id
             next_id += 1
             nodes.append(centre)
             radii.append(radius)
-            for local_idx in comp:
-                v2n[inner[local_idx]] = node_id
+            for vv in comp_idx:
+                v2n[int(vv)] = node_id
+
 
     nodes_arr = np.asarray(nodes, dtype=np.float32)
     radii_arr = np.asarray(radii, dtype=np.float32)
@@ -348,61 +372,101 @@ def skeletonize(
         keep = np.ones(len(nodes_arr), bool)
         for i in range(1, len(nodes_arr)):
             close = np.linalg.norm(nodes_arr[i] - c_soma) < soma_merge_dist_factor * r_soma
-            fat = radii_arr[i] >= soma_merge_radius_factor * r_soma
-            tiny = radii_arr[i] < tiny_radius_threshold
+            fat   = radii_arr[i] >= soma_merge_radius_factor * r_soma
+            tiny  = radii_arr[i] <  tiny_radius_threshold
             if close or fat or tiny:
                 keep[i] = False
+
         old2new = {old: new for new, old in enumerate(np.where(keep)[0])}
-        nodes_arr = nodes_arr[keep]
-        radii_arr = radii_arr[keep]
-        remap = lambda a: old2new[int(a)] if keep[int(a)] else None  # noqa: E731
-        edges_arr = np.array(
-            [tuple(sorted((remap(a), remap(b)))) for a, b in edges_arr
-             if remap(a) is not None and remap(b) is not None and remap(a) != remap(b)],
-            dtype=np.int64,
-        )
+        nodes_arr  = nodes_arr[keep]
+        radii_arr  = radii_arr[keep]
 
-    # ------------------------------------------------------------------
-    # 5. Connect all components (optional) ------------------------------
-    # ------------------------------------------------------------------
-    g_full = ig.Graph(n=len(nodes_arr), edges=[tuple(map(int, e)) for e in edges_arr], directed=False)
-    g_full.es["weight"] = [float(np.linalg.norm(nodes_arr[a] - nodes_arr[b])) for a, b in edges_arr]
+        # ----------- RECONNECT neighbours of every removed node -----------
+        adj: Dict[int, List[int]] = {i: [] for i in range(len(keep))}
+        for a, b in edges_arr:               # ← *original* edge list
+            adj[a].append(b)
+            adj[b].append(a)
 
-    if bridge_components and g_full.components().nc > 1:
-        comp_membership = g_full.components().membership
-        soma_comp = comp_membership[0]
-        comps = {}
-        for idx, comp_id in enumerate(comp_membership):
-            comps.setdefault(comp_id, []).append(idx)
+        new_edges: Set[Tuple[int, int]] = set()
+        for a, b in edges_arr:
+            ka, kb = keep[a], keep[b]
+            if ka and kb:
+                new_edges.add(tuple(sorted((old2new[a], old2new[b]))))
+            elif ka and not kb:
+                for n in adj[b]:
+                    if keep[n] and n != a:
+                        new_edges.add(tuple(sorted((old2new[a], old2new[n]))))
+            elif kb and not ka:
+                for n in adj[a]:
+                    if keep[n] and n != b:
+                        new_edges.add(tuple(sorted((old2new[b], old2new[n]))))
 
-        # KD‑tree for the soma component to find nearest neighbors fast
-        soma_kdt = cKDTree(nodes_arr[comps[soma_comp]])
+        edges_arr = np.asarray(sorted(new_edges), dtype=np.int64)
 
-        for comp_id, verts in comps.items():
-            if comp_id == soma_comp:
-                continue
-            # find k closest pairs between this component and soma component
-            dists, idxs = soma_kdt.query(nodes_arr[verts], k=min(bridge_k, len(comps[soma_comp])))
-            dists = np.atleast_2d(dists)
-            idxs = np.atleast_2d(idxs)
-            # add an edge for the single shortest pair
-            flat_idx = np.argmin(dists)
-            row, col = np.unravel_index(flat_idx, dists.shape)
-            u = verts[row]
-            v = comps[soma_comp][idxs[row, col]]
-            w = float(np.linalg.norm(nodes_arr[u] - nodes_arr[v]))
-            g_full.add_edge(u, v, weight=w)
+    # --------------------------------------------------------
+    # 5. Connect all components ------------------------------
+    # --------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # 6. Generate a global minimum‑spanning tree (MST) ------------------
-    # ------------------------------------------------------------------
-    mst = g_full.spanning_tree(weights="weight")
-    tree_edges = np.asarray(mst.get_edgelist(), dtype=np.int64)
+    g_full = ig.Graph(
+        n=len(nodes_arr),
+        edges=[tuple(map(int, e)) for e in edges_arr],
+        directed=False,
+    )
+    g_full.es["weight"] = [
+        float(np.linalg.norm(nodes_arr[a] - nodes_arr[b])) for a, b in edges_arr
+    ]
 
-    # final sanity (ensure undirected, sorted pairs)
-    tree_edges = np.sort(tree_edges, axis=1)
+    if bridge_components:
+        # 5-a)  Work out the connected components
+        vc           = g_full.components()
+        soma_comp_id = vc.membership[0]           # node 0 is the soma
+        comps        = [set(c) for c in vc]       # list[set[int]]
 
-    return Skeleton(nodes_arr, radii_arr, tree_edges)
+        if len(comps) > 1:                        # already fully connected?  → skip
+            # 5-b)  Build one KD-tree **per component** so we can find
+            #       nearest neighbours between any two components quickly.            
+            kdtrees = {
+                cid: _KDTree(nodes_arr[list(vids)])
+                for cid, vids in enumerate(comps)
+            }
+
+            # 5-c)  Greedily graft every *foreign* component onto the
+            #       growing “main island” that already reaches the soma.
+            main_island = set(comps[soma_comp_id])          # vertices already wired
+            island_tree = kdtrees[soma_comp_id]             # KD-tree of it
+
+            pending = [cid for cid in range(len(comps))
+                    if cid != soma_comp_id]
+
+            while pending:
+                cid   = pending.pop(0)
+                vids  = comps[cid]
+                pts   = nodes_arr[list(vids)]
+
+                # nearest neighbours *from that component* to the current island
+                dists, island_idx = island_tree.query(pts, k=1)
+                order = np.argsort(dists)
+                u_candidates = np.fromiter(vids, dtype=np.int64)
+                island_list  = np.fromiter(main_island, dtype=np.int64)
+
+                for j in order[:bridge_k]:
+                    u = int(u_candidates[j])
+                    v = int(island_list[island_idx[j]])
+                    w = float(np.linalg.norm(nodes_arr[u] - nodes_arr[v]))
+                    g_full.add_edge(u, v, weight=w)
+                    edges_arr = np.vstack([edges_arr, [u, v]])
+
+                # fuse that component into the island and rebuild the tree
+                main_island |= vids
+                island_tree  = _KDTree(nodes_arr[list(main_island)])
+
+    # 6. global minimum-spanning tree ------------------------------------
+    mst      = g_full.spanning_tree(weights="weight")
+    edges_mst = np.asarray(
+        sorted(tuple(sorted(e)) for e in mst.get_edgelist()), dtype=np.int64
+    )
+
+    return Skeleton(nodes_arr, radii_arr, edges_mst)
 
 # -----------------------------------------------------------------------------
 #  SWC loader (unchanged)

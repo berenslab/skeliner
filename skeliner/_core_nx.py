@@ -1,4 +1,6 @@
-
+"""Old code for skeletonization using NetworkX. It's twice slower than
+the new igraph version.
+"""
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -206,6 +208,7 @@ def skeletonize(
     soma_merge_dist_factor: float = 1.,
     soma_merge_radius_factor: float = 0.25,
     tiny_radius_threshold: float = 0.5,
+    bridge_components: bool = True,
 ) -> Skeleton:
     """
     Extract a centre-line skeleton from a neuronal surface mesh.
@@ -297,20 +300,39 @@ def skeletonize(
     v = mesh.vertices.view(np.ndarray)
     gsurf = _surface_graph(mesh)
 
+    edge_m = float(mesh.edges_unique_length.mean())
     soma_vids = np.fromiter(soma_verts, dtype=np.int64)
-    seed_vid   = soma_vids[np.argmax(np.linalg.norm(v[soma_vids] - c_soma, axis=1))]
-    dist_all  = nx.single_source_dijkstra_path_length(
-                    gsurf, seed_vid, weight="weight"
-                )
-    
-    arc_len = max(dist_all.values(), default=0.0)
-    edge_m = mesh.edges_unique_length.mean()
-    step = max(edge_m * 2.0, arc_len / target_shell_count)
 
-    bins: list[list[int]] = []
-    while not any(bins) and step < edge_m * max_shell_width_factor:
-        bins = _geodesic_bins(dist_all, step)
-        step *= 1.5
+    components = list(nx.connected_components(gsurf))      # NEW
+    all_bins: list[list[int]] = []                         # NEW
+
+    for comp_id, comp in enumerate(components):
+        comp_vertices = np.asarray(list(comp), dtype=np.int64)
+
+        # --- choose a seed for this component -----------------------------
+        if np.intersect1d(comp_vertices, soma_vids).size:
+            # soma-component: furthest-out soma vertex
+            seed_vid = int(
+                soma_vids[np.argmax(np.linalg.norm(v[soma_vids] - c_soma, axis=1))]
+            )
+        else:
+            # deterministic pseudo-random pick for reproducibility
+            seed_vid = int(comp_vertices[hash(comp_id) % len(comp_vertices)])
+
+        # --- bins for this component --------------------------------------
+        bins = _component_geodesic_bins(
+            gsurf,
+            v,
+            comp_vertices,
+            seed_vid,
+            target_shell_count,
+            max_shell_width_factor,
+            edge_m,
+        )
+        all_bins.extend(bins)
+
+    # from here on use *all_bins* exactly where the old code used *bins*
+    bins = all_bins
 
     nodes: list[np.ndarray] = [c_soma]
     radii: list[float] = [r_soma]
@@ -384,25 +406,10 @@ def skeletonize(
         edges_arr = np.array(sorted(edges), dtype=np.int64)
 
     # 3b. keep only the component that contains the soma -----------------
-    g = nx.Graph()
-    g.add_nodes_from(range(len(nodes_arr)))
-    g.add_edges_from(edges_arr)
+    if bridge_components:
+        edges_arr = _bridge_components(nodes_arr, edges_arr)
 
-    main_cc = max(nx.connected_components(g), key=len)
-    keep_cc = np.array([i in main_cc for i in range(len(nodes_arr))])
-    old2new_cc = {old: new for new, old in enumerate(np.where(keep_cc)[0])}
-
-    nodes_arr = nodes_arr[keep_cc]
-    radii_arr = radii_arr[keep_cc]
-
-    cc_edges = {
-        (old2new_cc[a], old2new_cc[b])
-        for a, b in edges_arr
-        if keep_cc[a] and keep_cc[b]
-    }
-    edges_arr = np.array(sorted(cc_edges), dtype=np.int64)
-
-    # remove cycles → keep only the BFS tree from soma
+    # 4. remove cycles → keep only the BFS tree from soma
     # -----------------------------------------------------------------
     parent = bfs_parents(edges_arr, len(nodes_arr), root=0)
     tree_edges = np.array(
@@ -410,6 +417,7 @@ def skeletonize(
          for i, pa in enumerate(parent) if pa != -1],
         dtype=np.int64,
     )
+
 
     return Skeleton(nodes_arr, radii_arr, tree_edges)
 
@@ -433,6 +441,83 @@ def _geodesic_bins(dist_dict: dict[int, float], step: float) -> list[list[int]]:
         [vid for vid, d in dist_dict.items() if a <= d < b]
         for a, b in zip(edges[:-1], edges[1:])
     ]
+
+def _component_geodesic_bins(
+    gsurf: nx.Graph,
+    v: np.ndarray,
+    comp_vertices: np.ndarray,
+    seed_vid: int,
+    target_shell_count: int,
+    max_shell_width_factor: int,
+    edge_mean: float,
+) -> list[list[int]]:
+    """Distance-bins of *comp_vertices* measured from *seed_vid*."""
+    dist_vec = nx.single_source_dijkstra_path_length(
+        gsurf, seed_vid, weight="weight"
+    )
+    dist_sub = {vid: dist_vec[vid] for vid in comp_vertices if vid in dist_vec}
+    if not dist_sub:
+        return []
+
+    arc_len = max(dist_sub.values())
+    step = max(edge_mean * 2.0, arc_len / target_shell_count)
+
+    bins: list[list[int]] = []
+    while not any(bins) and step < edge_mean * max_shell_width_factor:
+        bins = _geodesic_bins(dist_sub, step)
+        step *= 1.5
+    return bins
+
+def _bridge_components(nodes: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    """
+    Ensure the graph is fully connected while remaining acyclic.
+
+    The algorithm starts from the component that contains the soma
+    (node 0) and, at each step, grafts the nearest *remaining* component
+    onto the already connected set by inserting a single edge.
+    """
+    g = nx.Graph()
+    g.add_nodes_from(range(len(nodes)))
+    g.add_edges_from(edges)
+
+    comps = [set(c) for c in nx.connected_components(g)]
+    if len(comps) == 1:                 # nothing to do
+        return edges
+
+    connected = next(c for c in comps if 0 in c)
+    remaining = [c for c in comps if c is not connected]
+
+    new_edges: set[tuple[int, int]] = {tuple(sorted(e)) for e in edges}
+
+    while remaining:
+        best_pair: tuple[int, int] | None = None
+        best_dist = float("inf")
+        # vectorise distance search for speed
+        connected_idx = np.fromiter(connected, dtype=int)
+        connected_xyz = nodes[connected_idx]
+
+        for i, comp in enumerate(remaining):
+            comp_idx = np.fromiter(comp, dtype=int)
+            comp_xyz = nodes[comp_idx]
+
+            # pair-wise Euclidean distances: (|C|,|R|)
+            d = np.linalg.norm(
+                connected_xyz[:, None, :] - comp_xyz[None, :, :], axis=-1
+            )
+            k = np.argmin(d)                 # flat index of smallest distance
+            dist = d.flat[k]
+            if dist < best_dist:
+                best_dist = dist
+                u = connected_idx[k // d.shape[1]]
+                v = comp_idx[k % d.shape[1]]
+                best_pair = (u, v)
+                best_comp_idx = i
+
+        assert best_pair is not None        # safety
+        new_edges.add(tuple(sorted(best_pair)))
+        connected |= remaining.pop(best_comp_idx)
+
+    return np.asarray(sorted(new_edges), dtype=np.int64)
 
 
 def bfs_parents(edges: np.ndarray, n_nodes: int, *, root: int = 0) -> list[int]:
