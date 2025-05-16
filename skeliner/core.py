@@ -6,6 +6,7 @@ from typing import Iterable
 import networkx as nx
 import numpy as np
 import trimesh
+from scipy.spatial import cKDTree
 
 __all__ = [
     "Skeleton",
@@ -104,23 +105,78 @@ class Skeleton:
 #  public helpers
 # --------------------------
 
-def find_seed(mesh: "trimesh.Trimesh", seed: np.ndarray, /, *, seed_r: float, lam: float = 1.15) -> tuple[int, float]:
-    """Return index of the vertex closest to *seed* and its radius guess.
 
-    The *seed* is a 3‑vector (same units as *mesh* vertices).
+def _soma_surface_vertices(mesh: trimesh.Trimesh,
+                           probe_mult: float = 8.0,
+                           density_frac: float = 0.5,
+                           grow_steps: int = 1) -> set[int]:
     """
-    v = mesh.vertices.view(np.ndarray)
-    seed_vid = int(np.argmin(np.linalg.norm(v - seed, axis=1)))
-    return seed_vid, seed_r * lam
+    Return the *indices* of mesh vertices that belong to the soma surface.
+
+    Parameters
+    ----------
+    probe_mult     ∝ how large a ball is used for the neighbour count
+    density_frac   keep all vertices whose local neighbour count is
+                   at least `density_frac * max_count`
+    grow_steps     how many geodesic steps to dilate the patch
+    """
+    v     = mesh.vertices.view(np.ndarray)
+    gsurf = _surface_graph(mesh)     
+
+    edge_m  = mesh.edges_unique_length.mean()
+    probe_r = probe_mult * edge_m
+
+    kdt     = cKDTree(v)
+    counts  = np.asarray(kdt.query_ball_point(v, probe_r,
+                                              return_length=True))
+
+    # ---- 1a  keep everything above a relative threshold ----------------
+    dense_mask = counts >= counts.max() * density_frac
+    dense_vids = np.where(dense_mask)[0]
+
+    # ---- 1b  pick the largest connected component ----------------------
+    sub      = gsurf.subgraph(dense_vids)
+    soma_cc  = max(nx.connected_components(sub), key=len)
+    soma_set = set(soma_cc)
+
+    # ---- 1c  (optional) geodesic dilation to fill tiny gaps ------------
+    for _ in range(grow_steps):
+        boundary = {nb
+                    for v_ in soma_set
+                    for nb in gsurf.neighbors(v_)
+                    if nb not in soma_set}
+        soma_set.update(boundary)
+
+    return soma_set
+
+def find_soma(mesh: trimesh.Trimesh,
+                   probe_mult: float = 8.0,
+                   density_frac: float = 0.30,
+                   grow_steps: int = 1,
+                   lam: float = 1.15) -> tuple[np.ndarray, float, set[int]]:
+
+    soma_verts = _soma_surface_vertices(mesh,
+                                        probe_mult=probe_mult,
+                                        density_frac=density_frac,
+                                        grow_steps=grow_steps)
+
+    v       = mesh.vertices.view(np.ndarray)
+    pts     = v[list(soma_verts)]
+
+    centre  = pts.mean(axis=0)
+    radius  = np.percentile(np.linalg.norm(pts - centre, axis=1), 90)
+
+    return centre, radius, soma_verts
 
 
-def find_soma(mesh: "trimesh.Trimesh", seed: np.ndarray, *, seed_r: float, lam: float = 1.15) -> tuple[np.ndarray, float, set[int]]:
+def find_soma_with_seed(mesh: "trimesh.Trimesh", seed: np.ndarray, *, seed_r: float, lam: float = 1.15) -> tuple[np.ndarray, float, set[int]]:
     """Identify soma‑surface vertices around *seed*.
 
     Returns the centroid, an estimated radius and the vertex set.
     """
-    seed_vid, cutoff = find_seed(mesh, seed, seed_r=seed_r, lam=lam)
     v = mesh.vertices.view(np.ndarray)
+    seed_vid = int(np.argmin(np.linalg.norm(v - seed, axis=1)))
+    cutoff = seed_r * lam
     g = _surface_graph(mesh)
     dist = nx.single_source_dijkstra_path_length(g, seed_vid, weight="weight", cutoff=cutoff)
     soma_verts = set(dist)
@@ -129,38 +185,47 @@ def find_soma(mesh: "trimesh.Trimesh", seed: np.ndarray, *, seed_r: float, lam: 
     radius = np.percentile(np.linalg.norm(pts - centre, axis=1), 90)
     return centre, radius, soma_verts
 
+
 # --------------------------
 #  main algorithm
 # --------------------------
 
 def skeletonize(
     mesh: "trimesh.Trimesh",
-    seed: np.ndarray,
-    *,
+    probe_mult: float = 10.0,
+    density_frac: float = 0.30,
+    grow_steps: int = 1,
+    seed: np.ndarray | None = None,
     seed_r: float = 7_500.0,
     lam: float = 1.15,
     target_bins: int = 500,
     min_bin_sz: int = 1,
     max_bin_fac: int = 50,
-    collapse_dist: float = 1.25,
-    collapse_rad: float = 0.35,
-    radius_eps: float = 1.0,
+    collapse_dist: float = 1.,
+    collapse_rad: float = 0.25,
+    radius_eps: float = 0.5,
 ) -> Skeleton:
     """Extract a centre‑line skeleton from *mesh* starting at *seed*.
 
     Parameters mirror the original prototype script.
     """
     # 0. soma vertices ----------------------------------------------------
-    c_soma, r_soma, soma_verts = find_soma(
-        mesh, seed, seed_r=seed_r, lam=lam
-    )
+    if seed is None:
+        c_soma, r_soma, soma_verts = find_soma(mesh, probe_mult=probe_mult,
+                                            density_frac=density_frac, grow_steps=grow_steps)
+    else:
+        c_soma, r_soma, soma_verts = find_soma_with_seed(mesh, seed=seed, seed_r=seed_r, lam=lam)
 
     # 1. binning along geodesic shells ----------------------------------
     v = mesh.vertices.view(np.ndarray)
     gsurf = _surface_graph(mesh)
-    seed_vid = int(np.argmin(np.linalg.norm(v - seed, axis=1)))
-    dist_all = nx.single_source_dijkstra_path_length(gsurf, seed_vid, weight="weight")
 
+    soma_vids = np.fromiter(soma_verts, dtype=np.int64)
+    seed_vid   = soma_vids[np.argmax(np.linalg.norm(v[soma_vids] - c_soma, axis=1))]
+    dist_all  = nx.single_source_dijkstra_path_length(
+                    gsurf, seed_vid, weight="weight"
+                )
+    
     arc_len = max(dist_all.values(), default=0.0)
     edge_m = mesh.edges_unique_length.mean()
     step = max(edge_m * 2.0, arc_len / target_bins)
