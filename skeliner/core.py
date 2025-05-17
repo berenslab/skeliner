@@ -18,7 +18,7 @@ __all__ = [
 ]
 
 # -----------------------------------------------------------------------------
-#  Core dataclass
+# Dataclass
 # -----------------------------------------------------------------------------
 
 @dataclass(slots=True)
@@ -42,7 +42,7 @@ class Skeleton:
         Optional. None when loaded from SWC.
     """
     nodes: np.ndarray  # (N, 3) float32
-    radii: np.ndarray  # (N,)  float32
+    radii:  dict[str, np.ndarray]  # (N,)  float32
     edges: np.ndarray  # (E, 2) int64  – undirected, **sorted** pairs
     soma_verts: np.ndarray | None = None
 
@@ -51,7 +51,7 @@ class Skeleton:
     # ---------------------------------------------------------------------
     def __post_init__(self) -> None:
         """Validate basic shape constraints."""
-        if self.nodes.shape[0] != self.radii.shape[0]:
+        if self.nodes.shape[0] != self.r.shape[0]:
             raise ValueError("nodes and radii length mismatch")
         if self.edges.ndim != 2 or self.edges.shape[1] != 2:
             raise ValueError("edges must be (E, 2)")
@@ -68,7 +68,12 @@ class Skeleton:
     # ---------------------------------------------------------------------
     # I/O
     # ---------------------------------------------------------------------
-    def to_swc(self, path: str | Path, *, include_header: bool = True, scale: float = 1.0) -> None:
+    def to_swc(self, 
+               path: str | Path,
+               include_header: bool = True, 
+               scale: float = 1.0,
+               radius_metric: str | None = None
+    ) -> None:
         """Write the skeleton to SWC.
 
         The first node (index 0) is written as type 1 (soma) and acts as the
@@ -87,10 +92,17 @@ class Skeleton:
         """        
         path = Path(path)
         parent = _bfs_parents(self.edges, len(self.nodes), root=0)
+        nodes = self.nodes
+        if radius_metric is None:
+            radii = self.r
+        else:
+            if radius_metric not in self.radii:
+                raise ValueError(f"Unknown radius estimator '{radius_metric}'")
+            radii = self.radii[radius_metric]
         with path.open("w", encoding="utf8") as fh:
             if include_header:
                 fh.write("# id type x y z radius parent\n")
-            for idx, (p, r, pa) in enumerate(zip(self.nodes * scale, self.radii * scale, parent), start=1):
+            for idx, (p, r, pa) in enumerate(zip(nodes * scale, radii * scale, parent), start=1):
                 swc_type = 1 if idx == 1 else 0
                 fh.write(f"{idx} {swc_type} {p[0]} {p[1]} {p[2]} {r} {pa + 1 if pa != -1 else -1}\n")
 
@@ -143,6 +155,41 @@ class Skeleton:
         return [(cyc[i], cyc[(i + 1) % len(cyc)]) for i in range(len(cyc))]
 
     # ------------------------------------------------------------------
+    # radius recommendation
+    # ------------------------------------------------------------------
+    def recommend_radius(self) -> Tuple[str, str, Dict[str, float]]:
+        """Heuristic choice among mean / trim / median with explanation.
+
+        Returns
+        -------
+        choice : str
+            Name of the recommended estimator.
+        reason : str
+            Short human‑readable explanation.
+        stats : dict
+            Diagnostic numbers {"p50", "p75", "max"} of mean/median ratio.
+        """
+        mean = self.radii.get("mean")
+        median = self.radii.get("median")
+        if mean is None or median is None:
+            return "median", "Only one radius column available; using it.", {}
+
+        ratio = mean / median
+        p50 = float(np.percentile(ratio, 50))
+        p75 = float(np.percentile(ratio, 75))
+        pmax = float(ratio.max())
+
+        if p75 < 1.02:
+            choice, reason = "mean", "Bias ≤ 2% for 75% of nodes – distribution symmetric."
+        elif p50 < 1.05 and "trim" in self.radii:
+            choice, reason = "trim", "Moderate tails; 5% trimmed mean is robust and less biased."
+        else:
+            choice, reason = "median", "Long positive tails detected; median is safest."
+
+        return choice, reason, {"p50": p50, "p75": p75, "max": pmax}
+
+
+    # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
     @property
@@ -156,6 +203,12 @@ class Skeleton:
         mask = np.zeros(len(self.nodes), dtype=bool)
         mask[list(self.soma_verts)] = True
         return mask
+
+    @property
+    def r(self) -> np.ndarray:
+        """Just the estimator name chosen by :py:meth:`recommend_radius`."""
+        choice = self.recommend_radius()[0]
+        return self.radii[choice]
 
 # -----------------------------------------------------------------------------
 #  Graph helpers 
@@ -277,7 +330,9 @@ def _geodesic_bins(dist_dict: Dict[int, float], step: float) -> List[List[int]]:
 
 
 def _bfs_parents(edges: np.ndarray, n_nodes: int, *, root: int = 0) -> List[int]:
-    """Return parent[] array of BFS tree from *root* given undirected edge list."""
+    """
+    Return parent[] array of BFS tree from *root* given undirected edge list.
+    """
     adj: List[List[int]] = [[] for _ in range(n_nodes)]
     for a, b in edges:
         adj[int(a)].append(int(b))
@@ -291,6 +346,30 @@ def _bfs_parents(edges: np.ndarray, n_nodes: int, *, root: int = 0) -> List[int]
                 parent[v] = u
                 q.append(v)
     return parent
+
+
+def _estimate_radius(d: np.ndarray, *, method: str = "median", trim_fraction: float = 0.05, q: float = 0.90) -> float:
+    """Return one scalar radius according to *method*.
+
+    Methods
+    -------
+    median          : 50‑th percentile (robust default)
+    mean            : arithmetic mean (biased by tails)
+    trim            : mean after trimming *trim_fraction* at both ends
+    qXX / pXX       : upper quantile XX given as integer, e.g. "q90" or "p75"
+    """
+    if method == "median":
+        return float(np.median(d))
+    if method == "mean":
+        return float(d.mean())
+    if method == "max":
+        return float(d.max())
+    if method == "min":
+        return float(d.min())
+    if method == "trim":
+        lo, hi = np.quantile(d, [trim_fraction, 1.0 - trim_fraction])
+        return float(d[(d >= lo) & (d <= hi)].mean())
+    raise ValueError(f"Unknown radius estimator '{method}'.")
 
 
 def _edges_from_mesh(
@@ -323,18 +402,19 @@ def _edges_from_mesh(
 #  Post-processing helpers
 # -----------------------------------------------------------------------
 
-
 def _collapse_soma_nodes(
     nodes: np.ndarray,
     radii: np.ndarray,
-    edges: np.ndarray,                      # shape (E, 2)
+    edges: np.ndarray,                      
     *,
     c_soma: np.ndarray,
     r_soma: float,
     soma_merge_dist_factor: float,
     soma_merge_radius_factor: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Merge near‑soma redundant centroids and reconnect edges."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Merge near‑soma redundant centroids and reconnect edges.
+    """
     # ── 1. decide which vertices survive ────────────────────────────────
     close = np.linalg.norm(nodes - c_soma, axis=1) < soma_merge_dist_factor * r_soma
     fat   = radii >= soma_merge_radius_factor * r_soma
@@ -377,7 +457,7 @@ def _collapse_soma_nodes(
     edges_out = np.sort(edges_out, axis=1)
     edges_out = np.unique(edges_out, axis=0)
 
-    return nodes[keep], radii[keep], edges_out
+    return nodes[keep], radii[keep], edges_out, keep
 
 
 def _bridge_components(
@@ -436,7 +516,9 @@ def _bridge_components(
     return edges_aug
 
 def _build_mst(nodes: np.ndarray, edges: np.ndarray) -> np.ndarray:
-    """Return edge list of the global minimum-spanning tree."""
+    """
+    Return edge list of the global minimum-spanning tree.
+    """
     g = ig.Graph(
         n=len(nodes), edges=[tuple(map(int, e)) for e in edges], directed=False
     )
@@ -619,6 +701,8 @@ def find_soma_with_seed(
 
 def skeletonize(
     mesh: trimesh.Trimesh,
+    # --- radius estimation ---
+    radius_estimators: list[str] = ["median", "mean", "trim"],
     # --- soma detection ---
     soma_probe_radius_mult: float = 10.0,
     soma_density_threshold: float = 0.30,
@@ -628,7 +712,7 @@ def skeletonize(
     path_len_relax: float = 1.15,
     # --- geodesic sampling ---
     target_shell_count: int = 500,
-    min_cluster_vertices: int = 1,
+    min_cluster_vertices: int = 6,
     max_shell_width_factor: int = 50,
     # --- bridging disconnected patches ---
     bridge_components: bool = True,
@@ -640,6 +724,7 @@ def skeletonize(
     prune_tiny_neurites: bool = True,
     min_branch_nodes: int = 30,
     min_branch_extent_factor: float = 1.8,
+    # --- misc ---
     verbose: bool = False,
 ) -> Skeleton:
     """Compute a centre-line skeleton with radii of a neuronal mesh .
@@ -723,6 +808,11 @@ def skeletonize(
                 lam=path_len_relax,
             )
 
+    # store soma radius for every estimator
+    radii_dict_lists: Dict[str, List[float]] = {
+        est: [r_soma] for est in radius_estimators
+    }
+
     # 1. binning along geodesic shells ----------------------------------
     with _timed("↳  partition surface into geodesic shells"):
         v = mesh.vertices.view(np.ndarray)
@@ -736,24 +826,7 @@ def skeletonize(
 
         for cid, verts in enumerate(comp_vertices):
 
-            # -------- choose the *one* seed you used before ----------
-            # if np.intersect1d(verts, soma_vids).size:
-            #     seeds = [
-            #         int(
-            #             soma_vids[
-            #                 np.argmax(np.linalg.norm(v[soma_vids] - c_soma, axis=1))
-            #             ]
-            #         )
-            #     ]
-            # else:
-            #     seeds = [int(verts[(hash(cid) % len(verts))])]
-
-            # -------- single C call for this component ---------------
-            # dist_vec = gsurf.shortest_paths_dijkstra(
-            #     source=seeds,
-            #     target=verts,
-            #     weights="weight",
-            # )[0]                                            # shape = (1, |verts|)
+            # -------- choose the *one* seed you used before ----------                                   
             if np.intersect1d(verts, soma_vids).size:
                 seed_vid = int(
                     soma_vids[
@@ -764,7 +837,6 @@ def skeletonize(
                 seed_vid = int(verts[hash(cid) % len(verts)])
 
             dist_vec = _dist_vec_for_component(gsurf, verts, seed_vid)
-
             dist_sub = {int(v): float(d) for v, d in zip(verts, dist_vec)}
 
             # -------- adaptive shell binning (unchanged) -------------
@@ -798,17 +870,26 @@ def skeletonize(
                 comp_idx = np.fromiter((inner[i] for i in comp), dtype=np.int64)
                 pts      = v[comp_idx]
                 centre   = pts.mean(axis=0)
-                radius   = float(np.linalg.norm(pts - centre, axis=1).mean())
+                d = np.linalg.norm(pts - centre, axis=1)
+
+                # collect radii for every requested estimator
+                for est in radius_estimators:
+                    val = _estimate_radius(
+                        d, method=est, trim_fraction=0.05
+                    )
+                    radii_dict_lists.setdefault(est, []).append(val)
 
                 node_id = next_id
                 next_id += 1
                 nodes.append(centre)
-                radii.append(radius)
                 for vv in comp_idx:
                     v2n[int(vv)] = node_id
 
         nodes_arr = np.asarray(nodes, dtype=np.float32)
-        radii_arr = np.asarray(radii, dtype=np.float32)
+        nodes_arr = np.asarray(nodes, dtype=np.float32)
+        radii_dict = {
+            k: np.asarray(v, dtype=np.float32) for k, v in radii_dict_lists.items()
+        }
 
     # 3. edges from mesh connectivity -----------------------------------
     with _timed("↳  map mesh edges → skeleton edges"):
@@ -823,19 +904,23 @@ def skeletonize(
         with _timed("↳  merge redundant near-soma nodes"):
             (
                 nodes_arr,
-                radii_arr,
+                _,
                 edges_arr,
+                keep_mask
             ) = _collapse_soma_nodes(
                 nodes_arr,
-                radii_arr,
+                radii_dict[radius_estimators[0]],
                 edges_arr,
                 c_soma=c_soma,
-                r_soma=r_soma,
+                r_soma=radii_dict[radius_estimators[0]][0],
                 soma_merge_dist_factor=soma_merge_dist_factor,
                 soma_merge_radius_factor=soma_merge_radius_factor,
             )
 
-        
+            # apply same mask to all radius columns
+            for k in radii_dict:
+                radii_dict[k] = radii_dict[k][keep_mask]
+
     # 5. Connect all components ------------------------------
     if bridge_components:
         with _timed("↳  reconnect mesh gaps"):
@@ -852,19 +937,20 @@ def skeletonize(
                 nodes_arr,
                 edges_mst,
                 c_soma,
-                r_soma,
+                radii_dict[radius_estimators[0]][0],
                 min_branch_nodes=min_branch_nodes,           
                 min_branch_extent_factor=min_branch_extent_factor,
             )
             nodes_arr  = nodes_arr[keep_mask]
-            radii_arr  = radii_arr[keep_mask]
+            for k in radii_dict:
+                radii_dict[k] = radii_dict[k][keep_mask]
 
     if verbose:
         total_ms = (time.perf_counter() - _global_start)
         print(f"{'TOTAL':<50} {total_ms:8.1f} s")
 
     return Skeleton(nodes_arr, 
-                    radii_arr, 
+                    radii_dict, 
                     edges_mst, 
                     soma_verts=np.asarray(list(soma_verts), dtype=np.int64)
             )
@@ -875,7 +961,6 @@ def skeletonize(
 
 def load_swc(
     path: str | Path,
-    *,
     scale: float = 1.0,
     keep_types: Iterable[int] | None = None,
 ) -> Skeleton:
@@ -927,10 +1012,10 @@ def load_swc(
 
     id_map = {old: new for new, old in enumerate(ids)}
     nodes_arr = np.asarray(xyz, dtype=np.float32) * scale
-    radii_arr = np.asarray(radii, dtype=np.float32) * scale
+    radii_dict = {"median": np.asarray(radii, dtype=np.float32) * scale}
     edges = [
         (id_map[i], id_map[p])
         for i, p in zip(ids, parent, strict=True)
         if p != -1 and p in id_map
     ]
-    return Skeleton(nodes_arr, radii_arr, np.asarray(edges, dtype=np.int64))
+    return Skeleton(nodes_arr, radii_dict, np.asarray(edges, dtype=np.int64))

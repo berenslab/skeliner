@@ -1,5 +1,3 @@
-from typing import Optional
-
 import matplotlib.pyplot as plt
 import numpy as np
 import trimesh
@@ -68,13 +66,14 @@ def plot_projection(
     mesh: "trimesh.Trimesh",
     *,
     plane: str = "xy",
+    radius_metric: str | None = None,
     bins: int | tuple[int, int] = 800,
     scale: float | list = 1.0,
-    xlim: Optional[tuple[float, float]] = None,
-    ylim: Optional[tuple[float, float]] = None,
+    xlim: tuple[float, float] | None = None,
+    ylim: tuple[float, float] | None = None,
     draw_skel: bool = True,
     draw_edges: bool = False,
-    ax: Optional["Axes"] = None,
+    ax: Axes | None = None,
     cmap: str = "Blues",
     vmax_fraction: float = 0.10,
     circle_alpha: float = 0.25,
@@ -121,10 +120,13 @@ def plot_projection(
     if type(scale) is not list:
         scale = [scale, scale]
 
+    if radius_metric is None:
+        radius_metric = skel.recommend_radius()[0]
+
     # ─────────────────── project & scale ──────────────────────────────────
     xy_mesh = _project(mesh.vertices, ix, iy) * scale[1]
     xy_skel = _project(skel.nodes, ix, iy) * scale[0]
-    rr      = skel.radii * scale[0]
+    rr      = skel.radii[radius_metric] * scale[0]
 
     # ─────────────────── crop early to save work ──────────────────────────
     def _apply_window(xy: np.ndarray) -> np.ndarray:
@@ -211,7 +213,7 @@ def plot_projection(
         ax.add_patch(
             Circle(
                 (c_xy[0], c_xy[1]),
-                skel.radii[0] * scale[0],           # physical size
+                skel.radii[radius_metric][0] * scale[0],           # physical size
                 facecolor="none", edgecolor="black",
                 linestyle="--", linewidth=1.3, zorder=2,
             )
