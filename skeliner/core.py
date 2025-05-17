@@ -21,11 +21,25 @@ __all__ = [
 
 @dataclass(slots=True)
 class Skeleton:
-    """A minimal, numpy‑backed skeleton graph (igraph backend)."""
+    """
+    Minimal, NumPy-backed skeleton graph.
 
+    Parameters
+    ----------
+    nodes
+        (N, 3) float32 Cartesian coordinates.
+    radii
+        (N,) float32 local radii.
+    edges
+        (E, 2) int64 undirected **sorted** vertex pairs.
+    soma_verts
+        1-D int64 array of mesh-vertex IDs belonging to the soma surface.
+        Optional – may be ``None`` when loaded from SWC.
+    """
     nodes: np.ndarray  # (N, 3) float32
     radii: np.ndarray  # (N,)  float32
     edges: np.ndarray  # (E, 2) int64  – undirected, **sorted** pairs
+    soma_verts: np.ndarray | None = None          # NEW
 
     # ---------------------------------------------------------------------
     # sanity checks
@@ -35,6 +49,8 @@ class Skeleton:
             raise ValueError("nodes and radii length mismatch")
         if self.edges.ndim != 2 or self.edges.shape[1] != 2:
             raise ValueError("edges must be (E, 2)")
+        if self.soma_verts is not None and self.soma_verts.ndim != 1:
+            raise ValueError("soma_verts must be 1-D")
 
     # ---------------------------------------------------------------------
     # helpers
@@ -85,6 +101,21 @@ class Skeleton:
         # -- find a concrete cycle (slow but rare) -----------------------
         cyc = g.cycle_basis()[0]                  # list of vertex ids
         return [(cyc[i], cyc[(i + 1) % len(cyc)]) for i in range(len(cyc))]
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+    @property
+    def soma_mask(self) -> np.ndarray | None:
+        """
+        Boolean mask over `nodes` that is True for vertices whose *mesh*
+        vertex lay on the detected soma surface (None if not available).
+        """
+        if self.soma_verts is None:
+            return None
+        mask = np.zeros(len(self.nodes), dtype=bool)
+        mask[list(self.soma_verts)] = True
+        return mask
 
 # -----------------------------------------------------------------------------
 #  Graph helpers (igraph)
@@ -661,7 +692,11 @@ def skeletonize(
         nodes_arr  = nodes_arr[keep_mask]
         radii_arr  = radii_arr[keep_mask]
 
-    return Skeleton(nodes_arr, radii_arr, edges_mst)
+    return Skeleton(nodes_arr, 
+                    radii_arr, 
+                    edges_mst, 
+                    soma_verts=np.asarray(list(soma_verts), dtype=np.int64)
+            )
 
 # -----------------------------------------------------------------------------
 #  SWC loader (unchanged)
