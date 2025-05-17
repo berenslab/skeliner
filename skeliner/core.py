@@ -229,6 +229,26 @@ def _soma_surface_vertices(
 # -----------------------------------------------------------------------------
 #  Utility
 # -----------------------------------------------------------------------------
+def _dist_vec_for_component(
+    gsurf: ig.Graph,
+    verts: np.ndarray,        # 1-D int64 array of vertex IDs (one component)
+    seed_vid: int,            # mesh-vertex ID, must be in *verts*
+) -> np.ndarray:
+    """
+    Return the distance vector *d[verts[i]]* from *seed_vid* to every
+    vertex in this component, **without touching the rest of the mesh**.
+    """
+    # Build a dedicated sub-graph (much smaller than gsurf)
+    sub = gsurf.induced_subgraph(verts, implementation="create_from_scratch")
+
+    # Map the seed’s mesh-vertex ID → its local index in *sub*
+    root_idx = int(np.where(verts == seed_vid)[0][0])
+
+    # igraph returns shape (1, |verts|); squeeze to 1-D
+    return sub.shortest_paths_dijkstra(
+        source=[root_idx],
+        weights="weight",
+    )[0]
 
 def _geodesic_bins(dist_dict: Dict[int, float], step: float) -> List[List[int]]:
     """Bucket mesh vertices into concentric geodesic shells."""
@@ -717,23 +737,33 @@ def skeletonize(
         for cid, verts in enumerate(comp_vertices):
 
             # -------- choose the *one* seed you used before ----------
-            if np.intersect1d(verts, soma_vids).size:
-                seeds = [
-                    int(
-                        soma_vids[
-                            np.argmax(np.linalg.norm(v[soma_vids] - c_soma, axis=1))
-                        ]
-                    )
-                ]
-            else:
-                seeds = [int(verts[(hash(cid) % len(verts))])]
+            # if np.intersect1d(verts, soma_vids).size:
+            #     seeds = [
+            #         int(
+            #             soma_vids[
+            #                 np.argmax(np.linalg.norm(v[soma_vids] - c_soma, axis=1))
+            #             ]
+            #         )
+            #     ]
+            # else:
+            #     seeds = [int(verts[(hash(cid) % len(verts))])]
 
             # -------- single C call for this component ---------------
-            dist_vec = gsurf.shortest_paths_dijkstra(
-                source=seeds,
-                target=verts,
-                weights="weight",
-            )[0]                                            # shape = (1, |verts|)
+            # dist_vec = gsurf.shortest_paths_dijkstra(
+            #     source=seeds,
+            #     target=verts,
+            #     weights="weight",
+            # )[0]                                            # shape = (1, |verts|)
+            if np.intersect1d(verts, soma_vids).size:
+                seed_vid = int(
+                    soma_vids[
+                        np.argmax(np.linalg.norm(v[soma_vids] - c_soma, axis=1))
+                    ]
+                )
+            else:
+                seed_vid = int(verts[hash(cid) % len(verts)])
+
+            dist_vec = _dist_vec_for_component(gsurf, verts, seed_vid)
 
             dist_sub = {int(v): float(d) for v, d in zip(verts, dist_vec)}
 
