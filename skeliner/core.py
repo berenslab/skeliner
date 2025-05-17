@@ -21,8 +21,11 @@ __all__ = [
 
 @dataclass(slots=True)
 class Skeleton:
-    """
-    Minimal, NumPy-backed skeleton graph.
+    """Light-weight skeleton graph.
+
+    The skeleton is a forest-shaped graph (acyclic, undirected) whose vertices
+    sit on the centre-line of a mesh representation of a neurone. Node 0 is
+    reserved for the soma centroid; all other vertices belong to neurites.
 
     Parameters
     ----------
@@ -31,20 +34,21 @@ class Skeleton:
     radii
         (N,) float32 local radii.
     edges
-        (E, 2) int64 undirected **sorted** vertex pairs.
-    soma_verts
-        1-D int64 array of mesh-vertex IDs belonging to the soma surface.
-        Optional – may be ``None`` when loaded from SWC.
+        (E, 2) int64 undirected sorted vertex pairs.
+    soma_verts 
+        Optional 1D int64 array of mesh-vertex IDs belonging to the soma surface.
+        Optional. None when loaded from SWC.
     """
     nodes: np.ndarray  # (N, 3) float32
     radii: np.ndarray  # (N,)  float32
     edges: np.ndarray  # (E, 2) int64  – undirected, **sorted** pairs
-    soma_verts: np.ndarray | None = None          # NEW
+    soma_verts: np.ndarray | None = None
 
     # ---------------------------------------------------------------------
     # sanity checks
     # ---------------------------------------------------------------------
     def __post_init__(self) -> None:
+        """Validate basic shape constraints."""
         if self.nodes.shape[0] != self.radii.shape[0]:
             raise ValueError("nodes and radii length mismatch")
         if self.edges.ndim != 2 or self.edges.shape[1] != 2:
@@ -55,14 +59,30 @@ class Skeleton:
     # ---------------------------------------------------------------------
     # helpers
     # ---------------------------------------------------------------------
-    def _igraph(self) -> ig.Graph:  # on‑demand igraph view
+    def _igraph(self) -> ig.Graph:
+        """Return an :class:`igraph.Graph` view of self (undirected)."""
         return ig.Graph(n=len(self.nodes), edges=[tuple(map(int, e)) for e in self.edges], directed=False)
 
     # ---------------------------------------------------------------------
     # I/O
     # ---------------------------------------------------------------------
     def to_swc(self, path: str | Path, *, include_header: bool = True, scale: float = 1.0) -> None:
-        """Write to *path* in SWC format (id 1 = soma, parents 1‑indexed)."""
+        """Write the skeleton to SWC.
+
+        The first node (index 0) is written as type 1 (soma) and acts as the
+        root of the morphology tree. Parent IDs are therefore 1‑based to
+        comply with the SWC format.
+
+        Parameters
+        ----------
+        path
+            Output filename.
+        include_header
+            Prepend the canonical SWC header line if *True*.
+        scale
+            Unit conversion factor applied to *both* coordinates and radii when
+            writing; useful e.g. for nm→µm conversion.
+        """        
         path = Path(path)
         parent = _bfs_parents(self.edges, len(self.nodes), root=0)
         with path.open("w", encoding="utf8") as fh:
@@ -76,6 +96,20 @@ class Skeleton:
     # validation
     # ------------------------------------------------------------------
     def check_connectivity(self, *, return_isolated: bool = False):
+        """Verify that all nodes are reachable from the soma (node 0).
+
+        Parameters
+        ----------
+        return_isolated
+            If True return the list of orphan node indices instead of a
+            boolean flag.
+
+        Returns
+        -------
+        bool | list[int]
+            True when the skeleton is connected, otherwise False or a
+            list of isolated nodes if return_isolated=True.
+        """
         g = self._igraph()
         order, _, _ = g.bfs(0, mode="ALL")  # returns -1 for unreachable
         reachable: Set[int] = {v for v in order if v != -1}
@@ -84,13 +118,17 @@ class Skeleton:
         return len(reachable) == len(self.nodes)
 
     def check_acyclic(self, *, return_cycle: bool = False) -> bool | list[tuple[int, int]]:
-        """
-        Verify that **no cycles** are present (i.e. the skeleton is a forest).
+        """Detect cycles in the edge list.
 
-        Returns ``True`` when the edge count obeys |E| = |V| − C
-        where *C* is the number of connected components.  When
-        *return_cycle=True* one representative cycle is returned
-        (empty list ⇒ acyclic).
+        The skeleton is expected to be a forest (collection of trees).  This
+        method verifies :math:`|E| = |V| - C` where C is the number of
+        connected components.
+
+        Parameters
+        ----------
+        return_cycle
+            When True a representative cycle is returned if one exists; an
+            empty list means the graph is acyclic.
         """
         g = self._igraph()                        # helper that builds igraph
         num_comp = len(g.components())            # instead of .nc
@@ -108,7 +146,7 @@ class Skeleton:
     @property
     def soma_mask(self) -> np.ndarray | None:
         """
-        Boolean mask over `nodes` that is True for vertices whose *mesh*
+        Boolean mask over `nodes` that is True for vertices whose mesh
         vertex lay on the detected soma surface (None if not available).
         """
         if self.soma_verts is None:
@@ -118,11 +156,16 @@ class Skeleton:
         return mask
 
 # -----------------------------------------------------------------------------
-#  Graph helpers (igraph)
+#  Graph helpers 
 # -----------------------------------------------------------------------------
 
 def _surface_graph(mesh: trimesh.Trimesh) -> ig.Graph:
-    """Triangle‑adjacency graph of *mesh* (edge weight = Euclidean length)."""
+    """Return an edge‑weighted triangle‑adjacency graph.
+
+    The graph has one vertex per mesh‑vertex and an undirected edge for every
+    unique mesh edge.  Edge weights are the Euclidean lengths which later serve
+    as geodesic distances.
+    """
     edges = [tuple(map(int, e)) for e in mesh.edges_unique]
     g = ig.Graph(n=len(mesh.vertices), edges=edges, directed=False)
     g.es["weight"] = mesh.edges_unique_length.astype(float).tolist()
@@ -139,7 +182,19 @@ def _soma_surface_vertices(
     soma_dilation_steps: int = 1,
     gsurf: ig.Graph | None = None,
 ) -> Set[int]:
-    """Return indices of soma‑surface vertices via density filter + dilation."""
+    """Heuristic soma‑surface detection.
+
+    A density filter first selects vertices with the maximum neighbourhood
+    count inside a spherical probe. The largest connected component of this
+    high‑density set is considered soma; optional geodesic dilation helps
+    compensate mesh irregularities.
+
+    Notes
+    -----
+    This is a quick‑and‑dirty heuristic that works well for typical electron
+    microscopy segmentations but is not guaranteed to find the anatomical
+    soma for arbitrarily shaped meshes.
+    """    
     v = mesh.vertices.view(np.ndarray)
     if gsurf is None:
         gsurf = _surface_graph(mesh)
@@ -177,6 +232,35 @@ def find_soma(
     soma_dilation_steps: int = 1,
     gsurf: ig.Graph | None = None,
 ):
+    """Detect the soma surface by local surface-density filtering.
+
+    The algorithm quickly estimates a density map over mesh vertices, keeps the
+    densest connected cluster, and optionally performs a few geodesic dilation
+    steps to thicken the mask.
+    
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Watertight mesh of the neuron.
+    soma_probe_radius_mult : float, default ``8.0``
+        Probe radius = ``soma_probe_radius_mult × ⟨edge length⟩``.
+    soma_density_threshold : float, default ``0.30``
+        Keep vertices whose probe counts are at least this fraction of the
+        *maximum* count.
+    soma_dilation_steps : int, default ``1``
+        Number of geodesic dilations (1-ring expansions) of the dense core.
+    gsurf : ig.Graph | None, optional
+        Pre-computed surface graph to reuse (speed).
+
+    Returns
+    -------
+    centre : np.ndarray
+        Cartesian coordinates of the soma centroid.
+    radius : float
+        Approximate soma radius (90‑th percentile of point distances).
+    soma_verts : set[int]
+        Mesh‑vertex indices that form the detected soma surface.
+    """
     soma_verts = _soma_surface_vertices(
         mesh,
         gsurf=gsurf,
@@ -197,6 +281,11 @@ def find_soma_with_seed(
     lam: float = 1.15,
     gsurf: ig.Graph | None = None,
 ):
+    """Refine soma location given a seed point.
+
+    A user‑supplied seed point is snapped to the closest mesh vertex and a
+    geodesic flood‑fill up to lam × seed_r returns the soma patch.
+    """
     v = mesh.vertices.view(np.ndarray)
     seed_vid = int(np.argmin(np.linalg.norm(v - seed, axis=1)))
     cutoff = seed_r * lam
@@ -214,12 +303,7 @@ def find_soma_with_seed(
 # -----------------------------------------------------------------------------
 
 def _geodesic_bins(dist_dict: Dict[int, float], step: float) -> List[List[int]]:
-    """
-    Vectorised distance-to-bins helper.
-    Keeps the original semantics: bins are half-open [a, b)
-    so a vertex sitting exactly on the global max distance
-    joins the *previous* shell.
-    """
+    """Bucket mesh vertices into concentric geodesic shells."""
     if not dist_dict:
         return []
 
@@ -251,7 +335,6 @@ def _bfs_parents(edges: np.ndarray, n_nodes: int, *, root: int = 0) -> List[int]
         adj[int(a)].append(int(b))
         adj[int(b)].append(int(a))
     parent = [-1] * n_nodes
-    # q: List[int] = [root]
     q = deque([root])
     while q:
         u = q.popleft()
@@ -269,10 +352,6 @@ def _edges_from_mesh(
 ) -> np.ndarray:
     """
     Vectorised remap of mesh edges -> skeleton edges.
-
-    Returns
-    -------
-    edges_arr : (E′, 2) int64  sorted and unique.
     """
     # 1. build an int64 lookup table  mesh_vid -> node_id  (-1 if absent)
     lut = np.full(n_mesh_verts, -1, dtype=np.int64)
@@ -307,12 +386,12 @@ def _collapse_soma_nodes(
     soma_merge_dist_factor: float,
     soma_merge_radius_factor: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Merge close/fat centroids inside soma, then reconnect graph."""
+    """Merge near‑soma redundant centroids and reconnect edges."""
     # ── 1. decide which vertices survive ────────────────────────────────
     close = np.linalg.norm(nodes - c_soma, axis=1) < soma_merge_dist_factor * r_soma
     fat   = radii >= soma_merge_radius_factor * r_soma
     keep  = ~(close | fat)
-    keep[0] = True                                         # keep soma
+    keep[0] = True # keep soma                                        
 
     kept_idx = np.where(keep)[0]
     old2new = np.empty(len(keep), dtype=np.int64)
@@ -323,13 +402,13 @@ def _collapse_soma_nodes(
     a, b = edges.T
     both_keep = keep[a] & keep[b]
     edges_out = edges[both_keep].copy()
-    edges_out[:] = old2new[edges_out]                       # remap in-place
+    edges_out[:] = old2new[edges_out]                       
 
     # ── 3. reconnect neighbours of each removed vertex ─────────────────
     removed = np.where(~keep)[0]
     if removed.size:
         neigh: Dict[int, List[int]] = {int(r): [] for r in removed}
-        for u, v in edges.tolist():                         # now real tuples
+        for u, v in edges.tolist():                         
             if keep[u] and not keep[v]:
                 neigh[v].append(u)
             elif keep[v] and not keep[u]:
@@ -361,8 +440,8 @@ def _bridge_components(
 ) -> np.ndarray:
     """
     Use KD-trees to connect all graph components so that everything is
-    reachable from the soma.  Adds synthetic edges between *k* nearest
-    pairs.
+    reachable from the soma.  Adds synthetic edges between k nearest
+    pairs (default k=1).
     """
     g_full = ig.Graph(
         n=len(nodes), edges=[tuple(map(int, e)) for e in edges], directed=False
@@ -428,12 +507,12 @@ def _prune_soma_neurites(
     min_branch_extent_factor: float = 1.8,
 ):
     """
-    Remove spuriously small neurites that attach *directly* to the soma.
+    Remove spuriously small neurites that attach directly to the soma.
 
     Parameters
     ----------
     nodes
-        (N, 3) coordinates array **after** collapse/bridging/MST.
+        (N, 3) coordinates array after collapse/bridging/MST.
     edges
         (E, 2) int64 undirected edge list (tree).
     soma_pos
@@ -539,19 +618,44 @@ def skeletonize(
     min_branch_nodes: int = 30,
     min_branch_extent_factor: float = 1.8,
 ) -> Skeleton:
-    """Extract a centre‑line skeleton **and optionally bridge disconnected mesh patches**.
+    """Compute a centre-line skeleton with radii of a neuronal mesh .
 
+    The algorithm proceeds in eight conceptual stages:
+
+      0. soma localisation (:func:`find_soma` or the seeded variant)
+      1. geodesic shell binning of every connected surface patch
+      2. cluster each shell ⇒ interior node with local radius
+      3. project mesh edges ⇒ graph edges between nodes
+      4. optional collapsing of soma-like/fat nodes near the centroid
+      5. optional bridging of disconnected components
+      6. minimum-spanning tree (global) to remove microscopic cycles
+      7. optional pruning of tiny neurites sprouting directly from the soma
+
+    
     Parameters
     ----------
-    bridge_components
-        If *True* (default) the algorithm will add synthetic edges between
-        disconnected node groups so that every component is ultimately
-        connected to the soma (node 0).
-    bridge_k
-        How many *candidate* node pairs (per foreign component) are tested
-        when creating a bridge.  ``bridge_k=1`` means "connect via the single
-        closest pair" (fast, good for small gaps).  Larger values can create a
-        more tortuous but sometimes smoother bridge.
+    mesh : trimesh.Trimesh
+        Closed surface mesh of the neuron in *arbitrary* units.
+    target_shell_count : int, default ``500``
+        Rough number of geodesic shells to produce per component.  The actual
+        shell width is adapted to mesh resolution.
+    bridge_components : bool, default ``True``
+        If the mesh contains disconnected islands (breaks, imaging artefacts),
+        attempt to connect them back to the soma with synthetic edges.
+    bridge_k : int, default ``1``
+        How many candidate node pairs to test when bridging a foreign island.
+    prune_tiny_neurites : bool, default ``True``
+        Remove sub-trees with fewer than ``min_branch_nodes`` that attach
+        *directly* to the soma and do not extend beyond
+        ``min_branch_extent_factor × r_soma``.
+    collapse_soma : bool, default ``True``
+        Merge centroids that sit well inside the soma or have very fat radii.
+
+
+    Returns
+    -------
+    Skeleton
+        The (acyclic) skeleton with vertex 0 at the soma centroid.        
     """
 
     # 0. soma vertices ---------------------------------------------------
@@ -708,7 +812,30 @@ def load_swc(
     scale: float = 1.0,
     keep_types: Iterable[int] | None = None,
 ) -> Skeleton:
-    """Read *path* and return a :class:`Skeleton`.  IDs are converted to 0‑based."""
+    """
+    Read an SWC file into a :class:`Skeleton`.
+
+    Parameters
+    ----------
+    path : str or Path
+        Filename of the SWC file.
+    scale : float, default ``1.0``
+        Multiply coordinates and radii by this factor on load.
+    keep_types : Iterable[int] | None, optional
+        Sequence of SWC *type* codes to keep.  When *None* (default) all
+        node types are imported.
+
+    Returns
+    -------
+    Skeleton
+        The imported skeleton.  Note that ``soma_verts`` is **None** because
+        the SWC format has no concept of surface vertices.
+
+    Raises
+    ------
+    ValueError
+        If the file contains no valid nodes.
+    """    
     path = Path(path)
     ids: List[int] = []
     xyz: List[List[float]] = []
