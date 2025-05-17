@@ -9,15 +9,10 @@ description = "A lightweight neuromorphological mesh skeletonizer."
 authors = []
 requires-python = ">=3.10.0"
 dependencies = [
-    "ipykernel>=6.29.5",
-    "matplotlib>=3.9.4",
-    "networkx>=3.2.1",
+    "igraph>=0.11.8",
     "numpy>=2.0.2",
-    "pandas>=2.2.3",
-    "pykdtree>=1.4.1",
     "scipy>=1.13.1",
     "trimesh>=4.6.9",
-    "watermark>=2.5.0",
 ]
 readme = {file = "README.md", content-type = "text/markdown"}
 
@@ -27,9 +22,13 @@ dev = [
     "pytest",
     "twine", 
     "maturin",
+    "ipykernel>=6.29.5",
+    "watermark>=2.5.0",
+    "matplotlib>=3.10.3",
 ]
 
 [tool.setuptools]
 packages = {find = {}}
 include-package-data = true
+
 
