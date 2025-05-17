@@ -1,4 +1,6 @@
+import time
 from collections import defaultdict, deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Set, Tuple
@@ -6,7 +8,7 @@ from typing import Dict, Iterable, List, Set, Tuple
 import igraph as ig
 import numpy as np
 import trimesh
-from scipy.spatial import cKDTree as _KDTree
+from scipy.spatial import KDTree as _KDTree
 
 __all__ = [
     "Skeleton",
@@ -224,80 +226,6 @@ def _soma_surface_vertices(
 
     return soma_set
 
-
-def find_soma(
-    mesh: trimesh.Trimesh,
-    soma_probe_radius_mult: float = 8.0,
-    soma_density_threshold: float = 0.30,
-    soma_dilation_steps: int = 1,
-    gsurf: ig.Graph | None = None,
-):
-    """Detect the soma surface by local surface-density filtering.
-
-    The algorithm quickly estimates a density map over mesh vertices, keeps the
-    densest connected cluster, and optionally performs a few geodesic dilation
-    steps to thicken the mask.
-    
-    Parameters
-    ----------
-    mesh : trimesh.Trimesh
-        Watertight mesh of the neuron.
-    soma_probe_radius_mult : float, default ``8.0``
-        Probe radius = ``soma_probe_radius_mult × ⟨edge length⟩``.
-    soma_density_threshold : float, default ``0.30``
-        Keep vertices whose probe counts are at least this fraction of the
-        *maximum* count.
-    soma_dilation_steps : int, default ``1``
-        Number of geodesic dilations (1-ring expansions) of the dense core.
-    gsurf : ig.Graph | None, optional
-        Pre-computed surface graph to reuse (speed).
-
-    Returns
-    -------
-    centre : np.ndarray
-        Cartesian coordinates of the soma centroid.
-    radius : float
-        Approximate soma radius (90‑th percentile of point distances).
-    soma_verts : set[int]
-        Mesh‑vertex indices that form the detected soma surface.
-    """
-    soma_verts = _soma_surface_vertices(
-        mesh,
-        gsurf=gsurf,
-        soma_probe_radius_mult=soma_probe_radius_mult,
-        soma_density_threshold=soma_density_threshold,
-        soma_dilation_steps=soma_dilation_steps,
-    )
-    pts = mesh.vertices.view(np.ndarray)[list(soma_verts)]
-    centre = pts.mean(axis=0)
-    radius = np.percentile(np.linalg.norm(pts - centre, axis=1), 90)
-    return centre, radius, soma_verts
-
-
-def find_soma_with_seed(
-    mesh: trimesh.Trimesh,
-    seed: np.ndarray,
-    seed_r: float,
-    lam: float = 1.15,
-    gsurf: ig.Graph | None = None,
-):
-    """Refine soma location given a seed point.
-
-    A user‑supplied seed point is snapped to the closest mesh vertex and a
-    geodesic flood‑fill up to lam × seed_r returns the soma patch.
-    """
-    v = mesh.vertices.view(np.ndarray)
-    seed_vid = int(np.argmin(np.linalg.norm(v - seed, axis=1)))
-    cutoff = seed_r * lam
-    if gsurf is None:
-        gsurf = _surface_graph(mesh)
-    dists = gsurf.shortest_paths_dijkstra(source=seed_vid, weights="weight")[0]
-    soma_verts = {vid for vid, d in enumerate(dists) if d <= cutoff}
-    pts = v[list(soma_verts)]
-    centre = pts.mean(axis=0)
-    radius = np.percentile(np.linalg.norm(pts - centre, axis=1), 90)
-    return centre, radius, soma_verts
-
 # -----------------------------------------------------------------------------
 #  Utility
 # -----------------------------------------------------------------------------
@@ -471,6 +399,7 @@ def _bridge_components(
         pts = nodes[list(verts)]
 
         dists, island_idx = island_tree.query(pts, k=1, workers=-1)
+        island_idx = np.asarray(island_idx, dtype=np.intp) # fix type
         order = np.argsort(dists)
         u_candidates = np.fromiter(verts, dtype=np.int64)
         island_list = np.fromiter(main_island, dtype=np.int64)
@@ -591,8 +520,82 @@ def _prune_soma_neurites(
     return keep_mask, new_edges
 
 # -----------------------------------------------------------------------------
-#  Main algorithm (identical numerics, igraph ops)
+#  Public API
 # -----------------------------------------------------------------------------
+
+def find_soma(
+    mesh: trimesh.Trimesh,
+    soma_probe_radius_mult: float = 8.0,
+    soma_density_threshold: float = 0.30,
+    soma_dilation_steps: int = 1,
+    gsurf: ig.Graph | None = None,
+):
+    """Detect the soma surface by local surface-density filtering.
+
+    The algorithm quickly estimates a density map over mesh vertices, keeps the
+    densest connected cluster, and optionally performs a few geodesic dilation
+    steps to thicken the mask.
+    
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Watertight mesh of the neuron.
+    soma_probe_radius_mult : float, default ``8.0``
+        Probe radius = ``soma_probe_radius_mult × ⟨edge length⟩``.
+    soma_density_threshold : float, default ``0.30``
+        Keep vertices whose probe counts are at least this fraction of the
+        *maximum* count.
+    soma_dilation_steps : int, default ``1``
+        Number of geodesic dilations (1-ring expansions) of the dense core.
+    gsurf : ig.Graph | None, optional
+        Pre-computed surface graph to reuse (speed).
+
+    Returns
+    -------
+    centre : np.ndarray
+        Cartesian coordinates of the soma centroid.
+    radius : float
+        Approximate soma radius (90‑th percentile of point distances).
+    soma_verts : set[int]
+        Mesh‑vertex indices that form the detected soma surface.
+    """
+    soma_verts = _soma_surface_vertices(
+        mesh,
+        gsurf=gsurf,
+        soma_probe_radius_mult=soma_probe_radius_mult,
+        soma_density_threshold=soma_density_threshold,
+        soma_dilation_steps=soma_dilation_steps,
+    )
+    pts = mesh.vertices.view(np.ndarray)[list(soma_verts)]
+    centre = pts.mean(axis=0)
+    radius = np.percentile(np.linalg.norm(pts - centre, axis=1), 90)
+    return centre, radius, soma_verts
+
+
+def find_soma_with_seed(
+    mesh: trimesh.Trimesh,
+    seed: np.ndarray,
+    seed_r: float,
+    lam: float = 1.15,
+    gsurf: ig.Graph | None = None,
+):
+    """Refine soma location given a seed point.
+
+    A user‑supplied seed point is snapped to the closest mesh vertex and a
+    geodesic flood‑fill up to lam × seed_r returns the soma patch.
+    """
+    v = mesh.vertices.view(np.ndarray)
+    seed_vid = int(np.argmin(np.linalg.norm(v - seed, axis=1)))
+    cutoff = seed_r * lam
+    if gsurf is None:
+        gsurf = _surface_graph(mesh)
+    dists = gsurf.shortest_paths_dijkstra(source=seed_vid, weights="weight")[0]
+    soma_verts = {vid for vid, d in enumerate(dists) if d <= cutoff}
+    pts = v[list(soma_verts)]
+    centre = pts.mean(axis=0)
+    radius = np.percentile(np.linalg.norm(pts - centre, axis=1), 90)
+    return centre, radius, soma_verts
+
 
 def skeletonize(
     mesh: trimesh.Trimesh,
@@ -617,6 +620,7 @@ def skeletonize(
     prune_tiny_neurites: bool = True,
     min_branch_nodes: int = 30,
     min_branch_extent_factor: float = 1.8,
+    verbose: bool = False,
 ) -> Skeleton:
     """Compute a centre-line skeleton with radii of a neuronal mesh .
 
@@ -650,151 +654,184 @@ def skeletonize(
         ``min_branch_extent_factor × r_soma``.
     collapse_soma : bool, default ``True``
         Merge centroids that sit well inside the soma or have very fat radii.
-
+    verbose : bool, default ``False``
+        Print progress messages.
 
     Returns
     -------
     Skeleton
         The (acyclic) skeleton with vertex 0 at the soma centroid.        
     """
+    # ------------------------------------------------------------------
+    #  helpers for verbose timing
+    # ------------------------------------------------------------------
+    if verbose:
+        _global_start = time.perf_counter()
+        print("[skeliner] starting skeletonisation")
+
+    @contextmanager
+    def _timed(label: str):
+        """Print *label* before the block and time its execution."""
+        if verbose:
+            print(f" {label:<47} …", end="", flush=True)
+            _t0 = time.perf_counter()
+            try:
+                yield
+            finally:
+                dt_ms = (time.perf_counter() - _t0)
+                print(f" {dt_ms:8.1f} s")
+        else:
+            yield
 
     # 0. soma vertices ---------------------------------------------------
-    gsurf = _surface_graph(mesh)
-    if soma_seed_point is None:
-        c_soma, r_soma, soma_verts = find_soma(
-            mesh,
-            gsurf=gsurf,
-            soma_probe_radius_mult=soma_probe_radius_mult,
-            soma_density_threshold=soma_density_threshold,
-            soma_dilation_steps=soma_dilation_steps,
-        )
-    else:
-        c_soma, r_soma, soma_verts = find_soma_with_seed(
-            mesh,
-            gsurf=gsurf,
-            seed=soma_seed_point,
-            seed_r=soma_seed_radius,
-            lam=path_len_relax,
-        )
+    with _timed("↳  detect soma"):
+        gsurf = _surface_graph(mesh)
+        if soma_seed_point is None:
+            c_soma, r_soma, soma_verts = find_soma(
+                mesh,
+                gsurf=gsurf,
+                soma_probe_radius_mult=soma_probe_radius_mult,
+                soma_density_threshold=soma_density_threshold,
+                soma_dilation_steps=soma_dilation_steps,
+            )
+        else:
+            c_soma, r_soma, soma_verts = find_soma_with_seed(
+                mesh,
+                gsurf=gsurf,
+                seed=soma_seed_point,
+                seed_r=soma_seed_radius,
+                lam=path_len_relax,
+            )
 
     # 1. binning along geodesic shells ----------------------------------
-    v = mesh.vertices.view(np.ndarray)
-    
-    components    = gsurf.components()
-    comp_vertices = [np.asarray(c, dtype=np.int64) for c in components]
+    with _timed("↳  partition surface into geodesic shells"):
+        v = mesh.vertices.view(np.ndarray)
+        
+        components    = gsurf.components()
+        comp_vertices = [np.asarray(c, dtype=np.int64) for c in components]
 
-    soma_vids = np.fromiter(soma_verts, dtype=np.int64)
-    all_bins  : list[list[int]] = []
-    edge_m    = float(mesh.edges_unique_length.mean())
+        soma_vids = np.fromiter(soma_verts, dtype=np.int64)
+        all_bins  : list[list[int]] = []
+        edge_m    = float(mesh.edges_unique_length.mean())
 
-    for cid, verts in enumerate(comp_vertices):
+        for cid, verts in enumerate(comp_vertices):
 
-        # -------- choose the *one* seed you used before ----------
-        if np.intersect1d(verts, soma_vids).size:
-            seeds = [
-                int(
-                    soma_vids[
-                        np.argmax(np.linalg.norm(v[soma_vids] - c_soma, axis=1))
-                    ]
-                )
-            ]
-        else:
-            seeds = [int(verts[(hash(cid) % len(verts))])]
+            # -------- choose the *one* seed you used before ----------
+            if np.intersect1d(verts, soma_vids).size:
+                seeds = [
+                    int(
+                        soma_vids[
+                            np.argmax(np.linalg.norm(v[soma_vids] - c_soma, axis=1))
+                        ]
+                    )
+                ]
+            else:
+                seeds = [int(verts[(hash(cid) % len(verts))])]
 
-        # -------- single C call for this component ---------------
-        dist_vec = gsurf.shortest_paths_dijkstra(
-            source=seeds,
-            target=verts,
-            weights="weight",
-        )[0]                                            # shape = (1, |verts|)
+            # -------- single C call for this component ---------------
+            dist_vec = gsurf.shortest_paths_dijkstra(
+                source=seeds,
+                target=verts,
+                weights="weight",
+            )[0]                                            # shape = (1, |verts|)
 
-        dist_sub = {int(v): float(d) for v, d in zip(verts, dist_vec)}
+            dist_sub = {int(v): float(d) for v, d in zip(verts, dist_vec)}
 
-        # -------- adaptive shell binning (unchanged) -------------
-        if not dist_sub:
-            continue
-        arc_len = max(dist_sub.values())
-        step    = max(edge_m * 2.0, arc_len / target_shell_count)
-
-        bins: list[list[int]] = []
-        while not any(bins) and step < edge_m * max_shell_width_factor:
-            bins = _geodesic_bins(dist_sub, step)
-            step *= 1.5
-
-        all_bins.extend(bins)
-    
-    # 2. create skeleton nodes ------------------------------------------
-    nodes: List[np.ndarray] = [c_soma]
-    radii: List[float] = [r_soma]
-    v2n: Dict[int, int] = {v: 0 for v in soma_verts}
-    next_id = 1
-
-    for verts in all_bins:
-        inner = [vid for vid in verts if vid not in soma_verts]
-        if len(inner) < min_cluster_vertices:
-            continue
-        sub = gsurf.induced_subgraph(inner)
-        for comp in sub.components():
-            if len(comp) < min_cluster_vertices:
+            # -------- adaptive shell binning (unchanged) -------------
+            if not dist_sub:
                 continue
-            comp_idx = np.fromiter((inner[i] for i in comp), dtype=np.int64)
-            pts      = v[comp_idx]
-            centre   = pts.mean(axis=0)
-            radius   = float(np.linalg.norm(pts - centre, axis=1).mean())
+            arc_len = max(dist_sub.values())
+            step    = max(edge_m * 2.0, arc_len / target_shell_count)
 
-            node_id = next_id
-            next_id += 1
-            nodes.append(centre)
-            radii.append(radius)
-            for vv in comp_idx:
-                v2n[int(vv)] = node_id
+            bins: list[list[int]] = []
+            while not any(bins) and step < edge_m * max_shell_width_factor:
+                bins = _geodesic_bins(dist_sub, step)
+                step *= 1.5
 
-    nodes_arr = np.asarray(nodes, dtype=np.float32)
-    radii_arr = np.asarray(radii, dtype=np.float32)
+            all_bins.extend(bins)
+        
+    # 2. create skeleton nodes ------------------------------------------
+    with _timed("↳  place centroids + local radius"):
+        nodes: List[np.ndarray] = [c_soma]
+        radii: List[float] = [r_soma]
+        v2n: Dict[int, int] = {v: 0 for v in soma_verts}
+        next_id = 1
+
+        for verts in all_bins:
+            inner = [vid for vid in verts if vid not in soma_verts]
+            if len(inner) < min_cluster_vertices:
+                continue
+            sub = gsurf.induced_subgraph(inner)
+            for comp in sub.components():
+                if len(comp) < min_cluster_vertices:
+                    continue
+                comp_idx = np.fromiter((inner[i] for i in comp), dtype=np.int64)
+                pts      = v[comp_idx]
+                centre   = pts.mean(axis=0)
+                radius   = float(np.linalg.norm(pts - centre, axis=1).mean())
+
+                node_id = next_id
+                next_id += 1
+                nodes.append(centre)
+                radii.append(radius)
+                for vv in comp_idx:
+                    v2n[int(vv)] = node_id
+
+        nodes_arr = np.asarray(nodes, dtype=np.float32)
+        radii_arr = np.asarray(radii, dtype=np.float32)
 
     # 3. edges from mesh connectivity -----------------------------------
-    edges_arr = _edges_from_mesh(
-        mesh.edges_unique,
-        v2n,
-        n_mesh_verts=len(mesh.vertices),
-    )
+    with _timed("↳  map mesh edges → skeleton edges"):
+        edges_arr = _edges_from_mesh(
+            mesh.edges_unique,
+            v2n,
+            n_mesh_verts=len(mesh.vertices),
+        )
 
     # 4. collapse soma‑like / fat nodes ---------------------------
     if collapse_soma:
-        (
-            nodes_arr,
-            radii_arr,
-            edges_arr,
-        ) = _collapse_soma_nodes(
-            nodes_arr,
-            radii_arr,
-            edges_arr,
-            c_soma=c_soma,
-            r_soma=r_soma,
-            soma_merge_dist_factor=soma_merge_dist_factor,
-            soma_merge_radius_factor=soma_merge_radius_factor,
-        )
+        with _timed("↳  merge redundant near-soma nodes"):
+            (
+                nodes_arr,
+                radii_arr,
+                edges_arr,
+            ) = _collapse_soma_nodes(
+                nodes_arr,
+                radii_arr,
+                edges_arr,
+                c_soma=c_soma,
+                r_soma=r_soma,
+                soma_merge_dist_factor=soma_merge_dist_factor,
+                soma_merge_radius_factor=soma_merge_radius_factor,
+            )
 
-
+        
     # 5. Connect all components ------------------------------
     if bridge_components:
-        edges_arr = _bridge_components(nodes_arr, edges_arr, bridge_k=bridge_k)
-    
+        with _timed("↳  reconnect mesh gaps"):
+            edges_arr = _bridge_components(nodes_arr, edges_arr, bridge_k=bridge_k)
+
     # 6. global minimum-spanning tree ------------------------------------
-    edges_mst = _build_mst(nodes_arr, edges_arr)
+    with _timed("↳  build global minimum-spanning tree"):
+        edges_mst = _build_mst(nodes_arr, edges_arr)
 
     # 7. prune tiny sub-trees near the soma
     if prune_tiny_neurites:
-        keep_mask, edges_mst = _prune_soma_neurites(
-            nodes_arr,
-            edges_mst,
-            c_soma,
-            r_soma,
-            min_branch_nodes=min_branch_nodes,           
-            min_branch_extent_factor=min_branch_extent_factor,
-        )
-        nodes_arr  = nodes_arr[keep_mask]
-        radii_arr  = radii_arr[keep_mask]
+        with _timed("↳  prune tiny soma-attached branches"):
+            keep_mask, edges_mst = _prune_soma_neurites(
+                nodes_arr,
+                edges_mst,
+                c_soma,
+                r_soma,
+                min_branch_nodes=min_branch_nodes,           
+                min_branch_extent_factor=min_branch_extent_factor,
+            )
+            nodes_arr  = nodes_arr[keep_mask]
+            radii_arr  = radii_arr[keep_mask]
+
+    if verbose:
+        total_ms = (time.perf_counter() - _global_start)
+        print(f"{'TOTAL':<50} {total_ms:8.1f} s")
 
     return Skeleton(nodes_arr, 
                     radii_arr, 

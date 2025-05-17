@@ -3,6 +3,7 @@ from typing import Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import trimesh
+from matplotlib.axes import Axes
 from matplotlib.collections import LineCollection
 from matplotlib.patches import Circle
 from scipy.stats import binned_statistic_2d
@@ -21,7 +22,7 @@ def _project(arr: np.ndarray, ix: int, iy: int, /) -> np.ndarray:
     """Return 2-column slice (arr[:, (ix, iy)])."""
     return arr[:, (ix, iy)].copy()
 
-def _radii_to_scatter_size(rr: np.ndarray, ax: plt.Axes) -> np.ndarray:
+def _radii_to_scatter_size(rr: np.ndarray, ax: Axes) -> np.ndarray:
     """
     Convert radii in *data units* to matplotlib scatter sizes (points²) **in a
     way that is independent of the particular subplot’s width/height**.
@@ -73,15 +74,14 @@ def plot_projection(
     ylim: Optional[tuple[float, float]] = None,
     draw_skel: bool = True,
     draw_edges: bool = False,
-    ax: Optional["plt.Axes"] = None,
+    ax: Optional["Axes"] = None,
     cmap: str = "Blues",
     vmax_fraction: float = 0.10,
     circle_alpha: float = 0.25,
     line_alpha: float = 0.8,
     # --- soma ---
     draw_soma_mask: bool = True,
-    **imshow_kwargs,
-) -> tuple["plt.Figure", "plt.Axes"]:
+) -> tuple:
     """
     Plot a 2-D density map of *mesh* and overlay *skel* circles (and optionally
     edges) in the chosen *plane*.
@@ -143,12 +143,19 @@ def plot_projection(
     rr        = rr[keep_skel]
 
     # ─────────────────── density histogram ────────────────────────────────
+    # Ensure bins is either an int or a tuple of two ints
+    if isinstance(bins, int):
+        bins_arg: int | tuple[int, int] = bins
+    elif isinstance(bins, tuple) and len(bins) == 2 and all(isinstance(b, int) for b in bins):
+        bins_arg = (int(bins[0]), int(bins[1]))
+    else:
+        raise ValueError("bins must be an int or a tuple of two ints")
     hist, xedges, yedges, _ = binned_statistic_2d(
         xy_mesh[:, 0],
         xy_mesh[:, 1],
         None,
         statistic="count",
-        bins=bins,
+        bins=bins_arg,  # type: ignore
     )
     hist = hist.T  # transpose for imshow (row = y)
 
@@ -170,12 +177,11 @@ def plot_projection(
 
     ax.imshow(
         hist,
-        extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+        extent=(xedges[0], xedges[-1], yedges[0], yedges[-1]),
         origin="lower",
         cmap=cmap,
         vmax=hist.max() * vmax_fraction,
         alpha=1.0,
-        **imshow_kwargs,
     )
 
     # ─────────────────── circles ──────────────────────────────────────────
@@ -230,7 +236,7 @@ def plot_projection(
 
             # 4. hand over to Matplotlib
             lc = LineCollection(
-                segments,
+                segments.tolist(),
                 colors="black",
                 linewidths=1.0,
                 alpha=line_alpha,
