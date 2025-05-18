@@ -200,7 +200,7 @@ def plot_projection(
         )
 
     # ─── highlight the soma if requested ───────────────────────────────────
-    if draw_skel and draw_soma_mask and xy_soma is not None and len(xy_soma):
+    if draw_soma_mask and xy_soma is not None and len(xy_soma):
         ax.scatter(
             xy_soma[:, 0], xy_soma[:, 1],
             s=4, c="red", marker="o",
