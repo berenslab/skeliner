@@ -808,11 +808,6 @@ def skeletonize(
                 lam=path_len_relax,
             )
 
-    # store soma radius for every estimator
-    radii_dict_lists: Dict[str, List[float]] = {
-        est: [r_soma] for est in radius_estimators
-    }
-
     # 1. binning along geodesic shells ----------------------------------
     with _timed("↳  partition surface into geodesic shells"):
         v = mesh.vertices.view(np.ndarray)
@@ -855,7 +850,9 @@ def skeletonize(
     # 2. create skeleton nodes ------------------------------------------
     with _timed("↳  place centroids + local radius"):
         nodes: List[np.ndarray] = [c_soma]
-        radii: List[float] = [r_soma]
+        radii: Dict[str, List[float]] = {
+            est: [r_soma] for est in radius_estimators
+        }
         v2n: Dict[int, int] = {v: 0 for v in soma_verts}
         next_id = 1
 
@@ -877,7 +874,7 @@ def skeletonize(
                     val = _estimate_radius(
                         d, method=est, trim_fraction=0.05
                     )
-                    radii_dict_lists.setdefault(est, []).append(val)
+                    radii.setdefault(est, []).append(val)
 
                 node_id = next_id
                 next_id += 1
@@ -888,7 +885,7 @@ def skeletonize(
         nodes_arr = np.asarray(nodes, dtype=np.float32)
         nodes_arr = np.asarray(nodes, dtype=np.float32)
         radii_dict = {
-            k: np.asarray(v, dtype=np.float32) for k, v in radii_dict_lists.items()
+            k: np.asarray(v, dtype=np.float32) for k, v in radii.items()
         }
 
     # 3. edges from mesh connectivity -----------------------------------

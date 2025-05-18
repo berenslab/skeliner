@@ -1169,6 +1169,31 @@ wheels = [
 ]
 
 [[package]]
+name = "python-openctm"
+version = "1.0.12"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/52/16/b169b47321f31ba30bfe5410a48e374b4e12cd7e52685cc6efe97ae46642/python-openctm-1.0.12.tar.gz", hash = "sha256:e348d7df9375ea405df0e85c6b7b9d182d185dd54f21954bed6660d6629c06d9", size = 5069 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a0/5f/9bf1b41edde35b7c3d55987555ff6ed40e3a978fef52deee90fd6957491c/python_openctm-1.0.12-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:973a8b4bcf71879fcafcbdd4fafffa3eb3a2944ffcb42ee8b5e140a1eb7aa85e", size = 74683 },
+    { url = "https://files.pythonhosted.org/packages/17/a0/ac6612f6324f11832daa72005ba9af08c6c0f6e653b527b4d86c91e18780/python_openctm-1.0.12-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:942a54a3b26822423f85544a03ac72cc3669b7964995f058d2b89757875f4241", size = 72026 },
+    { url = "https://files.pythonhosted.org/packages/47/8b/ab9fe347334c17563fe5ebbe1697ed7be5898b51d0dbe8aa595d859838ad/python_openctm-1.0.12-cp310-cp310-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:9016d8fc9a156d4bac47e29c59974f598c09c7ad27e22bdfe7a83250c2691ffe", size = 75640 },
+    { url = "https://files.pythonhosted.org/packages/98/ff/031f660c4682590616b2e08d426d8d49a6fbb8d8efc3e9bee81854f1d089/python_openctm-1.0.12-cp310-cp310-musllinux_1_1_i686.whl", hash = "sha256:db273c18d9dd0b23ebeaaabdb7966e0454857d5022fd19273a960d8c58c9d3ab", size = 74787 },
+    { url = "https://files.pythonhosted.org/packages/91/b4/8a1f3e7625e92346be3627a692a43c3443c5b7a903868935f6cfa12d8ada/python_openctm-1.0.12-cp310-cp310-musllinux_1_1_x86_64.whl", hash = "sha256:30a1de71ffd953553baad96a30df69bae9f0d9e2551c6339a61cc84b8aa4e3c1", size = 72588 },
+    { url = "https://files.pythonhosted.org/packages/9d/01/8d895eab73d12a34f5c658925c37a4356c9056ac6f11324d21264407d234/python_openctm-1.0.12-cp310-cp310-win32.whl", hash = "sha256:3172333f8269face7c4d33dc97e18de347a45bd905df3dc9ac58ef0333d4b47d", size = 76058 },
+    { url = "https://files.pythonhosted.org/packages/02/fc/5d2151916139156f94869ceb5bbc32fcd73ee9e768ee1dae9412c06dbcb9/python_openctm-1.0.12-cp310-cp310-win_amd64.whl", hash = "sha256:4eca6294cbb21b02ebe038cca58325c2e2721583956e3bc9f7fb635a0fd3aa4d", size = 76066 },
+    { url = "https://files.pythonhosted.org/packages/ab/d0/769b208fc17dc7d646a7c8e3382dd41b0207d81e9b208d8f0e99a34666a0/python_openctm-1.0.12-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:940adc68f5bc839d67198c2f71b0a372cbcc8043206f3ead97fcb21bccc04c4c", size = 74683 },
+    { url = "https://files.pythonhosted.org/packages/2d/08/ad3d2cd4c072f63b4a9e4fde75c75e12f98d5830269a86f7cc7f72690244/python_openctm-1.0.12-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:f449d9bd82e1404e322f3c1d0f389ede019df1123f7ba6c94ec78d239ce4a67f", size = 72027 },
+    { url = "https://files.pythonhosted.org/packages/53/9a/52d4c6348d364acc555312c4f8850a1328c25e4c8d715a835dff17a231d8/python_openctm-1.0.12-cp311-cp311-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:6e7cdd38b4d7bdef3168868c0af189881db151b523a8cee2138aa5f8bc9f6a79", size = 75640 },
+    { url = "https://files.pythonhosted.org/packages/1a/57/3747653726794c11653b4aff8c662baa2c4e715840796e844c1a1f38c021/python_openctm-1.0.12-cp311-cp311-musllinux_1_1_i686.whl", hash = "sha256:b1780d490c57f9af5559945cb63722ab323b24d56f06662c4944c890cb38971a", size = 74786 },
+    { url = "https://files.pythonhosted.org/packages/bc/56/06c42880dbaa3cb542084af814ba8f0e1688cc32519d1d5ae7b860f2c060/python_openctm-1.0.12-cp311-cp311-musllinux_1_1_x86_64.whl", hash = "sha256:ca7470fe0194c1b3e2670e4e2bbe6f379f30200f9241c4648a00ce43eceb6437", size = 72588 },
+    { url = "https://files.pythonhosted.org/packages/a2/69/9b74af15d1c93e051a36dda65b31e7e7f85bdd4024bcb944d6579fdb898d/python_openctm-1.0.12-cp311-cp311-win32.whl", hash = "sha256:8ce6a9a8126c707a5796408089fe0ff5f62042d8bbccecac00934ca903e35663", size = 76060 },
+    { url = "https://files.pythonhosted.org/packages/c8/f6/2c1889161ab0d679c6e585e174996cfe9a350a7ff390374feafaffb00ba1/python_openctm-1.0.12-cp311-cp311-win_amd64.whl", hash = "sha256:695783814bf7a620b81cbca3973a3b065d20e0630c2baf9a3a33c4f0b3407342", size = 76066 },
+]
+
+[[package]]
 name = "pywin32"
 version = "310"
 source = { registry = "https://pypi.org/simple" }
@@ -1504,6 +1529,11 @@ dev = [
     { name = "watermark" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "python-openctm" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "igraph", specifier = ">=0.11.8" },
@@ -1518,6 +1548,9 @@ requires-dist = [
     { name = "twine", marker = "extra == 'dev'" },
     { name = "watermark", marker = "extra == 'dev'", specifier = ">=2.5.0" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "python-openctm", specifier = ">=1.0.12" }]
 
 [[package]]
 name = "stack-data"
