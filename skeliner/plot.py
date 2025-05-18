@@ -203,7 +203,7 @@ def plot_projection(
     if draw_soma_mask and xy_soma is not None and len(xy_soma):
         ax.scatter(
             xy_soma[:, 0], xy_soma[:, 1],
-            s=4, c="red", marker="o",
+            s=4, c="pink", marker="o",
             linewidths=0, alpha=0.9, label="soma surface"
         )
 
