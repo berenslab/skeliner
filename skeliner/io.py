@@ -15,7 +15,7 @@ def load_mesh(filepath: str | Path) -> trimesh.Trimesh:
 
     if filepath.suffix == ".ctm":
         mesh = openctm.import_mesh(filepath)
-        mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces)
+        mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, process=False)
     else:
         mesh = trimesh.load_mesh(filepath, process=False)
 
