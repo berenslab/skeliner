@@ -536,7 +536,7 @@ def _edges_from_mesh(
     edges = np.vstack([na, nb]).T
     edges = np.sort(edges, axis=1)          # canonical order
     edges = np.unique(edges, axis=0)        # drop duplicates
-    return edges.astype(np.int64, copy=False)
+    return edges.astype(np.int64)            # copy to new array
 
 
 # -----------------------------------------------------------------------
@@ -548,19 +548,33 @@ def _collapse_soma_nodes(
     radii: np.ndarray,
     edges: np.ndarray,                      
     *,
-    c_soma: np.ndarray,
-    r_soma: float,
     soma_merge_dist_factor: float,
     soma_merge_radius_factor: float,
+    c_soma: np.ndarray | None = None,
+    r_soma: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Merge near‑soma redundant centroids and reconnect edges.
     """
+
+    # ── 0. merged nodes with large radii as soma ----------------------------
+    if c_soma is None or r_soma is None:
+        # (a) pick “soma candidates” by very large radius
+        i_soma = radii >= np.percentile(radii, 99.9) # has to be strick to avoid dendritic trunk and bulbs
+        # (b) centroid of that cluster
+        c_soma = nodes[i_soma].mean(axis=0)
+        # (c) outer envelope = 90-th pct of (distance + local-radius)
+        d = np.linalg.norm(nodes[i_soma] - c_soma, axis=1) + radii[i_soma]
+        r_soma = float(np.percentile(d, 90))
+ 
+        nodes[0]  = c_soma
+        radii[0]  = r_soma
+    
     # ── 1. decide which vertices survive ────────────────────────────────
     close = np.linalg.norm(nodes - c_soma, axis=1) < soma_merge_dist_factor * r_soma
     fat   = radii >= soma_merge_radius_factor * r_soma
     keep  = ~(close | fat)
-    keep[0] = True # keep soma                                        
+    keep[0] = True # keep soma     
 
     kept_idx = np.where(keep)[0]
     old2new = np.empty(len(keep), dtype=np.int64)
@@ -574,25 +588,17 @@ def _collapse_soma_nodes(
     edges_out[:] = old2new[edges_out]                       
 
     # ── 3. reconnect neighbours of each removed vertex ─────────────────
-    removed = np.where(~keep)[0]
-    if removed.size:
-        neigh: Dict[int, List[int]] = {int(r): [] for r in removed}
-        for u, v in edges.tolist():                         
-            if keep[u] and not keep[v]:
-                neigh[v].append(u)
-            elif keep[v] and not keep[u]:
-                neigh[u].append(v)
+    candidates : set[int] = set()                 # survivors next to a removed node
+    for u, v in edges:                            # original indices
+        ku, kv = keep[u], keep[v]
+        if ku ^ kv:                               # exactly one survives
+            survivors_idx = u if ku else v
+            new_idx = int(old2new[survivors_idx])
+            candidates.add(new_idx)
 
-        extra: List[Tuple[int, int]] = []
-        for vs in neigh.values():
-            if len(vs) > 1:
-                base = vs[0]
-                extra.extend((base, o) for o in vs[1:])
-
-        if extra:
-            extra_arr = np.asarray(extra, dtype=np.int64)
-            extra_arr[:] = old2new[extra_arr]
-            edges_out = np.vstack([edges_out, extra_arr])
+    if candidates:
+        extra = np.array([[0, idx] for idx in sorted(candidates)], dtype=np.int64)
+        edges_out = np.vstack([edges_out, extra])
 
     # ── 4. canonicalise & uniq ─────────────────────────────────────────
     edges_out = np.sort(edges_out, axis=1)
@@ -843,6 +849,7 @@ def skeletonize(
     if verbose:
         _global_start = time.perf_counter()
         print("[skeliner] starting skeletonisation")
+        soma_ms = 0.0 # soma detection time
         post_ms = 0.0 # post-processing time
 
     @contextmanager
@@ -860,30 +867,43 @@ def skeletonize(
             yield
 
     # 0. soma vertices ---------------------------------------------------
-    with _timed("↳  detect soma"):
+    with _timed("↳  build surface graph"):
         gsurf = _surface_graph(mesh)
-        if detect_soma:
-            c_soma, r_soma, soma_verts = find_soma(
-                mesh,
-                gsurf=gsurf,
-                probe_radius=soma_seed_radius,
-                probe_multiplier=soma_seed_radius_multipler,
-                seed_density_cutoff=soma_density_cutoff,
-                dilation_steps=soma_dilation_steps,
-                top_seed_frac=soma_top_seed_frac,
-                seed_point=soma_seed_point,
-            )
-        else:
-            c_soma, r_soma, soma_verts = find_soma_with_seed(
-                mesh,
-                gsurf=gsurf,
-                seed_point=soma_seed_point,
-                seed_radius=soma_seed_radius,
-            )
 
-    if verbose:
-        soma_ms = time.perf_counter() - _global_start
-        
+    if detect_soma is False and soma_seed_point is None:
+        def _random_dense_vertex(mesh: trimesh.Trimesh, gsurf: ig.Graph) -> int:
+            deg = np.fromiter(gsurf.degree(), dtype=np.int64)
+            return int(np.argmax(deg))
+
+        # fallback block
+        seed_vid   = _random_dense_vertex(mesh, gsurf)
+        c_soma     = mesh.vertices.view(np.ndarray)[seed_vid]
+        r_soma     = float(mesh.edges_unique_length.mean()) * 3   # scale-aware default
+        soma_verts = {seed_vid}
+    else:
+        with _timed("↳  detect soma"):
+            if detect_soma:
+                c_soma, r_soma, soma_verts = find_soma(
+                    mesh,
+                    gsurf=gsurf,
+                    probe_radius=soma_seed_radius,
+                    probe_multiplier=soma_seed_radius_multipler,
+                    seed_density_cutoff=soma_density_cutoff,
+                    dilation_steps=soma_dilation_steps,
+                    top_seed_frac=soma_top_seed_frac,
+                    seed_point=soma_seed_point,
+                )
+            elif soma_seed_point is not None:
+                c_soma, r_soma, soma_verts = find_soma_with_seed(
+                    mesh,
+                    gsurf=gsurf,
+                    seed_point=soma_seed_point,
+                    seed_radius=soma_seed_radius,
+                )
+
+        if verbose:
+            soma_ms = time.perf_counter() - _global_start
+            
 
     # 1. binning along geodesic shells ----------------------------------
     with _timed("↳  partition surface into geodesic shells"):
@@ -972,14 +992,21 @@ def skeletonize(
             v2n,
             n_mesh_verts=len(mesh.vertices),
         )
+    
 
     # 4. collapse soma‑like / fat nodes ---------------------------
     if collapse_soma:
         _t0 = time.perf_counter() 
+        if detect_soma is False and soma_seed_point is None:
+            c_soma = None
+            r_soma = None
+        else:
+            r_soma = radii_dict[radius_estimators[0]][0]
+
         with _timed("↳  merge redundant near-soma nodes"):
             (
                 nodes_arr,
-                _,
+                radii_arr,
                 edges_arr,
                 keep_mask
             ) = _collapse_soma_nodes(
@@ -987,7 +1014,7 @@ def skeletonize(
                 radii_dict[radius_estimators[0]],
                 edges_arr,
                 c_soma=c_soma,
-                r_soma=radii_dict[radius_estimators[0]][0],
+                r_soma=r_soma,
                 soma_merge_dist_factor=soma_merge_dist_factor,
                 soma_merge_radius_factor=soma_merge_radius_factor,
             )
@@ -995,6 +1022,10 @@ def skeletonize(
             # apply same mask to all radius columns
             for k in radii_dict:
                 radii_dict[k] = radii_dict[k][keep_mask]
+                radii_dict[k][0] = radii_arr[0]
+
+            # update the vertex ID map
+            c_soma = nodes_arr[0]
 
         if verbose:
             post_ms += time.perf_counter() - _t0
