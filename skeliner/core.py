@@ -3,7 +3,7 @@ from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
 import igraph as ig
 import numpy as np
@@ -843,6 +843,7 @@ def skeletonize(
     if verbose:
         _global_start = time.perf_counter()
         print("[skeliner] starting skeletonisation")
+        post_ms = 0.0 # post-processing time
 
     @contextmanager
     def _timed(label: str):
@@ -854,7 +855,7 @@ def skeletonize(
                 yield
             finally:
                 dt_ms = (time.perf_counter() - _t0)
-                print(f" {dt_ms:8.1f} s")
+                print(f" {dt_ms:.1f} s")
         else:
             yield
 
@@ -879,6 +880,10 @@ def skeletonize(
                 seed_point=soma_seed_point,
                 seed_radius=soma_seed_radius,
             )
+
+    if verbose:
+        soma_ms = time.perf_counter() - _global_start
+        
 
     # 1. binning along geodesic shells ----------------------------------
     with _timed("↳  partition surface into geodesic shells"):
@@ -970,6 +975,7 @@ def skeletonize(
 
     # 4. collapse soma‑like / fat nodes ---------------------------
     if collapse_soma:
+        _t0 = time.perf_counter() 
         with _timed("↳  merge redundant near-soma nodes"):
             (
                 nodes_arr,
@@ -990,10 +996,16 @@ def skeletonize(
             for k in radii_dict:
                 radii_dict[k] = radii_dict[k][keep_mask]
 
+        if verbose:
+            post_ms += time.perf_counter() - _t0
+
     # 5. Connect all components ------------------------------
     if bridge_components:
+        _t0 = time.perf_counter() 
         with _timed("↳  reconnect mesh gaps"):
             edges_arr = _bridge_components(nodes_arr, edges_arr, bridge_k=bridge_k)
+        if verbose:
+            post_ms += time.perf_counter() - _t0
 
     # 6. global minimum-spanning tree ------------------------------------
     with _timed("↳  build global minimum-spanning tree"):
@@ -1001,6 +1013,7 @@ def skeletonize(
 
     # 7. prune tiny sub-trees near the soma
     if prune_tiny_neurites:
+        _t0 = time.perf_counter()
         with _timed("↳  prune tiny soma-attached branches"):
             keep_mask, edges_mst = _prune_soma_neurites(
                 nodes_arr,
@@ -1013,10 +1026,21 @@ def skeletonize(
             nodes_arr  = nodes_arr[keep_mask]
             for k in radii_dict:
                 radii_dict[k] = radii_dict[k][keep_mask]
+        if verbose:
+            post_ms += time.perf_counter() - _t0
 
     if verbose:
-        total_ms = (time.perf_counter() - _global_start)
-        print(f"{'TOTAL':<50} {total_ms:8.1f} s")
+        total_ms = time.perf_counter() - _global_start
+        core_ms  = total_ms - soma_ms - post_ms
+
+        if post_ms > 1e-6:       # at least one optional stage ran
+            print(f"{'TOTAL (soma + core + post)':<49}"
+                  f"… {total_ms:.1f} s "
+                  f"({soma_ms:.1f} + {core_ms:.1f} + {post_ms:.1f})")
+        else:                    # no post-processing at all
+            print(f"{'TOTAL (soma + core)':<49}"
+                  f"… {total_ms:.1f} s "
+                  f"({soma_ms:.1f} + {core_ms:.1f})")
 
     return Skeleton(nodes_arr, 
                     radii_dict, 
