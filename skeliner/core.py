@@ -777,7 +777,7 @@ def skeletonize(
     # --- radius estimation ---
     radius_estimators: list[str] = ["median", "mean", "trim"],
     # --- soma detection ---
-    detect_soma: bool = True,
+    detect_soma: str = "pre", # "pre", "post", "seed"
     soma_seed_point: np.ndarray | list | tuple | None = None,
     soma_seed_radius: float | None = None,
     soma_seed_radius_multipler: float = 8.0,
@@ -870,7 +870,8 @@ def skeletonize(
     with _timed("↳  build surface graph"):
         gsurf = _surface_graph(mesh)
 
-    if detect_soma is False and soma_seed_point is None:
+    if detect_soma == "post" and soma_seed_point is None:
+        # post skeletonization soma detection
         def _random_dense_vertex(mesh: trimesh.Trimesh, gsurf: ig.Graph) -> int:
             deg = np.fromiter(gsurf.degree(), dtype=np.int64)
             return int(np.argmax(deg))
@@ -878,11 +879,12 @@ def skeletonize(
         # fallback block
         seed_vid   = _random_dense_vertex(mesh, gsurf)
         c_soma     = mesh.vertices.view(np.ndarray)[seed_vid]
-        r_soma     = float(mesh.edges_unique_length.mean()) * 3   # scale-aware default
+        r_soma     = float(mesh.edges_unique_length.mean()) * 3   # hard-coded, not ideal
         soma_verts = {seed_vid}
     else:
+        # pre skeletonization soma detection
         with _timed("↳  detect soma"):
-            if detect_soma:
+            if detect_soma == "pre":
                 c_soma, r_soma, soma_verts = find_soma(
                     mesh,
                     gsurf=gsurf,
@@ -893,7 +895,7 @@ def skeletonize(
                     top_seed_frac=soma_top_seed_frac,
                     seed_point=soma_seed_point,
                 )
-            elif soma_seed_point is not None:
+            elif detect_soma == "seed" and soma_seed_point is not None:
                 c_soma, r_soma, soma_verts = find_soma_with_seed(
                     mesh,
                     gsurf=gsurf,
@@ -997,7 +999,7 @@ def skeletonize(
     # 4. collapse soma‑like / fat nodes ---------------------------
     if collapse_soma:
         _t0 = time.perf_counter() 
-        if detect_soma is False and soma_seed_point is None:
+        if detect_soma == "post" and soma_seed_point is None:
             c_soma = None
             r_soma = None
         else:
