@@ -608,7 +608,7 @@ def _collapse_soma_nodes(
     return nodes[keep], radii[keep], edges_out, keep
 
 
-def _bridge_components(
+def _bridge_gaps(
     nodes: np.ndarray,
     edges: np.ndarray,
     *,
@@ -624,9 +624,9 @@ def _bridge_components(
     ----------
     bridge_k
         How many vertex pairs to add for each component.
-    max_bridge_factor
+    bridge_max_factor
         Skip a component for now if its closest gap is larger than
-        ``max_bridge_factor × <mean edge length>``.
+        ``bridge_max_factor × <mean edge length>``.
     recalc_after
         Re-compute all component-to-island distances after this many
         successful merges (keeps the priority queue fresh at minimal cost).
@@ -654,7 +654,7 @@ def _bridge_components(
         pts = nodes[comp_idx[cid]]
         dists, idx_is = island_tree.query(pts, k=1, workers=-1)
         best = int(np.argmin(dists))
-        return float(dists[best]), best, int(idx_is[best])
+        return float(dists[best]), best, np.asarray(idx_is, dtype=np.int64)[best]
 
     # priority queue of (gap_distance, cid, best_comp_idx, best_island_idx)
     pq = [
@@ -879,7 +879,7 @@ def skeletonize(
     min_cluster_vertices: int = 6,
     max_shell_width_factor: int = 50,
     # --- bridging disconnected patches ---
-    bridge_components: bool = True,
+    bridge_gaps: bool = True,
     bridge_max_factor: float = 12.0,
     bridge_recalc_after: int | None = None,
     # --- post‑processing ---
@@ -915,7 +915,7 @@ def skeletonize(
     target_shell_count : int, default ``500``
         Rough number of geodesic shells to produce per component.  The actual
         shell width is adapted to mesh resolution.
-    bridge_components : bool, default ``True``
+    bridge_gaps : bool, default ``True``
         If the mesh contains disconnected islands (breaks, imaging artefacts),
         attempt to connect them back to the soma with synthetic edges.
     bridge_k : int, default ``1``
@@ -962,14 +962,7 @@ def skeletonize(
         gsurf = _surface_graph(mesh)
 
     if detect_soma == "post":
-        # post skeletonization soma detection
-        # def _random_dense_vertex(mesh: trimesh.Trimesh, gsurf: ig.Graph) -> int:
-        #     deg = np.fromiter(gsurf.degree(), dtype=np.int64)
-        #     return int(np.argmax(deg))
-
-        # fallback block
-        # seed_vid   = _random_dense_vertex(mesh, gsurf)
-
+        # delay soma detection until after skeletonization
         if soma_seed_point is not None:
             seed_vid = int(np.argmin(np.linalg.norm(mesh.vertices.view(np.ndarray) - np.asarray(soma_seed_point), axis=1)))
         else:
@@ -1007,7 +1000,7 @@ def skeletonize(
             
 
     # 1. binning along geodesic shells ----------------------------------
-    with _timed("↳  partition surface into geodesic shells"):
+    with _timed("↳  bin surface vertices by geodesic distance"):
         v = mesh.vertices.view(np.ndarray)
         
         components    = gsurf.components()
@@ -1046,7 +1039,7 @@ def skeletonize(
             all_bins.extend(bins)
         
     # 2. create skeleton nodes ------------------------------------------
-    with _timed("↳  place centroids + local radius"):
+    with _timed("↳  compute bin centroids and radii"):
         nodes: List[np.ndarray] = [c_soma]
         radii: Dict[str, List[float]] = {
             est: [r_soma] for est in radius_estimators
@@ -1087,7 +1080,7 @@ def skeletonize(
         }
 
     # 3. edges from mesh connectivity -----------------------------------
-    with _timed("↳  map mesh edges → skeleton edges"):
+    with _timed("↳  map mesh faces to skeleton edges"):
         edges_arr = _edges_from_mesh(
             mesh.edges_unique,
             v2n,
@@ -1132,10 +1125,10 @@ def skeletonize(
             post_ms += time.perf_counter() - _t0
 
     # 5. Connect all components ------------------------------
-    if bridge_components:
+    if bridge_gaps:
         _t0 = time.perf_counter() 
-        with _timed("↳  reconnect mesh gaps"):
-            edges_arr = _bridge_components(
+        with _timed("↳  bridge skeleton gaps"):
+            edges_arr = _bridge_gaps(
                 nodes_arr, edges_arr, 
                 bridge_max_factor = bridge_max_factor,
                 bridge_recalc_after= bridge_recalc_after,
