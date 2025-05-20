@@ -689,8 +689,7 @@ def _bridge_components(
     current_max  = bridge_max_factor * edge_len_mean
 
     while pq:
-        gap, cid, b_comp, b_is = heapq.heappop(pq)
-
+        _, cid, _, _ = heapq.heappop(pq)
         # postpone if the component is still too far away
         gap, best_c, best_i = closest_pair(cid)
 
