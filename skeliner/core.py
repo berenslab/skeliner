@@ -613,59 +613,88 @@ def _bridge_components(
     edges: np.ndarray,
     *,
     bridge_k: int = 1,
-    bridge_max_gap_factor: float = 12.0,
+    bridge_max_factor: float = 12.0,
+    bridge_recalc_after: int = 5,
 ) -> np.ndarray:
+    """
+    Connect every isolated component back to the soma component.
+    Components are processed in order of *current* proximity to the island,
+    which prevents far-away fragments from being bridged before nearer ones.
+
+    Parameters
+    ----------
+    bridge_k
+        How many vertex pairs to add for each component.
+    max_bridge_factor
+        Skip a component for now if its closest gap is larger than
+        ``max_bridge_factor × <mean edge length>``.
+    recalc_after
+        Re-compute all component-to-island distances after this many
+        successful merges (keeps the priority queue fresh at minimal cost).
+    """
+
+    # -- 0. quick exit if already connected ---------------------------------
     g = ig.Graph(n=len(nodes), edges=[tuple(map(int, e)) for e in edges], directed=False)
     comps = [set(c) for c in g.components()]
     soma_cid = g.components().membership[0]
     if len(comps) == 1:
         return edges
 
-    # --- caches ---------------------------------------------------------
-    comp_xyz  = {cid: nodes[list(v)] for cid, v in enumerate(comps)}
-    kdtrees   = {cid: KDTree(xyz, leafsize=32) for cid, xyz in comp_xyz.items()}
+    # -- 1. build one KD-tree per component ---------------------------------
     edge_len_mean = np.linalg.norm(nodes[edges[:, 0]] - nodes[edges[:, 1]], axis=1).mean()
 
-    # --- grow island ----------------------------------------------------
-    island      = set(comps[soma_cid])
-    island_xyz  = nodes[list(island)]
-    island_tree = KDTree(island_xyz, leafsize=64)
+    # -- 2. grow the island using a distance-ordered priority queue ---------
+    island = set(comps[soma_cid])
+    island_tree = KDTree(nodes[list(island)])
 
-    def closest(cid: int) -> float:
-        return kdtrees[cid].query(island_xyz, k=1)[0].min()
+    # helper to compute the *current* closest gap of a component
+    def closest_gap(cid: int) -> float:
+        pts = nodes[list(comps[cid])]
+        return island_tree.query(pts, k=1, workers=-1)[0].min()
 
-    pq = [(closest(cid), cid) for cid in range(len(comps)) if cid != soma_cid]
+    # priority queue of (gap_distance, component_id)
+    pq: list[tuple[float, int]] = [
+        (closest_gap(cid), cid) for cid in range(len(comps)) if cid != soma_cid
+    ]
     heapq.heapify(pq)
 
     edges_aug = edges.copy()
+    merges_since_recalc = 0
+
     while pq:
         gap, cid = heapq.heappop(pq)
-        if cid in island:            # stale tuple
-            continue
-        if gap > bridge_max_gap_factor * edge_len_mean:
+
+        # postpone if the component is still too far away
+        if gap > bridge_max_factor * edge_len_mean:
             heapq.heappush(pq, (gap, cid))
             continue
 
-        xyz_c = comp_xyz[cid]
-        d_ic, idx_i = island_tree.query(xyz_c, k=1)
-        best = np.argsort(d_ic)[:bridge_k]
-        for j in best:
-            edges_aug = np.vstack([edges_aug,
-                                   [int(comps[cid][j]), int(list(island)[idx_i[j]])]])
+        verts = comps[cid]
+        pts = nodes[list(verts)]
 
-        # merge ----------------------------------------------------------------
-        island |= comps[cid]
-        island_xyz = np.vstack([island_xyz, xyz_c])
-        if island_xyz.shape[0] > island_tree.n * 2:   # amortised rebuild
-            island_tree = KDTree(island_xyz, leafsize=64)
+        # find up to bridge_k nearest vertex pairs (component ↔ island)
+        dists, idx_island = island_tree.query(pts, k=1, workers=-1)
+        order = np.argsort(dists)[:bridge_k]
 
-        # update gaps lazily (decrease-key)
-        for gap_new, cid2 in [(kdtrees[cid2].query(xyz_c, k=1)[0].min(), cid2)
-                              for _, cid2 in pq]:
-            heapq.heappush(pq, (gap_new, cid2))
+        verts_arr   = np.fromiter(verts, dtype=np.int64, count=len(verts))
+        island_arr  = np.fromiter(island, dtype=np.int64, count=len(island))
+        for j in order:
+            u = int(verts_arr[j])
+            v = int(island_arr[idx_island[j]])
+            edges_aug = np.vstack([edges_aug, [u, v]])
+
+        # merge component into island and rebuild KD-tree
+        island |= verts
+        island_tree = KDTree(nodes[list(island)])
+
+        merges_since_recalc += 1
+        if merges_since_recalc >= bridge_recalc_after:
+            # distances of *every* remaining component may have changed
+            pq = [(closest_gap(cid), cid) for _, cid in pq]  # drop old gaps
+            heapq.heapify(pq)
+            merges_since_recalc = 0
 
     return np.unique(edges_aug, axis=0)
-
 
 def _build_mst(nodes: np.ndarray, edges: np.ndarray) -> np.ndarray:
     """
@@ -1072,7 +1101,7 @@ def skeletonize(
             edges_arr = _bridge_components(
                 nodes_arr, edges_arr, 
                 bridge_k=bridge_k,
-                bridge_max_gap_factor = bridge_max_factor,
+                bridge_max_factor = bridge_max_factor,
             )
         if verbose:
             post_ms += time.perf_counter() - _t0
