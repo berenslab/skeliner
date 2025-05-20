@@ -1,3 +1,4 @@
+import heapq
 import time
 from collections import defaultdict, deque
 from contextlib import contextmanager
@@ -611,56 +612,60 @@ def _bridge_components(
     nodes: np.ndarray,
     edges: np.ndarray,
     *,
-    bridge_k: int,
+    bridge_k: int = 1,
+    bridge_max_gap_factor: float = 12.0,
 ) -> np.ndarray:
-    """
-    Use KD-trees to connect all graph components so that everything is
-    reachable from the soma.  Adds synthetic edges between k nearest
-    pairs (default k=1).
-    """
-    g_full = ig.Graph(
-        n=len(nodes), edges=[tuple(map(int, e)) for e in edges], directed=False
-    )
-    g_full.es["weight"] = [
-        float(np.linalg.norm(nodes[a] - nodes[b])) for a, b in edges
-    ]
-
-    vc = g_full.components()
-    soma_comp_id = vc.membership[0]
-    comps = [set(c) for c in vc]
-
+    g = ig.Graph(n=len(nodes), edges=[tuple(map(int, e)) for e in edges], directed=False)
+    comps = [set(c) for c in g.components()]
+    soma_cid = g.components().membership[0]
     if len(comps) == 1:
-        return edges  # already connected
+        return edges
 
-    # one KD-tree per component
-    kdtrees = {cid: KDTree(nodes[list(verts)]) for cid, verts in enumerate(comps)}
+    # --- caches ---------------------------------------------------------
+    comp_xyz  = {cid: nodes[list(v)] for cid, v in enumerate(comps)}
+    kdtrees   = {cid: KDTree(xyz, leafsize=32) for cid, xyz in comp_xyz.items()}
+    edge_len_mean = np.linalg.norm(nodes[edges[:, 0]] - nodes[edges[:, 1]], axis=1).mean()
 
-    main_island = set(comps[soma_comp_id])
-    island_tree = kdtrees[soma_comp_id]
-    pending = [cid for cid in range(len(comps)) if cid != soma_comp_id]
+    # --- grow island ----------------------------------------------------
+    island      = set(comps[soma_cid])
+    island_xyz  = nodes[list(island)]
+    island_tree = KDTree(island_xyz, leafsize=64)
+
+    def closest(cid: int) -> float:
+        return kdtrees[cid].query(island_xyz, k=1)[0].min()
+
+    pq = [(closest(cid), cid) for cid in range(len(comps)) if cid != soma_cid]
+    heapq.heapify(pq)
 
     edges_aug = edges.copy()
-    while pending:
-        cid = pending.pop(0)
-        verts = comps[cid]
-        pts = nodes[list(verts)]
+    while pq:
+        gap, cid = heapq.heappop(pq)
+        if cid in island:            # stale tuple
+            continue
+        if gap > bridge_max_gap_factor * edge_len_mean:
+            heapq.heappush(pq, (gap, cid))
+            continue
 
-        dists, island_idx = island_tree.query(pts, k=1, workers=-1)
-        island_idx = np.asarray(island_idx, dtype=np.intp) # fix type
-        order = np.argsort(dists)
-        u_candidates = np.fromiter(verts, dtype=np.int64)
-        island_list = np.fromiter(main_island, dtype=np.int64)
+        xyz_c = comp_xyz[cid]
+        d_ic, idx_i = island_tree.query(xyz_c, k=1)
+        best = np.argsort(d_ic)[:bridge_k]
+        for j in best:
+            edges_aug = np.vstack([edges_aug,
+                                   [int(comps[cid][j]), int(list(island)[idx_i[j]])]])
 
-        for j in order[: bridge_k]:
-            u = int(u_candidates[j])
-            v = int(island_list[island_idx[j]])
-            edges_aug = np.vstack([edges_aug, [u, v]])
+        # merge ----------------------------------------------------------------
+        island |= comps[cid]
+        island_xyz = np.vstack([island_xyz, xyz_c])
+        if island_xyz.shape[0] > island_tree.n * 2:   # amortised rebuild
+            island_tree = KDTree(island_xyz, leafsize=64)
 
-        # merge component into island and rebuild KD-tree
-        main_island |= verts
-        island_tree = KDTree(nodes[list(main_island)])
+        # update gaps lazily (decrease-key)
+        for gap_new, cid2 in [(kdtrees[cid2].query(xyz_c, k=1)[0].min(), cid2)
+                              for _, cid2 in pq]:
+            heapq.heappush(pq, (gap_new, cid2))
 
-    return edges_aug
+    return np.unique(edges_aug, axis=0)
+
 
 def _build_mst(nodes: np.ndarray, edges: np.ndarray) -> np.ndarray:
     """
@@ -810,6 +815,7 @@ def skeletonize(
     # --- bridging disconnected patches ---
     bridge_components: bool = True,
     bridge_k: int = 1,
+    bridge_max_factor: float = 12.0,
     # --- post‑processing ---
     # --- collapse soma-like nodes ---
     collapse_soma: bool = True,
@@ -1063,7 +1069,11 @@ def skeletonize(
     if bridge_components:
         _t0 = time.perf_counter() 
         with _timed("↳  reconnect mesh gaps"):
-            edges_arr = _bridge_components(nodes_arr, edges_arr, bridge_k=bridge_k)
+            edges_arr = _bridge_components(
+                nodes_arr, edges_arr, 
+                bridge_k=bridge_k,
+                bridge_max_gap_factor = bridge_max_factor,
+            )
         if verbose:
             post_ms += time.perf_counter() - _t0
 
