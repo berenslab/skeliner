@@ -768,6 +768,22 @@ def _prune_soma_neurites(
     )
     return keep_mask, new_edges
 
+def _extreme_vertex(mesh: trimesh.Trimesh,
+                    axis: str = "z",
+                    mode: str = "min") -> int:
+    """
+    Return the mesh-vertex index with either the minimal or maximal coordinate
+    along *axis* (“x”, “y” or “z”).
+
+    Examples
+    --------
+    >>> vid = _extreme_vertex(mesh, axis="x", mode="max")   # right-most tip
+    >>> vid = _extreme_vertex(mesh, axis="z")               # lowest-z (default)
+    """
+    ax_idx = {"x": 0, "y": 1, "z": 2}[axis.lower()]
+    coords = mesh.vertices[:, ax_idx]
+    return int(np.argmin(coords) if mode == "min" else np.argmax(coords))
+
 # -----------------------------------------------------------------------------
 #  Skeletonization Public API
 # -----------------------------------------------------------------------------
@@ -784,6 +800,9 @@ def skeletonize(
     soma_density_cutoff: float = 0.50,
     soma_dilation_steps: int = 1,
     soma_top_seed_frac: float = 0.02,
+    # -- for post-skeletonization soma detection only--
+    soma_fallback_extreme_axis: str  = "z",   # "x" | "y" | "z"
+    soma_fallback_extreme_mode: str  = "min", # "min" | "max"
     # --- geodesic sampling ---
     target_shell_count: int = 500,
     min_cluster_vertices: int = 6,
@@ -870,14 +889,22 @@ def skeletonize(
     with _timed("↳  build surface graph"):
         gsurf = _surface_graph(mesh)
 
-    if detect_soma == "post" and soma_seed_point is None:
+    if detect_soma == "post":
         # post skeletonization soma detection
-        def _random_dense_vertex(mesh: trimesh.Trimesh, gsurf: ig.Graph) -> int:
-            deg = np.fromiter(gsurf.degree(), dtype=np.int64)
-            return int(np.argmax(deg))
+        # def _random_dense_vertex(mesh: trimesh.Trimesh, gsurf: ig.Graph) -> int:
+        #     deg = np.fromiter(gsurf.degree(), dtype=np.int64)
+        #     return int(np.argmax(deg))
 
         # fallback block
-        seed_vid   = _random_dense_vertex(mesh, gsurf)
+        # seed_vid   = _random_dense_vertex(mesh, gsurf)
+
+        if soma_seed_point is not None:
+            seed_vid = int(np.argmin(np.linalg.norm(mesh.vertices.view(np.ndarray) - np.asarray(soma_seed_point), axis=1)))
+        else:
+            seed_vid = _extreme_vertex(mesh,
+                                       axis=soma_fallback_extreme_axis,
+                                       mode=soma_fallback_extreme_mode)
+
         c_soma     = mesh.vertices.view(np.ndarray)[seed_vid]
         r_soma     = float(mesh.edges_unique_length.mean()) * 3   # hard-coded, not ideal
         soma_verts = {seed_vid}
