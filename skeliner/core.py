@@ -612,9 +612,8 @@ def _bridge_components(
     nodes: np.ndarray,
     edges: np.ndarray,
     *,
-    bridge_k: int = 1,
     bridge_max_factor: float = 12.0,
-    bridge_recalc_after: int = 8,
+    bridge_recalc_after: int | None = None,
 ) -> np.ndarray:
     """
     Connect every isolated component back to the soma component.
@@ -651,41 +650,68 @@ def _bridge_components(
     island_tree = KDTree(nodes[island_idx])
 
     # helper to compute the *current* closest gap of a component
-    def closest_gap(cid: int) -> float:
-        # pts = nodes[list(comps[cid])]
-        pts = nodes[comp_idx[cid]] 
-        return island_tree.query(pts, k=1, workers=-1)[0].min()
+    def closest_pair(cid: int) -> tuple[float, int, int]:
+        pts = nodes[comp_idx[cid]]
+        dists, idx_is = island_tree.query(pts, k=1, workers=-1)
+        best = int(np.argmin(dists))
+        return float(dists[best]), best, int(idx_is[best])
 
-    # priority queue of (gap_distance, component_id)
-    pq: list[tuple[float, int]] = [
-        (closest_gap(cid), cid) for cid in range(len(comps)) if cid != soma_cid
-    ]
+    # priority queue of (gap_distance, cid, best_comp_idx, best_island_idx)
+    pq = [
+        (gap, cid, b_comp, b_is)
+                for cid in range(len(comps)) if cid != soma_cid for gap, b_comp, b_is in (closest_pair(cid), )
+        ]
     heapq.heapify(pq)
 
     edges_new: list[tuple[int, int]] = []
     merges_since_recalc = 0
 
+    if bridge_recalc_after is None:
+        def _choose_recalc_after(n_gaps: int) -> int:
+            """Return a suitable recalc period for the given number of gaps."""
+            if n_gaps <= 10:          # tiny: update often
+                return 2
+            if n_gaps <= 50:          # small: every 3–4 merges
+                return 4
+            if n_gaps <= 200:         # medium: every ~5 % of gaps
+                return max(4, n_gaps // 20)
+            # giant meshes: cap to 32 so we never starve
+            return 32 
+
+        gaps = len(comps) - 1
+        recalc_after = _choose_recalc_after(gaps)
+    else:
+        recalc_after = bridge_recalc_after
+
+    stall = 0
+    relax_factor = 1.5
+    max_stall = 3 * len(pq)
+    current_max  = bridge_max_factor * edge_len_mean
+
     while pq:
-        gap, cid = heapq.heappop(pq)
+        gap, cid, b_comp, b_is = heapq.heappop(pq)
 
         # postpone if the component is still too far away
-        if gap > bridge_max_factor * edge_len_mean:
-            heapq.heappush(pq, (gap, cid))
+        gap, best_c, best_i = closest_pair(cid)
+
+        if gap > current_max:
+            heapq.heappush(pq, (gap, cid, best_c, best_i))   # still too far, re-queue
+            stall += 1
+            if stall >= 2 * max_stall:
+                # after too many futile tries, do a *forced* heap rebuild
+                pq = [(g, cid2, bc, bi)
+                    for _, cid2, _, _ in pq
+                    for g, bc, bi in (closest_pair(cid2),)]
+                heapq.heapify(pq)
+                current_max *= relax_factor
+                stall = 0
             continue
 
-        verts_idx = comp_idx[cid]  
-        pts = nodes[verts_idx]
-
-        # find up to bridge_k nearest vertex pairs (component ↔ island)
-        dists, idx_island = island_tree.query(pts, k=1, workers=-1)
-        idx_island = np.asarray(idx_island, dtype=np.int64)
-        order = np.argsort(dists)[:bridge_k]
-
-        verts_arr = verts_idx
-        for j in order:
-            u = int(verts_arr[j])
-            v = int(island_idx[idx_island[j]])
-            edges_new.append((u, v))
+        stall = 0
+        verts_idx = comp_idx[cid]
+        u = int(verts_idx[best_c])
+        v = int(island_idx[best_i])
+        edges_new.append((u, v))
 
         # merge component into island and rebuild KD-tree
         island |= comps[cid]     
@@ -693,9 +719,11 @@ def _bridge_components(
         island_tree  = KDTree(nodes[island_idx])
 
         merges_since_recalc += 1
-        if merges_since_recalc >= bridge_recalc_after:
+        if merges_since_recalc >= recalc_after:
             # distances of *every* remaining component may have changed
-            pq = [(closest_gap(cid), cid) for _, cid in pq]  # drop old gaps
+            pq = [(gap, cid, b_comp, b_is)
+                    for _, cid, _, _ in pq
+                    for gap, b_comp, b_is in (closest_pair(cid),)]
             heapq.heapify(pq)
             merges_since_recalc = 0
 
@@ -853,8 +881,8 @@ def skeletonize(
     max_shell_width_factor: int = 50,
     # --- bridging disconnected patches ---
     bridge_components: bool = True,
-    bridge_k: int = 1,
     bridge_max_factor: float = 12.0,
+    bridge_recalc_after: int | None = None,
     # --- post‑processing ---
     # --- collapse soma-like nodes ---
     collapse_soma: bool = True,
@@ -1110,8 +1138,8 @@ def skeletonize(
         with _timed("↳  reconnect mesh gaps"):
             edges_arr = _bridge_components(
                 nodes_arr, edges_arr, 
-                bridge_k=bridge_k,
                 bridge_max_factor = bridge_max_factor,
+                bridge_recalc_after= bridge_recalc_after,
             )
         if verbose:
             post_ms += time.perf_counter() - _t0
