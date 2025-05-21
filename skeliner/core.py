@@ -1165,6 +1165,7 @@ def skeletonize(
         radii: Dict[str, List[float]] = {
             est: [r_soma] for est in radius_estimators
         }
+        node2mesh: List[np.ndarray] = [np.fromiter(soma_verts, dtype=np.int64)]
         v2n: Dict[int, int] = {v: 0 for v in soma_verts}
         next_id = 1
 
@@ -1191,6 +1192,7 @@ def skeletonize(
                 node_id = next_id
                 next_id += 1
                 nodes.append(centre)
+                node2mesh.append(comp_idx)
                 for vv in comp_idx:
                     v2n[int(vv)] = node_id
 
@@ -1206,7 +1208,12 @@ def skeletonize(
                 nodes_arr, radii_dict[radius_estimators[0]]
             )
             # expose the soma nodes to later steps just like the pre-path
-            soma_verts = set()          # no mesh verts – but keep var defined
+            # soma_verts = set()          # no mesh verts – but keep var defined
+            soma_verts = {
+                int(v)
+                for nid in soma_nodes        # typically {0}, but generic
+                for v in node2mesh[nid]      # gather all contributing surface verts
+            }
             nodes_arr[0] = c_soma
             for k in radii_dict:
                 radii_dict[k][0] = r_soma
@@ -1225,12 +1232,7 @@ def skeletonize(
         _t0 = time.perf_counter() 
 
         with _timed("↳  merge redundant near-soma nodes"):
-            (
-                nodes_arr,
-                radii_arr,
-                edges_arr,
-                keep_mask
-            ) = _merge_near_soma_nodes(
+            (nodes_arr, radii_arr, edges_arr, keep_mask) = _merge_near_soma_nodes(
                 nodes_arr,
                 radii_dict[radius_estimators[0]],
                 edges_arr,
@@ -1239,6 +1241,15 @@ def skeletonize(
                 soma_merge_dist_factor=soma_merge_dist_factor,
                 soma_merge_radius_factor=soma_merge_radius_factor,
             )
+
+            # --- rebuild the list ---
+            removed_idx = np.where(~keep_mask)[0]          # nodes that were collapsed
+            for idx in removed_idx:
+                soma_verts.update(node2mesh[idx])          # node2mesh from stage 2
+
+            # extra = [node2mesh[idx] for idx in removed_idx]
+            # node2mesh[0] = np.concatenate([node2mesh[0], *extra])
+            # node2mesh = [node2mesh[i] for i in np.where(keep_mask)[0]]
 
             # apply same mask to all radius columns
             for k in radii_dict:
@@ -1282,6 +1293,8 @@ def skeletonize(
             nodes_arr  = nodes_arr[keep_mask]
             for k in radii_dict:
                 radii_dict[k] = radii_dict[k][keep_mask]
+            # node2mesh = [node2mesh[i] for i in np.where(keep_mask)[0]]
+
         if verbose:
             post_ms += time.perf_counter() - _t0
 
