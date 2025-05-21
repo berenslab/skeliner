@@ -1025,8 +1025,8 @@ def skeletonize(
     # --- post‑processing ---
     # --- collapse soma-like nodes ---
     collapse_soma: bool = True,
-    soma_merge_dist_factor: float = 1.15,
-    soma_merge_radius_factor: float = 0.25,
+    collapse_soma_dist_factor: float = 1.15,
+    collapse_soma_radius_factor: float = 0.25,
     # --- prune tiny neurites ---
     prune_tiny_neurites: bool = True,
     prune_min_branch_nodes: int = 50,
@@ -1284,8 +1284,8 @@ def skeletonize(
                 edges_arr,
                 c_soma=c_soma,
                 r_soma=radii_dict[radius_estimators[0]][0],
-                soma_merge_dist_factor=soma_merge_dist_factor,
-                soma_merge_radius_factor=soma_merge_radius_factor,
+                soma_merge_dist_factor=collapse_soma_dist_factor,
+                soma_merge_radius_factor=collapse_soma_radius_factor,
             )
 
             # --- rebuild the list ---

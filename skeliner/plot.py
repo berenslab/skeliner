@@ -241,7 +241,7 @@ def plot_projection(
             lc = LineCollection(
                 segments.tolist(),
                 colors="black",
-                linewidths=1.0,
+                linewidths=.5,
                 alpha=line_alpha,
             )
             ax.add_collection(lc)
