@@ -1,3 +1,4 @@
+import heapq
 import time
 from collections import defaultdict, deque
 from contextlib import contextmanager
@@ -607,60 +608,198 @@ def _collapse_soma_nodes(
     return nodes[keep], radii[keep], edges_out, keep
 
 
-def _bridge_components(
+def _bridge_gaps(
     nodes: np.ndarray,
     edges: np.ndarray,
     *,
-    bridge_k: int,
+    bridge_max_factor: float | None = None,
+    bridge_recalc_after: int | None = None,
 ) -> np.ndarray:
     """
-    Use KD-trees to connect all graph components so that everything is
-    reachable from the soma.  Adds synthetic edges between k nearest
-    pairs (default k=1).
+    Bridge all disconnected surface components of a neuron mesh **back to the
+    soma component** by inserting synthetic edges.
+
+    The routine works in four logical stages:
+
+    1.  **Component analysis** – build an undirected graph of the mesh,
+        identify connected components, and mark the one that contains the
+        soma (vertex 0) as the *island*.
+    2.  **Gap prioritisation** – for every *foreign* component find the
+        geodesically closest vertex pair (component ↔ island) and push the
+        tuple ``(gap_distance, cid, idx_comp, idx_island)`` into a
+        min-heap.  
+        If *bridge_max_factor* is *None* we estimate a conservative upper
+        bound from the initial gap distribution:
+
+        ``factor = clip( 55-th percentile(gaps) / ⟨edge⟩ , [6 ×, 12 ×] )``
+
+        This filters out pathologically long jumps right from the start.
+    3.  **Greedy growth** – repeatedly pop the nearest component from the
+        heap and connect it with **one** synthetic edge (the cached closest
+        pair).  After each merge the island KD-tree is rebuilt and the heap
+        entries are refreshed every *bridge_recalc_after* merges
+        (auto-chosen if *None*; ≈ 5 % of remaining gaps, capped at 32).
+        A stall counter and a gentle *relax_factor* (1.5) guarantee
+        termination even on meshes with extremely uneven gap sizes.
+    4.  **Finish** – return the original edges plus all new bridges,
+        sorted and de-duplicated.
+
+    Notes
+    -----
+    * Only **one** edge per foreign component is added; the global MST step
+      later will prune any redundant cycles that could arise.
+    * Complexity is dominated by KD-tree queries:  
+      *O((|V_island| + Σ|V_comp|) log |V|)* in practice.
+    * The heuristic defaults trade a few hundred ms of runtime for a markedly
+      lower rate of “long-jump” bridges.  Power users can override
+      *bridge_max_factor* or *bridge_recalc_after* if desired.
+
+    Parameters
+    ----------
+    nodes
+        ``(N, 3)`` float32 array of mesh-vertex coordinates.
+    edges
+        ``(E, 2)`` int64 array of **undirected, sorted** mesh edges.
+    bridge_max_factor
+        Optional hard ceiling for acceptable bridge length expressed as a
+        multiple of the mean mesh-edge length.  If *None* an adaptive value
+        (see above) is chosen.
+    bridge_recalc_after
+        How many successful merges to perform before all component-to-island
+        distances are recomputed.  If *None* an adaptive value based on the
+        number of gaps is used.
+
+    Returns
+    -------
+    np.ndarray
+        ``(E′, 2)`` int64 undirected edge list containing the original mesh
+        edges **plus** one synthetic edge for every formerly disconnected
+        component.  The array is sorted row-wise and de-duplicated.
     """
-    g_full = ig.Graph(
-        n=len(nodes), edges=[tuple(map(int, e)) for e in edges], directed=False
-    )
-    g_full.es["weight"] = [
-        float(np.linalg.norm(nodes[a] - nodes[b])) for a, b in edges
-    ]
 
-    vc = g_full.components()
-    soma_comp_id = vc.membership[0]
-    comps = [set(c) for c in vc]
+    def _auto_bridge_max(gaps: list[float],
+                        edge_mean: float,
+                        *,
+                        pct: float = 55.,
+                        lo: float = 6.,
+                        hi: float = 12.) -> float:
+        """
+        Choose a bridge_max_factor from the initial gap distribution. Default is the
+        55th percentile of the gap distribution, clipped to [6, 20] times the mean edge
+        """
+        raw = np.percentile(gaps, pct) / edge_mean
+        return float(np.clip(raw, lo, hi))
 
+    def _auto_recalc_after(n_gaps: int) -> int:
+        """Return a suitable recalc period for the given number of gaps."""
+        if n_gaps <= 10:          # tiny: update often
+            return 2
+        if n_gaps <= 50:          # small: every 3–4 merges
+            return 4
+        if n_gaps <= 200:         # medium: every ~5 % of gaps
+            return max(4, n_gaps // 20)
+        # giant meshes: cap to 32 so we never starve
+        return 32 
+
+
+    # -- 0. quick exit if already connected ---------------------------------
+    g = ig.Graph(n=len(nodes), edges=[tuple(map(int, e)) for e in edges], directed=False)
+    comps = [set(c) for c in g.components()]
+    comp_idx = {cid: np.fromiter(verts, dtype=np.int64)
+            for cid, verts in enumerate(comps)}
+    soma_cid = g.components().membership[0]
     if len(comps) == 1:
-        return edges  # already connected
+        return edges
 
-    # one KD-tree per component
-    kdtrees = {cid: KDTree(nodes[list(verts)]) for cid, verts in enumerate(comps)}
 
-    main_island = set(comps[soma_comp_id])
-    island_tree = kdtrees[soma_comp_id]
-    pending = [cid for cid in range(len(comps)) if cid != soma_comp_id]
+    # -- 1. build one KD-tree per component ---------------------------------
+    edge_len_mean = np.linalg.norm(nodes[edges[:, 0]] - nodes[edges[:, 1]], axis=1).mean()
 
-    edges_aug = edges.copy()
-    while pending:
-        cid = pending.pop(0)
-        verts = comps[cid]
-        pts = nodes[list(verts)]
+    # -- 2. grow the island using a distance-ordered priority queue ---------
+    island = set(comps[soma_cid])
+    island_idx  = np.fromiter(island, dtype=np.int64)
+    island_tree = KDTree(nodes[island_idx])
 
-        dists, island_idx = island_tree.query(pts, k=1, workers=-1)
-        island_idx = np.asarray(island_idx, dtype=np.intp) # fix type
-        order = np.argsort(dists)
-        u_candidates = np.fromiter(verts, dtype=np.int64)
-        island_list = np.fromiter(main_island, dtype=np.int64)
+    # helper to compute the *current* closest gap of a component
+    def closest_pair(cid: int) -> tuple[float, int, int]:
+        pts = nodes[comp_idx[cid]]
+        dists, idx_is = island_tree.query(pts, k=1, workers=-1)
+        best = int(np.argmin(dists))
+        return float(dists[best]), best, np.asarray(idx_is, dtype=np.int64)[best]
 
-        for j in order[: bridge_k]:
-            u = int(u_candidates[j])
-            v = int(island_list[island_idx[j]])
-            edges_aug = np.vstack([edges_aug, [u, v]])
+    # priority queue of (gap_distance, cid, best_comp_idx, best_island_idx)
+    pq = []
+    gap_samples = []                       
+    for cid in range(len(comps)):
+        if cid == soma_cid:
+            continue
+        gap, b_comp, b_is = closest_pair(cid)
+        pq.append((gap, cid, b_comp, b_is))
+        gap_samples.append(gap)            
+    heapq.heapify(pq)
+
+    # -- heuristic hyperparameters if not given -------------------------------
+    if bridge_max_factor is None:
+        bridge_max_factor = _auto_bridge_max(gap_samples, edge_len_mean)
+
+    if bridge_recalc_after is None:
+        gaps = len(comps) - 1
+        recalc_after = _auto_recalc_after(gaps)
+    else:
+        recalc_after = bridge_recalc_after
+
+    edges_new: list[tuple[int, int]] = []
+    merges_since_recalc = 0
+
+    stall = 0
+    relax_factor = 1.5
+    max_stall = 3 * len(pq)
+    current_max  = bridge_max_factor * edge_len_mean
+
+    while pq:
+        _, cid, _, _ = heapq.heappop(pq)
+        # postpone if the component is still too far away
+        gap, best_c, best_i = closest_pair(cid)
+
+        if gap > current_max:
+            heapq.heappush(pq, (gap, cid, best_c, best_i))   # still too far, re-queue
+            stall += 1
+            if stall >= 2 * max_stall:
+                # after too many futile tries, do a *forced* heap rebuild
+                pq = [(g, cid2, bc, bi)
+                    for _, cid2, _, _ in pq
+                    for g, bc, bi in (closest_pair(cid2),)]
+                heapq.heapify(pq)
+                current_max *= relax_factor
+                stall = 0
+            continue
+
+        stall = 0
+        verts_idx = comp_idx[cid]
+        u = int(verts_idx[best_c])
+        v = int(island_idx[best_i])
+        edges_new.append((u, v))
 
         # merge component into island and rebuild KD-tree
-        main_island |= verts
-        island_tree = KDTree(nodes[list(main_island)])
+        island |= comps[cid]     
+        island_idx   = np.concatenate([island_idx, verts_idx])
+        island_tree  = KDTree(nodes[island_idx])
 
-    return edges_aug
+        merges_since_recalc += 1
+        if merges_since_recalc >= recalc_after:
+            # distances of *every* remaining component may have changed
+            pq = [(gap, cid, b_comp, b_is)
+                    for _, cid, _, _ in pq
+                    for gap, b_comp, b_is in (closest_pair(cid),)]
+            heapq.heapify(pq)
+            merges_since_recalc = 0
+
+    if edges_new:
+        edges_aug = np.vstack([edges, np.asarray(edges_new, dtype=np.int64)])
+    else:
+        edges_aug = edges
+
+    return np.unique(edges_aug, axis=0)
 
 def _build_mst(nodes: np.ndarray, edges: np.ndarray) -> np.ndarray:
     """
@@ -768,6 +907,22 @@ def _prune_soma_neurites(
     )
     return keep_mask, new_edges
 
+def _extreme_vertex(mesh: trimesh.Trimesh,
+                    axis: str = "z",
+                    mode: str = "min") -> int:
+    """
+    Return the mesh-vertex index with either the minimal or maximal coordinate
+    along *axis* (“x”, “y” or “z”).
+
+    Examples
+    --------
+    >>> vid = _extreme_vertex(mesh, axis="x", mode="max")   # right-most tip
+    >>> vid = _extreme_vertex(mesh, axis="z")               # lowest-z (default)
+    """
+    ax_idx = {"x": 0, "y": 1, "z": 2}[axis.lower()]
+    coords = mesh.vertices[:, ax_idx]
+    return int(np.argmin(coords) if mode == "min" else np.argmax(coords))
+
 # -----------------------------------------------------------------------------
 #  Skeletonization Public API
 # -----------------------------------------------------------------------------
@@ -784,13 +939,17 @@ def skeletonize(
     soma_density_cutoff: float = 0.50,
     soma_dilation_steps: int = 1,
     soma_top_seed_frac: float = 0.02,
+    # -- for post-skeletonization soma detection only--
+    soma_fallback_extreme_axis: str  = "z",   # "x" | "y" | "z"
+    soma_fallback_extreme_mode: str  = "min", # "min" | "max"
     # --- geodesic sampling ---
     target_shell_count: int = 500,
     min_cluster_vertices: int = 6,
     max_shell_width_factor: int = 50,
     # --- bridging disconnected patches ---
-    bridge_components: bool = True,
-    bridge_k: int = 1,
+    bridge_gaps: bool = True,
+    bridge_max_factor: float | None = None,
+    bridge_recalc_after: int | None = None,
     # --- post‑processing ---
     # --- collapse soma-like nodes ---
     collapse_soma: bool = True,
@@ -824,7 +983,7 @@ def skeletonize(
     target_shell_count : int, default ``500``
         Rough number of geodesic shells to produce per component.  The actual
         shell width is adapted to mesh resolution.
-    bridge_components : bool, default ``True``
+    bridge_gaps : bool, default ``True``
         If the mesh contains disconnected islands (breaks, imaging artefacts),
         attempt to connect them back to the soma with synthetic edges.
     bridge_k : int, default ``1``
@@ -870,14 +1029,15 @@ def skeletonize(
     with _timed("↳  build surface graph"):
         gsurf = _surface_graph(mesh)
 
-    if detect_soma == "post" and soma_seed_point is None:
-        # post skeletonization soma detection
-        def _random_dense_vertex(mesh: trimesh.Trimesh, gsurf: ig.Graph) -> int:
-            deg = np.fromiter(gsurf.degree(), dtype=np.int64)
-            return int(np.argmax(deg))
+    if detect_soma == "post":
+        # delay soma detection until after skeletonization
+        if soma_seed_point is not None:
+            seed_vid = int(np.argmin(np.linalg.norm(mesh.vertices.view(np.ndarray) - np.asarray(soma_seed_point), axis=1)))
+        else:
+            seed_vid = _extreme_vertex(mesh,
+                                       axis=soma_fallback_extreme_axis,
+                                       mode=soma_fallback_extreme_mode)
 
-        # fallback block
-        seed_vid   = _random_dense_vertex(mesh, gsurf)
         c_soma     = mesh.vertices.view(np.ndarray)[seed_vid]
         r_soma     = float(mesh.edges_unique_length.mean()) * 3   # hard-coded, not ideal
         soma_verts = {seed_vid}
@@ -908,7 +1068,7 @@ def skeletonize(
             
 
     # 1. binning along geodesic shells ----------------------------------
-    with _timed("↳  partition surface into geodesic shells"):
+    with _timed("↳  bin surface vertices by geodesic distance"):
         v = mesh.vertices.view(np.ndarray)
         
         components    = gsurf.components()
@@ -947,7 +1107,7 @@ def skeletonize(
             all_bins.extend(bins)
         
     # 2. create skeleton nodes ------------------------------------------
-    with _timed("↳  place centroids + local radius"):
+    with _timed("↳  compute bin centroids and radii"):
         nodes: List[np.ndarray] = [c_soma]
         radii: Dict[str, List[float]] = {
             est: [r_soma] for est in radius_estimators
@@ -988,7 +1148,7 @@ def skeletonize(
         }
 
     # 3. edges from mesh connectivity -----------------------------------
-    with _timed("↳  map mesh edges → skeleton edges"):
+    with _timed("↳  map mesh faces to skeleton edges"):
         edges_arr = _edges_from_mesh(
             mesh.edges_unique,
             v2n,
@@ -1033,10 +1193,14 @@ def skeletonize(
             post_ms += time.perf_counter() - _t0
 
     # 5. Connect all components ------------------------------
-    if bridge_components:
+    if bridge_gaps:
         _t0 = time.perf_counter() 
-        with _timed("↳  reconnect mesh gaps"):
-            edges_arr = _bridge_components(nodes_arr, edges_arr, bridge_k=bridge_k)
+        with _timed("↳  bridge skeleton gaps"):
+            edges_arr = _bridge_gaps(
+                nodes_arr, edges_arr, 
+                bridge_max_factor = bridge_max_factor,
+                bridge_recalc_after= bridge_recalc_after,
+            )
         if verbose:
             post_ms += time.perf_counter() - _t0
 

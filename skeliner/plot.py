@@ -78,6 +78,7 @@ def plot_projection(
     vmax_fraction: float = 0.10,
     circle_alpha: float = 0.25,
     line_alpha: float = 0.8,
+    unit: str | None = None,
     # --- soma ---
     draw_soma_mask: bool = True,
 ) -> tuple:
@@ -246,8 +247,15 @@ def plot_projection(
             ax.add_collection(lc)
     # ─────────────────── final tweaks ─────────────────────────────────────
     ax.set_aspect("equal")
-    ax.set_xlabel(f"{plane[0]} (scaled units)")
-    ax.set_ylabel(f"{plane[1]} (scaled units)")
+    if unit is None:
+        if scale[0] == 1.0:
+            unit_str = ""
+        else:
+            unit_str = f"(Scaled by {scale[0]})"
+    else:
+        unit_str = f"({unit})"
+    ax.set_xlabel(f"{plane[0]} {unit_str}")
+    ax.set_ylabel(f"{plane[1]} {unit_str}")
 
     if xlim is not None:
         ax.set_xlim(xlim)
