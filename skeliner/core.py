@@ -229,6 +229,16 @@ def _surface_graph(mesh: trimesh.Trimesh) -> ig.Graph:
 # -----------------------------------------------------------------------------
 #  Soma detection API
 # -----------------------------------------------------------------------------
+def _likely_has_soma(
+    radii: np.ndarray,
+    ratio: float = 3.0,       
+    min_nodes: int = 3,      # minimum number of large nodes
+) -> bool:
+    """
+    Return True if a plausible soma cluster is present.
+    """
+    return sum(radii > np.mean(radii) * ratio) > min_nodes
+
 
 def _probe_radius(
     mesh: trimesh.Trimesh,
@@ -1197,12 +1207,16 @@ def skeletonize(
                     v2n[int(vv)] = node_id
 
         nodes_arr = np.asarray(nodes, dtype=np.float32)
-        nodes_arr = np.asarray(nodes, dtype=np.float32)
         radii_dict = {
             k: np.asarray(v, dtype=np.float32) for k, v in radii.items()
         }
 
-    if detect_soma == "post":
+        # check if we have soma candidates
+   
+        r_primary = radii_dict[radius_estimators[0]]
+        has_soma = _likely_has_soma(r_primary)
+
+    if has_soma and detect_soma == "post":
         with _timed("↳  post-skeletonization soma detection"):
             c_soma, r_soma, soma_nodes = find_soma_with_radius(
                 nodes_arr, radii_dict[radius_estimators[0]]
@@ -1223,8 +1237,10 @@ def skeletonize(
 
                 # 3. fix the vertex-to-node lookup used later by _edges_from_mesh()
                 for vid, nid in v2n.items():
-                    if   nid == 0:        v2n[vid] = new_root
-                    elif nid == new_root: v2n[vid] = 0
+                    if   nid == 0:
+                        v2n[vid] = new_root
+                    elif nid == new_root:
+                        v2n[vid] = 0
 
                 # 4. make the ID set consistent
                 soma_nodes = np.where(soma_nodes == new_root, 0, soma_nodes)
@@ -1233,18 +1249,6 @@ def skeletonize(
             c_soma = nodes_arr[0]
             for k in radii_dict:
                 radii_dict[k][0] = r_soma
-            # # expose the soma nodes to later steps just like the pre-path
-            # # soma_verts = set()          # no mesh verts – but keep var defined
-            # soma_verts = {
-            #     int(v)
-            #     for nid in soma_nodes        # typically {0}, but generic
-            #     for v in node2mesh[nid]      # gather all contributing surface verts
-            # }
-            # for vv in soma_verts:
-            #     v2n[int(vv)] = 0 
-            # nodes_arr[0] = c_soma
-            # for k in radii_dict:
-            #     radii_dict[k][0] = r_soma
 
     # 3. edges from mesh connectivity -----------------------------------
     with _timed("↳  map mesh faces to skeleton edges"):
@@ -1256,7 +1260,7 @@ def skeletonize(
     
 
     # 4. collapse soma‑like / fat nodes ---------------------------
-    if collapse_soma:
+    if has_soma and collapse_soma:
         _t0 = time.perf_counter() 
 
         with _timed("↳  merge redundant near-soma nodes"):
@@ -1307,7 +1311,7 @@ def skeletonize(
         edges_mst = _build_mst(nodes_arr, edges_arr)
 
     # 7. prune tiny sub-trees near the soma
-    if prune_tiny_neurites:
+    if has_soma and prune_tiny_neurites:
         _t0 = time.perf_counter()
         with _timed("↳  prune tiny soma-attached branches"):
             keep_mask, edges_mst = _prune_soma_neurites(
