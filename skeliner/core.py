@@ -616,20 +616,65 @@ def _bridge_gaps(
     bridge_recalc_after: int | None = None,
 ) -> np.ndarray:
     """
-    Connect every isolated component back to the soma component.
-    Components are processed in order of *current* proximity to the island,
-    which prevents far-away fragments from being bridged before nearer ones.
+    Bridge all disconnected surface components of a neuron mesh **back to the
+    soma component** by inserting synthetic edges.
+
+    The routine works in four logical stages:
+
+    1.  **Component analysis** – build an undirected graph of the mesh,
+        identify connected components, and mark the one that contains the
+        soma (vertex 0) as the *island*.
+    2.  **Gap prioritisation** – for every *foreign* component find the
+        geodesically closest vertex pair (component ↔ island) and push the
+        tuple ``(gap_distance, cid, idx_comp, idx_island)`` into a
+        min-heap.  
+        If *bridge_max_factor* is *None* we estimate a conservative upper
+        bound from the initial gap distribution:
+
+        ``factor = clip( 55-th percentile(gaps) / ⟨edge⟩ , [6 ×, 12 ×] )``
+
+        This filters out pathologically long jumps right from the start.
+    3.  **Greedy growth** – repeatedly pop the nearest component from the
+        heap and connect it with **one** synthetic edge (the cached closest
+        pair).  After each merge the island KD-tree is rebuilt and the heap
+        entries are refreshed every *bridge_recalc_after* merges
+        (auto-chosen if *None*; ≈ 5 % of remaining gaps, capped at 32).
+        A stall counter and a gentle *relax_factor* (1.5) guarantee
+        termination even on meshes with extremely uneven gap sizes.
+    4.  **Finish** – return the original edges plus all new bridges,
+        sorted and de-duplicated.
+
+    Notes
+    -----
+    * Only **one** edge per foreign component is added; the global MST step
+      later will prune any redundant cycles that could arise.
+    * Complexity is dominated by KD-tree queries:  
+      *O((|V_island| + Σ|V_comp|) log |V|)* in practice.
+    * The heuristic defaults trade a few hundred ms of runtime for a markedly
+      lower rate of “long-jump” bridges.  Power users can override
+      *bridge_max_factor* or *bridge_recalc_after* if desired.
 
     Parameters
     ----------
-    bridge_k
-        How many vertex pairs to add for each component.
+    nodes
+        ``(N, 3)`` float32 array of mesh-vertex coordinates.
+    edges
+        ``(E, 2)`` int64 array of **undirected, sorted** mesh edges.
     bridge_max_factor
-        Skip a component for now if its closest gap is larger than
-        ``bridge_max_factor × <mean edge length>``.
-    recalc_after
-        Re-compute all component-to-island distances after this many
-        successful merges (keeps the priority queue fresh at minimal cost).
+        Optional hard ceiling for acceptable bridge length expressed as a
+        multiple of the mean mesh-edge length.  If *None* an adaptive value
+        (see above) is chosen.
+    bridge_recalc_after
+        How many successful merges to perform before all component-to-island
+        distances are recomputed.  If *None* an adaptive value based on the
+        number of gaps is used.
+
+    Returns
+    -------
+    np.ndarray
+        ``(E′, 2)`` int64 undirected edge list containing the original mesh
+        edges **plus** one synthetic edge for every formerly disconnected
+        component.  The array is sorted row-wise and de-duplicated.
     """
 
     def _auto_bridge_max(gaps: list[float],
@@ -683,20 +728,14 @@ def _bridge_gaps(
         return float(dists[best]), best, np.asarray(idx_is, dtype=np.int64)[best]
 
     # priority queue of (gap_distance, cid, best_comp_idx, best_island_idx)
-    # pq = [
-    #     (gap, cid, b_comp, b_is)
-    #             for cid in range(len(comps)) if cid != soma_cid for gap, b_comp, b_is in (closest_pair(cid), )
-    #     ]
-    # heapq.heapify(pq)
-
     pq = []
-    gap_samples = []                       # NEW
+    gap_samples = []                       
     for cid in range(len(comps)):
         if cid == soma_cid:
             continue
         gap, b_comp, b_is = closest_pair(cid)
         pq.append((gap, cid, b_comp, b_is))
-        gap_samples.append(gap)            # NEW
+        gap_samples.append(gap)            
     heapq.heapify(pq)
 
     # -- heuristic hyperparameters if not given -------------------------------
