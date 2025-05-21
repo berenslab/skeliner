@@ -231,8 +231,8 @@ def _surface_graph(mesh: trimesh.Trimesh) -> ig.Graph:
 # -----------------------------------------------------------------------------
 def _likely_has_soma(
     radii: np.ndarray,
-    ratio: float = 3.0,       
-    min_nodes: int = 3,      # minimum number of large nodes
+    ratio: float = 3.5,       
+    min_nodes: int = 5,      
 ) -> bool:
     """
     Return True if a plausible soma cluster is present.
@@ -668,6 +668,15 @@ def _merge_near_soma_nodes(
     edges_out = np.sort(edges_out, axis=1)
     edges_out = np.unique(edges_out, axis=0)
 
+    # ── 5. re-centre node 0  (all centroids now belonging to the soma) ──
+    merged_idx = np.where(~keep)[0]                 # the ones we collapsed
+    if merged_idx.size:                             # avoid mean([]) runtime-warning
+        soma_centroids = np.vstack((nodes[0], nodes[merged_idx]))
+        nodes_keep = nodes[keep].copy()
+        nodes_keep[0] = soma_centroids.mean(axis=0) # updated centroid
+    else:
+        nodes_keep = nodes[keep]                    # fast path – nothing merged
+
     return nodes[keep], radii[keep], edges_out, keep
 
 
@@ -995,16 +1004,16 @@ def skeletonize(
     # --- radius estimation ---
     radius_estimators: list[str] = ["median", "mean", "trim"],
     # --- soma detection ---
-    detect_soma: str = "pre", # "pre", "post", "seed"
+    detect_soma: str | bool = "post", # options: {"post", "pre", "seed", "off" or False}
     soma_seed_point: np.ndarray | list | tuple | None = None,
     soma_seed_radius: float | None = None,
-    soma_seed_radius_multipler: float = 8.0,
+    soma_seed_radius_multiplier: float = 8.0,
     soma_density_cutoff: float = 0.50,
     soma_dilation_steps: int = 1,
     soma_top_seed_frac: float = 0.02,
     # -- for post-skeletonization soma detection only--
-    soma_fallback_extreme_axis: str  = "z",   # "x" | "y" | "z"
-    soma_fallback_extreme_mode: str  = "min", # "min" | "max"
+    soma_init_guess_axis: str  = "z",   # "x" | "y" | "z"
+    soma_init_guess_mode: str  = "min", # "min" | "max"
     # --- geodesic sampling ---
     target_shell_count: int = 500,
     min_cluster_vertices: int = 6,
@@ -1016,12 +1025,12 @@ def skeletonize(
     # --- post‑processing ---
     # --- collapse soma-like nodes ---
     collapse_soma: bool = True,
-    soma_merge_dist_factor: float = 1.0,
+    soma_merge_dist_factor: float = 1.15,
     soma_merge_radius_factor: float = 0.25,
     # --- prune tiny neurites ---
     prune_tiny_neurites: bool = True,
-    min_branch_nodes: int = 30,
-    min_branch_extent_factor: float = 1.8,
+    prune_min_branch_nodes: int = 50,
+    prune_min_branch_extent_factor: float = 1.8,
     # --- misc ---
     verbose: bool = False,
 ) -> Skeleton:
@@ -1092,14 +1101,15 @@ def skeletonize(
     with _timed("↳  build surface graph"):
         gsurf = _surface_graph(mesh)
 
-    if detect_soma == "post":
+    if detect_soma == "post" or detect_soma == "off" or detect_soma is False:
         # delay soma detection until after skeletonization
+        # but seed point is still needed for binning
         if soma_seed_point is not None:
             seed_vid = int(np.argmin(np.linalg.norm(mesh.vertices.view(np.ndarray) - np.asarray(soma_seed_point), axis=1)))
         else:
             seed_vid = _extreme_vertex(mesh,
-                                       axis=soma_fallback_extreme_axis,
-                                       mode=soma_fallback_extreme_mode)
+                                       axis=soma_init_guess_axis,
+                                       mode=soma_init_guess_mode)
 
         c_soma     = mesh.vertices.view(np.ndarray)[seed_vid]
         r_soma     = float(mesh.edges_unique_length.mean()) * 3   # hard-coded, not ideal
@@ -1112,7 +1122,7 @@ def skeletonize(
                     mesh,
                     gsurf=gsurf,
                     probe_radius=soma_seed_radius,
-                    probe_multiplier=soma_seed_radius_multipler,
+                    probe_multiplier=soma_seed_radius_multiplier,
                     seed_density_cutoff=soma_density_cutoff,
                     dilation_steps=soma_dilation_steps,
                     top_seed_frac=soma_top_seed_frac,
@@ -1214,7 +1224,11 @@ def skeletonize(
         # check if we have soma candidates
    
         r_primary = radii_dict[radius_estimators[0]]
-        has_soma = _likely_has_soma(r_primary)
+        if detect_soma == "off" or detect_soma is False:
+            has_soma = False
+        else:
+            has_soma = _likely_has_soma(r_primary)
+
 
     if has_soma and detect_soma == "post":
         with _timed("↳  post-skeletonization soma detection"):
@@ -1319,8 +1333,8 @@ def skeletonize(
                 edges_mst,
                 c_soma,
                 radii_dict[radius_estimators[0]][0],
-                min_branch_nodes=min_branch_nodes,           
-                min_branch_extent_factor=min_branch_extent_factor,
+                min_branch_nodes=prune_min_branch_nodes,           
+                min_branch_extent_factor=prune_min_branch_extent_factor,
             )
             nodes_arr  = nodes_arr[keep_mask]
             for k in radii_dict:
