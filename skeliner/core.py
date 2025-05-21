@@ -612,7 +612,7 @@ def _bridge_gaps(
     nodes: np.ndarray,
     edges: np.ndarray,
     *,
-    bridge_max_factor: float = 12.0,
+    bridge_max_factor: float | None = None,
     bridge_recalc_after: int | None = None,
 ) -> np.ndarray:
     """
@@ -632,6 +632,31 @@ def _bridge_gaps(
         successful merges (keeps the priority queue fresh at minimal cost).
     """
 
+    def _auto_bridge_max(gaps: list[float],
+                        edge_mean: float,
+                        *,
+                        pct: float = 55.,
+                        lo: float = 6.,
+                        hi: float = 12.) -> float:
+        """
+        Choose a bridge_max_factor from the initial gap distribution. Default is the
+        55th percentile of the gap distribution, clipped to [6, 20] times the mean edge
+        """
+        raw = np.percentile(gaps, pct) / edge_mean
+        return float(np.clip(raw, lo, hi))
+
+    def _auto_recalc_after(n_gaps: int) -> int:
+        """Return a suitable recalc period for the given number of gaps."""
+        if n_gaps <= 10:          # tiny: update often
+            return 2
+        if n_gaps <= 50:          # small: every 3–4 merges
+            return 4
+        if n_gaps <= 200:         # medium: every ~5 % of gaps
+            return max(4, n_gaps // 20)
+        # giant meshes: cap to 32 so we never starve
+        return 32 
+
+
     # -- 0. quick exit if already connected ---------------------------------
     g = ig.Graph(n=len(nodes), edges=[tuple(map(int, e)) for e in edges], directed=False)
     comps = [set(c) for c in g.components()]
@@ -640,6 +665,7 @@ def _bridge_gaps(
     soma_cid = g.components().membership[0]
     if len(comps) == 1:
         return edges
+
 
     # -- 1. build one KD-tree per component ---------------------------------
     edge_len_mean = np.linalg.norm(nodes[edges[:, 0]] - nodes[edges[:, 1]], axis=1).mean()
@@ -657,31 +683,34 @@ def _bridge_gaps(
         return float(dists[best]), best, np.asarray(idx_is, dtype=np.int64)[best]
 
     # priority queue of (gap_distance, cid, best_comp_idx, best_island_idx)
-    pq = [
-        (gap, cid, b_comp, b_is)
-                for cid in range(len(comps)) if cid != soma_cid for gap, b_comp, b_is in (closest_pair(cid), )
-        ]
+    # pq = [
+    #     (gap, cid, b_comp, b_is)
+    #             for cid in range(len(comps)) if cid != soma_cid for gap, b_comp, b_is in (closest_pair(cid), )
+    #     ]
+    # heapq.heapify(pq)
+
+    pq = []
+    gap_samples = []                       # NEW
+    for cid in range(len(comps)):
+        if cid == soma_cid:
+            continue
+        gap, b_comp, b_is = closest_pair(cid)
+        pq.append((gap, cid, b_comp, b_is))
+        gap_samples.append(gap)            # NEW
     heapq.heapify(pq)
+
+    # -- heuristic hyperparameters if not given -------------------------------
+    if bridge_max_factor is None:
+        bridge_max_factor = _auto_bridge_max(gap_samples, edge_len_mean)
+
+    if bridge_recalc_after is None:
+        gaps = len(comps) - 1
+        recalc_after = _auto_recalc_after(gaps)
+    else:
+        recalc_after = bridge_recalc_after
 
     edges_new: list[tuple[int, int]] = []
     merges_since_recalc = 0
-
-    if bridge_recalc_after is None:
-        def _choose_recalc_after(n_gaps: int) -> int:
-            """Return a suitable recalc period for the given number of gaps."""
-            if n_gaps <= 10:          # tiny: update often
-                return 2
-            if n_gaps <= 50:          # small: every 3–4 merges
-                return 4
-            if n_gaps <= 200:         # medium: every ~5 % of gaps
-                return max(4, n_gaps // 20)
-            # giant meshes: cap to 32 so we never starve
-            return 32 
-
-        gaps = len(comps) - 1
-        recalc_after = _choose_recalc_after(gaps)
-    else:
-        recalc_after = bridge_recalc_after
 
     stall = 0
     relax_factor = 1.5
@@ -880,7 +909,7 @@ def skeletonize(
     max_shell_width_factor: int = 50,
     # --- bridging disconnected patches ---
     bridge_gaps: bool = True,
-    bridge_max_factor: float = 12.0,
+    bridge_max_factor: float | None = None,
     bridge_recalc_after: int | None = None,
     # --- post‑processing ---
     # --- collapse soma-like nodes ---
