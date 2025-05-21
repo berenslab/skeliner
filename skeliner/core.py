@@ -229,6 +229,16 @@ def _surface_graph(mesh: trimesh.Trimesh) -> ig.Graph:
 # -----------------------------------------------------------------------------
 #  Soma detection API
 # -----------------------------------------------------------------------------
+def _likely_has_soma(
+    radii: np.ndarray,
+    ratio: float = 3.5,       
+    min_nodes: int = 5,      
+) -> bool:
+    """
+    Return True if a plausible soma cluster is present.
+    """
+    return sum(radii > np.mean(radii) * ratio) > min_nodes
+
 
 def _probe_radius(
     mesh: trimesh.Trimesh,
@@ -420,6 +430,51 @@ def find_soma_with_seed(
     radius = np.percentile(np.linalg.norm(pts - centre, axis=1), 90)
     return centre, radius, soma_verts
 
+def find_soma_with_radius(
+    nodes: np.ndarray,
+    radii: np.ndarray,
+    *,
+    pct_large: float = 99.9,
+    radius_quantile: float = 0.90,
+) -> tuple[np.ndarray, float, np.ndarray]:
+    """Post-skeletonization soma detection, using node radii only.
+
+    Parameters
+    ----------
+    nodes
+        ``(N, 3)`` skeleton coordinates.
+    radii
+        ``(N,)`` radius column (choose the estimator you like best).
+    pct_large
+        Nodes whose radius is above this percentile are considered
+        “soma candidates”.
+    radius_quantile
+        Outer envelope of the soma = *radius_quantile*-th percentile of
+        *distance + local radius* inside the candidate cluster.
+
+    Returns
+    -------
+    centre
+        Centroid of the candidate cluster.
+    radius
+        Envelope radius (see above).
+    soma_nodes
+        1-D array of node IDs classified as belonging to the soma.
+    """
+    # (a) pick “soma candidates” by very large radius
+    is_soma = radii >= np.percentile(radii, pct_large)
+
+    if not np.any(is_soma):
+        raise RuntimeError("no soma-sized nodes found – check the percentile")
+
+    centre = nodes[is_soma].mean(axis=0)
+
+    # (b) 90-th percentile of distance+radius ➜ outer envelope
+    dist_plus_r = np.linalg.norm(nodes[is_soma] - centre, axis=1) + radii[is_soma]
+    radius = float(np.percentile(dist_plus_r, radius_quantile * 100))
+
+    soma_nodes = np.where(is_soma)[0]
+    return centre, radius, soma_nodes
 
 # -----------------------------------------------------------------------------
 #  Utility
@@ -544,38 +599,46 @@ def _edges_from_mesh(
 #  Post-processing helpers
 # -----------------------------------------------------------------------
 
-def _collapse_soma_nodes(
+def _merge_near_soma_nodes(
     nodes: np.ndarray,
     radii: np.ndarray,
     edges: np.ndarray,                      
     *,
+    c_soma: np.ndarray,
+    r_soma: float,
     soma_merge_dist_factor: float,
     soma_merge_radius_factor: float,
-    c_soma: np.ndarray | None = None,
-    r_soma: float | None = None,
+
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Merge near‑soma redundant centroids and reconnect edges.
+    Remove centroids that sit (a) well inside the soma volume or
+    (b) are *very* fat, and reconnect their neighbours to node 0.
+
+    Parameters
+    ----------
+    nodes, radii, edges
+        Skeleton arrays *before* merging.  `nodes[0]` **must** be the soma
+        centre and `radii[0]` its envelope radius.
+    c_soma, r_soma
+        Refined soma centre / radius from the earlier detection step.
+    soma_merge_dist_factor
+        Discard a node if its distance to the soma centre is below
+        `factor × r_soma`.
+    soma_merge_radius_factor
+        Discard a node if its own radius is above `factor × r_soma`.
+
+    Returns
+    -------
+    new_nodes, new_radii, new_edges, keep_mask
+        Skeleton arrays *after* merging plus the boolean keep-mask that
+        was applied.
     """
 
-    # ── 0. merged nodes with large radii as soma ----------------------------
-    if c_soma is None or r_soma is None:
-        # (a) pick “soma candidates” by very large radius
-        i_soma = radii >= np.percentile(radii, 99.9) # has to be strick to avoid dendritic trunk and bulbs
-        # (b) centroid of that cluster
-        c_soma = nodes[i_soma].mean(axis=0)
-        # (c) outer envelope = 90-th pct of (distance + local-radius)
-        d = np.linalg.norm(nodes[i_soma] - c_soma, axis=1) + radii[i_soma]
-        r_soma = float(np.percentile(d, 90))
- 
-        nodes[0]  = c_soma
-        radii[0]  = r_soma
-    
     # ── 1. decide which vertices survive ────────────────────────────────
     close = np.linalg.norm(nodes - c_soma, axis=1) < soma_merge_dist_factor * r_soma
     fat   = radii >= soma_merge_radius_factor * r_soma
     keep  = ~(close | fat)
-    keep[0] = True # keep soma     
+    keep[0] = True                     # never drop the soma itself
 
     kept_idx = np.where(keep)[0]
     old2new = np.empty(len(keep), dtype=np.int64)
@@ -604,6 +667,15 @@ def _collapse_soma_nodes(
     # ── 4. canonicalise & uniq ─────────────────────────────────────────
     edges_out = np.sort(edges_out, axis=1)
     edges_out = np.unique(edges_out, axis=0)
+
+    # ── 5. re-centre node 0  (all centroids now belonging to the soma) ──
+    merged_idx = np.where(~keep)[0]                 # the ones we collapsed
+    if merged_idx.size:                             # avoid mean([]) runtime-warning
+        soma_centroids = np.vstack((nodes[0], nodes[merged_idx]))
+        nodes_keep = nodes[keep].copy()
+        nodes_keep[0] = soma_centroids.mean(axis=0) # updated centroid
+    else:
+        nodes_keep = nodes[keep]                    # fast path – nothing merged
 
     return nodes[keep], radii[keep], edges_out, keep
 
@@ -932,16 +1004,16 @@ def skeletonize(
     # --- radius estimation ---
     radius_estimators: list[str] = ["median", "mean", "trim"],
     # --- soma detection ---
-    detect_soma: str = "pre", # "pre", "post", "seed"
+    detect_soma: str | bool = "post", # options: {"post", "pre", "seed", "off" or False}
     soma_seed_point: np.ndarray | list | tuple | None = None,
     soma_seed_radius: float | None = None,
-    soma_seed_radius_multipler: float = 8.0,
+    soma_seed_radius_multiplier: float = 8.0,
     soma_density_cutoff: float = 0.50,
     soma_dilation_steps: int = 1,
     soma_top_seed_frac: float = 0.02,
     # -- for post-skeletonization soma detection only--
-    soma_fallback_extreme_axis: str  = "z",   # "x" | "y" | "z"
-    soma_fallback_extreme_mode: str  = "min", # "min" | "max"
+    soma_init_guess_axis: str  = "z",   # "x" | "y" | "z"
+    soma_init_guess_mode: str  = "min", # "min" | "max"
     # --- geodesic sampling ---
     target_shell_count: int = 500,
     min_cluster_vertices: int = 6,
@@ -953,12 +1025,12 @@ def skeletonize(
     # --- post‑processing ---
     # --- collapse soma-like nodes ---
     collapse_soma: bool = True,
-    soma_merge_dist_factor: float = 1.0,
-    soma_merge_radius_factor: float = 0.25,
+    collapse_soma_dist_factor: float = 1.15,
+    collapse_soma_radius_factor: float = 0.25,
     # --- prune tiny neurites ---
     prune_tiny_neurites: bool = True,
-    min_branch_nodes: int = 30,
-    min_branch_extent_factor: float = 1.8,
+    prune_min_branch_nodes: int = 50,
+    prune_min_branch_extent_factor: float = 1.8,
     # --- misc ---
     verbose: bool = False,
 ) -> Skeleton:
@@ -1029,27 +1101,28 @@ def skeletonize(
     with _timed("↳  build surface graph"):
         gsurf = _surface_graph(mesh)
 
-    if detect_soma == "post":
+    if detect_soma == "post" or detect_soma == "off" or detect_soma is False:
         # delay soma detection until after skeletonization
+        # but seed point is still needed for binning
         if soma_seed_point is not None:
             seed_vid = int(np.argmin(np.linalg.norm(mesh.vertices.view(np.ndarray) - np.asarray(soma_seed_point), axis=1)))
         else:
             seed_vid = _extreme_vertex(mesh,
-                                       axis=soma_fallback_extreme_axis,
-                                       mode=soma_fallback_extreme_mode)
+                                       axis=soma_init_guess_axis,
+                                       mode=soma_init_guess_mode)
 
         c_soma     = mesh.vertices.view(np.ndarray)[seed_vid]
         r_soma     = float(mesh.edges_unique_length.mean()) * 3   # hard-coded, not ideal
         soma_verts = {seed_vid}
     else:
         # pre skeletonization soma detection
-        with _timed("↳  detect soma"):
+        with _timed("↳  pre-skeletonization soma detection"):
             if detect_soma == "pre":
                 c_soma, r_soma, soma_verts = find_soma(
                     mesh,
                     gsurf=gsurf,
                     probe_radius=soma_seed_radius,
-                    probe_multiplier=soma_seed_radius_multipler,
+                    probe_multiplier=soma_seed_radius_multiplier,
                     seed_density_cutoff=soma_density_cutoff,
                     dilation_steps=soma_dilation_steps,
                     top_seed_frac=soma_top_seed_frac,
@@ -1112,6 +1185,7 @@ def skeletonize(
         radii: Dict[str, List[float]] = {
             est: [r_soma] for est in radius_estimators
         }
+        node2mesh: List[np.ndarray] = [np.fromiter(soma_verts, dtype=np.int64)]
         v2n: Dict[int, int] = {v: 0 for v in soma_verts}
         next_id = 1
 
@@ -1138,14 +1212,57 @@ def skeletonize(
                 node_id = next_id
                 next_id += 1
                 nodes.append(centre)
+                node2mesh.append(comp_idx)
                 for vv in comp_idx:
                     v2n[int(vv)] = node_id
 
         nodes_arr = np.asarray(nodes, dtype=np.float32)
-        nodes_arr = np.asarray(nodes, dtype=np.float32)
         radii_dict = {
             k: np.asarray(v, dtype=np.float32) for k, v in radii.items()
         }
+
+        # check if we have soma candidates
+   
+        r_primary = radii_dict[radius_estimators[0]]
+        if detect_soma == "off" or detect_soma is False:
+            has_soma = False
+        else:
+            has_soma = _likely_has_soma(r_primary)
+
+
+    if has_soma and detect_soma == "post":
+        with _timed("↳  post-skeletonization soma detection"):
+            c_soma, r_soma, soma_nodes = find_soma_with_radius(
+                nodes_arr, radii_dict[radius_estimators[0]]
+            )
+
+            # 1. choose which candidate will become the new root
+            if 0 not in soma_nodes:
+                # pick the fattest candidate (max radius) for robustness
+                new_root = int(
+                    soma_nodes[np.argmax(radii_dict[radius_estimators[0]][soma_nodes])]
+                )
+
+                # 2. swap node 0  ⇄  new_root  in every structure
+                nodes_arr[[0, new_root]] = nodes_arr[[new_root, 0]]
+                for k in radii_dict:
+                    radii_dict[k][[0, new_root]] = radii_dict[k][[new_root, 0]]
+                node2mesh[0], node2mesh[new_root] = node2mesh[new_root], node2mesh[0]
+
+                # 3. fix the vertex-to-node lookup used later by _edges_from_mesh()
+                for vid, nid in v2n.items():
+                    if   nid == 0:
+                        v2n[vid] = new_root
+                    elif nid == new_root:
+                        v2n[vid] = 0
+
+                # 4. make the ID set consistent
+                soma_nodes = np.where(soma_nodes == new_root, 0, soma_nodes)
+
+            # 5. finally update the canonical soma centre/radius
+            c_soma = nodes_arr[0]
+            for k in radii_dict:
+                radii_dict[k][0] = r_soma
 
     # 3. edges from mesh connectivity -----------------------------------
     with _timed("↳  map mesh faces to skeleton edges"):
@@ -1157,29 +1274,28 @@ def skeletonize(
     
 
     # 4. collapse soma‑like / fat nodes ---------------------------
-    if collapse_soma:
+    if has_soma and collapse_soma:
         _t0 = time.perf_counter() 
-        if detect_soma == "post" and soma_seed_point is None:
-            c_soma = None
-            r_soma = None
-        else:
-            r_soma = radii_dict[radius_estimators[0]][0]
 
         with _timed("↳  merge redundant near-soma nodes"):
-            (
-                nodes_arr,
-                radii_arr,
-                edges_arr,
-                keep_mask
-            ) = _collapse_soma_nodes(
+            (nodes_arr, radii_arr, edges_arr, keep_mask) = _merge_near_soma_nodes(
                 nodes_arr,
                 radii_dict[radius_estimators[0]],
                 edges_arr,
                 c_soma=c_soma,
-                r_soma=r_soma,
-                soma_merge_dist_factor=soma_merge_dist_factor,
-                soma_merge_radius_factor=soma_merge_radius_factor,
+                r_soma=radii_dict[radius_estimators[0]][0],
+                soma_merge_dist_factor=collapse_soma_dist_factor,
+                soma_merge_radius_factor=collapse_soma_radius_factor,
             )
+
+            # --- rebuild the list ---
+            removed_idx = np.where(~keep_mask)[0]          # nodes that were collapsed
+            for idx in removed_idx:
+                soma_verts.update(node2mesh[idx])          # node2mesh from stage 2
+
+            # extra = [node2mesh[idx] for idx in removed_idx]
+            # node2mesh[0] = np.concatenate([node2mesh[0], *extra])
+            # node2mesh = [node2mesh[i] for i in np.where(keep_mask)[0]]
 
             # apply same mask to all radius columns
             for k in radii_dict:
@@ -1209,7 +1325,7 @@ def skeletonize(
         edges_mst = _build_mst(nodes_arr, edges_arr)
 
     # 7. prune tiny sub-trees near the soma
-    if prune_tiny_neurites:
+    if has_soma and prune_tiny_neurites:
         _t0 = time.perf_counter()
         with _timed("↳  prune tiny soma-attached branches"):
             keep_mask, edges_mst = _prune_soma_neurites(
@@ -1217,12 +1333,14 @@ def skeletonize(
                 edges_mst,
                 c_soma,
                 radii_dict[radius_estimators[0]][0],
-                min_branch_nodes=min_branch_nodes,           
-                min_branch_extent_factor=min_branch_extent_factor,
+                min_branch_nodes=prune_min_branch_nodes,           
+                min_branch_extent_factor=prune_min_branch_extent_factor,
             )
             nodes_arr  = nodes_arr[keep_mask]
             for k in radii_dict:
                 radii_dict[k] = radii_dict[k][keep_mask]
+            # node2mesh = [node2mesh[i] for i in np.where(keep_mask)[0]]
+
         if verbose:
             post_ms += time.perf_counter() - _t0
 
