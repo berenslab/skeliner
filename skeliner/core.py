@@ -1207,16 +1207,44 @@ def skeletonize(
             c_soma, r_soma, soma_nodes = find_soma_with_radius(
                 nodes_arr, radii_dict[radius_estimators[0]]
             )
-            # expose the soma nodes to later steps just like the pre-path
-            # soma_verts = set()          # no mesh verts – but keep var defined
-            soma_verts = {
-                int(v)
-                for nid in soma_nodes        # typically {0}, but generic
-                for v in node2mesh[nid]      # gather all contributing surface verts
-            }
-            nodes_arr[0] = c_soma
+
+            # 1. choose which candidate will become the new root
+            if 0 not in soma_nodes:
+                # pick the fattest candidate (max radius) for robustness
+                new_root = int(
+                    soma_nodes[np.argmax(radii_dict[radius_estimators[0]][soma_nodes])]
+                )
+
+                # 2. swap node 0  ⇄  new_root  in every structure
+                nodes_arr[[0, new_root]] = nodes_arr[[new_root, 0]]
+                for k in radii_dict:
+                    radii_dict[k][[0, new_root]] = radii_dict[k][[new_root, 0]]
+                node2mesh[0], node2mesh[new_root] = node2mesh[new_root], node2mesh[0]
+
+                # 3. fix the vertex-to-node lookup used later by _edges_from_mesh()
+                for vid, nid in v2n.items():
+                    if   nid == 0:        v2n[vid] = new_root
+                    elif nid == new_root: v2n[vid] = 0
+
+                # 4. make the ID set consistent
+                soma_nodes = np.where(soma_nodes == new_root, 0, soma_nodes)
+
+            # 5. finally update the canonical soma centre/radius
+            c_soma = nodes_arr[0]
             for k in radii_dict:
                 radii_dict[k][0] = r_soma
+            # # expose the soma nodes to later steps just like the pre-path
+            # # soma_verts = set()          # no mesh verts – but keep var defined
+            # soma_verts = {
+            #     int(v)
+            #     for nid in soma_nodes        # typically {0}, but generic
+            #     for v in node2mesh[nid]      # gather all contributing surface verts
+            # }
+            # for vv in soma_verts:
+            #     v2n[int(vv)] = 0 
+            # nodes_arr[0] = c_soma
+            # for k in radii_dict:
+            #     radii_dict[k][0] = r_soma
 
     # 3. edges from mesh connectivity -----------------------------------
     with _timed("↳  map mesh faces to skeleton edges"):
