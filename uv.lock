@@ -1513,6 +1513,7 @@ source = { editable = "." }
 dependencies = [
     { name = "igraph" },
     { name = "numpy" },
+    { name = "python-openctm" },
     { name = "scipy", version = "1.13.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "trimesh" },
@@ -1529,11 +1530,6 @@ dev = [
     { name = "watermark" },
 ]
 
-[package.dev-dependencies]
-dev = [
-    { name = "python-openctm" },
-]
-
 [package.metadata]
 requires-dist = [
     { name = "igraph", specifier = ">=0.11.8" },
@@ -1542,15 +1538,13 @@ requires-dist = [
     { name = "maturin", marker = "extra == 'dev'" },
     { name = "numpy", specifier = ">=2.0.2" },
     { name = "pytest", marker = "extra == 'dev'" },
+    { name = "python-openctm", specifier = ">=1.0.12" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "scipy", specifier = ">=1.13.1" },
     { name = "trimesh", specifier = ">=4.6.9" },
     { name = "twine", marker = "extra == 'dev'" },
     { name = "watermark", marker = "extra == 'dev'", specifier = ">=2.5.0" },
 ]
-
-[package.metadata.requires-dev]
-dev = [{ name = "python-openctm", specifier = ">=1.0.12" }]
 
 [[package]]
 name = "stack-data"

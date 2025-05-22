@@ -495,7 +495,7 @@ def _dist_vec_for_component(
     root_idx = int(np.where(verts == seed_vid)[0][0])
 
     # igraph returns shape (1, |verts|); squeeze to 1-D
-    return sub.shortest_paths_dijkstra(
+    return sub.distances(
         source=[root_idx],
         weights="weight",
     )[0]
@@ -608,7 +608,7 @@ def _merge_near_soma_nodes(
     r_soma: float,
     soma_merge_dist_factor: float,
     soma_merge_radius_factor: float,
-
+    node2mesh: dict[int, list[int]],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Remove centroids that sit (a) well inside the soma volume or
@@ -670,14 +670,21 @@ def _merge_near_soma_nodes(
 
     # ── 5. re-centre node 0  (all centroids now belonging to the soma) ──
     merged_idx = np.where(~keep)[0]                 # the ones we collapsed
-    if merged_idx.size:                             # avoid mean([]) runtime-warning
-        soma_centroids = np.vstack((nodes[0], nodes[merged_idx]))
-        nodes_keep = nodes[keep].copy()
-        nodes_keep[0] = soma_centroids.mean(axis=0) # updated centroid
-    else:
-        nodes_keep = nodes[keep]                    # fast path – nothing merged
+    if merged_idx.size:
+        # number of mesh vertices represented by each centroid
+        weights = np.array([len(node2mesh[0]), *[len(node2mesh[i]) for i in merged_idx]],
+                        dtype=np.float64)
 
-    return nodes[keep], radii[keep], edges_out, keep
+        # centres to average
+        soma_centroids = np.vstack((nodes[0], nodes[merged_idx]))
+
+        # weighted average = true centroid of all involved mesh vertices
+        nodes_keep = nodes[keep].copy()
+        nodes_keep[0] = np.average(soma_centroids, axis=0, weights=weights)
+    else:
+        nodes_keep = nodes[keep]
+
+    return nodes_keep, radii[keep], edges_out, keep
 
 
 def _bridge_gaps(
@@ -1038,14 +1045,15 @@ def skeletonize(
 
     The algorithm proceeds in eight conceptual stages:
 
-      0. soma localisation (:func:`find_soma` or the seeded variant)
+      0. optional pre-skeletonization soma detection>
       1. geodesic shell binning of every connected surface patch
       2. cluster each shell ⇒ interior node with local radius
-      3. project mesh edges ⇒ graph edges between nodes
-      4. optional collapsing of soma-like/fat nodes near the centroid
-      5. optional bridging of disconnected components
-      6. minimum-spanning tree (global) to remove microscopic cycles
-      7. optional pruning of tiny neurites sprouting directly from the soma
+      3. optional post-skeletonization soma detection>
+      4. project mesh edges ⇒ graph edges between nodes
+      5. optional collapsing of soma-like/fat nodes near the centroid
+      6. optional bridging of disconnected components
+      7. minimum-spanning tree (global) to remove microscopic cycles
+      8. optional pruning of tiny neurites sprouting directly from the soma
 
     
     Parameters
@@ -1079,7 +1087,8 @@ def skeletonize(
     # ------------------------------------------------------------------
     if verbose:
         _global_start = time.perf_counter()
-        print("[skeliner] starting skeletonisation")
+        print(f"[skeliner] starting skeletonisation ({len(mesh.vertices)} vertices, "
+              f"{len(mesh.faces)} faces)")
         soma_ms = 0.0 # soma detection time
         post_ms = 0.0 # post-processing time
 
@@ -1286,16 +1295,13 @@ def skeletonize(
                 r_soma=radii_dict[radius_estimators[0]][0],
                 soma_merge_dist_factor=collapse_soma_dist_factor,
                 soma_merge_radius_factor=collapse_soma_radius_factor,
+                node2mesh=node2mesh,
             )
 
             # --- rebuild the list ---
             removed_idx = np.where(~keep_mask)[0]          # nodes that were collapsed
             for idx in removed_idx:
                 soma_verts.update(node2mesh[idx])          # node2mesh from stage 2
-
-            # extra = [node2mesh[idx] for idx in removed_idx]
-            # node2mesh[0] = np.concatenate([node2mesh[0], *extra])
-            # node2mesh = [node2mesh[i] for i in np.where(keep_mask)[0]]
 
             # apply same mask to all radius columns
             for k in radii_dict:
@@ -1323,6 +1329,7 @@ def skeletonize(
     # 6. global minimum-spanning tree ------------------------------------
     with _timed("↳  build global minimum-spanning tree"):
         edges_mst = _build_mst(nodes_arr, edges_arr)
+        post_ms += time.perf_counter() - _t0
 
     # 7. prune tiny sub-trees near the soma
     if has_soma and prune_tiny_neurites:

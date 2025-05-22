@@ -13,6 +13,7 @@ dependencies = [
     "numpy>=2.0.2",
     "scipy>=1.13.1",
     "trimesh>=4.6.9",
+    "python-openctm>=1.0.12",
 ]
 readme = {file = "README.md", content-type = "text/markdown"}
 
@@ -25,7 +26,6 @@ dev = [
     "ipykernel>=6.29.5",
     "watermark>=2.5.0",
     "matplotlib>=3.10.3",
-    "python-openctm>=1.0.12",
 ]
 
 [tool.setuptools]

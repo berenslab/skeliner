@@ -3,7 +3,6 @@ import numpy as np
 import trimesh
 from matplotlib.axes import Axes
 from matplotlib.collections import LineCollection
-from matplotlib.patches import Circle
 from scipy.stats import binned_statistic_2d
 
 from .core import Skeleton
@@ -58,7 +57,7 @@ def _radii_to_scatter_size(rr: np.ndarray, ax: Axes) -> np.ndarray:
     # radius: data-units → pixels → points → area (points²)
     r_px = rr * ppd
     r_pt = r_px * 72.0 / dpi
-    return np.pi * r_pt**2
+    return np.pi * r_pt**2, ppd
 
 
 def plot_projection(
@@ -189,7 +188,7 @@ def plot_projection(
 
     # ─────────────────── circles ──────────────────────────────────────────
     if draw_skel:
-        sizes = _radii_to_scatter_size(rr, ax)
+        sizes, ppd = _radii_to_scatter_size(rr, ax)
         ax.scatter(
             xy_skel[:, 0],
             xy_skel[:, 1],
@@ -198,28 +197,25 @@ def plot_projection(
             edgecolors="red",
             linewidths=1.0,
             alpha=circle_alpha,
+            zorder=2,
         )
 
     # ─── highlight the soma if requested ───────────────────────────────────
     if draw_soma_mask and xy_soma is not None and len(xy_soma):
         ax.scatter(
             xy_soma[:, 0], xy_soma[:, 1],
-            s=4, c="pink", marker="o",
-            linewidths=0, alpha=0.9, label="soma surface"
+            s=1, c="pink", marker="o",
+            linewidths=0, alpha=0.5, label="soma surface"
         )
 
         # centroid + dashed outline for radius readability
         c_xy = _project(skel.nodes[[0]] * scale[0], ix, iy).ravel()
         ax.scatter(*c_xy, c="k", s=15, zorder=3, label="soma centre")
-        ax.add_patch(
-            Circle(
-                (c_xy[0], c_xy[1]),
-                skel.radii[radius_metric][0] * scale[0],           # physical size
-                facecolor="none", edgecolor="black",
-                linestyle="--", linewidth=1.3, zorder=2,
-            )
-        )
 
+        r_px = skel.radii[radius_metric][0] * scale[0] * ppd # pixels
+        r_pt = r_px * 72.0 / fig.dpi # points
+        ax.scatter(*c_xy, edgecolors="k", facecolors="none", s=np.pi*r_pt**2) # identical to scatter
+    
     # ─────────────────── optional edges ───────────────────────────────────
     if draw_skel and draw_edges and skel.edges.size:
         keep = keep_skel                              # local alias
