@@ -1101,6 +1101,49 @@ def _prune_soma_neurites(
     )
     return keep_mask, new_edges
 
+def _prune_tiny_terminals(
+    nodes: np.ndarray,
+    edges: np.ndarray,
+    *,
+    min_terminal_nodes: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Remove every leaf-attached branch with fewer than *min_terminal_nodes*.
+    """
+    parent = _bfs_parents(edges, len(nodes), root=0)
+
+    # 1. collect leaves (out-degree == 1, except the soma)
+    degree = np.bincount(edges.ravel(), minlength=len(nodes))
+    leaves = [v for v in range(1, len(nodes)) if degree[v] == 1]
+
+    to_drop: set[int] = set()
+
+    # 2. for each leaf, walk up until first branching point
+    for leaf in leaves:
+        branch = []
+        v = leaf
+        while v != 0 and degree[v] == 1:
+            branch.append(v)
+            v = parent[v]
+        if len(branch) < min_terminal_nodes:
+            to_drop.update(branch)
+
+    if not to_drop:
+        return np.ones(len(nodes), bool), edges      # nothing pruned
+
+    keep = np.ones(len(nodes), bool)
+    keep[list(to_drop)] = False
+
+    # re-index edges exactly like in _prune_soma_neurites
+    old2new = {old: new for new, old in enumerate(np.where(keep)[0])}
+    new_edges = np.asarray(
+        [(old2new[a], old2new[b])
+         for a, b in edges if keep[a] and keep[b]],
+        dtype=np.int64,
+    )
+    return keep, new_edges
+
+
 def _extreme_vertex(mesh: trimesh.Trimesh,
                     axis: str = "z",
                     mode: str = "min") -> int:
@@ -1194,7 +1237,7 @@ def skeletonize(
     soma_init_guess_axis: str  = "z",   # "x" | "y" | "z"
     soma_init_guess_mode: str  = "min", # "min" | "max"
     # --- geodesic sampling ---
-    target_shell_count: int = 800,
+    target_shell_count: int = 1000,
     min_cluster_vertices: int = 6,
     max_shell_width_factor: int = 50,
     # --- bridging disconnected patches ---
@@ -1208,8 +1251,7 @@ def skeletonize(
     collapse_soma_radius_factor: float = 0.25,
     # --- prune tiny neurites ---
     prune_tiny_neurites: bool = True,
-    prune_min_branch_nodes: int = 50,
-    prune_min_branch_extent_factor: float = 1.8,
+    prune_min_nodes: int = 5,
     # --- misc ---
     verbose: bool = False,
 ) -> Skeleton:
@@ -1515,14 +1557,11 @@ def skeletonize(
     if has_soma and prune_tiny_neurites:
         _t0 = time.perf_counter()
         with _timed("↳  prune tiny soma-attached branches"):
-            keep_mask, edges_mst = _prune_soma_neurites(
-                nodes_arr,
-                edges_mst,
-                c_soma,
-                radii_dict[radius_estimators[0]][0],
-                min_branch_nodes=prune_min_branch_nodes,           
-                min_branch_extent_factor=prune_min_branch_extent_factor,
-            )
+            keep_mask, edges_mst = _prune_tiny_terminals(
+                    nodes_arr,
+                    edges_mst,
+                    min_terminal_nodes=prune_min_nodes,
+                )
             nodes_arr  = nodes_arr[keep_mask]
             for k in radii_dict:
                 radii_dict[k] = radii_dict[k][keep_mask]
