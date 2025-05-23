@@ -498,133 +498,6 @@ def find_soma_with_radius(
         
     return centre, radius, soma_idx, has_soma
 
-# def find_soma_with_radius(
-#     nodes: np.ndarray,
-#     radii: np.ndarray,
-#     *,
-#     pct_large: float = 99.95,
-#     eps_factor: float = 2.0,      # ε = eps_factor × median(candidate_radii)
-#     min_samples: int = 3,
-# ) -> tuple[np.ndarray, float, np.ndarray]:
-#     """
-#     Soma ≙ the DBSCAN cluster that
-#     (i)  contains the node with *maximum* radius, and
-#     (ii) is composed of nodes whose radii exceed the pct_large percentile.
-
-#     Parameters
-#     ----------
-#     nodes : (N, 3) float
-#         Skeleton coordinates.
-#     radii : (N,) float
-#         Node radii (same length as *nodes*).
-#     pct_large : float, default 99.95
-#         Percentile used to mark “large” radii.
-#     eps_factor : float, default 2.0
-#         ε for DBSCAN is computed as eps_factor × median(radius of candidates).
-#         Keep it ≈ 1–3; larger values merge more nodes.
-#     min_samples : int, default 3
-#         Standard DBSCAN parameter (minimum cluster size).
-
-#     Returns
-#     -------
-#     centre : (3,) float
-#         Centroid of the chosen cluster.
-#     radius : float
-#         90-th percentile of (distance + radius) inside the cluster.
-#     soma_nodes : (M,) int
-#         Indices of nodes classified as belonging to the soma.
-#     """
-#     if nodes.shape[0] == 0:
-#         raise ValueError("empty skeleton")
-
-#     # ------------------------------------------------------------------ #
-#     # 1. radius threshold: candidate set                                 #
-#     # ------------------------------------------------------------------ #
-#     large_thresh = np.percentile(radii, pct_large)
-#     cand_idx = np.where(radii >= large_thresh)[0]
-
-#     if cand_idx.size == 0:
-#         raise RuntimeError("no soma-sized nodes found – try lowering pct_large")
-
-#     # ------------------------------------------------------------------ #
-#     # 2. DBSCAN in XYZ space                                             #
-#     # ------------------------------------------------------------------ #
-#     r_median = np.median(radii[cand_idx])
-#     eps = eps_factor * r_median
-#     labels = DBSCAN(eps=eps, min_samples=min_samples).fit(nodes[cand_idx]).labels_
-
-#     # –1 means “noise”: drop it right away
-#     keep_mask = labels != -1
-#     cand_idx   = cand_idx[keep_mask]
-#     labels     = labels[keep_mask]
-
-#     if cand_idx.size == 0:
-#         raise RuntimeError("all large-radius nodes were DBSCAN noise – decrease eps_factor")
-
-#     # ------------------------------------------------------------------ #
-#     # 3. choose the cluster that owns the absolute-largest radius node   #
-#     # ------------------------------------------------------------------ #
-#     mega_idx       = int(np.argmax(radii))          # index of global-max radius
-#     if mega_idx not in cand_idx:
-#         # max node was below percentile threshold → treat it as singleton cluster
-#         cand_idx   = np.append(cand_idx, mega_idx)
-#         labels     = np.append(labels, max(labels, default=-1)+1)
-
-#     mega_label     = labels[np.where(cand_idx == mega_idx)[0][0]]
-#     soma_idx       = cand_idx[labels == mega_label]
-
-#     # ------------------------------------------------------------------ #
-#     # 4. geometric properties                                            #
-#     # ------------------------------------------------------------------ #
-#     centre = nodes[soma_idx].mean(axis=0)
-#     dist_plus_r = np.linalg.norm(nodes[soma_idx] - centre, axis=1) + radii[soma_idx]
-#     radius = float(np.percentile(dist_plus_r, 90))
-
-#     return centre, radius, soma_idx
-
-
-# def find_soma_with_radius(
-#     nodes: np.ndarray,
-#     radii: np.ndarray,
-#     *,
-#     pct_large: float = 99.95,
-# ) -> tuple[np.ndarray, float, np.ndarray]:
-#     """Post-skeletonization soma detection, using node radii only.
-
-#     Parameters
-#     ----------
-#     nodes
-#         ``(N, 3)`` skeleton coordinates.
-#     radii
-#         ``(N,)`` radius column (choose the estimator you like best).
-#     pct_large
-#         Nodes whose radius is above this percentile are considered
-#         “soma candidates”.
-
-#     Returns
-#     -------
-#     centre
-#         Centroid of the candidate cluster.
-#     radius
-#         Envelope radius (see above).
-#     soma_nodes
-#         1-D array of node IDs classified as belonging to the soma.
-#     """
-#     # (a) pick “soma candidates” by very large radius
-#     is_soma = radii >= np.percentile(radii, pct_large)
-
-#     if not np.any(is_soma):
-#         raise RuntimeError("no soma-sized nodes found – check the percentile")
-
-#     centre = nodes[is_soma].mean(axis=0)
-
-#     # (b) 90-th percentile of distance+radius ➜ outer envelope
-#     dist_plus_r = np.linalg.norm(nodes[is_soma] - centre, axis=1) + radii[is_soma]
-#     radius = float(np.percentile(dist_plus_r,  90))
-
-#     soma_nodes = np.where(is_soma)[0]
-#     return centre, radius, soma_nodes
-
 # -----------------------------------------------------------------------------
 #  Utility
 # -----------------------------------------------------------------------------
@@ -1271,54 +1144,11 @@ def _prune_soma_neurites(
     )
     return keep_mask, new_edges
 
-# def _prune_tiny_terminals(
-#     nodes: np.ndarray,
-#     edges: np.ndarray,
-#     *,
-#     min_terminal_nodes: int,
-# ) -> tuple[np.ndarray, np.ndarray]:
-#     """
-#     Remove every leaf-attached branch with fewer than *min_terminal_nodes*.
-#     """
-#     parent = _bfs_parents(edges, len(nodes), root=0)
-
-#     # 1. collect leaves (out-degree == 1, except the soma)
-#     degree = np.bincount(edges.ravel(), minlength=len(nodes))
-#     leaves = [v for v in range(1, len(nodes)) if degree[v] == 1]
-
-#     to_drop: set[int] = set()
-
-#     # 2. for each leaf, walk up until first branching point
-#     for leaf in leaves:
-#         branch = []
-#         v = leaf
-#         while v != 0 and degree[v] == 1:
-#             branch.append(v)
-#             v = parent[v]
-#         if len(branch) < min_terminal_nodes:
-#             to_drop.update(branch)
-
-#     if not to_drop:
-#         return np.ones(len(nodes), bool), edges      # nothing pruned
-
-#     keep = np.ones(len(nodes), bool)
-#     keep[list(to_drop)] = False
-
-#     # re-index edges exactly like in _prune_soma_neurites
-#     old2new = {old: new for new, old in enumerate(np.where(keep)[0])}
-#     new_edges = np.asarray(
-#         [(old2new[a], old2new[b])
-#          for a, b in edges if keep[a] and keep[b]],
-#         dtype=np.int64,
-#     )
-#     return keep, new_edges
-
 def _prune_tiny_terminals(
     nodes: np.ndarray,
     edges: np.ndarray,
     *,
     min_terminal_nodes: int          = 5,
-    # extra knobs for soma-attached branches
     min_soma_branch_nodes: int       = 30,
     min_soma_extent_factor: float    = 1.8,
     soma_pos: np.ndarray | None      = None,
