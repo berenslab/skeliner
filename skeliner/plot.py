@@ -421,9 +421,10 @@ def diagnostic(
     else:                                    # plain mesh → uniform grey
         colours = "0.6"
 
+
     ax.scatter(
         xy_mesh_scatter[:, 0], xy_mesh_scatter[:, 1],
-        s=1.0, c=colours, alpha=1, linewidths=0, zorder=9
+        s=1.0, c=colours, alpha=0.1, linewidths=0, zorder=9
     )
 
     sizes, ppd = _radii_to_sizes(rr, ax)
@@ -494,7 +495,7 @@ def diagnostic(
 
         ax.scatter(
             xy_soma[:, 0], xy_soma[:, 1],
-            s=1.0, c="magenta", alpha=0.45, linewidths=0, zorder=8,
+            s=1.0, c="blue", alpha=0.45, linewidths=0, zorder=9,
             label="soma surface",
         )
         # centre + outline

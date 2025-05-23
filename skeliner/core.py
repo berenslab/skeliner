@@ -1,6 +1,6 @@
 import heapq
 import time
-from collections import defaultdict, deque
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -1051,178 +1051,11 @@ def _build_mst(nodes: np.ndarray, edges: np.ndarray) -> np.ndarray:
     mst = g.spanning_tree(weights="weight")
     return np.asarray(sorted(tuple(sorted(e)) for e in mst.get_edgelist()), dtype=np.int64)
 
-
-def _prune_soma_neurites(
-    nodes: np.ndarray,
-    edges: np.ndarray,
-    soma_pos: np.ndarray,
-    r_soma: float,
-    min_branch_nodes: int = 30,
-    min_branch_extent_factor: float = 1.8,
-):
-    """
-    Remove spuriously small neurites that attach directly to the soma.
-
-    Parameters
-    ----------
-    nodes
-        (N, 3) coordinates array after collapse/bridging/MST.
-    edges
-        (E, 2) int64 undirected edge list (tree).
-    soma_pos
-        3-vector of the soma centre (node 0).
-    r_soma
-        Soma radius.
-    min_branch_nodes
-        Keep a branch if it has at least this many nodes.
-    min_branch_extent_factor
-        Keep a branch if any node lies further than
-        ``min_branch_extent_factor × r_soma`` from the soma.
-
-    Returns
-    -------
-    keep_mask : np.ndarray[bool]
-        True for nodes to keep.
-    new_edges : np.ndarray[int64] shape (E′, 2)
-        Edge list re-indexed to the surviving nodes.
-    """
-
-    # ------------------------------------------------------------------
-    # 1. build children lists from the parent[] array
-    # ------------------------------------------------------------------
-    parent = _bfs_parents(edges, len(nodes), root=0)
-    children_of = defaultdict(list)
-    for v, p in enumerate(parent):
-        if p != -1:
-            children_of[p].append(v)
-
-    soma_children = children_of[0]                 # neighbours of the soma
-    to_drop: set[int] = set()
-
-    # ------------------------------------------------------------------
-    # 2. inspect every branch below each soma child
-    # ------------------------------------------------------------------
-    for c in soma_children:
-        stack = [c]
-        desc  = []                                 # vertices in this branch
-        while stack:
-            u = stack.pop()
-            desc.append(u)
-            stack.extend(children_of.get(u, []))   # grandchildren …
-
-        desc_arr = np.asarray(desc, dtype=np.int64)
-        size     = desc_arr.size
-        extent   = np.linalg.norm(nodes[desc_arr] - soma_pos, axis=1).max()
-
-        keep = (size >= min_branch_nodes) or (
-            extent >= min_branch_extent_factor * r_soma
-        )
-        if not keep:
-            to_drop.update(desc)
-
-    # nothing to drop?  → fast-path
-    if not to_drop:
-        return np.ones(len(nodes), bool), edges
-
-    # ------------------------------------------------------------------
-    # 3. rebuild node list and edge list
-    # ------------------------------------------------------------------
-    keep_mask = np.ones(len(nodes), bool)
-    keep_mask[list(to_drop)] = False
-    keep_mask[0] = True                        # never drop the soma
-
-    # old-index → new-index map
-    old2new = {old: new for new, old in enumerate(np.where(keep_mask)[0])}
-
-    new_edges = np.asarray(
-        [
-            (old2new[a], old2new[b])
-            for a, b in edges
-            if keep_mask[a] and keep_mask[b]
-        ],
-        dtype=np.int64,
-    )
-    return keep_mask, new_edges
-
-# def _prune_tiny_terminals(
-#     nodes: np.ndarray,
-#     edges: np.ndarray,
-#     *,
-#     min_terminal_nodes: int          = 5,
-#     min_soma_branch_nodes: int       = 30,
-#     min_soma_extent_factor: float    = 1.8,
-#     soma_pos: np.ndarray | None      = None,
-#     r_soma: float | None             = None,
-# ) -> tuple[np.ndarray, np.ndarray]:
-#     """
-#     Remove twiggy leaf-branches.
-#     • Ordinary terminals    : drop if size < *min_terminal_nodes*.
-#     • Soma-attached neurites: drop if BOTH
-#         size   < *min_soma_branch_nodes*   AND
-#         extent < *min_soma_extent_factor* × r_soma.
-#     """
-#     parent = _bfs_parents(edges, len(nodes), root=0)
-
-#     # ------------------------------------------------------------------
-#     # 1. collect leaves (out-degree == 1, except the soma)
-#     # ------------------------------------------------------------------
-#     degree = np.bincount(edges.ravel(), minlength=len(nodes))
-#     leaves = [v for v in range(1, len(nodes)) if degree[v] == 1]
-
-#     to_drop: set[int] = set()
-
-#     # ------------------------------------------------------------------
-#     # 2. inspect every leaf-to-fork path
-#     # ------------------------------------------------------------------
-#     for leaf in leaves:
-#         branch = []
-#         v = leaf
-#         touches_soma = False
-#         while v != 0 and degree[v] == 1:
-#             branch.append(v)
-#             v = parent[v]
-#         if v == 0:
-#             touches_soma = True       # walked all the way to the soma
-
-#         # ---------- decide what to do with this branch ----------------
-#         n_nodes = len(branch)
-
-#         if touches_soma:                         # “primary neurite” case
-#             size_ok = n_nodes >= min_soma_branch_nodes
-#             extent_ok = False
-#             if soma_pos is not None and r_soma is not None:
-#                 extent = np.linalg.norm(nodes[branch] - soma_pos, axis=1).max()
-#                 extent_ok = extent >= min_soma_extent_factor * r_soma
-#             keep = size_ok or extent_ok
-#         else:                                    # ordinary twig
-#             keep = n_nodes >= min_terminal_nodes
-
-#         if not keep:
-#             to_drop.update(branch)
-
-#     # ------------------------------------------------------------------
-#     # 3. rebuild node and edge arrays (unchanged from your code)
-#     # ------------------------------------------------------------------
-#     if not to_drop:
-#         return np.ones(len(nodes), bool), edges      # fast-path: nothing pruned
-
-#     keep_mask = np.ones(len(nodes), bool)
-#     keep_mask[list(to_drop)] = False
-#     keep_mask[0] = True                              # never drop the soma
-
-#     old2new = {old: new for new, old in enumerate(np.where(keep_mask)[0])}
-#     new_edges = np.asarray(
-#         [(old2new[a], old2new[b])
-#          for a, b in edges if keep_mask[a] and keep_mask[b]],
-#         dtype=np.int64,
-#     )
-#     return keep_mask, new_edges
-
 def _prune_tiny_neurites(
     nodes: np.ndarray,
     edges: np.ndarray,
     *,
-    min_twig_stem_nodes: int    = 5,   # twigs on dendrites
+    min_twig_stem_nodes: int = 5,   # twigs on dendrites
     min_soma_stem_nodes: int = 30,  # tiny primary neurites
 ) -> tuple[np.ndarray, np.ndarray]:
     """
