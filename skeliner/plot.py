@@ -424,7 +424,7 @@ def diagnostic(
 
     ax.scatter(
         xy_mesh_scatter[:, 0], xy_mesh_scatter[:, 1],
-        s=1.0, c=colours, alpha=0.1, linewidths=0, zorder=9
+        s=1.0, c=colours, alpha=0.75, linewidths=0, zorder=9
     )
 
     sizes, ppd = _radii_to_sizes(rr, ax)
@@ -495,7 +495,7 @@ def diagnostic(
 
         ax.scatter(
             xy_soma[:, 0], xy_soma[:, 1],
-            s=1.0, c="blue", alpha=0.45, linewidths=0, zorder=9,
+            s=1.0, c="C0", alpha=0.45, linewidths=0, zorder=9,
             label="soma surface",
         )
         # centre + outline
@@ -549,7 +549,7 @@ def threeviews(
     skel: Skeleton,
     mesh: trimesh.Trimesh,
     *,
-    planes: tuple[str, str, str] | list[str] = ("yx", "yz", "zx"),
+    planes: tuple[str, str, str] | list[str] = ["xy", "xz", "zy"],
     scale: float = 1e-3,                 # nm → µm by default
     title: str | None = None,
     figsize: tuple[int, int] = (8, 8),
@@ -648,6 +648,12 @@ def threeviews(
             **plot_kwargs,
         )
         axd[label].set_aspect("equal")
+
+    # ── 3. cosmetic tweaks ────────────────────────────────────────────────
+    axd["B"].set_xlabel("")
+    axd["B"].set_xticklabels([])
+    axd["C"].set_ylabel("")
+    axd["C"].set_yticklabels([])
 
     if title is not None:
         fig.suptitle(title, y=0.98)
