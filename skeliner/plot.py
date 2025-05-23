@@ -70,6 +70,7 @@ def _make_lut(name: str, n: int) -> np.ndarray:
     idx = (np.arange(max(n, 1)) * _GOLDEN_RATIO) % 1.0
     return cmap(idx)
 
+
 def plot_projection(
     skel: Skeleton,
     mesh: "trimesh.Trimesh",
@@ -493,18 +494,18 @@ def diagnostic(
 
         ax.scatter(
             xy_soma[:, 0], xy_soma[:, 1],
-            s=1.0, c="magenta", alpha=0.45, linewidths=0, zorder=1.5,
+            s=1.0, c="magenta", alpha=0.45, linewidths=0, zorder=8,
             label="soma surface",
         )
         # centre + outline
         c_xy = _project(skel.nodes[[0]] * scl_skel, ix, iy).ravel()
-        ax.scatter(*c_xy, c="k", s=16, zorder=4)
+        ax.scatter(*c_xy, c="k", s=16, zorder=9)
 
         # dashed outline matching circle size
         r_px = skel.radii[radius_metric][0] * scl_skel * ppd
         r_pt = r_px * 72.0 / fig.dpi
         ax.scatter(*c_xy, facecolors="none", edgecolors="k",
-                   linestyle="--", s=np.pi * r_pt**2, zorder=4)
+                   linestyle="--", s=np.pi * r_pt**2, zorder=10)
 
     # ------------- cosmetics -------------------------------------------------
     ax.set_aspect("equal")
@@ -525,3 +526,130 @@ def diagnostic(
 
     plt.tight_layout()
     return fig, ax
+
+
+## Plot Three Views
+
+def _axis_extents(v: np.ndarray):
+    """Return min/max tuples and ranges along x, y, z of *v* (μm)."""
+    gx = (v[:, 0].min(), v[:, 0].max())   # x-limits
+    gy = (v[:, 1].min(), v[:, 1].max())   # y-limits
+    gz = (v[:, 2].min(), v[:, 2].max())   # z-limits
+    dx, dy, dz = np.ptp(v, axis=0)        # ranges
+    return dict(x=gx, y=gy, z=gz), dict(x=dx, y=dy, z=dz)
+
+def _plane_axes(plane: str) -> tuple[str, str]:
+    """Return (horizontal_axis, vertical_axis) for a 2-letter plane code."""
+    if len(plane) != 2 or any(c not in "xyz" for c in plane.lower()):
+        raise ValueError(f"invalid plane spec '{plane}'")
+    return plane[0].lower(), plane[1].lower()
+
+def threeviews(
+    skel: Skeleton,
+    mesh: trimesh.Trimesh,
+    *,
+    planes: tuple[str, str, str] | list[str] = ("yx", "yz", "zx"),
+    scale: float = 1e-3,                 # nm → µm by default
+    title: str | None = None,
+    figsize: tuple[int, int] = (8, 8),
+    draw_edges: bool = True,
+    draw_soma_mask: bool = True,
+    **plot_kwargs,
+):
+    """
+    2 × 2 mosaic of orthogonal projections (A, B, C panels).
+
+    Layout::
+
+        B .
+        A C
+
+    By default this shows **A = yx**, **B = yz**, **C = zx**, matching the
+    classic neuroanatomy view (sagittal, coronal, axial).
+
+    Parameters
+    ----------
+    skel, mesh
+        Skeleton and surface mesh to visualise.  ``skel`` can be *None* if
+        you only want coloured surface clusters.
+    planes
+        Three distinct plane codes (any of ``"xy" "yx" "xz" "zx" "yz" "zy"``)
+        that map, in order, to panels **A**, **B**, **C**.
+    scale
+        Coordinate conversion factor applied *once* to the mesh for limits
+        (and forwarded to the projection helper).
+    title
+        Optional super-title.
+    figsize
+        Size of the whole mosaic figure in inches.
+    draw_edges, draw_soma_mask
+        Passed straight to :pyfunc:`plot_components_projection`.
+    **plot_kwargs
+        Any additional keyword arguments accepted by
+        :pyfunc:`plot_components_projection` (e.g. ``show_node_ids``).
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    axes : dict[str, matplotlib.axes.Axes]
+        Figure plus the mapping ``{"A": axA, "B": axB, "C": axC}``.
+    """
+    planes = list(planes)
+    if len(planes) != 3:
+        raise ValueError("planes must be a sequence of exactly three plane strings")
+
+    # ── 0. global bounding box (already scaled) ────────────────────────────
+    v_scaled = mesh.vertices.view(np.ndarray) * scale
+    lims, spans = _axis_extents(v_scaled)
+
+    # helper: pick limits for a given plane string
+    def _limits(p: str):
+        h, v = _plane_axes(p)
+        return lims[h], lims[v]            # (xlim, ylim)
+
+    # ── 1. gridspec ratios derived from the chosen planes ──────────────────
+    A, B, C = planes                           # unpack for readability
+    _, vA = _plane_axes(A)
+    _, vB = _plane_axes(B)
+    hA, _ = _plane_axes(A)
+    hC, _ = _plane_axes(C)
+
+    height_ratios = [spans[vB], spans[vA]]     # row0, row1
+    width_ratios  = [spans[hA], spans[hC]]     # col0, col1
+
+    mosaic = """
+    B.
+    AC
+    """
+
+    fig, axd = plt.subplot_mosaic(
+        mosaic,
+        figsize=figsize,
+        gridspec_kw={
+            "height_ratios": height_ratios,
+            "width_ratios":  width_ratios,
+        },
+    )
+
+    # ── 2. render every occupied panel ─────────────────────────────────────
+    for label, plane in zip(("A", "B", "C"), planes):
+        xlim, ylim = _limits(plane)
+        plot_projection(
+            skel,
+            mesh,
+            plane=plane,
+            scale=scale,
+            ax=axd[label],
+            xlim=xlim,
+            ylim=ylim,
+            draw_edges=draw_edges,
+            draw_soma_mask=draw_soma_mask,
+            **plot_kwargs,
+        )
+        axd[label].set_aspect("equal")
+
+    if title is not None:
+        fig.suptitle(title, y=0.98)
+
+    fig.tight_layout()
+    return fig, axd

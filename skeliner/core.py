@@ -424,7 +424,7 @@ def find_soma_with_radius(
     nodes: np.ndarray,
     radii: np.ndarray,
     *,
-    pct_large: float = 99.9,
+    pct_large: float = 99.95,
 ) -> tuple[np.ndarray, float, np.ndarray]:
     """Post-skeletonization soma detection, using node radii only.
 
@@ -454,10 +454,13 @@ def find_soma_with_radius(
         raise RuntimeError("no soma-sized nodes found – check the percentile")
 
     centre = nodes[is_soma].mean(axis=0)
+    # is_soma = radii == np.max(radii)
+    # centre = nodes[is_soma]
 
     # (b) 90-th percentile of distance+radius ➜ outer envelope
     dist_plus_r = np.linalg.norm(nodes[is_soma] - centre, axis=1) + radii[is_soma]
     radius = float(np.percentile(dist_plus_r,  90))
+    # radius = float(radii[is_soma])
 
     soma_nodes = np.where(is_soma)[0]
     return centre, radius, soma_nodes
@@ -781,6 +784,7 @@ def _merge_near_soma_nodes(
 
     # ── 5. re-centre node 0  (all centroids now belonging to the soma) ──
     merged_idx = np.where(~keep)[0]                 # the ones we collapsed
+    radii_keep = radii[keep].copy()
     if merged_idx.size:
         # number of mesh vertices represented by each centroid
         weights = np.array([len(node2verts[0]), *[len(node2verts[i]) for i in merged_idx]],
@@ -792,10 +796,19 @@ def _merge_near_soma_nodes(
         # weighted average = true centroid of all involved mesh vertices
         nodes_keep = nodes[keep].copy()
         nodes_keep[0] = np.average(soma_centroids, axis=0, weights=weights)
+        
+        envelope = np.concatenate((
+            [radii[0]],                                  # old soma radius
+            np.linalg.norm(nodes[merged_idx] - nodes_keep[0], axis=1)
+            + radii[merged_idx]
+        ))
+        radii_keep[0] = float(envelope.max())            # new soma radius
     else:
         nodes_keep = nodes[keep]
+        radii_keep[0] = radii[0]                         # nothing merged
+    
 
-    return nodes_keep, radii[keep], edges_out, keep
+    return nodes_keep, radii_keep, edges_out, keep
 
 
 def _bridge_gaps(
