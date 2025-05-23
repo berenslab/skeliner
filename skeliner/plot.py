@@ -1,3 +1,4 @@
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import trimesh
@@ -9,56 +10,65 @@ from .core import Skeleton
 
 __all__ = ["plot_projection"]
 
+
 _PLANE_AXES = {
     "xy": (0, 1), "yx": (1, 0),
     "xz": (0, 2), "zx": (2, 0),
     "yz": (1, 2), "zy": (2, 1),  
 }
 
+_GOLDEN_RATIO = 0.618033988749895          # for visually distinct colours
+
 def _project(arr: np.ndarray, ix: int, iy: int, /) -> np.ndarray:
     """Return 2-column slice (arr[:, (ix, iy)])."""
     return arr[:, (ix, iy)].copy()
 
-def _radii_to_scatter_size(rr: np.ndarray, ax: Axes) -> np.ndarray:
+def _component_labels(n_verts: int,
+                      node2verts: list[np.ndarray]) -> np.ndarray:
     """
-    Convert radii in *data units* to matplotlib scatter sizes (points²) **in a
-    way that is independent of the particular subplot’s width/height**.
+    LAB[mesh_vid] = *component id* (“cluster id”)  – or –1 if vertex does not
+    belong to any skeleton node (shouldn’t normally happen).
 
-    For axes that use ``ax.set_aspect("equal")`` the pixel–per–data-unit ratio
-    is identical in *both* directions, but it can differ from one panel to the
-    next if their x– or y-ranges (or their physical sizes on the canvas) are
-    different.  We therefore
+    One node ↔ one component, therefore a simple linear scan is sufficient.
+    """
+    lab = np.full(n_verts, -1, dtype=np.int64)
+    for cid, verts in enumerate(node2verts):
+        lab[verts] = cid
+    return lab
 
-    1. work out the ratio in *both* directions,  
-    2. take the *smaller* of the two (guaranteed to be the true isotropic
-       scale), and  
-    3. convert radii → pixels → points.
-
-    This ensures that the same radius in data units is rendered with the same
-    diameter in points in **every** subplot that belongs to the figure.
+def _radii_to_sizes(rr: np.ndarray, ax: Axes) -> tuple[np.ndarray, float]:
+    """
+    Convert radii (data units) → *scatter* sizes (points²) so that the same
+    physical radius is rendered identically in every subplot.
     """
     fig = ax.figure
     dpi = fig.dpi
 
-    # current axis limits (data units)
     x0, x1 = ax.get_xlim()
     y0, y1 = ax.get_ylim()
+    bbox   = ax.get_window_extent()
 
-    # axis size on the canvas (pixels)
-    bbox = ax.get_window_extent()
-
-    # pixels per data-unit in each direction
     ppd_x = bbox.width  / abs(x1 - x0)
     ppd_y = bbox.height / abs(y1 - y0)
+    ppd   = min(ppd_x, ppd_y)
 
-    # use the isotropic (smaller) scale so all panels agree
-    ppd = min(ppd_x, ppd_y)
-
-    # radius: data-units → pixels → points → area (points²)
     r_px = rr * ppd
     r_pt = r_px * 72.0 / dpi
     return np.pi * r_pt**2, ppd
 
+def _make_lut(name: str, n: int) -> np.ndarray:
+    """
+    Return an ``(n, 4)`` RGBA array from *name* colormap, shuffled so that
+    neighbouring IDs get well-separated colours.
+
+    Works on Matplotlib ≥ 3.5 and stays silent on ≥ 3.7.
+    """
+    # Matplotlib ≥ 3.5 – the recommended public API
+    cmap = mpl.colormaps.get_cmap(name).resampled(max(n, 1))
+
+    # golden-ratio shift ensures adjacent IDs differ strongly
+    idx = (np.arange(max(n, 1)) * _GOLDEN_RATIO) % 1.0
+    return cmap(idx)
 
 def plot_projection(
     skel: Skeleton,
@@ -188,7 +198,7 @@ def plot_projection(
 
     # ─────────────────── circles ──────────────────────────────────────────
     if draw_skel:
-        sizes, ppd = _radii_to_scatter_size(rr, ax)
+        sizes, ppd = _radii_to_sizes(rr, ax)
         ax.scatter(
             xy_skel[:, 0],
             xy_skel[:, 1],
@@ -257,6 +267,261 @@ def plot_projection(
         ax.set_xlim(xlim)
     if ylim is not None:
         ax.set_ylim(ylim)
+
+    plt.tight_layout()
+    return fig, ax
+
+
+def diagnostic(
+    mesh: "trimesh.Trimesh",
+    skel: Skeleton,
+    *,
+    plane: str = "xy",
+    # background histogram --------------------------------------------------- #
+    bins: int | tuple[int, int] = 800,
+    hist_cmap: str = "Blues",
+    vmax_fraction: float = 0.10,
+    # overlays --------------------------------------------------------------- #
+    draw_nodes: bool = True,
+    draw_edges: bool = False,
+    draw_soma_mask: bool = True,
+    show_node_ids: bool = False,
+    radius_metric: str | None = None,
+    # appearance ------------------------------------------------------------- #
+    cluster_cmap: str = "tab20",
+    circle_alpha: float = 0.9,
+    edge_color: str = "0.25",
+    edge_lw: float = 0.8,
+    id_fontsize: int = 6,
+    id_color: str = "black",
+    id_offset: tuple[float, float] = (0.0, 0.0),
+    # geometry ---------------------------------------------------------------- #
+    scale: float | tuple[float, float] | list[float] = 1.0,
+    xlim: tuple[float, float] | None = None,
+    ylim: tuple[float, float] | None = None,
+    # title ------------------------------------------------------------------ #
+    title: str | None = None,
+    unit: str | None = None,
+    # axes                                                                     #
+    ax: Axes | None = None,
+):
+    """
+    2-D overview plot – mesh density + coloured clusters + optional skeleton.
+
+    Parameters
+    ----------
+    plane
+        Projection plane, one of ``{"xy","xz","yz","yx","zx","zy"}``.
+    bins
+        Background histogram resolution (passed to
+        :pyfunc:`scipy.stats.binned_statistic_2d`).
+    scale
+        Either a single factor applied to *both* mesh and skeleton or a pair
+        ``(skel_scale, mesh_scale)``.
+    draw_nodes, draw_edges
+        Overlay the skeleton circles and/or edges.
+    cluster_cmap
+        Matplotlib colormap for the clusters (colours are shuffled using the
+        golden-ratio trick so neighbouring IDs differ).
+    xlim, ylim
+        Optional crop window **before** any rendering work is done.
+    """
+    # ------------- housekeeping / defaults ----------------------------------
+    if plane not in _PLANE_AXES:
+        raise ValueError(f"plane must be one of {tuple(_PLANE_AXES)}")
+
+    ix, iy = _PLANE_AXES[plane]
+
+    if isinstance(scale, (int, float)):
+        scale = (float(scale),) * 2
+    if len(scale) != 2:
+        raise ValueError("scale must be a scalar or a pair/list of two scalars")
+    scl_skel, scl_mesh = map(float, scale)
+
+    if radius_metric is None:
+        radius_metric = skel.recommend_radius()[0]
+
+    # ------------- project & crop -------------------------------------------
+    xy_mesh_all = _project(mesh.vertices.view(np.ndarray), ix, iy) * scl_mesh
+    xy_skel = _project(skel.nodes, ix, iy) * scl_skel
+    rr      = skel.radii[radius_metric] * scl_skel
+
+    def _mask_window(xy: np.ndarray) -> np.ndarray:
+        keep = np.ones(len(xy), bool)
+        if xlim is not None:
+            keep &= (xy[:, 0] >= xlim[0]) & (xy[:, 0] <= xlim[1])
+        if ylim is not None:
+            keep &= (xy[:, 1] >= ylim[0]) & (xy[:, 1] <= ylim[1])
+        return keep
+
+    keep_mesh     = _mask_window(xy_mesh_all)
+    xy_mesh_crop  = xy_mesh_all[keep_mesh]
+
+    keep_skel = _mask_window(xy_skel)
+    xy_skel   = xy_skel[keep_skel]
+    rr        = rr[keep_skel]
+
+    # ------------- density histogram ----------------------------------------
+    # Import here to keep hard deps minimal
+    from scipy.stats import binned_statistic_2d  # local import
+
+    if isinstance(bins, int):
+        bins_arg: int | tuple[int, int] = bins
+    else:
+        if (not isinstance(bins, tuple)) or len(bins) != 2:
+            raise ValueError("bins must be int or (int, int)")
+        bins_arg = tuple(map(int, bins))
+
+    hist, xedges, yedges, _ = binned_statistic_2d(
+        xy_mesh_crop[:, 0], xy_mesh_crop[:, 1], None,
+        statistic="count", bins=bins_arg,
+    )
+    hist = hist.T                                      # imshow(rows=y)
+
+    # -------- component labels for every *mesh* vertex ----------------------
+    # -------- prepare vertex–cluster labels (if we have a skeleton) ---------
+    if skel is not None and skel.node2verts is not None:
+        lab_full   = _component_labels(len(mesh.vertices), skel.node2verts)
+        # restrict to vertices that belong to *some* node
+        in_cluster = lab_full >= 0
+        mask_mesh  = keep_mesh & in_cluster
+
+        xy_mesh_scatter = xy_mesh_all[mask_mesh]
+        lab_mesh        = lab_full[mask_mesh]
+        n_comp          = int(lab_full.max() + 1)
+    else:
+        # no skeleton → fall back to “plot-everything” but colour uniformly
+        xy_mesh_scatter = xy_mesh_crop
+        lab_mesh        = None          # single colour
+        n_comp          = 0             # disables LUT
+ 
+    # ------------- figure / axes --------------------------------------------
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 6))
+    else:
+        fig = ax.figure
+
+    # Show the blue density map only if we do NOT have node-based clusters
+    if skel is None or skel.node2verts is None:
+        ax.imshow(
+            hist,
+            extent=(xedges[0], xedges[-1], yedges[0], yedges[-1]),
+            origin="lower",
+            cmap=hist_cmap,
+            vmax=hist.max() * vmax_fraction,
+            alpha=1.0,
+            zorder=0,
+        )
+
+   # ------------- vertex cloud overlay -------------------------------------
+    if n_comp:                               # skeleton → coloured clusters
+        lut = _make_lut(cluster_cmap, n_comp)
+        colours = lut[lab_mesh]
+    else:                                    # plain mesh → uniform grey
+        colours = "0.6"
+
+    ax.scatter(
+        xy_mesh_scatter[:, 0], xy_mesh_scatter[:, 1],
+        s=1.0, c=colours, alpha=1, linewidths=0, zorder=9
+    )
+
+    sizes, ppd = _radii_to_sizes(rr, ax)
+    # ------------- skeleton circles & centres -------------------------------
+    if draw_nodes and len(xy_skel):
+        
+
+        # per-node colour uses *first vertex* of the cluster as label
+        node_comp   = np.array([
+            lab_full[skel.node2verts[i][0]] if len(skel.node2verts[i]) else -1
+            for i in range(len(skel.nodes))
+        ])
+        node_comp   = node_comp[keep_skel]
+        node_colors = lut[node_comp]
+
+        # circles (facecolor none, coloured edge)
+        ax.scatter(
+            xy_skel[:, 0], xy_skel[:, 1],
+            s=sizes, facecolors="none", edgecolors=node_colors,
+            linewidths=0.9, alpha=circle_alpha, zorder=3,
+        )
+        # centre points
+        ax.scatter(
+            xy_skel[:, 0], xy_skel[:, 1],
+            s=10, c=node_colors, alpha=circle_alpha, zorder=4,
+            linewidths=0,
+        )
+
+
+        # optional node-ID labels
+        if show_node_ids:
+            orig_ids = np.flatnonzero(keep_skel)
+            dx, dy   = id_offset
+            for nid, (x, y) in zip(orig_ids, xy_skel):
+                ax.text(
+                    x + dx, y + dy, str(nid),
+                    fontsize=id_fontsize, color=id_color,
+                    ha="center", va="center", zorder=5)
+
+    # ------------- edges -----------------------------------------------------
+    if draw_edges and skel.edges.size:
+        # keep edges whose *both* endpoints survived cropping
+        keep_flags = keep_skel
+        ekeep      = keep_flags[skel.edges[:, 0]] & keep_flags[skel.edges[:, 1]]
+        edges_kept = skel.edges[ekeep]
+
+        if edges_kept.size:
+            # compress indices once
+            idx_map = -np.ones(len(keep_flags), dtype=int)
+            idx_map[np.flatnonzero(keep_flags)] = np.arange(keep_flags.sum())
+
+            seg_start = xy_skel[idx_map[edges_kept[:, 0]]]
+            seg_end   = xy_skel[idx_map[edges_kept[:, 1]]]
+            segs      = np.stack((seg_start, seg_end), axis=1)
+
+            lc = LineCollection(
+                segs, colors=edge_color, linewidths=edge_lw,
+                alpha=circle_alpha * 0.9, zorder=2)
+            ax.add_collection(lc)
+
+    # ------------- optional soma shell --------------------------------------
+    if draw_soma_mask and skel.soma_verts is not None and len(skel.soma_verts):
+        xy_soma = _project(
+            mesh.vertices[np.asarray(skel.soma_verts, dtype=np.int64)], ix, iy
+        ) * scl_mesh
+        soma_keep = _mask_window(xy_soma)
+        xy_soma   = xy_soma[soma_keep]
+
+        ax.scatter(
+            xy_soma[:, 0], xy_soma[:, 1],
+            s=1.0, c="magenta", alpha=0.45, linewidths=0, zorder=1.5,
+            label="soma surface",
+        )
+        # centre + outline
+        c_xy = _project(skel.nodes[[0]] * scl_skel, ix, iy).ravel()
+        ax.scatter(*c_xy, c="k", s=16, zorder=4)
+
+        # dashed outline matching circle size
+        r_px = skel.radii[radius_metric][0] * scl_skel * ppd
+        r_pt = r_px * 72.0 / fig.dpi
+        ax.scatter(*c_xy, facecolors="none", edgecolors="k",
+                   linestyle="--", s=np.pi * r_pt**2, zorder=4)
+
+    # ------------- cosmetics -------------------------------------------------
+    ax.set_aspect("equal")
+    if unit is None:
+        ax.set_xlabel(f"{plane[0]}")
+        ax.set_ylabel(f"{plane[1]}")
+    else:
+        ax.set_xlabel(f"{plane[0]} ({unit})")
+        ax.set_ylabel(f"{plane[1]} ({unit})")
+
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+
+    if title is not None:
+        ax.set_title(title)
 
     plt.tight_layout()
     return fig, ax

@@ -425,7 +425,6 @@ def find_soma_with_radius(
     radii: np.ndarray,
     *,
     pct_large: float = 99.9,
-    radius_quantile: float = 0.90,
 ) -> tuple[np.ndarray, float, np.ndarray]:
     """Post-skeletonization soma detection, using node radii only.
 
@@ -438,9 +437,6 @@ def find_soma_with_radius(
     pct_large
         Nodes whose radius is above this percentile are considered
         “soma candidates”.
-    radius_quantile
-        Outer envelope of the soma = *radius_quantile*-th percentile of
-        *distance + local radius* inside the candidate cluster.
 
     Returns
     -------
@@ -461,7 +457,7 @@ def find_soma_with_radius(
 
     # (b) 90-th percentile of distance+radius ➜ outer envelope
     dist_plus_r = np.linalg.norm(nodes[is_soma] - centre, axis=1) + radii[is_soma]
-    radius = float(np.percentile(dist_plus_r, radius_quantile * 100))
+    radius = float(np.percentile(dist_plus_r,  90))
 
     soma_nodes = np.where(is_soma)[0]
     return centre, radius, soma_nodes
@@ -1237,7 +1233,7 @@ def skeletonize(
     soma_init_guess_axis: str  = "z",   # "x" | "y" | "z"
     soma_init_guess_mode: str  = "min", # "min" | "max"
     # --- geodesic sampling ---
-    target_shell_count: int = 1000,
+    target_shell_count: int = 1000, # higher = more bins, smaller bin size
     min_cluster_vertices: int = 6,
     max_shell_width_factor: int = 50,
     # --- bridging disconnected patches ---
@@ -1247,8 +1243,8 @@ def skeletonize(
     # --- post‑processing ---
     # --- collapse soma-like nodes ---
     collapse_soma: bool = True,
-    collapse_soma_dist_factor: float = 1.15,
-    collapse_soma_radius_factor: float = 0.25,
+    collapse_soma_dist_factor: float = 1.2,
+    collapse_soma_radius_factor: float = 0.20,
     # --- prune tiny neurites ---
     prune_tiny_neurites: bool = True,
     prune_min_nodes: int = 5,
@@ -1358,6 +1354,7 @@ def skeletonize(
         soma_verts = {seed_vid}
     else:
         # pre skeletonization soma detection
+        _t0 = time.perf_counter()
         with _timed("↳  pre-skeletonization soma detection"):
             if detect_soma == "pre":
                 c_soma, r_soma, soma_verts = find_soma(
@@ -1379,7 +1376,7 @@ def skeletonize(
                 )
 
         if verbose:
-            soma_ms = time.perf_counter() - _global_start
+            soma_ms = time.perf_counter() - _t0
             
 
     # 1. binning along geodesic shells ----------------------------------
@@ -1457,9 +1454,10 @@ def skeletonize(
 
 
     if has_soma and detect_soma == "post":
+        _t0 = time.perf_counter() 
         with _timed("↳  post-skeletonization soma detection"):
             c_soma, r_soma, soma_nodes = find_soma_with_radius(
-                nodes_arr, radii_dict[radius_estimators[0]]
+                nodes_arr, radii_dict[radius_estimators[0]],
             )
 
             # 1. choose which candidate will become the new root
@@ -1490,6 +1488,9 @@ def skeletonize(
             for k in radii_dict:
                 radii_dict[k][0] = r_soma
 
+            if verbose:
+                soma_ms = time.perf_counter() - _t0
+
     # 3. edges from mesh connectivity -----------------------------------
     with _timed("↳  map mesh faces to skeleton edges"):
         edges_arr = _edges_from_mesh(
@@ -1502,7 +1503,6 @@ def skeletonize(
     # 4. collapse soma‑like / fat nodes ---------------------------
     if has_soma and collapse_soma:
         _t0 = time.perf_counter() 
-
         with _timed("↳  merge redundant near-soma nodes") as log:
             (nodes_arr, radii_arr, edges_arr, keep_mask) = _merge_near_soma_nodes(
                 nodes_arr,
@@ -1556,7 +1556,7 @@ def skeletonize(
     # 7. prune tiny sub-trees near the soma
     if has_soma and prune_tiny_neurites:
         _t0 = time.perf_counter()
-        with _timed("↳  prune tiny soma-attached branches"):
+        with _timed("↳  prune tiny neurites"):
             keep_mask, edges_mst = _prune_tiny_terminals(
                     nodes_arr,
                     edges_mst,
@@ -1578,13 +1578,13 @@ def skeletonize(
 
         if post_ms > 1e-6:       # at least one optional stage ran
             print(f"{'TOTAL (soma + core + post)':<49}"
-                  f"… {total_ms:.1f} s "
-                  f"({soma_ms:.1f} + {core_ms:.1f} + {post_ms:.1f})")
+                  f"… {total_ms:.2f} s "
+                  f"({soma_ms:.2f} + {core_ms:.2f} + {post_ms:.2f})")
             print(f"({len(nodes_arr):,} nodes, {edges_mst.shape[0]:,} edges)")
         else:                    # no post-processing at all
             print(f"{'TOTAL (soma + core)':<49}"
-                  f"… {total_ms:.1f} s "
-                  f"({soma_ms:.1f} + {core_ms:.1f})")
+                  f"… {total_ms:.2f} s "
+                  f"({soma_ms:.2f} + {core_ms:.2f})")
 
     return Skeleton(nodes_arr, 
                     radii_dict, 
