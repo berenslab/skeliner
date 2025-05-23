@@ -469,6 +469,25 @@ def find_soma_with_radius(
 # -----------------------------------------------------------------------------
 #  Utility
 # -----------------------------------------------------------------------------
+def _bfs_parents(edges: np.ndarray, n_nodes: int, *, root: int = 0) -> List[int]:
+    """
+    Return parent[] array of BFS tree from *root* given undirected edge list.
+    """
+    adj: List[List[int]] = [[] for _ in range(n_nodes)]
+    for a, b in edges:
+        adj[int(a)].append(int(b))
+        adj[int(b)].append(int(a))
+    parent = [-1] * n_nodes
+    q = deque([root])
+    while q:
+        u = q.popleft()
+        for v in adj[u]:
+            if v != root and parent[v] == -1:
+                parent[v] = u
+                q.append(v)
+    return parent
+
+
 def _dist_vec_for_component(
     gsurf: ig.Graph,
     verts: np.ndarray,        # 1-D int64 array of vertex IDs (one component)
@@ -515,24 +534,130 @@ def _geodesic_bins(dist_dict: Dict[int, float], step: float) -> List[List[int]]:
 
     return bins
 
+def _bin_geodesic_shells(
+    mesh: trimesh.Trimesh,
+    gsurf: ig.Graph,
+    *,
+    c_soma: np.ndarray,                       # canonical soma centre
+    soma_verts: Set[int],                     # mesh-vertex IDs of the soma shell
+    target_shell_count: int        = 500,
+    min_cluster_vertices: int      = 6,
+    max_shell_width_factor: float  = 50.0,
+) -> List[List[np.ndarray]]:
+    """
+    Cluster every connected surface patch into sets of *geodesic shells*.
 
-def _bfs_parents(edges: np.ndarray, n_nodes: int, *, root: int = 0) -> List[int]:
+    The function reproduces the logic that used to live inline in
+    :pyfunc:`skeletonize`, but is now reusable and unit-testable.
+
+    Parameters
+    ----------
+    mesh
+        The watertight neuron mesh.
+    gsurf
+        Undirected triangle-adjacency graph of the mesh (from
+        :pyfunc:`_surface_graph`).
+    c_soma
+        3-vector of the soma centroid **chosen earlier**.  
+        (Its exact origin depends on `detect_soma`.)
+    soma_verts
+        Set of mesh-vertex IDs that belong to the detected soma patch (may be a
+        singleton `{seed_vid}` if soma detection is deferred or disabled).
+    target_shell_count
+        Requested number of shells per connected component.  The actual width
+        is adapted to mesh resolution.
+    min_cluster_vertices
+        Discard clusters smaller than this size; they usually represent noise.
+    max_shell_width_factor
+        Upper limit for the shell width expressed as a multiple of the mean
+        mesh-edge length.  Prevents *very* sparse meshes from producing a
+        single giant shell.
+
+    Returns
+    -------
+    List[List[np.ndarray]]
+        Outer list = shells ordered by growing distance;  
+        inner list = connected vertex clusters inside that shell;  
+        each cluster is a 1-D ``int64`` array of mesh-vertex IDs.
+
+        The structure is exactly what stage 2 of *skeletonize()* expects.
     """
-    Return parent[] array of BFS tree from *root* given undirected edge list.
-    """
-    adj: List[List[int]] = [[] for _ in range(n_nodes)]
-    for a, b in edges:
-        adj[int(a)].append(int(b))
-        adj[int(b)].append(int(a))
-    parent = [-1] * n_nodes
-    q = deque([root])
-    while q:
-        u = q.popleft()
-        for v in adj[u]:
-            if v != root and parent[v] == -1:
-                parent[v] = u
-                q.append(v)
-    return parent
+    v   = mesh.vertices.view(np.ndarray)
+    e_m = float(mesh.edges_unique_length.mean())     # mean mesh-edge length
+
+    # ------------------------------------------------------------------
+    # build a vertex list for every connected surface patch
+    # ------------------------------------------------------------------
+    comp_vertices = [
+        np.asarray(c, dtype=np.int64) for c in gsurf.components()
+    ]
+
+    soma_vids = np.fromiter(soma_verts, dtype=np.int64)
+    all_shells: List[List[np.ndarray]] = []
+
+    for cid, verts in enumerate(comp_vertices):
+
+        # --------------------------------------------------------------
+        # choose one seed *per component* – deterministic but cheap
+        # --------------------------------------------------------------
+        if np.intersect1d(verts, soma_vids).size:
+            # component that contains (part of) the soma ➜
+            # pick the *furthest* soma vertex from the centroid to avoid
+            # degeneracy when the soma spans many shells
+            seed_vid = int(
+                soma_vids[
+                    np.argmax(np.linalg.norm(v[soma_vids] - c_soma, axis=1))
+                ]
+            )
+        else:
+            # foreign island ➜ pick a pseudo-random, yet deterministic vertex
+            seed_vid = int(verts[hash(cid) % len(verts)])
+
+        # --------------------------------------------------------------
+        # geodesic distance of *all* vertices in this component
+        # --------------------------------------------------------------
+        dist_vec = _dist_vec_for_component(gsurf, verts, seed_vid)
+        dist_sub = {int(vid): float(d) for vid, d in zip(verts, dist_vec)}
+
+        if not dist_sub:
+            continue
+
+        # shell width: max(edge × 2, arc_len / target_shell_count)
+        arc_len = max(dist_sub.values())
+        step    = max(e_m * 2.0, arc_len / target_shell_count)
+
+        # ------------------------------------------------------------------
+        # increase the step until we get at least one non-empty shell
+        # (avoids pathological meshes with *too* fine resolution)
+        # ------------------------------------------------------------------
+        shells: List[List[int]] = []
+        while not any(shells) and step < e_m * max_shell_width_factor:
+            shells = _geodesic_bins(dist_sub, step)
+            step  *= 1.5
+
+        # --------------------------------------------------------------
+        # for every shell: split it into connected sub-clusters
+        # --------------------------------------------------------------
+        for shell_verts in shells:
+            # exclude explicit soma vertices to keep the centre clean
+            inner = [vid for vid in shell_verts if vid not in soma_verts]
+            if not inner:
+                continue
+
+            sub   = gsurf.induced_subgraph(inner)
+            comps = []
+            for comp in sub.components():
+                if len(comp) < min_cluster_vertices:
+                    continue      # too small ➜ ignore
+                comp_idx = np.fromiter(
+                    (inner[i] for i in comp), dtype=np.int64
+                )
+                comps.append(comp_idx)
+
+            all_shells.append(comps)
+
+    return all_shells
+
 
 
 def _estimate_radius(d: np.ndarray, *, method: str = "median", trim_fraction: float = 0.05, q: float = 0.90) -> float:
@@ -1162,50 +1287,15 @@ def skeletonize(
     with _timed("↳  bin surface vertices by geodesic distance"):
         v = mesh.vertices.view(np.ndarray)
         
-        components    = gsurf.components()
-        comp_vertices = [np.asarray(c, dtype=np.int64) for c in components]
-
-        soma_vids = np.fromiter(soma_verts, dtype=np.int64)
-        all_comps: list[list[np.ndarray]] = []
-        edge_m    = float(mesh.edges_unique_length.mean())
-
-        for cid, verts in enumerate(comp_vertices):
-
-            # -------- choose the *one* seed you used before ----------                                   
-            if np.intersect1d(verts, soma_vids).size:
-                seed_vid = int(
-                    soma_vids[
-                        np.argmax(np.linalg.norm(v[soma_vids] - c_soma, axis=1))
-                    ]
-                )
-            else:
-                seed_vid = int(verts[hash(cid) % len(verts)])
-
-            dist_vec = _dist_vec_for_component(gsurf, verts, seed_vid)
-            dist_sub = {int(v): float(d) for v, d in zip(verts, dist_vec)}
-
-            if not dist_sub:
-                continue
-
-            arc_len = max(dist_sub.values())
-            step    = max(edge_m * 2.0, arc_len / target_shell_count)
-
-            bins: list[list[int]] = []
-            while not any(bins) and step < edge_m * max_shell_width_factor:
-                bins = _geodesic_bins(dist_sub, step)
-                step *= 1.5
-
-            # --- build the component list for every bin ----------------------
-            for bin_verts in bins:
-                inner  = [vid for vid in bin_verts if vid not in soma_verts]
-                sub    = gsurf.induced_subgraph(inner)
-                comps  = []
-                for comp in sub.components():
-                    if len(comp) < min_cluster_vertices:
-                        continue
-                    comp_idx = np.fromiter((inner[i] for i in comp), dtype=np.int64)
-                    comps.append(comp_idx)
-                all_comps.append(comps)    
+        all_shells = _bin_geodesic_shells(
+            mesh,
+            gsurf,
+            c_soma=c_soma,
+            soma_verts=soma_verts,
+            target_shell_count=target_shell_count,
+            min_cluster_vertices=min_cluster_vertices,
+            max_shell_width_factor=max_shell_width_factor,
+        )
 
     # 2. create skeleton nodes ------------------------------------------
     with _timed("↳  compute bin centroids and radii"):
@@ -1217,9 +1307,9 @@ def skeletonize(
         vert2node: Dict[int, int] = {v: 0 for v in soma_verts} # map mesh-vertex ID to node ID
         next_id = 1
 
-        for shell_idx, comps in enumerate(all_comps):          # ← iterate over shells
-            for comp_idx in comps:                             #    iterate over comps
-                pts    = v[comp_idx]
+        for shells in all_shells:          # ← iterate over shells
+            for bin_ids in shells:                             #    iterate over shells
+                pts    = v[bin_ids]
                 centre = pts.mean(axis=0)                      # centre of component
 
                 d = np.linalg.norm(pts - centre, axis=1)  # radii sample
@@ -1233,9 +1323,9 @@ def skeletonize(
                 node_id = next_id
                 next_id += 1
                 nodes.append(centre)
-                node2verts.append(comp_idx)
-                for vv in comp_idx:
-                    vert2node[int(vv)] = node_id
+                node2verts.append(bin_ids)
+                for bin_id in bin_ids:
+                    vert2node[int(bin_id)] = node_id
 
         nodes_arr = np.asarray(nodes, dtype=np.float32)
         radii_dict = {
