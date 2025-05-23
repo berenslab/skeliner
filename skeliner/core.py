@@ -1,6 +1,6 @@
 import heapq
 import time
-from collections import defaultdict, deque
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +10,7 @@ import igraph as ig
 import numpy as np
 import trimesh
 from scipy.spatial import KDTree
+from scipy.stats import skew
 
 __all__ = [
     "Skeleton",
@@ -219,16 +220,39 @@ def _surface_graph(mesh: trimesh.Trimesh) -> ig.Graph:
 # -----------------------------------------------------------------------------
 #  Soma detection API
 # -----------------------------------------------------------------------------
+# def _likely_has_soma(
+#     radii: np.ndarray,
+#     ratio: float = 3.5,       
+#     min_nodes: int = 5,      
+# ) -> bool:
+#     """
+#     Return True if a plausible soma cluster is present.
+#     """
+#     return sum(radii > np.mean(radii) * ratio) > min_nodes
 def _likely_has_soma(
     radii: np.ndarray,
-    ratio: float = 3.5,       
-    min_nodes: int = 5,      
+    skew_thresh: float = 1.0,       # how asymmetric must the distribution be?
+    tail_frac: float = 0.02,        # top X % of nodes we call the “tail”
+    tail_ratio: float = 3.0,        # how much larger than the median must the tail be?
 ) -> bool:
     """
-    Return True if a plausible soma cluster is present.
+    Heuristic: regard a soma as present when
+    1.  the radius distribution is sufficiently right-skewed, *and*
+    2.  the radii in the extreme right tail are much larger than typical radii.
     """
-    return sum(radii > np.mean(radii) * ratio) > min_nodes
+    if radii.size == 0:
+        return False          # empty container -> no soma
 
+    # --- 1. global shape: skewness -----------------------------------------
+    # scipy.stats.skew uses Fisher’s definition (0 ⇒ symmetric).
+    if skew(radii, bias=False) < skew_thresh:
+        return False
+
+    # --- 2. local extreme: fat right tail ----------------------------------
+    p_tail  = np.percentile(radii, 100 * (1 - tail_frac))
+    med     = np.median(radii)
+
+    return p_tail > med * tail_ratio
 
 def _probe_radius(
     mesh: trimesh.Trimesh,
@@ -424,51 +448,78 @@ def find_soma_with_radius(
     nodes: np.ndarray,
     radii: np.ndarray,
     *,
-    pct_large: float = 99.9,
-    radius_quantile: float = 0.90,
-) -> tuple[np.ndarray, float, np.ndarray]:
-    """Post-skeletonization soma detection, using node radii only.
-
-    Parameters
-    ----------
-    nodes
-        ``(N, 3)`` skeleton coordinates.
-    radii
-        ``(N,)`` radius column (choose the estimator you like best).
-    pct_large
-        Nodes whose radius is above this percentile are considered
-        “soma candidates”.
-    radius_quantile
-        Outer envelope of the soma = *radius_quantile*-th percentile of
-        *distance + local radius* inside the candidate cluster.
-
-    Returns
-    -------
-    centre
-        Centroid of the candidate cluster.
-    radius
-        Envelope radius (see above).
-    soma_nodes
-        1-D array of node IDs classified as belonging to the soma.
+    pct_large : float = 99.95,
+    dist_factor: float = 4.0,   # keep nodes within dist_factor × R_max
+    min_keep: int = 3,
+) -> tuple[np.ndarray, float, np.ndarray, bool]:
     """
-    # (a) pick “soma candidates” by very large radius
-    is_soma = radii >= np.percentile(radii, pct_large)
+    Soma = {  nodes whose radius ≥ pct_large-percentile
+              AND whose Euclidean distance to the *largest* node
+                  ≤ dist_factor × R_max  }.
 
-    if not np.any(is_soma):
-        raise RuntimeError("no soma-sized nodes found – check the percentile")
+    No clustering libraries needed—just one distance vector.
+    """
+    if nodes.shape[0] == 0:
+        raise ValueError("empty skeleton")
 
-    centre = nodes[is_soma].mean(axis=0)
+    # -------------------------------------------------------------
+    # 1. radius threshold → initial candidate set
+    # -------------------------------------------------------------
+    large_thresh = np.percentile(radii, pct_large)
+    cand_idx = np.where(radii >= large_thresh)[0]
+    if cand_idx.size == 0:
+        raise RuntimeError(
+            f"no nodes above the {pct_large:g}-th percentile "
+            "(try lowering pct_large)"
+        )
 
-    # (b) 90-th percentile of distance+radius ➜ outer envelope
-    dist_plus_r = np.linalg.norm(nodes[is_soma] - centre, axis=1) + radii[is_soma]
-    radius = float(np.percentile(dist_plus_r, radius_quantile * 100))
+    # -------------------------------------------------------------
+    # 2. choose the global-maximum node as “soma anchor”
+    # -------------------------------------------------------------
+    idx_max = int(np.argmax(radii))              # index in the full array
+    R_max   = radii[idx_max]
 
-    soma_nodes = np.where(is_soma)[0]
-    return centre, radius, soma_nodes
+    # -------------------------------------------------------------
+    # 3. distance filter: stay close to anchor
+    # -------------------------------------------------------------
+    dists = np.linalg.norm(nodes[cand_idx] - nodes[idx_max], axis=1)
+    keep  = dists <= dist_factor * R_max
+    soma_idx = cand_idx[keep]
+
+    # -------------------------------------------------------------
+    # 4. envelope geometry (same as your original code)
+    # -------------------------------------------------------------
+    centre = nodes[soma_idx].mean(axis=0)
+    dist_plus_r = np.linalg.norm(nodes[soma_idx] - centre, axis=1) + radii[soma_idx]
+    radius = float(np.percentile(dist_plus_r, 90))
+    
+
+    has_soma = False if len(soma_idx) < min_keep else True
+        
+    return centre, radius, soma_idx, has_soma
 
 # -----------------------------------------------------------------------------
 #  Utility
 # -----------------------------------------------------------------------------
+def _bfs_parents(edges: np.ndarray, n_nodes: int, *, root: int = 0) -> List[int]:
+    """
+    Return parent[] array of BFS tree from *root* given undirected edge list.
+    """
+    adj: List[List[int]] = [[] for _ in range(n_nodes)]
+    for a, b in edges:
+        adj[int(a)].append(int(b))
+        adj[int(b)].append(int(a))
+    parent = [-1] * n_nodes
+    q = deque([root])
+    while q:
+        u = q.popleft()
+        for v in adj[u]:
+            if v != root and parent[v] == -1:
+                parent[v] = u
+                q.append(v)
+    return parent
+
+
 def _dist_vec_for_component(
     gsurf: ig.Graph,
     verts: np.ndarray,        # 1-D int64 array of vertex IDs (one component)
@@ -515,24 +566,130 @@ def _geodesic_bins(dist_dict: Dict[int, float], step: float) -> List[List[int]]:
 
     return bins
 
+def _bin_geodesic_shells(
+    mesh: trimesh.Trimesh,
+    gsurf: ig.Graph,
+    *,
+    c_soma: np.ndarray,                       # canonical soma centre
+    soma_verts: Set[int],                     # mesh-vertex IDs of the soma shell
+    target_shell_count: int        = 500,
+    min_cluster_vertices: int      = 6,
+    max_shell_width_factor: float  = 50.0,
+) -> List[List[np.ndarray]]:
+    """
+    Cluster every connected surface patch into sets of *geodesic shells*.
 
-def _bfs_parents(edges: np.ndarray, n_nodes: int, *, root: int = 0) -> List[int]:
+    The function reproduces the logic that used to live inline in
+    :pyfunc:`skeletonize`, but is now reusable and unit-testable.
+
+    Parameters
+    ----------
+    mesh
+        The watertight neuron mesh.
+    gsurf
+        Undirected triangle-adjacency graph of the mesh (from
+        :pyfunc:`_surface_graph`).
+    c_soma
+        3-vector of the soma centroid **chosen earlier**.  
+        (Its exact origin depends on `detect_soma`.)
+    soma_verts
+        Set of mesh-vertex IDs that belong to the detected soma patch (may be a
+        singleton `{seed_vid}` if soma detection is deferred or disabled).
+    target_shell_count
+        Requested number of shells per connected component.  The actual width
+        is adapted to mesh resolution.
+    min_cluster_vertices
+        Discard clusters smaller than this size; they usually represent noise.
+    max_shell_width_factor
+        Upper limit for the shell width expressed as a multiple of the mean
+        mesh-edge length.  Prevents *very* sparse meshes from producing a
+        single giant shell.
+
+    Returns
+    -------
+    List[List[np.ndarray]]
+        Outer list = shells ordered by growing distance;  
+        inner list = connected vertex clusters inside that shell;  
+        each cluster is a 1-D ``int64`` array of mesh-vertex IDs.
+
+        The structure is exactly what stage 2 of *skeletonize()* expects.
     """
-    Return parent[] array of BFS tree from *root* given undirected edge list.
-    """
-    adj: List[List[int]] = [[] for _ in range(n_nodes)]
-    for a, b in edges:
-        adj[int(a)].append(int(b))
-        adj[int(b)].append(int(a))
-    parent = [-1] * n_nodes
-    q = deque([root])
-    while q:
-        u = q.popleft()
-        for v in adj[u]:
-            if v != root and parent[v] == -1:
-                parent[v] = u
-                q.append(v)
-    return parent
+    v   = mesh.vertices.view(np.ndarray)
+    e_m = float(mesh.edges_unique_length.mean())     # mean mesh-edge length
+
+    # ------------------------------------------------------------------
+    # build a vertex list for every connected surface patch
+    # ------------------------------------------------------------------
+    comp_vertices = [
+        np.asarray(c, dtype=np.int64) for c in gsurf.components()
+    ]
+
+    soma_vids = np.fromiter(soma_verts, dtype=np.int64)
+    all_shells: List[List[np.ndarray]] = []
+
+    for cid, verts in enumerate(comp_vertices):
+
+        # --------------------------------------------------------------
+        # choose one seed *per component* – deterministic but cheap
+        # --------------------------------------------------------------
+        if np.intersect1d(verts, soma_vids).size:
+            # component that contains (part of) the soma ➜
+            # pick the *furthest* soma vertex from the centroid to avoid
+            # degeneracy when the soma spans many shells
+            seed_vid = int(
+                soma_vids[
+                    np.argmax(np.linalg.norm(v[soma_vids] - c_soma, axis=1))
+                ]
+            )
+        else:
+            # foreign island ➜ pick a pseudo-random, yet deterministic vertex
+            seed_vid = int(verts[hash(cid) % len(verts)])
+
+        # --------------------------------------------------------------
+        # geodesic distance of *all* vertices in this component
+        # --------------------------------------------------------------
+        dist_vec = _dist_vec_for_component(gsurf, verts, seed_vid)
+        dist_sub = {int(vid): float(d) for vid, d in zip(verts, dist_vec)}
+
+        if not dist_sub:
+            continue
+
+        # shell width: max(edge × 2, arc_len / target_shell_count)
+        arc_len = max(dist_sub.values())
+        step    = max(e_m * 2.0, arc_len / target_shell_count)
+
+        # ------------------------------------------------------------------
+        # increase the step until we get at least one non-empty shell
+        # (avoids pathological meshes with *too* fine resolution)
+        # ------------------------------------------------------------------
+        shells: List[List[int]] = []
+        while not any(shells) and step < e_m * max_shell_width_factor:
+            shells = _geodesic_bins(dist_sub, step)
+            step  *= 1.5
+
+        # --------------------------------------------------------------
+        # for every shell: split it into connected sub-clusters
+        # --------------------------------------------------------------
+        for shell_verts in shells:
+            # exclude explicit soma vertices to keep the centre clean
+            inner = [vid for vid in shell_verts if vid not in soma_verts]
+            if not inner:
+                continue
+
+            sub   = gsurf.induced_subgraph(inner)
+            comps = []
+            for comp in sub.components():
+                if len(comp) < min_cluster_vertices:
+                    continue      # too small ➜ ignore
+                comp_idx = np.fromiter(
+                    (inner[i] for i in comp), dtype=np.int64
+                )
+                comps.append(comp_idx)
+
+            all_shells.append(comps)
+
+    return all_shells
+
 
 
 def _estimate_radius(d: np.ndarray, *, method: str = "median", trim_fraction: float = 0.05, q: float = 0.90) -> float:
@@ -625,9 +782,10 @@ def _merge_near_soma_nodes(
     """
 
     # ── 1. decide which vertices survive ────────────────────────────────
-    close = np.linalg.norm(nodes - c_soma, axis=1) < soma_merge_dist_factor * r_soma
-    fat   = radii >= soma_merge_radius_factor * r_soma
-    keep  = ~(close | fat)
+    dist = np.linalg.norm(nodes - c_soma, axis=1)
+    close = dist < soma_merge_dist_factor * r_soma
+    fat_and_near = (radii >= soma_merge_radius_factor * r_soma) & (dist < 2  * r_soma)
+    keep  = ~(close | fat_and_near)
     keep[0] = True                     # never drop the soma itself
 
     kept_idx = np.where(keep)[0]
@@ -660,6 +818,7 @@ def _merge_near_soma_nodes(
 
     # ── 5. re-centre node 0  (all centroids now belonging to the soma) ──
     merged_idx = np.where(~keep)[0]                 # the ones we collapsed
+    radii_keep = radii[keep].copy()
     if merged_idx.size:
         # number of mesh vertices represented by each centroid
         weights = np.array([len(node2verts[0]), *[len(node2verts[i]) for i in merged_idx]],
@@ -671,10 +830,19 @@ def _merge_near_soma_nodes(
         # weighted average = true centroid of all involved mesh vertices
         nodes_keep = nodes[keep].copy()
         nodes_keep[0] = np.average(soma_centroids, axis=0, weights=weights)
+        
+        envelope = np.concatenate((
+            [radii[0]],                                  # old soma radius
+            np.linalg.norm(nodes[merged_idx] - nodes_keep[0], axis=1)
+            + radii[merged_idx]
+        ))
+        radii_keep[0] = float(envelope.max())            # new soma radius
     else:
         nodes_keep = nodes[keep]
+        radii_keep[0] = radii[0]                         # nothing merged
+    
 
-    return nodes_keep, radii[keep], edges_out, keep
+    return nodes_keep, radii_keep, edges_out, keep
 
 
 def _bridge_gaps(
@@ -883,98 +1051,88 @@ def _build_mst(nodes: np.ndarray, edges: np.ndarray) -> np.ndarray:
     mst = g.spanning_tree(weights="weight")
     return np.asarray(sorted(tuple(sorted(e)) for e in mst.get_edgelist()), dtype=np.int64)
 
-
-def _prune_soma_neurites(
+def _prune_tiny_neurites(
     nodes: np.ndarray,
     edges: np.ndarray,
-    soma_pos: np.ndarray,
-    r_soma: float,
-    min_branch_nodes: int = 30,
-    min_branch_extent_factor: float = 1.8,
-):
+    *,
+    min_twig_stem_nodes: int = 5,   # twigs on dendrites
+    min_soma_stem_nodes: int = 30,  # tiny primary neurites
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Remove spuriously small neurites that attach directly to the soma.
+    Remove “twiggy” leaf-branches:
 
-    Parameters
-    ----------
-    nodes
-        (N, 3) coordinates array after collapse/bridging/MST.
-    edges
-        (E, 2) int64 undirected edge list (tree).
-    soma_pos
-        3-vector of the soma centre (node 0).
-    r_soma
-        Soma radius.
-    min_branch_nodes
-        Keep a branch if it has at least this many nodes.
-    min_branch_extent_factor
-        Keep a branch if any node lies further than
-        ``min_branch_extent_factor × r_soma`` from the soma.
+        • Ordinary terminals    – drop if stem length < min_terminal_nodes
+        • Soma-attached neurites – drop if stem length < min_soma_branch_nodes
 
-    Returns
-    -------
-    keep_mask : np.ndarray[bool]
-        True for nodes to keep.
-    new_edges : np.ndarray[int64] shape (E′, 2)
-        Edge list re-indexed to the surviving nodes.
+    ***Branches (paths whose distal end is NOT a tip) are never touched.***
     """
+    N = len(nodes)
 
-    # ------------------------------------------------------------------
-    # 1. build children lists from the parent[] array
-    # ------------------------------------------------------------------
-    parent = _bfs_parents(edges, len(nodes), root=0)
-    children_of = defaultdict(list)
-    for v, p in enumerate(parent):
-        if p != -1:
-            children_of[p].append(v)
+    # ---- degree table & parent array ---------------------------------
+    degree  = np.bincount(edges.ravel(), minlength=N)
+    parent  = _bfs_parents(edges, N, root=0)
 
-    soma_children = children_of[0]                 # neighbours of the soma
+    # adjacency list (needed for fast subtree flood-fill)
+    adj = [[] for _ in range(N)]
+    for a, b in edges:
+        adj[a].append(b)
+        adj[b].append(a)
+
     to_drop: set[int] = set()
+    changed = True
+    while changed:                       # iterate to catch newly exposed tips
+        changed = False
 
-    # ------------------------------------------------------------------
-    # 2. inspect every branch below each soma child
-    # ------------------------------------------------------------------
-    for c in soma_children:
-        stack = [c]
-        desc  = []                                 # vertices in this branch
-        while stack:
-            u = stack.pop()
-            desc.append(u)
-            stack.extend(children_of.get(u, []))   # grandchildren …
+        # current leaves except the soma and those already marked
+        leaves = [v for v in range(1, N) if degree[v] == 1 and v not in to_drop]
 
-        desc_arr = np.asarray(desc, dtype=np.int64)
-        size     = desc_arr.size
-        extent   = np.linalg.norm(nodes[desc_arr] - soma_pos, axis=1).max()
+        for leaf in leaves:
+            stem = []
+            v = leaf
 
-        keep = (size >= min_branch_nodes) or (
-            extent >= min_branch_extent_factor * r_soma
-        )
-        if not keep:
-            to_drop.update(desc)
+            # -------- walk up through the linear shaft ----------------
+            while v != 0 and degree[v] <= 2:    # 1 ⇒ tip, 2 ⇒ straight segment
+                stem.append(v)
+                v = parent[v]
 
-    # nothing to drop?  → fast-path
+            touches_soma = v == 0
+            stem_len = len(stem)
+
+            # ---------- prune decision --------------------------------
+            if touches_soma:
+                keep = stem_len >= min_soma_stem_nodes
+            else:
+                keep = stem_len >= min_twig_stem_nodes
+
+            if not keep:
+                changed = True
+                # drop the entire stem (no further subtree – it ends in a tip)
+                for n in stem:
+                    if n in to_drop:
+                        continue
+                    to_drop.add(n)
+                    for nb in adj[n]:
+                        degree[nb] -= 1          # update degrees on the fly
+                    degree[n] = 0
+
+    # ---- rebuild node / edge arrays ----------------------------------
     if not to_drop:
-        return np.ones(len(nodes), bool), edges
+        return np.ones(N, bool), edges
 
-    # ------------------------------------------------------------------
-    # 3. rebuild node list and edge list
-    # ------------------------------------------------------------------
-    keep_mask = np.ones(len(nodes), bool)
-    keep_mask[list(to_drop)] = False
-    keep_mask[0] = True                        # never drop the soma
+    keep = np.ones(N, bool)
+    keep[list(to_drop)] = False
+    keep[0] = True                              # never drop the soma
 
-    # old-index → new-index map
-    old2new = {old: new for new, old in enumerate(np.where(keep_mask)[0])}
-
+    remap = {old: new for new, old in enumerate(np.where(keep)[0])}
     new_edges = np.asarray(
-        [
-            (old2new[a], old2new[b])
-            for a, b in edges
-            if keep_mask[a] and keep_mask[b]
-        ],
+        [(remap[a], remap[b])
+         for a, b in edges
+         if keep[a] and keep[b]],
         dtype=np.int64,
     )
-    return keep_mask, new_edges
+
+    return keep, new_edges
+
 
 def _extreme_vertex(mesh: trimesh.Trimesh,
                     axis: str = "z",
@@ -991,6 +1149,62 @@ def _extreme_vertex(mesh: trimesh.Trimesh,
     ax_idx = {"x": 0, "y": 1, "z": 2}[axis.lower()]
     coords = mesh.vertices[:, ax_idx]
     return int(np.argmin(coords) if mode == "min" else np.argmax(coords))
+
+def _merge_nested_nodes(
+    nodes: np.ndarray,
+    radii: np.ndarray,              # primary estimator (e.g. "median")
+    node2verts: list[np.ndarray],
+    *,
+    inside_frac: float = 0.9,       # 1.0 = 100 % (strict), 0.99 ≈ 99 %, …
+    keep_root: bool = True,
+    tol: float = 1e-6,
+) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
+    """
+    Collapse node *j* into node *i* when at least ``inside_frac`` of *j*'s
+    radius lies inside *i*'s radius:
+
+        ‖cᵢ – cⱼ‖ + inside_frac · rⱼ  ≤  rᵢ  + tol
+
+    The “keeper” (larger sphere) inherits *j*’s vertex IDs.
+
+    Returns
+    -------
+    keep_mask      – Boolean mask to apply to all node-wise arrays.
+    node2verts_new – Updated mapping (same order as keep_mask==True).
+    old2new        – Vector mapping old → new node IDs (-1 if dropped).
+    """
+    if not (0.0 < inside_frac <= 1.0):
+        raise ValueError("inside_frac must be in (0, 1].")
+
+    N     = len(nodes)
+    order = np.argsort(-radii)            # big → small
+    tree  = KDTree(nodes)
+
+    keep_mask = np.ones(N, bool)
+    old2new   = np.arange(N, dtype=np.int64)
+
+    for i in order:
+        if keep_root and i == 0:
+            continue                      # never drop soma
+        if not keep_mask[i]:
+            continue                      # already swallowed
+
+        # neighbours that *might* fit: distance ≤ rᵢ + r_max
+        cand_idx = tree.query_ball_point(nodes[i], radii[i] + radii.max())
+        for j in cand_idx:
+            if j == i or not keep_mask[j] or radii[j] > radii[i]:
+                continue                  # j is larger or gone; skip
+
+            dist = np.linalg.norm(nodes[i] - nodes[j])
+            # modified containment test
+            if dist + inside_frac * radii[j] <= radii[i] + tol:
+                node2verts[i] = np.concatenate((node2verts[i], node2verts[j]))
+                keep_mask[j]  = False
+                old2new[j]    = old2new[i]
+
+    # compact node2verts into surviving order
+    node2verts_new = [node2verts[k] for k in np.where(keep_mask)[0]]
+    return keep_mask, node2verts_new, old2new
 
 # -----------------------------------------------------------------------------
 #  Skeletonization Public API
@@ -1012,7 +1226,7 @@ def skeletonize(
     soma_init_guess_axis: str  = "z",   # "x" | "y" | "z"
     soma_init_guess_mode: str  = "min", # "min" | "max"
     # --- geodesic sampling ---
-    target_shell_count: int = 500,
+    target_shell_count: int = 1000, # higher = more bins, smaller bin size
     min_cluster_vertices: int = 6,
     max_shell_width_factor: int = 50,
     # --- bridging disconnected patches ---
@@ -1022,12 +1236,12 @@ def skeletonize(
     # --- post‑processing ---
     # --- collapse soma-like nodes ---
     collapse_soma: bool = True,
-    collapse_soma_dist_factor: float = 1.15,
-    collapse_soma_radius_factor: float = 0.25,
+    collapse_soma_dist_factor: float = 1.2,
+    collapse_soma_radius_factor: float = 0.2,
     # --- prune tiny neurites ---
     prune_tiny_neurites: bool = True,
-    prune_min_branch_nodes: int = 50,
-    prune_min_branch_extent_factor: float = 1.8,
+    prune_min_twig_stem_nodes: int = 1,
+    prune_min_soma_stem_nodes: int = 30,
     # --- misc ---
     verbose: bool = False,
 ) -> Skeleton:
@@ -1134,6 +1348,7 @@ def skeletonize(
         soma_verts = {seed_vid}
     else:
         # pre skeletonization soma detection
+        _t0 = time.perf_counter()
         with _timed("↳  pre-skeletonization soma detection"):
             if detect_soma == "pre":
                 c_soma, r_soma, soma_verts = find_soma(
@@ -1155,57 +1370,22 @@ def skeletonize(
                 )
 
         if verbose:
-            soma_ms = time.perf_counter() - _global_start
+            soma_ms = time.perf_counter() - _t0
             
 
     # 1. binning along geodesic shells ----------------------------------
     with _timed("↳  bin surface vertices by geodesic distance"):
         v = mesh.vertices.view(np.ndarray)
         
-        components    = gsurf.components()
-        comp_vertices = [np.asarray(c, dtype=np.int64) for c in components]
-
-        soma_vids = np.fromiter(soma_verts, dtype=np.int64)
-        all_comps: list[list[np.ndarray]] = []
-        edge_m    = float(mesh.edges_unique_length.mean())
-
-        for cid, verts in enumerate(comp_vertices):
-
-            # -------- choose the *one* seed you used before ----------                                   
-            if np.intersect1d(verts, soma_vids).size:
-                seed_vid = int(
-                    soma_vids[
-                        np.argmax(np.linalg.norm(v[soma_vids] - c_soma, axis=1))
-                    ]
-                )
-            else:
-                seed_vid = int(verts[hash(cid) % len(verts)])
-
-            dist_vec = _dist_vec_for_component(gsurf, verts, seed_vid)
-            dist_sub = {int(v): float(d) for v, d in zip(verts, dist_vec)}
-
-            if not dist_sub:
-                continue
-
-            arc_len = max(dist_sub.values())
-            step    = max(edge_m * 2.0, arc_len / target_shell_count)
-
-            bins: list[list[int]] = []
-            while not any(bins) and step < edge_m * max_shell_width_factor:
-                bins = _geodesic_bins(dist_sub, step)
-                step *= 1.5
-
-            # --- build the component list for every bin ----------------------
-            for bin_verts in bins:
-                inner  = [vid for vid in bin_verts if vid not in soma_verts]
-                sub    = gsurf.induced_subgraph(inner)
-                comps  = []
-                for comp in sub.components():
-                    if len(comp) < min_cluster_vertices:
-                        continue
-                    comp_idx = np.fromiter((inner[i] for i in comp), dtype=np.int64)
-                    comps.append(comp_idx)
-                all_comps.append(comps)    
+        all_shells = _bin_geodesic_shells(
+            mesh,
+            gsurf,
+            c_soma=c_soma,
+            soma_verts=soma_verts,
+            target_shell_count=target_shell_count,
+            min_cluster_vertices=min_cluster_vertices,
+            max_shell_width_factor=max_shell_width_factor,
+        )
 
     # 2. create skeleton nodes ------------------------------------------
     with _timed("↳  compute bin centroids and radii"):
@@ -1217,9 +1397,9 @@ def skeletonize(
         vert2node: Dict[int, int] = {v: 0 for v in soma_verts} # map mesh-vertex ID to node ID
         next_id = 1
 
-        for shell_idx, comps in enumerate(all_comps):          # ← iterate over shells
-            for comp_idx in comps:                             #    iterate over comps
-                pts    = v[comp_idx]
+        for shells in all_shells:          # ← iterate over shells
+            for bin_ids in shells:                             #    iterate over shells
+                pts    = v[bin_ids]
                 centre = pts.mean(axis=0)                      # centre of component
 
                 d = np.linalg.norm(pts - centre, axis=1)  # radii sample
@@ -1233,16 +1413,34 @@ def skeletonize(
                 node_id = next_id
                 next_id += 1
                 nodes.append(centre)
-                node2verts.append(comp_idx)
-                for vv in comp_idx:
-                    vert2node[int(vv)] = node_id
+                node2verts.append(bin_ids)
+                for bin_id in bin_ids:
+                    vert2node[int(bin_id)] = node_id
 
         nodes_arr = np.asarray(nodes, dtype=np.float32)
         radii_dict = {
             k: np.asarray(v, dtype=np.float32) for k, v in radii.items()
         }
-        # check if we have soma candidates
+
         r_primary = radii_dict[radius_estimators[0]]
+        keep_mask, node2verts, _ = _merge_nested_nodes(
+            nodes_arr,
+            r_primary,
+            node2verts,
+        )
+
+        # apply the mask to every node-wise array
+        nodes_arr = nodes_arr[keep_mask]
+        for k in radii_dict:
+            radii_dict[k] = radii_dict[k][keep_mask]
+
+        # rebuild vert2node from the fresh node2verts
+        vert2node = {int(v): int(nid)
+                    for nid, verts in enumerate(node2verts)
+                    for v in verts}
+
+        # check if we have soma candidates
+        
         if detect_soma == "off" or detect_soma is False:
             has_soma = False
         else:
@@ -1250,9 +1448,10 @@ def skeletonize(
 
 
     if has_soma and detect_soma == "post":
+        _t0 = time.perf_counter() 
         with _timed("↳  post-skeletonization soma detection"):
-            c_soma, r_soma, soma_nodes = find_soma_with_radius(
-                nodes_arr, radii_dict[radius_estimators[0]]
+            c_soma, r_soma, soma_nodes, has_soma = find_soma_with_radius(
+                nodes_arr, radii_dict[radius_estimators[0]],
             )
 
             # 1. choose which candidate will become the new root
@@ -1283,6 +1482,9 @@ def skeletonize(
             for k in radii_dict:
                 radii_dict[k][0] = r_soma
 
+            if verbose:
+                soma_ms = time.perf_counter() - _t0
+
     # 3. edges from mesh connectivity -----------------------------------
     with _timed("↳  map mesh faces to skeleton edges"):
         edges_arr = _edges_from_mesh(
@@ -1295,7 +1497,6 @@ def skeletonize(
     # 4. collapse soma‑like / fat nodes ---------------------------
     if has_soma and collapse_soma:
         _t0 = time.perf_counter() 
-
         with _timed("↳  merge redundant near-soma nodes") as log:
             (nodes_arr, radii_arr, edges_arr, keep_mask) = _merge_near_soma_nodes(
                 nodes_arr,
@@ -1349,15 +1550,13 @@ def skeletonize(
     # 7. prune tiny sub-trees near the soma
     if has_soma and prune_tiny_neurites:
         _t0 = time.perf_counter()
-        with _timed("↳  prune tiny soma-attached branches"):
-            keep_mask, edges_mst = _prune_soma_neurites(
-                nodes_arr,
-                edges_mst,
-                c_soma,
-                radii_dict[radius_estimators[0]][0],
-                min_branch_nodes=prune_min_branch_nodes,           
-                min_branch_extent_factor=prune_min_branch_extent_factor,
-            )
+        with _timed("↳  prune tiny neurites"):
+            keep_mask, edges_mst = _prune_tiny_neurites(
+                    nodes_arr,
+                    edges_mst,
+                    min_twig_stem_nodes=prune_min_twig_stem_nodes,
+                    min_soma_stem_nodes=prune_min_soma_stem_nodes,       # primary neurites need ≥ 40 nodes …
+                )
             nodes_arr  = nodes_arr[keep_mask]
             for k in radii_dict:
                 radii_dict[k] = radii_dict[k][keep_mask]
@@ -1374,13 +1573,13 @@ def skeletonize(
 
         if post_ms > 1e-6:       # at least one optional stage ran
             print(f"{'TOTAL (soma + core + post)':<49}"
-                  f"… {total_ms:.1f} s "
-                  f"({soma_ms:.1f} + {core_ms:.1f} + {post_ms:.1f})")
+                  f"… {total_ms:.2f} s "
+                  f"({soma_ms:.2f} + {core_ms:.2f} + {post_ms:.2f})")
             print(f"({len(nodes_arr):,} nodes, {edges_mst.shape[0]:,} edges)")
         else:                    # no post-processing at all
             print(f"{'TOTAL (soma + core)':<49}"
-                  f"… {total_ms:.1f} s "
-                  f"({soma_ms:.1f} + {core_ms:.1f})")
+                  f"… {total_ms:.2f} s "
+                  f"({soma_ms:.2f} + {core_ms:.2f})")
 
     return Skeleton(nodes_arr, 
                     radii_dict, 
