@@ -45,6 +45,8 @@ class Skeleton:
     radii:  dict[str, np.ndarray]  # (N,)  float32
     edges: np.ndarray  # (E, 2) int64  – undirected, **sorted** pairs
     soma_verts: np.ndarray | None = None
+    node2verts: list[np.ndarray] | None = None
+    vert2node: dict[int, int] | None = None
 
     # ---------------------------------------------------------------------
     # sanity checks
@@ -192,18 +194,6 @@ class Skeleton:
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
-    @property
-    def soma_mask(self) -> np.ndarray | None:
-        """
-        Boolean mask over `nodes` that is True for vertices whose mesh
-        vertex lay on the detected soma surface (None if not available).
-        """
-        if self.soma_verts is None:
-            return None
-        mask = np.zeros(len(self.nodes), dtype=bool)
-        mask[list(self.soma_verts)] = True
-        return mask
-
     @property
     def r(self) -> np.ndarray:
         """Just the estimator name chosen by :py:meth:`recommend_radius`."""
@@ -608,7 +598,7 @@ def _merge_near_soma_nodes(
     r_soma: float,
     soma_merge_dist_factor: float,
     soma_merge_radius_factor: float,
-    node2mesh: dict[int, list[int]],
+    node2verts: list[np.ndarray],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Remove centroids that sit (a) well inside the soma volume or
@@ -672,7 +662,7 @@ def _merge_near_soma_nodes(
     merged_idx = np.where(~keep)[0]                 # the ones we collapsed
     if merged_idx.size:
         # number of mesh vertices represented by each centroid
-        weights = np.array([len(node2mesh[0]), *[len(node2mesh[i]) for i in merged_idx]],
+        weights = np.array([len(node2verts[0]), *[len(node2verts[i]) for i in merged_idx]],
                         dtype=np.float64)
 
         # centres to average
@@ -1093,18 +1083,37 @@ def skeletonize(
         post_ms = 0.0 # post-processing time
 
     @contextmanager
-    def _timed(label: str):
-        """Print *label* before the block and time its execution."""
-        if verbose:
-            print(f" {label:<47} …", end="", flush=True)
-            _t0 = time.perf_counter()
-            try:
-                yield
-            finally:
-                dt_ms = (time.perf_counter() - _t0)
-                print(f" {dt_ms:.1f} s")
-        else:
-            yield
+    def _timed(label: str, *, verbose: bool = True):      # keep the signature you like
+        """
+        Context manager that prints
+
+            ↳  <label padded to width> … <elapsed> s
+                └─ <sub-message 1>
+                └─ <sub-message 2>
+                …
+
+        Use the yielded `log()` callback to record any number of sub-messages.
+        """
+        if not verbose:
+            yield lambda *_: None
+            return
+
+        PAD = 47                       # keeps the old alignment
+        print(f" {label:<{PAD}} …", end="", flush=True)
+        t0 = time.perf_counter()
+        _msgs: list[str] = []
+
+        def log(msg: str) -> None:
+            _msgs.append(str(msg))
+
+        try:
+            yield log                   # the `with`-body gets this function
+        finally:
+            dt = time.perf_counter() - t0
+            print(f" {dt:.2f} s")       # finish first line
+
+            for m in _msgs:             # then all sub-messages, nicely indented
+                print(f"      └─ {m}")
 
     # 0. soma vertices ---------------------------------------------------
     with _timed("↳  build surface graph"):
@@ -1157,7 +1166,7 @@ def skeletonize(
         comp_vertices = [np.asarray(c, dtype=np.int64) for c in components]
 
         soma_vids = np.fromiter(soma_verts, dtype=np.int64)
-        all_bins  : list[list[int]] = []
+        all_comps: list[list[np.ndarray]] = []
         edge_m    = float(mesh.edges_unique_length.mean())
 
         for cid, verts in enumerate(comp_vertices):
@@ -1175,9 +1184,9 @@ def skeletonize(
             dist_vec = _dist_vec_for_component(gsurf, verts, seed_vid)
             dist_sub = {int(v): float(d) for v, d in zip(verts, dist_vec)}
 
-            # -------- adaptive shell binning (unchanged) -------------
             if not dist_sub:
                 continue
+
             arc_len = max(dist_sub.values())
             step    = max(edge_m * 2.0, arc_len / target_shell_count)
 
@@ -1186,52 +1195,53 @@ def skeletonize(
                 bins = _geodesic_bins(dist_sub, step)
                 step *= 1.5
 
-            all_bins.extend(bins)
-        
+            # --- build the component list for every bin ----------------------
+            for bin_verts in bins:
+                inner  = [vid for vid in bin_verts if vid not in soma_verts]
+                sub    = gsurf.induced_subgraph(inner)
+                comps  = []
+                for comp in sub.components():
+                    if len(comp) < min_cluster_vertices:
+                        continue
+                    comp_idx = np.fromiter((inner[i] for i in comp), dtype=np.int64)
+                    comps.append(comp_idx)
+                all_comps.append(comps)    
+
     # 2. create skeleton nodes ------------------------------------------
     with _timed("↳  compute bin centroids and radii"):
         nodes: List[np.ndarray] = [c_soma]
         radii: Dict[str, List[float]] = {
             est: [r_soma] for est in radius_estimators
         }
-        node2mesh: List[np.ndarray] = [np.fromiter(soma_verts, dtype=np.int64)]
-        v2n: Dict[int, int] = {v: 0 for v in soma_verts}
+        node2verts: List[np.ndarray] = [np.fromiter(soma_verts, dtype=np.int64)] # map node ID to mesh-vertex IDs
+        vert2node: Dict[int, int] = {v: 0 for v in soma_verts} # map mesh-vertex ID to node ID
         next_id = 1
 
-        for verts in all_bins:
-            inner = [vid for vid in verts if vid not in soma_verts]
-            if len(inner) < min_cluster_vertices:
-                continue
-            sub = gsurf.induced_subgraph(inner)
-            for comp in sub.components():
-                if len(comp) < min_cluster_vertices:
-                    continue
-                comp_idx = np.fromiter((inner[i] for i in comp), dtype=np.int64)
-                pts      = v[comp_idx]
-                centre   = pts.mean(axis=0)
-                d = np.linalg.norm(pts - centre, axis=1)
+        for shell_idx, comps in enumerate(all_comps):          # ← iterate over shells
+            for comp_idx in comps:                             #    iterate over comps
+                pts    = v[comp_idx]
+                centre = pts.mean(axis=0)                      # centre of component
 
-                # collect radii for every requested estimator
+                d = np.linalg.norm(pts - centre, axis=1)  # radii sample
+
+                # store radii for every estimator
                 for est in radius_estimators:
-                    val = _estimate_radius(
-                        d, method=est, trim_fraction=0.05
+                    radii.setdefault(est, []).append(
+                        _estimate_radius(d, method=est, trim_fraction=0.05)
                     )
-                    radii.setdefault(est, []).append(val)
 
                 node_id = next_id
                 next_id += 1
                 nodes.append(centre)
-                node2mesh.append(comp_idx)
+                node2verts.append(comp_idx)
                 for vv in comp_idx:
-                    v2n[int(vv)] = node_id
+                    vert2node[int(vv)] = node_id
 
         nodes_arr = np.asarray(nodes, dtype=np.float32)
         radii_dict = {
             k: np.asarray(v, dtype=np.float32) for k, v in radii.items()
         }
-
         # check if we have soma candidates
-   
         r_primary = radii_dict[radius_estimators[0]]
         if detect_soma == "off" or detect_soma is False:
             has_soma = False
@@ -1256,14 +1266,14 @@ def skeletonize(
                 nodes_arr[[0, new_root]] = nodes_arr[[new_root, 0]]
                 for k in radii_dict:
                     radii_dict[k][[0, new_root]] = radii_dict[k][[new_root, 0]]
-                node2mesh[0], node2mesh[new_root] = node2mesh[new_root], node2mesh[0]
+                node2verts[0], node2verts[new_root] = node2verts[new_root], node2verts[0]
 
                 # 3. fix the vertex-to-node lookup used later by _edges_from_mesh()
-                for vid, nid in v2n.items():
-                    if   nid == 0:
-                        v2n[vid] = new_root
+                for vid, nid in vert2node.items():
+                    if nid == 0:
+                        vert2node[vid] = new_root
                     elif nid == new_root:
-                        v2n[vid] = 0
+                        vert2node[vid] = 0
 
                 # 4. make the ID set consistent
                 soma_nodes = np.where(soma_nodes == new_root, 0, soma_nodes)
@@ -1277,7 +1287,7 @@ def skeletonize(
     with _timed("↳  map mesh faces to skeleton edges"):
         edges_arr = _edges_from_mesh(
             mesh.edges_unique,
-            v2n,
+            vert2node,
             n_mesh_verts=len(mesh.vertices),
         )
     
@@ -1286,7 +1296,7 @@ def skeletonize(
     if has_soma and collapse_soma:
         _t0 = time.perf_counter() 
 
-        with _timed("↳  merge redundant near-soma nodes"):
+        with _timed("↳  merge redundant near-soma nodes") as log:
             (nodes_arr, radii_arr, edges_arr, keep_mask) = _merge_near_soma_nodes(
                 nodes_arr,
                 radii_dict[radius_estimators[0]],
@@ -1295,15 +1305,20 @@ def skeletonize(
                 r_soma=radii_dict[radius_estimators[0]][0],
                 soma_merge_dist_factor=collapse_soma_dist_factor,
                 soma_merge_radius_factor=collapse_soma_radius_factor,
-                node2mesh=node2mesh,
+                node2verts=node2verts,
             )
+            log(f"{(~keep_mask).sum()} nodes merged into soma")
 
-            # --- rebuild the list ---
+            # --- rebuild the soma list ---
             removed_idx = np.where(~keep_mask)[0]          # nodes that were collapsed
+            node2verts_keep = [node2verts[i] for i in np.where(keep_mask)[0]]
             for idx in removed_idx:
-                soma_verts.update(node2mesh[idx])          # node2mesh from stage 2
-
-            # apply same mask to all radius columns
+                soma_verts.update(node2verts[idx])          # node2verts from stage 2
+                node2verts_keep[0] = np.concatenate((node2verts_keep[0], node2verts[idx]))
+            node2verts = node2verts_keep
+            vert2node = {int(v): int(new_id)
+                        for new_id, verts in enumerate(node2verts)
+                        for v in verts}
             for k in radii_dict:
                 radii_dict[k] = radii_dict[k][keep_mask]
                 radii_dict[k][0] = radii_arr[0]
@@ -1317,7 +1332,7 @@ def skeletonize(
     # 5. Connect all components ------------------------------
     if bridge_gaps:
         _t0 = time.perf_counter() 
-        with _timed("↳  bridge skeleton gaps"):
+        with _timed("↳  bridge skeleton gaps")  as log:
             edges_arr = _bridge_gaps(
                 nodes_arr, edges_arr, 
                 bridge_max_factor = bridge_max_factor,
@@ -1346,8 +1361,10 @@ def skeletonize(
             nodes_arr  = nodes_arr[keep_mask]
             for k in radii_dict:
                 radii_dict[k] = radii_dict[k][keep_mask]
-            # node2mesh = [node2mesh[i] for i in np.where(keep_mask)[0]]
-
+            node2verts = [node2verts[i] for i in np.where(keep_mask)[0]]
+            vert2node = {int(v): int(new_id)
+                        for new_id, verts in enumerate(node2verts)
+                        for v in verts}
         if verbose:
             post_ms += time.perf_counter() - _t0
 
@@ -1359,6 +1376,7 @@ def skeletonize(
             print(f"{'TOTAL (soma + core + post)':<49}"
                   f"… {total_ms:.1f} s "
                   f"({soma_ms:.1f} + {core_ms:.1f} + {post_ms:.1f})")
+            print(f"({len(nodes_arr):,} nodes, {edges_mst.shape[0]:,} edges)")
         else:                    # no post-processing at all
             print(f"{'TOTAL (soma + core)':<49}"
                   f"… {total_ms:.1f} s "
@@ -1367,5 +1385,7 @@ def skeletonize(
     return Skeleton(nodes_arr, 
                     radii_dict, 
                     edges_mst, 
-                    soma_verts=np.asarray(list(soma_verts), dtype=np.int64)
+                    soma_verts=np.asarray(list(soma_verts), dtype=np.int64),
+                    node2verts=node2verts,
+                    vert2node=vert2node,
             )
