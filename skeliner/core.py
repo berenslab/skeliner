@@ -1117,6 +1117,63 @@ def _extreme_vertex(mesh: trimesh.Trimesh,
     coords = mesh.vertices[:, ax_idx]
     return int(np.argmin(coords) if mode == "min" else np.argmax(coords))
 
+# --- utilities ------------------------------------------------------------
+def _merge_nested_nodes(
+    nodes: np.ndarray,
+    radii: np.ndarray,              # primary estimator (e.g. "median")
+    node2verts: list[np.ndarray],
+    *,
+    inside_frac: float = 0.9,       # 1.0 = 100 % (strict), 0.99 ≈ 99 %, …
+    keep_root: bool = True,
+    tol: float = 1e-6,
+) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
+    """
+    Collapse node *j* into node *i* when at least ``inside_frac`` of *j*'s
+    radius lies inside *i*'s radius:
+
+        ‖cᵢ – cⱼ‖ + inside_frac · rⱼ  ≤  rᵢ  + tol
+
+    The “keeper” (larger sphere) inherits *j*’s vertex IDs.
+
+    Returns
+    -------
+    keep_mask      – Boolean mask to apply to all node-wise arrays.
+    node2verts_new – Updated mapping (same order as keep_mask==True).
+    old2new        – Vector mapping old → new node IDs (-1 if dropped).
+    """
+    if not (0.0 < inside_frac <= 1.0):
+        raise ValueError("inside_frac must be in (0, 1].")
+
+    N     = len(nodes)
+    order = np.argsort(-radii)            # big → small
+    tree  = KDTree(nodes)
+
+    keep_mask = np.ones(N, bool)
+    old2new   = np.arange(N, dtype=np.int64)
+
+    for i in order:
+        if keep_root and i == 0:
+            continue                      # never drop soma
+        if not keep_mask[i]:
+            continue                      # already swallowed
+
+        # neighbours that *might* fit: distance ≤ rᵢ + r_max
+        cand_idx = tree.query_ball_point(nodes[i], radii[i] + radii.max())
+        for j in cand_idx:
+            if j == i or not keep_mask[j] or radii[j] > radii[i]:
+                continue                  # j is larger or gone; skip
+
+            dist = np.linalg.norm(nodes[i] - nodes[j])
+            # modified containment test
+            if dist + inside_frac * radii[j] <= radii[i] + tol:
+                node2verts[i] = np.concatenate((node2verts[i], node2verts[j]))
+                keep_mask[j]  = False
+                old2new[j]    = old2new[i]
+
+    # compact node2verts into surviving order
+    node2verts_new = [node2verts[k] for k in np.where(keep_mask)[0]]
+    return keep_mask, node2verts_new, old2new
+
 # -----------------------------------------------------------------------------
 #  Skeletonization Public API
 # -----------------------------------------------------------------------------
@@ -1137,7 +1194,7 @@ def skeletonize(
     soma_init_guess_axis: str  = "z",   # "x" | "y" | "z"
     soma_init_guess_mode: str  = "min", # "min" | "max"
     # --- geodesic sampling ---
-    target_shell_count: int = 500,
+    target_shell_count: int = 800,
     min_cluster_vertices: int = 6,
     max_shell_width_factor: int = 50,
     # --- bridging disconnected patches ---
@@ -1331,8 +1388,26 @@ def skeletonize(
         radii_dict = {
             k: np.asarray(v, dtype=np.float32) for k, v in radii.items()
         }
-        # check if we have soma candidates
+
         r_primary = radii_dict[radius_estimators[0]]
+        keep_mask, node2verts, old2new = _merge_nested_nodes(
+            nodes_arr,
+            r_primary,
+            node2verts,
+        )
+
+        # apply the mask to every node-wise array
+        nodes_arr = nodes_arr[keep_mask]
+        for k in radii_dict:
+            radii_dict[k] = radii_dict[k][keep_mask]
+
+        # rebuild vert2node from the fresh node2verts
+        vert2node = {int(v): int(nid)
+                    for nid, verts in enumerate(node2verts)
+                    for v in verts}
+
+        # check if we have soma candidates
+        
         if detect_soma == "off" or detect_soma is False:
             has_soma = False
         else:
