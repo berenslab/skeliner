@@ -220,31 +220,6 @@ def _surface_graph(mesh: trimesh.Trimesh) -> ig.Graph:
 #  Soma detection API
 # -----------------------------------------------------------------------------
 
-def _likely_has_soma(
-    radii: np.ndarray,
-    skew_thresh: float = 1.0,       # how asymmetric must the distribution be?
-    tail_frac: float = 0.02,        # top X % of nodes we call the “tail”
-    tail_ratio: float = 3.0,        # how much larger than the median must the tail be?
-) -> bool:
-    """
-    Heuristic: regard a soma as present when
-    1.  the radius distribution is sufficiently right-skewed, *and*
-    2.  the radii in the extreme right tail are much larger than typical radii.
-    """
-    if radii.size == 0:
-        return False          # empty container -> no soma
-
-    # --- 1. global shape: skewness -----------------------------------------
-    # scipy.stats.skew uses Fisher’s definition (0 ⇒ symmetric).
-    if skew(radii, bias=False) < skew_thresh:
-        return False
-
-    # --- 2. local extreme: fat right tail ----------------------------------
-    p_tail  = np.percentile(radii, 100 * (1 - tail_frac))
-    med     = np.median(radii)
-
-    return bool(p_tail > med * tail_ratio)
-
 def _find_soma(
     nodes: np.ndarray,
     radii: np.ndarray,
@@ -1184,37 +1159,34 @@ def _detect_soma(
     radii: dict[str, np.ndarray],
     node2verts: list[np.ndarray],
     vert2node: dict[int, int],
+    soma_radius_percentile_threshold: float,
+    soma_radius_distance_factor: float,
+    soma_min_nodes: int,
     *,
     detect_soma: bool,
     radius_key: str,
     log: Callable | None = None,          # pass in the `log()` from _timed
 ) -> tuple[np.ndarray, dict[str, np.ndarray],
            list[np.ndarray], dict[int, int],
-           np.ndarray, float, bool]:
+           np.ndarray, bool]:
     """
     Make node 0 the final soma centroid and update all related arrays/maps.
 
     Returns
     -------
-    nodes, radii, node2verts, vert2node, c_soma, r_soma, has_soma
+    nodes, radii, node2verts, vert2node, c_soma, has_soma
     """
     if not detect_soma:
         c_soma = nodes[0]
         r_soma = float(radii[radius_key][0])
-        return (nodes, radii, node2verts, vert2node, c_soma, r_soma, False)
-
-    # quick symmetry test – should we even try?
-    has_soma = _likely_has_soma(radii[radius_key])
-    if not has_soma:
-        if log:
-            log("No convincing soma signature – skipping.")
-        c_soma = nodes[0]
-        r_soma = float(radii[radius_key][0])
-        return (nodes, radii, node2verts, vert2node, c_soma, r_soma, False)
+        return (nodes, radii, node2verts, vert2node, c_soma, False)
 
     # a) geometric detection ------------------------------------------------
     c_soma, r_soma, soma_nodes, has_soma = _find_soma(
         nodes, radii[radius_key],
+        pct_large=soma_radius_percentile_threshold,
+        dist_factor=soma_radius_distance_factor,
+        min_keep=soma_min_nodes,
     )
 
     if not has_soma:                     # heuristic failed – keep status quo
@@ -1222,7 +1194,7 @@ def _detect_soma(
             log("find_soma() returned <min_keep>; continuing without soma.")
         c_soma = nodes[0]
         r_soma = float(radii[radius_key][0])
-        return (nodes, radii, node2verts, vert2node, c_soma, r_soma, False)
+        return (nodes, radii, node2verts, vert2node, c_soma, False)
 
     # b) ensure the fattest soma candidate is node 0 ------------------------
     if 0 not in soma_nodes:
@@ -1251,7 +1223,7 @@ def _detect_soma(
     for k in radii:
         radii[k][0] = r_soma
 
-    return (nodes, radii, node2verts, vert2node, c_soma, r_soma, True)
+    return (nodes, radii, node2verts, vert2node, c_soma, True)
 
 
 # -----------------------------------------------------------------------------
@@ -1265,7 +1237,9 @@ def skeletonize(
     # --- soma detection ---
     detect_soma: bool = True, 
     soma_seed_point: np.ndarray | list | tuple | None = None,
-    soma_seed_radius: float | None = None,
+    soma_radius_percentile_threshold: float = 99.9,
+    soma_radius_distance_factor: float = 4, 
+    soma_min_nodes: int = 3, 
     # -- for post-skeletonization soma detection only--
     soma_init_guess_axis: str  = "z",   # "x" | "y" | "z"
     soma_init_guess_mode: str  = "min", # "min" | "max"
@@ -1422,17 +1396,14 @@ def skeletonize(
             merge_kwargs={},        # tune `inside_frac`/`keep_root` here if needed
         )
 
-        r_primary = radii_dict[radius_estimators[0]]
-        has_soma  = _likely_has_soma(r_primary) if detect_soma else False
-
-
     # 3. soma detection (optional) -----------------------------------
     _t0 = time.perf_counter()
     with _timed("↳  post-skeletonization soma detection") as log:
-        (nodes_arr, radii_dict, node2verts, vert2node,
-            c_soma, r_soma, has_soma,
-        ) = _detect_soma(
+        (nodes_arr, radii_dict, node2verts, vert2node, c_soma, has_soma) = _detect_soma(
             nodes_arr, radii_dict, node2verts, vert2node,
+            soma_radius_percentile_threshold=soma_radius_percentile_threshold,
+            soma_radius_distance_factor=soma_radius_distance_factor,
+            soma_min_nodes=soma_min_nodes,
             detect_soma=detect_soma,
             radius_key=radius_estimators[0],
             log=log,
