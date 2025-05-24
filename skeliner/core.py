@@ -220,15 +220,7 @@ def _surface_graph(mesh: trimesh.Trimesh) -> ig.Graph:
 # -----------------------------------------------------------------------------
 #  Soma detection API
 # -----------------------------------------------------------------------------
-# def _likely_has_soma(
-#     radii: np.ndarray,
-#     ratio: float = 3.5,       
-#     min_nodes: int = 5,      
-# ) -> bool:
-#     """
-#     Return True if a plausible soma cluster is present.
-#     """
-#     return sum(radii > np.mean(radii) * ratio) > min_nodes
+
 def _likely_has_soma(
     radii: np.ndarray,
     skew_thresh: float = 1.0,       # how asymmetric must the distribution be?
@@ -252,203 +244,13 @@ def _likely_has_soma(
     p_tail  = np.percentile(radii, 100 * (1 - tail_frac))
     med     = np.median(radii)
 
-    return p_tail > med * tail_ratio
-
-def _probe_radius(
-    mesh: trimesh.Trimesh,
-    *,
-    probe_radius: float | None,
-    probe_multiplier: float,
-) -> float:
-    """Return the probe radius in *mesh units*.
-
-    If *probe_radius* is given, return it as‑is.  Otherwise compute
-    `probe_multiplier × mean(mesh.edges_unique_length)`.
-    """
-    if probe_radius is not None:
-        return float(probe_radius)
-
-    edge_mean = mesh.edges_unique_length.mean()
-    return probe_multiplier * edge_mean
-
-
-def _find_seed(
-    counts: np.ndarray,
-    gsurf: ig.Graph,
-    *,
-    top_seed_frac: float = 0.01,
-) -> int:
-    """Pick a seed inside the densest *blob* rather than the densest *vertex*.
-
-    Parameters
-    ----------
-    counts
-        Local‑density array (`len == n_vertices`).
-    gsurf
-        Surface graph for connected‑component look‑ups.
-    top_seed_frac
-        Fraction of top‑ranked vertices considered as seed candidates.  A value
-        between 0.5–2 % is usually sufficient.
-    """
-    k = max(1, int(len(counts) * top_seed_frac))
-    top_idx = np.argpartition(counts, -k)[-k:]      # unsorted top‑k set
-
-    sub = gsurf.induced_subgraph(top_idx)
-    comps = sub.components()
-
-    # component score: |comp| × mean(counts)  → favours large & dense blobs
-    scores = [len(c) * counts[top_idx[c]].mean() for c in comps]
-    best_comp = comps[int(np.argmax(scores))]
-
-    comp_vertices = top_idx[best_comp]
-    seed_local = int(np.argmax(counts[comp_vertices]))
-    return int(comp_vertices[seed_local])
-
-
-def _soma_surface_vertices(
-    mesh: trimesh.Trimesh,
-    *,
-    gsurf: ig.Graph | None = None,
-    probe_radius: float | None = None,
-    probe_multiplier: float = 8.0,
-    seed_density_cutoff: float = 0.5,
-    dilation_steps: int = 1,
-    top_seed_frac: float = 0.01,
-    seed_point: np.ndarray | list | tuple | None = None,
-) -> Set[int]:
-    """Return the set of mesh‑vertex indices that form the detected soma shell."""
-    v = mesh.vertices.view(np.ndarray)
-    gsurf = gsurf if gsurf is not None else _surface_graph(mesh)
-
-    # 1. Probe radius ----------------------------------------------------------------
-    probe_r = _probe_radius(mesh, probe_radius=probe_radius, probe_multiplier=probe_multiplier)
-
-    # 2. Local density (vertex neighbour counts) --------------------------------------
-    counts = np.asarray(
-        KDTree(v).query_ball_point(v, probe_r, return_length=True, workers=-1)
-    )
-
-    # 3. Seed selection ---------------------------------------------------------------
-    if seed_point is not None:
-        seed_idx = int(np.argmin(np.linalg.norm(v - np.asarray(seed_point), axis=1)))
-    else:
-        seed_idx = _find_seed(counts, gsurf, top_seed_frac=top_seed_frac)
-
-    # 4. Threshold relative to seed density ------------------------------------------
-    density_thr = counts[seed_idx] * (1 - seed_density_cutoff)
-    dense_mask = counts >= density_thr
-    dense_vids = np.where(dense_mask)[0]
-
-    # 5. Connected component containing the seed -------------------------------------
-    sub = gsurf.induced_subgraph(dense_vids)
-    comps = sub.components()
-    seed_sub_idx = int(np.where(dense_vids == seed_idx)[0][0])
-    comp_id = comps.membership[seed_sub_idx]
-    soma_set: Set[int] = {int(dense_vids[i]) for i in comps[comp_id]}
-
-    # 6. Optional geodesic dilations --------------------------------------------------
-    for _ in range(dilation_steps):
-        boundary = {
-            nb
-            for vv in soma_set
-            for nb in gsurf.neighbors(vv)
-            if nb not in soma_set
-        }
-        soma_set.update(boundary)
-
-    return soma_set
+    return bool(p_tail > med * tail_ratio)
 
 def find_soma(
-    mesh: trimesh.Trimesh,
-    *,
-    probe_radius: float | None = None,
-    probe_multiplier: float = 8.0,
-    seed_density_cutoff: float = 0.30,
-    dilation_steps: int = 1,
-    top_seed_frac: float = 0.02,
-    seed_point: np.ndarray | list | tuple | None = None,
-    gsurf: ig.Graph | None = None,
-) -> Tuple[np.ndarray, float, Set[int]]:
-    """Detect the soma surface and return its centroid, radius, and vertex set.
-
-    Parameters
-    ----------
-    mesh
-        Watertight neuron mesh (coordinates in any consistent physical unit).
-    probe_radius
-        Absolute probe radius in *mesh units*.  Overrides `probe_multiplier` if
-        given.
-    probe_multiplier
-        Adaptive probe size: `probe_multiplier × ⟨edge length⟩`.
-    density_relative_drop
-        Keep vertices whose local density is at least `(1‑density_relative_drop)`
-        of the seed’s density.
-    dilation_steps
-        Number of geodesic 1‑ring dilations applied to the detected core.
-    top_seed_frac
-        Fraction of highest‑density vertices used for seed‑component sampling.
-    seed_point
-        Optional 3‑D coordinate that forces the seed to the nearest vertex.
-    gsurf
-        Pre‑computed surface graph (reuse for speed).
-    verbose
-        If *True*, print timing and parameter info to stdout.
-
-    Returns
-    -------
-    centre, radius, soma_verts
-        • *centre*: centroid of the soma vertices.\
-        • *radius*: 90‑th percentile of vertex distances from the centroid.\
-        • *soma_verts*: set of vertex indices belonging to the soma shell.
-    """
-    soma_verts = _soma_surface_vertices(
-        mesh,
-        gsurf=gsurf,
-        probe_radius=probe_radius,
-        probe_multiplier=probe_multiplier,
-        seed_density_cutoff=seed_density_cutoff,
-        dilation_steps=dilation_steps,
-        top_seed_frac=top_seed_frac,
-        seed_point=seed_point,
-    )
-
-    pts = mesh.vertices.view(np.ndarray)[list(soma_verts)]
-    centre = pts.mean(axis=0)
-    if probe_radius:
-        # use the probe radius as a hard limit
-        radius = probe_radius
-    else:
-        radius = float(np.percentile(np.linalg.norm(pts - centre, axis=1), 90))
-    return centre, radius, soma_verts
-
-def find_soma_with_seed(
-    mesh: trimesh.Trimesh,
-    seed_point: np.ndarray | list | tuple | None = None,
-    seed_radius: float | None = 5_000.,
-    gsurf: ig.Graph | None = None,
-):
-    """Refine soma location given a seed point.
-
-    A user‑supplied seed point is snapped to the closest mesh vertex and a
-    geodesic flood‑fill up to lam × prob_radius returns the soma patch.
-    """
-    v = mesh.vertices.view(np.ndarray)
-    seed_vid = int(np.argmin(np.linalg.norm(v - seed_point, axis=1)))
-    cutoff = seed_radius
-    if gsurf is None:
-        gsurf = _surface_graph(mesh)
-    dists = gsurf.shortest_paths_dijkstra(source=seed_vid, weights="weight")[0]
-    soma_verts = {vid for vid, d in enumerate(dists) if d <= cutoff}
-    pts = v[list(soma_verts)]
-    centre = pts.mean(axis=0)
-    radius = np.percentile(np.linalg.norm(pts - centre, axis=1), 90)
-    return centre, radius, soma_verts
-
-def find_soma_with_radius(
     nodes: np.ndarray,
     radii: np.ndarray,
     *,
-    pct_large : float = 99.95,
+    pct_large : float = 99.9,
     dist_factor: float = 4.0,   # keep nodes within dist_factor × R_max
     min_keep: int = 3,
 ) -> tuple[np.ndarray, float, np.ndarray, bool]:
@@ -566,6 +368,62 @@ def _geodesic_bins(dist_dict: Dict[int, float], step: float) -> List[List[int]]:
 
     return bins
 
+def _split_comp_if_elongated(
+    comp_idx: np.ndarray,
+    v: np.ndarray,
+    *,
+    aspect_thr: float = 2.0,          # “acceptable” λ1 / λ2
+    min_cluster_vertices: int = 6,
+    max_vertices_per_slice: int | None = None,
+):
+    """
+    Yield 1–k vertex arrays after optional PCA-based splitting.
+
+    •  If λ1/λ2 ≤ aspect_thr  → keep the component intact.
+    •  Otherwise slice it into ⌈λ1/λ2 / aspect_thr⌉ roughly equal chunks.
+
+    The automatic rule guarantees that **every resulting slice will have
+    an aspect ratio ≤ aspect_thr** (plus a small safety margin).
+    """
+
+    if comp_idx.size < min_cluster_vertices:
+        yield comp_idx
+        return
+
+    # ── fast 3-D PCA ----------------------------------------------------
+    pts        = v[comp_idx].astype(np.float32)
+    cov        = np.cov(pts, rowvar=False)
+    evals, vec = np.linalg.eigh(cov)           # ascending order
+    elong      = evals[-1] / (evals[-2] + 1e-9)
+
+    if elong <= aspect_thr:
+        yield comp_idx
+        return
+
+    # ── how many slices?  automatic & bounded  --------------------------
+    n_split = int(np.ceil(elong / aspect_thr))
+
+    # 1. never make more slices than vertices allow
+    n_split = min(n_split, comp_idx.size // min_cluster_vertices)
+
+    # 2. optional extra guard: cap by absolute slice size
+    if max_vertices_per_slice is not None:
+        n_split = min(n_split, int(np.ceil(comp_idx.size / max_vertices_per_slice)))
+
+    if n_split <= 1:
+        yield comp_idx
+        return
+
+    # ── 1-D k-means via quantile cuts  ----------------------------------
+    axis = vec[:, -1]                 # major axis (unit vector)
+    proj = pts @ axis                # scalar coordinate
+    cuts = np.quantile(proj, np.linspace(0, 1, n_split + 1))
+
+    for lo, hi in zip(cuts[:-1], cuts[1:]):
+        m = (proj >= lo) & (proj <= hi)
+        if m.sum() >= min_cluster_vertices:
+            yield comp_idx[m]
+
 def _bin_geodesic_shells(
     mesh: trimesh.Trimesh,
     gsurf: ig.Graph,
@@ -575,6 +433,11 @@ def _bin_geodesic_shells(
     target_shell_count: int        = 500,
     min_cluster_vertices: int      = 6,
     max_shell_width_factor: float  = 50.0,
+    # -- split elongated shells (optional) ------------------------
+    split_elongated_shells: bool = True,
+    split_aspect_thr: float = 3.0,             # λ1 / λ2
+    split_min_cluster_vertices: int = 50,       # minimum size of a cluster to split
+    split_max_vertices_per_slice: int | None = None,  # max size of a slice
 ) -> List[List[np.ndarray]]:
     """
     Cluster every connected surface patch into sets of *geodesic shells*.
@@ -684,7 +547,15 @@ def _bin_geodesic_shells(
                 comp_idx = np.fromiter(
                     (inner[i] for i in comp), dtype=np.int64
                 )
-                comps.append(comp_idx)
+                # comps.append(comp_idx)
+                if split_elongated_shells and len(comp) < 1500: # hard-coded for now, if too large, might be a soma
+                    for part in _split_comp_if_elongated(comp_idx, v, 
+                                                            aspect_thr=split_aspect_thr, 
+                                                            min_cluster_vertices=split_min_cluster_vertices,
+                                                            max_vertices_per_slice=split_max_vertices_per_slice):
+                        comps.append(part)
+                else:
+                    comps.append(comp_idx)
 
             all_shells.append(comps)
 
@@ -1221,10 +1092,14 @@ def skeletonize(
     # -- for post-skeletonization soma detection only--
     soma_init_guess_axis: str  = "z",   # "x" | "y" | "z"
     soma_init_guess_mode: str  = "min", # "min" | "max"
-    # --- geodesic sampling ---
+    # --- geodesic binning ---
     target_shell_count: int = 1000, # higher = more bins, smaller bin size
     min_cluster_vertices: int = 6,
     max_shell_width_factor: int = 50,
+    split_elongated_shells: bool = True,
+    split_aspect_thr: float = 3.0,  # λ1 / λ2
+    split_min_cluster_vertices: int = 15,
+    split_max_vertices_per_slice: int | None = None,
     # --- bridging disconnected patches ---
     bridge_gaps: bool = True,
     bridge_max_factor: float | None = None,
@@ -1237,7 +1112,7 @@ def skeletonize(
     # --- prune tiny neurites ---
     prune_tiny_neurites: bool = True,
     prune_min_twig_stem_nodes: int = 1,
-    prune_min_soma_stem_nodes: int = 30,
+    prune_min_soma_stem_nodes: int = 50,
     # --- misc ---
     verbose: bool = False,
 ) -> Skeleton:
@@ -1330,7 +1205,6 @@ def skeletonize(
         gsurf = _surface_graph(mesh)
 
 
-
     # 1. binning along geodesic shells ----------------------------------
     with _timed("↳  bin surface vertices by geodesic distance"):
         v = mesh.vertices.view(np.ndarray)
@@ -1355,6 +1229,10 @@ def skeletonize(
             target_shell_count=target_shell_count,
             min_cluster_vertices=min_cluster_vertices,
             max_shell_width_factor=max_shell_width_factor,
+            split_elongated_shells=split_elongated_shells,
+            split_aspect_thr=split_aspect_thr,
+            split_min_cluster_vertices=split_min_cluster_vertices,
+            split_max_vertices_per_slice=split_max_vertices_per_slice,
         )
 
     # 2. create skeleton nodes ------------------------------------------
@@ -1419,7 +1297,7 @@ def skeletonize(
     if has_soma and detect_soma:
         _t0 = time.perf_counter() 
         with _timed("↳  post-skeletonization soma detection") as log:
-            c_soma, r_soma, soma_nodes, has_soma = find_soma_with_radius(
+            c_soma, r_soma, soma_nodes, has_soma = find_soma(
                 nodes_arr, radii_dict[radius_estimators[0]],
             )
 
