@@ -1215,13 +1215,9 @@ def skeletonize(
     # --- radius estimation ---
     radius_estimators: list[str] = ["median", "mean", "trim"],
     # --- soma detection ---
-    detect_soma: str | bool = "post", # options: {"post", "pre", "seed", "off" or False}
+    detect_soma: bool = True, 
     soma_seed_point: np.ndarray | list | tuple | None = None,
     soma_seed_radius: float | None = None,
-    soma_seed_radius_multiplier: float = 8.0,
-    soma_density_cutoff: float = 0.50,
-    soma_dilation_steps: int = 1,
-    soma_top_seed_frac: float = 0.02,
     # -- for post-skeletonization soma detection only--
     soma_init_guess_axis: str  = "z",   # "x" | "y" | "z"
     soma_init_guess_mode: str  = "min", # "min" | "max"
@@ -1233,7 +1229,7 @@ def skeletonize(
     bridge_gaps: bool = True,
     bridge_max_factor: float | None = None,
     bridge_recalc_after: int | None = None,
-    # --- post‑processing ---
+    # -- post‑processing --
     # --- collapse soma-like nodes ---
     collapse_soma: bool = True,
     collapse_soma_dist_factor: float = 1.2,
@@ -1333,50 +1329,24 @@ def skeletonize(
     with _timed("↳  build surface graph"):
         gsurf = _surface_graph(mesh)
 
-    if detect_soma == "post" or detect_soma == "off" or detect_soma is False:
-        # delay soma detection until after skeletonization
-        # but seed point is still needed for binning
-        if soma_seed_point is not None:
-            seed_vid = int(np.argmin(np.linalg.norm(mesh.vertices.view(np.ndarray) - np.asarray(soma_seed_point), axis=1)))
-        else:
-            seed_vid = _extreme_vertex(mesh,
-                                       axis=soma_init_guess_axis,
-                                       mode=soma_init_guess_mode)
 
-        c_soma     = mesh.vertices.view(np.ndarray)[seed_vid]
-        r_soma     = float(mesh.edges_unique_length.mean()) * 3   # hard-coded, not ideal
-        soma_verts = {seed_vid}
-    else:
-        # pre skeletonization soma detection
-        _t0 = time.perf_counter()
-        with _timed("↳  pre-skeletonization soma detection"):
-            if detect_soma == "pre":
-                c_soma, r_soma, soma_verts = find_soma(
-                    mesh,
-                    gsurf=gsurf,
-                    probe_radius=soma_seed_radius,
-                    probe_multiplier=soma_seed_radius_multiplier,
-                    seed_density_cutoff=soma_density_cutoff,
-                    dilation_steps=soma_dilation_steps,
-                    top_seed_frac=soma_top_seed_frac,
-                    seed_point=soma_seed_point,
-                )
-            elif detect_soma == "seed" and soma_seed_point is not None:
-                c_soma, r_soma, soma_verts = find_soma_with_seed(
-                    mesh,
-                    gsurf=gsurf,
-                    seed_point=soma_seed_point,
-                    seed_radius=soma_seed_radius,
-                )
-
-        if verbose:
-            soma_ms = time.perf_counter() - _t0
-            
 
     # 1. binning along geodesic shells ----------------------------------
     with _timed("↳  bin surface vertices by geodesic distance"):
         v = mesh.vertices.view(np.ndarray)
         
+        # pseudo-random soma seed point for kick-starting the binning
+        if soma_seed_point is not None:
+            seed_vid = int(np.argmin(np.linalg.norm(mesh.vertices.view(np.ndarray) - np.asarray(soma_seed_point), axis=1)))
+        else:
+            seed_vid = _extreme_vertex(mesh,
+                                        axis=soma_init_guess_axis,
+                                        mode=soma_init_guess_mode)
+
+        c_soma     = mesh.vertices.view(np.ndarray)[seed_vid]
+        r_soma     = float(mesh.edges_unique_length.mean()) * 3   if soma_seed_radius is None else float(soma_seed_radius)
+        soma_verts = {seed_vid}
+
         all_shells = _bin_geodesic_shells(
             mesh,
             gsurf,
@@ -1440,19 +1410,22 @@ def skeletonize(
                     for v in verts}
 
         # check if we have soma candidates
-        
-        if detect_soma == "off" or detect_soma is False:
+        if detect_soma is False:
             has_soma = False
         else:
             has_soma = _likely_has_soma(r_primary)
 
 
-    if has_soma and detect_soma == "post":
+    if has_soma and detect_soma:
         _t0 = time.perf_counter() 
-        with _timed("↳  post-skeletonization soma detection"):
+        with _timed("↳  post-skeletonization soma detection") as log:
             c_soma, r_soma, soma_nodes, has_soma = find_soma_with_radius(
                 nodes_arr, radii_dict[radius_estimators[0]],
             )
+
+            if not has_soma:
+                log("No soma found, continuing without it.\n\tTry `detect_soma=False` or\n"
+                    "\tpick a smaller `target_shell_count`")
 
             # 1. choose which candidate will become the new root
             if 0 not in soma_nodes:
