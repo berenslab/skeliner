@@ -173,9 +173,9 @@ def plot_projection(
     hist = hist.T  # transpose for imshow (row = y)
 
     # ─────────────────── optional soma overlay ────────────────────────────
-    if draw_soma_mask and skel.soma_verts is not None:
+    if draw_soma_mask and skel.soma is not None:
         xy_soma = _project(
-            mesh.vertices[np.asarray(skel.soma_verts, dtype=np.int64)], ix, iy
+            mesh.vertices[np.asarray(skel.soma.verts, dtype=np.int64)], ix, iy
         ) * scale[1]                                 # note: mesh scale!
         keep_soma = _apply_window(xy_soma)           # respect crop
         xy_soma   = xy_soma[keep_soma]
@@ -486,9 +486,9 @@ def diagnostic(
             ax.add_collection(lc)
 
     # ------------- optional soma shell --------------------------------------
-    if draw_soma_mask and skel.soma_verts is not None and len(skel.soma_verts):
+    if draw_soma_mask and skel.soma is not None:
         xy_soma = _project(
-            mesh.vertices[np.asarray(skel.soma_verts, dtype=np.int64)], ix, iy
+            mesh.vertices[np.asarray(skel.soma.verts, dtype=np.int64)], ix, iy
         ) * scl_mesh
         soma_keep = _mask_window(xy_soma)
         xy_soma   = xy_soma[soma_keep]

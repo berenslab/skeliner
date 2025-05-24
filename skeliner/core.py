@@ -2,7 +2,7 @@ import heapq
 import time
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Set, Tuple
 
@@ -21,64 +21,114 @@ __all__ = [
 # -----------------------------------------------------------------------------
 @dataclass(slots=True)
 class Soma:
-    """Ellipsoidal soma model.
+    """
+    Ellipsoidal soma model.
+
+    The ellipsoid is defined in *world coordinates* by the triple
+    `(centre, axes, R)` that satisfies
+
+        **world = R @ body + centre**
+
+    where *body* points live inside the unit sphere ``‖body‖ ≤ 1``.
 
     Parameters
     ----------
     centre : (3,) float32
-        XYZ world‑space coordinates of the ellipsoid centre.
-    axes : (3,) float32
-        Semi‑axis lengths **sorted** (a ≥ b ≥ c).
-    R : (3,3) float32
-        Rotation matrix whose *columns* are the ellipsoid's principal axes
-        expressed in world space.  ``R @ body = world``.
-
-    Notes
-    -----
-    *The soma lives only in memory.*  Down‑stream file formats like SWC
-    keep the scalar **equivalent radius** exposed via :pyattr:`equiv_radius`.
+        XYZ world-space coordinates of the ellipsoid centre.
+    axes   : (3,) float32
+        Semi-axis lengths **sorted** as  a ≥ b ≥ c.
+    R      : (3,3) float32
+        Right-handed rotation matrix whose *columns* are the principal
+        axes expressed in world space.
+    verts  : optional (N,) int64
+        Mesh-vertex IDs belonging to the soma surface.
     """
 
-    centre: np.ndarray  # shape (3,)
-    axes:   np.ndarray  # shape (3,)
-    R:      np.ndarray  # shape (3,3)
-    verts: np.ndarray | None = None   # 1-D int64 mesh-vertex IDs
+    centre: np.ndarray                # (3,)
+    axes:   np.ndarray                # (3,)
+    R:      np.ndarray                # (3,3)
+    verts:  np.ndarray | None = None  # (N,)
 
-    # -----------------------------------------------------------------
-    # helpers
-    # -----------------------------------------------------------------
+    # ---- cached helper (not part of the public API) -----------------------
+    _W: np.ndarray = field(init=False, repr=False)   # (3,3) affine map
+
+    # ---------------------------------------------------------------------
+    # dataclass life-cycle
+    # ---------------------------------------------------------------------
+    def __post_init__(self) -> None:
+        self.centre = np.asarray(self.centre, dtype=np.float32).reshape(3)
+        self.axes   = np.asarray(self.axes,   dtype=np.float32).reshape(3)
+        self.R      = np.asarray(self.R,      dtype=np.float32).reshape(3, 3)
+
+        # ---- fast safety checks -----------------------------------------
+        if not np.all(np.diff(self.axes) <= 0):
+            raise ValueError("axes must be sorted a ≥ b ≥ c")
+        det = np.linalg.det(self.R)
+        if not np.isclose(det, 1.0, atol=1e-3):
+            raise ValueError(f"R must be a proper rotation (det ≈ 1); got {det:.3f}")
+
+        # ---- pre-compute affine map  ξ = (x−c) @ W -----------------------
+        self._W = (self.R / self.axes).astype(np.float32)
+
+    # ---------------------------------------------------------------------
+    # geometry
+    # ---------------------------------------------------------------------
     def _body_coords(self, x: np.ndarray) -> np.ndarray:
-        """World → body coordinates where the ellipsoid becomes the unit sphere."""
-        return (self.R.T @ (x - self.centre).T).T / self.axes
+        """World ➜ body coords where the ellipsoid becomes the *unit sphere*."""
+        x = np.asarray(x, dtype=np.float32)
+        return (x - self.centre) @ self._W
 
-    # -----------------------------------------------------------------
-    # public API
-    # -----------------------------------------------------------------
     def contains(self, x: np.ndarray, *, inside_frac: float = 1.0) -> np.ndarray:
-        """Return *bool mask* telling if each point lies within the scaled ellipsoid."""
-        ξ = self._body_coords(np.asarray(x, dtype=np.float32))
+        """
+        Boolean mask telling whether points lie **inside** the scaled ellipsoid
+        (‖ξ‖ ≤ inside_frac).
+        """
+        ξ = self._body_coords(x)
         ρ2 = (ξ ** 2).sum(axis=-1)
         return ρ2 <= inside_frac ** 2
 
+    def distance(self, x: np.ndarray) -> np.ndarray:
+        """
+        **Signed distance** (in *world units*)  
+        Negative inside, zero on the surface, positive outside.
+        """
+        ξ = self._body_coords(x)
+        return np.linalg.norm(ξ, axis=-1) - 1.0
+
+    # ---------------------------------------------------------------------
+    # derived scalars
+    # ---------------------------------------------------------------------
     @property
     def equiv_radius(self) -> float:
-        """Sphere radius of equal volume ( (abc)^{1/3} )."""
+        """Radius of the sphere with equal volume ((abc)^{1/3})."""
         a, b, c = self.axes
         return float((a * b * c) ** (1.0 / 3.0))
 
-    # -----------------------------------------------------------------
+    # ---------------------------------------------------------------------
     # constructors
-    # -----------------------------------------------------------------
+    # ---------------------------------------------------------------------
     @classmethod
-    def fit(cls, pts: np.ndarray) -> "Soma":
-        """Fast PCA‑based ellipsoid fit to *pts* (≥3× axes)."""
-        pts = np.asarray(pts, dtype=np.float32)
-        centre = pts.mean(axis=0)
-        cov = np.cov(pts - centre, rowvar=False)
+    def fit(cls, verts: np.ndarray) -> "Soma":
+        """
+        Fast PCA-based ellipsoid fit to ≥ 3×`axes` sample points.
+        Rough 95 %-mass envelope, same idea as the original *sphere* fit.
+        """
+        verts = np.asarray(verts, dtype=np.float32)
+        centre = verts.mean(axis=0)
+        cov = np.cov(verts - centre, rowvar=False)
         evals, evecs = np.linalg.eigh(cov)           # λ₁ ≤ λ₂ ≤ λ₃
-        axes = np.sqrt(evals * 5.0)[::-1]            # quick 95 % mass
-        R = evecs[:, ::-1]                           # reorder to a≥b≥c
-        return cls(centre, axes, R, verts=None)
+        axes = np.sqrt(evals * 5.0)[::-1]            # 95 % of mass → 2 σ ≈ √5
+        R = evecs[:, ::-1]                           # reorder to a ≥ b ≥ c
+        return cls(centre, axes, R, verts=verts)
+
+    @classmethod
+    def from_sphere(cls, centre: np.ndarray, radius: float, verts: np.ndarray | None) -> "Soma":
+        """Backward-compat helper – treat a sphere as a = b = c = radius."""
+        centre = np.asarray(centre, dtype=np.float32)
+        axes   = np.full(3, float(radius), dtype=np.float32)
+        R      = np.eye(3, dtype=np.float32)
+        return cls(centre, axes, R, verts=verts)
+
 
 @dataclass(slots=True)
 class Skeleton:
@@ -460,8 +510,7 @@ def _bin_geodesic_shells(
     mesh: trimesh.Trimesh,
     gsurf: ig.Graph,
     *,
-    c_soma: np.ndarray,                       # canonical soma centre
-    soma_verts: Set[int],                     # mesh-vertex IDs of the soma shell
+    soma: Soma,
     target_shell_count: int        = 500,
     min_cluster_vertices: int      = 6,
     max_shell_width_factor: float  = 50.0,
@@ -511,6 +560,10 @@ def _bin_geodesic_shells(
     """
     v   = mesh.vertices.view(np.ndarray)
     e_m = float(mesh.edges_unique_length.mean())     # mean mesh-edge length
+
+    c_soma       = soma.centre
+    soma_verts   = set() if soma.verts is None else set(map(int, soma.verts))
+    soma_vids    = np.fromiter(soma_verts, dtype=np.int64)
 
     # ------------------------------------------------------------------
     # build a vertex list for every connected surface patch
@@ -1430,14 +1483,15 @@ def skeletonize(
                                         axis=soma_init_guess_axis,
                                         mode=soma_init_guess_mode)
 
-        c_soma = mesh_vertices[seed_vid]
-        soma_verts = {seed_vid}
+        avg_edge = float(mesh.edges_unique_length.mean())
+        soma = Soma.from_sphere(mesh_vertices[seed_vid],
+                                radius=avg_edge,
+                                verts=np.array([seed_vid], dtype=np.int64))
+
 
         all_shells = _bin_geodesic_shells(
-            mesh,
-            gsurf,
-            c_soma=c_soma,
-            soma_verts=soma_verts,
+            mesh, gsurf,
+            soma=soma,                           # <── NEW
             target_shell_count=target_shell_count,
             min_cluster_vertices=min_cluster_vertices,
             max_shell_width_factor=max_shell_width_factor,
@@ -1550,7 +1604,7 @@ def skeletonize(
     return Skeleton(nodes_arr, 
                     radii_dict, 
                     edges_mst, 
-                    soma_verts=np.asarray(list(soma_verts), dtype=np.int64),
+                    soma=soma,
                     node2verts=node2verts,
                     vert2node=vert2node,
             )
