@@ -10,7 +10,6 @@ import igraph as ig
 import numpy as np
 import trimesh
 from scipy.spatial import KDTree
-from scipy.stats import skew
 
 __all__ = [
     "Skeleton",
@@ -20,6 +19,66 @@ __all__ = [
 # -----------------------------------------------------------------------------
 # Dataclass
 # -----------------------------------------------------------------------------
+@dataclass(slots=True)
+class Soma:
+    """Ellipsoidal soma model.
+
+    Parameters
+    ----------
+    centre : (3,) float32
+        XYZ world‑space coordinates of the ellipsoid centre.
+    axes : (3,) float32
+        Semi‑axis lengths **sorted** (a ≥ b ≥ c).
+    R : (3,3) float32
+        Rotation matrix whose *columns* are the ellipsoid's principal axes
+        expressed in world space.  ``R @ body = world``.
+
+    Notes
+    -----
+    *The soma lives only in memory.*  Down‑stream file formats like SWC
+    keep the scalar **equivalent radius** exposed via :pyattr:`equiv_radius`.
+    """
+
+    centre: np.ndarray  # shape (3,)
+    axes:   np.ndarray  # shape (3,)
+    R:      np.ndarray  # shape (3,3)
+    verts: np.ndarray | None = None   # 1-D int64 mesh-vertex IDs
+
+    # -----------------------------------------------------------------
+    # helpers
+    # -----------------------------------------------------------------
+    def _body_coords(self, x: np.ndarray) -> np.ndarray:
+        """World → body coordinates where the ellipsoid becomes the unit sphere."""
+        return (self.R.T @ (x - self.centre).T).T / self.axes
+
+    # -----------------------------------------------------------------
+    # public API
+    # -----------------------------------------------------------------
+    def contains(self, x: np.ndarray, *, inside_frac: float = 1.0) -> np.ndarray:
+        """Return *bool mask* telling if each point lies within the scaled ellipsoid."""
+        ξ = self._body_coords(np.asarray(x, dtype=np.float32))
+        ρ2 = (ξ ** 2).sum(axis=-1)
+        return ρ2 <= inside_frac ** 2
+
+    @property
+    def equiv_radius(self) -> float:
+        """Sphere radius of equal volume ( (abc)^{1/3} )."""
+        a, b, c = self.axes
+        return float((a * b * c) ** (1.0 / 3.0))
+
+    # -----------------------------------------------------------------
+    # constructors
+    # -----------------------------------------------------------------
+    @classmethod
+    def fit(cls, pts: np.ndarray) -> "Soma":
+        """Fast PCA‑based ellipsoid fit to *pts* (≥3× axes)."""
+        pts = np.asarray(pts, dtype=np.float32)
+        centre = pts.mean(axis=0)
+        cov = np.cov(pts - centre, rowvar=False)
+        evals, evecs = np.linalg.eigh(cov)           # λ₁ ≤ λ₂ ≤ λ₃
+        axes = np.sqrt(evals * 5.0)[::-1]            # quick 95 % mass
+        R = evecs[:, ::-1]                           # reorder to a≥b≥c
+        return cls(centre, axes, R, verts=None)
 
 @dataclass(slots=True)
 class Skeleton:
@@ -44,7 +103,7 @@ class Skeleton:
     nodes: np.ndarray  # (N, 3) float32
     radii:  dict[str, np.ndarray]  # (N,)  float32
     edges: np.ndarray  # (E, 2) int64  – undirected, **sorted** pairs
-    soma_verts: np.ndarray | None = None
+    soma: Soma | None = None
     node2verts: list[np.ndarray] | None = None
     vert2node: dict[int, int] | None = None
 
@@ -57,8 +116,9 @@ class Skeleton:
             raise ValueError("nodes and radii length mismatch")
         if self.edges.ndim != 2 or self.edges.shape[1] != 2:
             raise ValueError("edges must be (E, 2)")
-        if self.soma_verts is not None and self.soma_verts.ndim != 1:
-            raise ValueError("soma_verts must be 1-D")
+        if self.soma is not None:
+            if self.soma.verts is not None and self.soma.verts.ndim != 1:
+                raise ValueError("soma_verts must be 1-D")
 
     # ---------------------------------------------------------------------
     # helpers
