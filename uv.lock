@@ -1512,6 +1512,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "igraph" },
+    { name = "matplotlib" },
     { name = "numpy" },
     { name = "python-openctm" },
     { name = "scipy", version = "1.13.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -1522,7 +1523,6 @@ dependencies = [
 [package.optional-dependencies]
 dev = [
     { name = "ipykernel" },
-    { name = "matplotlib" },
     { name = "maturin" },
     { name = "pytest" },
     { name = "ruff" },
@@ -1534,7 +1534,7 @@ dev = [
 requires-dist = [
     { name = "igraph", specifier = ">=0.11.8" },
     { name = "ipykernel", marker = "extra == 'dev'", specifier = ">=6.29.5" },
-    { name = "matplotlib", marker = "extra == 'dev'", specifier = ">=3.10.3" },
+    { name = "matplotlib", specifier = ">=3.10.3" },
     { name = "maturin", marker = "extra == 'dev'" },
     { name = "numpy", specifier = ">=2.0.2" },
     { name = "pytest", marker = "extra == 'dev'" },
