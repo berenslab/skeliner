@@ -61,11 +61,8 @@ class Soma:
         self.R      = np.asarray(self.R,      dtype=np.float32).reshape(3, 3)
 
         # ---- fast safety checks -----------------------------------------
-        # if not np.all(np.diff(self.axes) <= 0):
-        #     raise ValueError("axes must be sorted a ≥ b ≥ c")
-        # det = np.linalg.det(self.R)
-        # if not np.isclose(det, 1.0, atol=1e-3):
-        #     raise ValueError(f"R must be a proper rotation (det ≈ 1); got {det:.3f}")
+        if not np.all(np.diff(self.axes) <= 0):
+            raise ValueError("axes must be sorted a ≥ b ≥ c")
 
         # ---- pre-compute affine map  ξ = (x−c) @ W -----------------------
         self._W = (self.R / self.axes).astype(np.float32)
@@ -87,13 +84,59 @@ class Soma:
         ρ2 = (ξ ** 2).sum(axis=-1)
         return ρ2 <= inside_frac ** 2
 
-    def distance(self, x: np.ndarray) -> np.ndarray:
+    def distance(
+        self, x: np.ndarray, *, atol: float = 1e-9, max_iter: int = 64
+    ) -> np.ndarray | float:
         """
-        **Signed distance** (in *world units*)  
-        Negative inside, zero on the surface, positive outside.
+        Exact signed Euclidean distance to the ellipsoid surface
+        ( > 0 outside | ≈ 0 on surface | < 0 inside ).
         """
-        ξ = self._body_coords(x)
-        return np.linalg.norm(ξ, axis=-1) - 1.0
+        x = np.asanyarray(x, dtype=np.float64)
+        single_input = x.ndim == 1
+        if single_input:
+            x = x[None, :]
+
+        # --- body-coordinates: align to principal axes --------------------
+        p   = (x - self.centre) @ self.R          # (N,3)
+        a   = self.axes
+        a2  = a * a
+        r2  = (p**2 / a2).sum(axis=1)             # ‖p‖² in unit-sphere space
+        out = r2 > 1.0 + 1e-12                    # bool mask
+        dist = np.empty(len(p), dtype=np.float64)
+
+        # ---------------- OUTSIDE points  ---------------------------------
+        if out.any():
+            po = p[out]
+            t  = np.zeros(len(po))
+            for _ in range(max_iter):
+                denom = t[:, None] + a2
+                f   = (a2 * po**2 / denom**2).sum(1) - 1.0
+                fp  = (-2.0 * a2 * po**2 / denom**3).sum(1)
+                dt  = -f / fp
+                t  += dt
+                if np.all(np.abs(dt) < atol):
+                    break
+            xs  = a2 * po / (t[:, None] + a2)     # nearest surface points
+            dist[out] = np.linalg.norm(xs - po, axis=1)
+
+        # ---------------- INSIDE points  ----------------------------------
+        inn = ~out
+        if inn.any():
+            idx_inn = np.where(inn)[0]
+            pi      = p[inn]
+            s       = np.sqrt(r2[inn])            # radial factor
+            nz      = s > atol                    # not at exact centre
+
+            # general interior points
+            if nz.any():
+                xs   = pi[nz] / s[nz, None]       # radial projection
+                dist[idx_inn[nz]] = -np.linalg.norm(xs - pi[nz], axis=1)
+
+            # exact centre → shortest half-axis
+            if (~nz).any():
+                dist[idx_inn[~nz]] = -a.min()
+
+        return dist[0] if single_input else dist
 
     # ---------------------------------------------------------------------
     # derived scalars
@@ -152,7 +195,7 @@ class Skeleton:
     nodes: np.ndarray  # (N, 3) float32
     radii:  dict[str, np.ndarray]  # (N,)  float32
     edges: np.ndarray  # (E, 2) int64  – undirected, **sorted** pairs
-    soma: Soma | None = None
+    soma: Soma
     node2verts: list[np.ndarray] | None = None
     vert2node: dict[int, int] | None = None
 
@@ -738,7 +781,7 @@ def _merge_near_soma_nodes(
     fat    = r_primary >= fat_scale * r_sphere
     keep_mask = ~(inside | (fat & near))
     keep_mask[0] = True
-    merged_idx       = np.where(~keep_mask)[0]
+    merged_idx = np.where(~keep_mask)[0]
 
     if log:
         log(f"{(~keep_mask).sum()} nodes merged into soma")
