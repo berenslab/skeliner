@@ -1,6 +1,6 @@
 from . import io
 from .core import Skeleton, skeletonize
-from .plot import plot_projection as plot2d
+from .plot import projection as plot2d
 from .plot import threeviews as plot3v
 
 __all__ = [

@@ -11,6 +11,8 @@ import numpy as np
 import trimesh
 from scipy.spatial import KDTree
 
+from . import io
+
 __all__ = [
     "Skeleton",
     "skeletonize",
@@ -244,22 +246,17 @@ class Skeleton:
             Unit conversion factor applied to *both* coordinates and radii when
             writing; useful e.g. for nm→µm conversion.
         """        
-        path = Path(path)
-        parent = _bfs_parents(self.edges, len(self.nodes), root=0)
-        nodes = self.nodes
-        if radius_metric is None:
-            radii = self.r
-        else:
-            if radius_metric not in self.radii:
-                raise ValueError(f"Unknown radius estimator '{radius_metric}'")
-            radii = self.radii[radius_metric]
-        with path.open("w", encoding="utf8") as fh:
-            if include_header:
-                fh.write("# id type x y z radius parent\n")
-            for idx, (p, r, pa) in enumerate(zip(nodes * scale, radii * scale, parent), start=1):
-                swc_type = 1 if idx == 1 else 0
-                fh.write(f"{idx} {swc_type} {p[0]} {p[1]} {p[2]} {r} {pa + 1 if pa != -1 else -1}\n")
+        io.to_swc(self, path, include_header=include_header, scale=scale, radius_metric=radius_metric)
 
+    def to_npz(self, path: str | Path) -> None:
+        """Write the skeleton to a compressed NumPy archive.
+
+        Parameters
+        ----------
+        path
+            Output filename.
+        """
+        io.to_npz(self, path)
     # ------------------------------------------------------------------
     # validation
     # ------------------------------------------------------------------
@@ -777,7 +774,7 @@ def _merge_near_soma_nodes(
 
     # --- decide which nodes survive ---------------------------------
     inside = soma.contains(nodes, inside_frac=near_scale)
-    near   = np.linalg.norm(nodes - soma.centre, axis=1) < near_scale * r_sphere
+    near   = soma.distance(nodes) < (near_scale * r_sphere)
     fat    = r_primary >= fat_scale * r_sphere
     keep_mask = ~(inside | (fat & near))
     keep_mask[0] = True
@@ -1049,124 +1046,212 @@ def _build_mst(nodes: np.ndarray, edges: np.ndarray) -> np.ndarray:
     mst = g.spanning_tree(weights="weight")
     return np.asarray(sorted(tuple(sorted(e)) for e in mst.get_edgelist()), dtype=np.int64)
 
-def _prune_tiny_neurites(
+def _prune_neurites(
     nodes: np.ndarray,
     radii_dict: dict[str, np.ndarray],
     node2verts: list[np.ndarray],
     edges: np.ndarray,
     *,
-    r_soma: float,
-    extent_factor_tip: float  = 1.2,   #  tip twigs  (<–× r_soma)
-    extent_factor_soma: float = 3.0,   #  soma stems (<–× r_soma)
-    fallback: bool = True,            # also honour min_*_stem_nodes
-    min_twig_stem_nodes: int = 5,
-    min_soma_stem_nodes: int = 30,
-) -> tuple[np.ndarray, dict[str, np.ndarray],
-           list[np.ndarray], dict[int, int], np.ndarray]:
+    soma: Soma,
+    d_max_tip  : float = 1.0,   # µm beyond ellipsoid for ordinary neurites
+    d_max_soma : float = 3.0,   # µm beyond ellipsoid for stems touching soma
+):
     """
-    Drop terminal sub-trees that do **not** exit a small sphere around the
-    soma.  A sub-tree is considered *tiny* when
+    Remove **entire neurites** that remain within an expanded ellipsoid
+    (distance-to-surface ≤ `d_max_*`).  Works with arbitrarily branched tips.
 
-        max‖x_sub – x_root‖  <  R_lim
+    – A *neurite* is the entire connected component that hangs off the main
+      tree if you cut the unique edge that leads toward the soma (root 0).
 
-    with
-
-        R_lim = { extent_factor_tip  × r_soma   (ordinary terminals)
-                { extent_factor_soma × r_soma   (direct soma stems)
-
-    Parameters
-    ----------
-    r_soma
-        Envelope radius of the soma (already refined in step 3).
-    extent_factor_tip / _soma
-        Multipliers that set the allowed extent.  Increase them if you keep
-        deleting spines or stubby branches you actually need.
-    fallback
-        Apply the *old* node-count heuristic **in addition** – useful if you
-        want behaviour identical to the legacy code.
-
-    Returns
-    -------
-    Updated  (nodes, radii_dict, node2verts, vert2node, edges)
+    – Two distance thresholds are used:
+        • components whose **root edge is NOT the soma** → `d_max_tip`
+        • components **directly attached** to the soma  → `d_max_soma`
     """
     N = len(nodes)
-    degree  = np.bincount(edges.ravel(), minlength=N)
-    parent  = _bfs_parents(edges, N, root=0)
+    parent = _bfs_parents(edges, N, root=0)        # 0-based IDs, −1 at root
 
-    # build adjacency list once
-    adj: list[list[int]] = [[] for _ in range(N)]
+    # 1. build adjacency once
+    adj = [[] for _ in range(N)]
     for a, b in edges:
         adj[a].append(b)
         adj[b].append(a)
 
-    to_drop: set[int] = set()
-    todo    : list[int] = [v for v in range(1, N) if degree[v] == 1]
+    # 2. components reachable after cutting each edge (except cycles → forest)
+    to_drop = set()
+    visited = np.zeros(N, bool)
 
-    while todo:
-        leaf = todo.pop()
-        if leaf in to_drop or degree[leaf] != 1:
+    for child in range(1, N):                      # node 0 is soma
+        if visited[child]:
             continue
 
-        # -------- climb up the stem ----------------------------------
-        stem = []
-        v = leaf
-        while v != 0 and degree[v] <= 2:        # straight shaft
-            stem.append(v)
-            v = parent[v]
-
-        if not stem:            # <── bail out early
+        par = parent[child]
+        if par == -1:                              # should not happen in a tree
             continue
 
-        touches_soma = (v == 0)
-        pts          = nodes[stem]
-        extent       = np.linalg.norm(pts - nodes[0], axis=1).max()
-        if touches_soma:
-            tiny = extent < extent_factor_soma * r_soma
-            if fallback:
-                tiny &= len(stem) < min_soma_stem_nodes
-        else:
-            tiny = extent < extent_factor_tip * r_soma
-            if fallback:
-                tiny &= len(stem) < min_twig_stem_nodes
-
-        if not tiny:
-            continue
-
-        # mark for deletion & update degrees
-        for n in stem:
-            if n in to_drop:
+        # ----- walk away from soma collecting the component -------------
+        comp = []
+        stack = [child]
+        while stack:
+            v = stack.pop()
+            if visited[v]:
                 continue
-            to_drop.add(n)
-            for nb in adj[n]:
-                degree[nb] -= 1
-                if degree[nb] == 1 and nb not in to_drop:
-                    todo.append(nb)
-            degree[n] = 0                     # fully removed
+            visited[v] = True
+            comp.append(v)
+            for nb in adj[v]:
+                if nb == par:                      # do not step back toward soma
+                    continue
+                if parent[nb] == v or parent[v] == nb:
+                    stack.append(nb)
 
-    # ---- nothing pruned ------------------------------------------------
+        # maximum outward distance of *this* component
+        max_d = soma.distance(nodes[comp]).max()
+
+        # decide which threshold to use
+        thr = d_max_soma if par == 0 else d_max_tip
+        if max_d <= thr:
+            to_drop.update(comp)
+
+    # 3. rebuild the tables exactly like in the legacy routine -----------
     if not to_drop:
-        return nodes, radii_dict, node2verts, {v: i for i, vs in enumerate(node2verts) for v in vs}, edges
+        vert2node = {int(v): i for i, vs in enumerate(node2verts) for v in vs}
+        return nodes, radii_dict, node2verts, vert2node, edges
 
-    # ---- rebuild all tables -------------------------------------------
     keep = np.ones(N, bool)
     keep[list(to_drop)] = False
-    keep[0] = True                              # never drop the soma
+    keep[0] = True
 
     remap = {old: new for new, old in enumerate(np.where(keep)[0])}
 
-    nodes     = nodes[keep]
-    node2_new = [node2verts[i] for i in np.where(keep)[0]]
-    radii_new = {k: v[keep].copy() for k, v in radii_dict.items()}
-    edges_new = np.asarray(
+    nodes_new     = nodes[keep]
+    node2verts_new = [node2verts[i] for i in np.where(keep)[0]]
+    radii_new     = {k: v[keep].copy() for k, v in radii_dict.items()}
+    edges_new     = np.asarray(
         [(remap[a], remap[b]) for a, b in edges if keep[a] and keep[b]],
         dtype=np.int64,
     )
+    vert2node = {int(v): i for i, vs in enumerate(node2verts_new) for v in vs}
 
-    vert2node = {int(v): int(i)
-                 for i, verts in enumerate(node2_new)
-                 for v in verts}
+    return nodes_new, radii_new, node2verts_new, vert2node, edges_new
 
-    return nodes, radii_new, node2_new, vert2node, edges_new
+
+# def _prune_tiny_neurites(
+#     nodes: np.ndarray,
+#     radii_dict: dict[str, np.ndarray],
+#     node2verts: list[np.ndarray],
+#     edges: np.ndarray,
+#     *,
+#     r_soma: float,
+#     extent_factor_tip: float  = 1.2,   #  tip twigs  (<–× r_soma)
+#     extent_factor_soma: float = 3.0,   #  soma stems (<–× r_soma)
+#     fallback: bool = True,            # also honour min_*_stem_nodes
+#     min_twig_stem_nodes: int = 5,
+#     min_soma_stem_nodes: int = 30,
+# ) -> tuple[np.ndarray, dict[str, np.ndarray],
+#            list[np.ndarray], dict[int, int], np.ndarray]:
+#     """
+#     Drop terminal sub-trees that do **not** exit a small sphere around the
+#     soma.  A sub-tree is considered *tiny* when
+
+#         max‖x_sub – x_root‖  <  R_lim
+
+#     with
+
+#         R_lim = { extent_factor_tip  × r_soma   (ordinary terminals)
+#                 { extent_factor_soma × r_soma   (direct soma stems)
+
+#     Parameters
+#     ----------
+#     r_soma
+#         Envelope radius of the soma (already refined in step 3).
+#     extent_factor_tip / _soma
+#         Multipliers that set the allowed extent.  Increase them if you keep
+#         deleting spines or stubby branches you actually need.
+#     fallback
+#         Apply the *old* node-count heuristic **in addition** – useful if you
+#         want behaviour identical to the legacy code.
+
+#     Returns
+#     -------
+#     Updated  (nodes, radii_dict, node2verts, vert2node, edges)
+#     """
+#     N = len(nodes)
+#     degree  = np.bincount(edges.ravel(), minlength=N)
+#     parent  = _bfs_parents(edges, N, root=0)
+
+#     # build adjacency list once
+#     adj: list[list[int]] = [[] for _ in range(N)]
+#     for a, b in edges:
+#         adj[a].append(b)
+#         adj[b].append(a)
+
+#     to_drop: set[int] = set()
+#     todo    : list[int] = [v for v in range(1, N) if degree[v] == 1]
+
+#     while todo:
+#         leaf = todo.pop()
+#         if leaf in to_drop or degree[leaf] != 1:
+#             continue
+
+#         # -------- climb up the stem ----------------------------------
+#         stem = []
+#         v = leaf
+#         while v != 0 and degree[v] <= 2:        # straight shaft
+#             stem.append(v)
+#             v = parent[v]
+
+#         if not stem:            # <── bail out early
+#             continue
+
+#         touches_soma = (v == 0)
+#         pts          = nodes[stem]
+#         extent       = np.linalg.norm(pts - nodes[0], axis=1).max()
+#         if touches_soma:
+#             tiny = extent < extent_factor_soma * r_soma
+#             if fallback:
+#                 tiny &= len(stem) < min_soma_stem_nodes
+#         else:
+#             tiny = extent < extent_factor_tip * r_soma
+#             if fallback:
+#                 tiny &= len(stem) < min_twig_stem_nodes
+
+#         if not tiny:
+#             continue
+
+#         # mark for deletion & update degrees
+#         for n in stem:
+#             if n in to_drop:
+#                 continue
+#             to_drop.add(n)
+#             for nb in adj[n]:
+#                 degree[nb] -= 1
+#                 if degree[nb] == 1 and nb not in to_drop:
+#                     todo.append(nb)
+#             degree[n] = 0                     # fully removed
+
+#     # ---- nothing pruned ------------------------------------------------
+#     if not to_drop:
+#         return nodes, radii_dict, node2verts, {v: i for i, vs in enumerate(node2verts) for v in vs}, edges
+
+#     # ---- rebuild all tables -------------------------------------------
+#     keep = np.ones(N, bool)
+#     keep[list(to_drop)] = False
+#     keep[0] = True                              # never drop the soma
+
+#     remap = {old: new for new, old in enumerate(np.where(keep)[0])}
+
+#     nodes     = nodes[keep]
+#     node2_new = [node2verts[i] for i in np.where(keep)[0]]
+#     radii_new = {k: v[keep].copy() for k, v in radii_dict.items()}
+#     edges_new = np.asarray(
+#         [(remap[a], remap[b]) for a, b in edges if keep[a] and keep[b]],
+#         dtype=np.int64,
+#     )
+
+#     vert2node = {int(v): int(i)
+#                  for i, verts in enumerate(node2_new)
+#                  for v in verts}
+
+#     return nodes, radii_new, node2_new, vert2node, edges_new
 
 def _extreme_vertex(mesh: trimesh.Trimesh,
                     axis: str = "z",
@@ -1632,15 +1717,21 @@ def skeletonize(
     if has_soma and prune_tiny_neurites:
         _t0 = time.perf_counter()
         with _timed("↳  prune tiny neurites"):
+            # (nodes_arr, radii_dict, node2verts, vert2node,
+            #     edges_mst) = _prune_tiny_neurites(
+            #         nodes_arr, radii_dict, node2verts, edges_mst,
+            #         soma=soma,
+            #         tip_max_dist = prune_extent_factor_tip,
+            #         soma_max_dist = prune_extent_factor_soma,
+            #         fallback=True,                       # keep legacy check too
+            #         min_twig_stem_nodes = prune_min_twig_stem_nodes,
+            #         min_soma_stem_nodes = prune_min_soma_stem_nodes,
+            #     )
             (nodes_arr, radii_dict, node2verts, vert2node,
-                edges_mst) = _prune_tiny_neurites(
+                edges_mst) = _prune_neurites(
                     nodes_arr, radii_dict, node2verts, edges_mst,
-                    r_soma=radii_dict[radius_estimators[0]][0],
-                    extent_factor_tip = prune_extent_factor_tip,
-                    extent_factor_soma = prune_extent_factor_soma,
-                    fallback=True,                       # keep legacy check too
-                    min_twig_stem_nodes = prune_min_twig_stem_nodes,
-                    min_soma_stem_nodes = prune_min_soma_stem_nodes,
+                    soma=soma,
+                    d_max_tip=1.0, d_max_soma=2.0,
                 )
         if verbose:
             post_ms += time.perf_counter() - _t0

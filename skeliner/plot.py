@@ -7,9 +7,9 @@ from matplotlib.collections import LineCollection
 from matplotlib.patches import Ellipse
 from scipy.stats import binned_statistic_2d
 
-from .core import Skeleton, Soma
+from .core import Skeleton
 
-__all__ = ["plot_projection"]
+__all__ = ["projection", "threeviews", "diagnostic"]
 
 
 _PLANE_AXES = {
@@ -110,7 +110,7 @@ def _make_lut(name: str, n: int) -> np.ndarray:
     return cmap(idx)
 
 
-def plot_projection(
+def projection(
     skel: Skeleton,
     mesh: "trimesh.Trimesh",
     *,
@@ -211,15 +211,7 @@ def plot_projection(
     )
     hist = hist.T  # transpose for imshow (row = y)
 
-    # ─────────────────── optional soma overlay ────────────────────────────
-    if draw_soma_mask and skel.soma is not None:
-        xy_soma = _project(
-            mesh.vertices[np.asarray(skel.soma.verts, dtype=np.int64)], ix, iy
-        ) * scale[1]                                 # note: mesh scale!
-        keep_soma = _apply_window(xy_soma)           # respect crop
-        xy_soma   = xy_soma[keep_soma]
-    else:
-        xy_soma = None
+
 
     # ─────────────────── figure / axes ────────────────────────────────────
     if ax is None:
@@ -251,7 +243,14 @@ def plot_projection(
         )
 
     # ─── highlight the soma if requested ───────────────────────────────────
-    if draw_soma_mask and skel.soma is not None:
+    if draw_soma_mask and skel.soma is not None and skel.soma.verts is not None:
+
+        xy_soma = _project(
+            mesh.vertices[np.asarray(skel.soma.verts, dtype=np.int64)], ix, iy
+        ) * scale[1]                                 # note: mesh scale!
+        keep_soma = _apply_window(xy_soma)           # respect crop
+        xy_soma   = xy_soma[keep_soma]
+
         ax.scatter(
             xy_soma[:, 0], xy_soma[:, 1],
             s=1, c="pink", marker="o",
@@ -261,10 +260,6 @@ def plot_projection(
         # centroid + dashed outline for radius readability
         c_xy = _project(skel.nodes[[0]] * scale[0], ix, iy).ravel()
         ax.scatter(*c_xy, c="k", s=15, zorder=3, label="soma centre")
-
-        # r_px = skel.radii[radius_metric][0] * scale[0] * ppd # pixels
-        # r_pt = r_px * 72.0 / fig.dpi # points
-        # ax.scatter(*c_xy, edgecolors="k", facecolors="none", s=np.pi*r_pt**2) # identical to scatter
 
         ell = _soma_ellipse2d(skel.soma, plane, scale=scale[0])
                             # dashed outline as before
@@ -534,7 +529,7 @@ def diagnostic(
             ax.add_collection(lc)
 
     # ------------- optional soma shell --------------------------------------
-    if draw_soma_mask and skel.soma is not None:
+    if draw_soma_mask and skel.soma is not None and skel.soma.verts is not None:
         xy_soma = _project(
             mesh.vertices[np.asarray(skel.soma.verts, dtype=np.int64)], ix, iy
         ) * scl_mesh
@@ -685,7 +680,7 @@ def threeviews(
     # ── 2. render every occupied panel ─────────────────────────────────────
     for label, plane in zip(("A", "B", "C"), planes):
         xlim, ylim = _limits(plane)
-        plot_projection(
+        projection(
             skel,
             mesh,
             plane=plane,
