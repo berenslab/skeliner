@@ -85,8 +85,17 @@ class Soma:
         ξ = self._body_coords(x)
         ρ2 = (ξ ** 2).sum(axis=-1)
         return ρ2 <= inside_frac ** 2
+    
+    def distance_to_center(self, x: np.ndarray) -> np.ndarray | float:
+        """Unsigned Euclidean distance from *x* to the soma *centre*."""
+        x = np.asanyarray(x, dtype=np.float32)
+        single_input = x.ndim == 1
+        if single_input:
+            x = x[None, :]
+        d = np.linalg.norm(x - self.centre, axis=1)
+        return d[0] if single_input else d
 
-    def distance(
+    def distance_to_surface(
         self, x: np.ndarray, *, atol: float = 1e-9, max_iter: int = 64
     ) -> np.ndarray | float:
         """
@@ -374,7 +383,7 @@ def _find_soma(
     radii: np.ndarray,
     *,
     pct_large : float = 99.9,
-    dist_factor: float = 4.0,   # keep nodes within dist_factor × R_max
+    dist_factor: float = 3.0,   # keep nodes within dist_factor × R_max
     min_keep: int = 3,
 ) -> tuple[Soma, np.ndarray, bool]:
     """
@@ -408,13 +417,13 @@ def _find_soma(
     dists = np.linalg.norm(nodes[cand_idx] - nodes[idx_max], axis=1)
     keep  = dists <= dist_factor * R_max
     soma_idx = cand_idx[keep]
-    has_soma = False if len(soma_idx) < min_keep else True
+    has_soma = soma_idx.size >= min_keep
 
     if not has_soma:
         return Soma.from_sphere(nodes[idx_max], R_max, None), soma_idx, has_soma
     else:
         # -------------------------------------------------------------
-        # 4. envelope geometry (same as your original code)
+        # 4. envelope geometry 
         # -------------------------------------------------------------
         centre = nodes[soma_idx].mean(0)
         # quick PCA (= same logic you used in Soma.fit)
@@ -752,41 +761,46 @@ def _merge_near_soma_nodes(
     edges: np.ndarray,
     node2verts: list[np.ndarray],
     *,
-    soma: Soma,                        
+    soma: Soma,
     radius_key: str,
     mesh_vertices: np.ndarray,
-    near_scale:   float = 1.5,          # max. centre-line distance (× r_sphere)
-    fat_scale:    float = 0.25,         # fat node if r ≥ fat_scale × r_sphere
+    # ---- new, all relative to the fitted spherical radius -------------
+    inside_tol: float = 0.0,        # anything with d < 0 − tol is *inside*
+    near_factor: float = 1.0,       # “near” if d < near_factor × r_soma
+    fat_factor : float = 0.25,      # “fat” if r ≥ fat_factor  × r_soma
     log: Callable | None = None,
 ):
-    
     """
-    Collapse every skeleton node whose *centre* lies **inside** the soma
-    ellipsoid (enlarged by `inside_scale`) or is both *fat* and *near*.
+    Collapse every skeleton node whose sphere would overlap the soma
+    **according to strictly geometric tests based on `Soma.distance`.**
 
-    Returns all arrays **plus** the updated `soma` object whose vertex set
-    now contains every merged node’s faces and whose axes/rotation have been
-    re-fitted on those surface vertices.
+    *Inside test*  
+        `d < −inside_tol`  (negative ➜ centre is strictly inside)
+
+    *Near-and-fat test*  
+        `d <  near_factor × r_soma   AND   r ≥ fat_factor × r_soma`
+
+    All factors are *dimension­less* and therefore unit-safe.
     """
-
-    r_sphere = soma.spherical_radius
+    # ------------------------------------------------------------------
+    r_soma     = soma.spherical_radius
     r_primary  = radii_dict[radius_key]
+    d2s        = soma.distance_to_center(nodes)
+    inside     = d2s < -inside_tol
+    near       = d2s < near_factor * r_soma
+    fat        = r_primary > fat_factor * r_soma
 
-    # --- decide which nodes survive ---------------------------------
-    inside = soma.contains(nodes, inside_frac=near_scale)
-    near   = soma.distance(nodes) < (near_scale * r_sphere)
-    fat    = r_primary >= fat_scale * r_sphere
-    keep_mask = ~(inside | (fat & near))
-    keep_mask[0] = True
+    keep_mask  = ~(inside | (near & fat))
+    keep_mask[0] = True                        # never drop the soma vertex
     merged_idx = np.where(~keep_mask)[0]
 
     if log:
-        log(f"{(~keep_mask).sum()} nodes merged into soma")
+        log(f"{merged_idx.size} nodes merged into soma")
 
+    # ---- remainder is identical to your original routine -------------
     old2new = -np.ones(len(nodes), np.int64)
     old2new[np.where(keep_mask)[0]] = np.arange(keep_mask.sum())
 
-    # -------- rebuild edge list ----------------------------------------
     a, b      = edges.T
     both_keep = keep_mask[a] & keep_mask[b]
     edges_out = np.unique(np.sort(old2new[edges[both_keep]], 1), axis=0)
@@ -798,47 +812,43 @@ def _merge_near_soma_nodes(
                                np.array([[0, i] for i in sorted(leaves)],
                                         dtype=np.int64)])
 
-    # -------- compact node arrays --------------------------------------
-    nodes_keep = nodes[keep_mask].copy()
-    radii_keep = {k: v[keep_mask].copy() for k, v in radii_dict.items()}
-    node2_keep = [node2verts[i] for i in np.where(keep_mask)[0]]
-    vert2node  = {}
+    nodes_keep  = nodes[keep_mask].copy()
+    radii_keep  = {k: v[keep_mask].copy() for k, v in radii_dict.items()}
+    node2_keep  = [node2verts[i] for i in np.where(keep_mask)[0]]
+    vert2node   = {}
 
-    # -------- absorb merged nodes into node-0 ---------------------------
     if merged_idx.size:
-        # weighted centroid of all vertices (gives nicer centre shift)
         w = np.array([len(node2verts[0]), *[len(node2verts[i])
                      for i in merged_idx]], dtype=np.float32)
         nodes_keep[0] = np.average(
             np.vstack([nodes[0], nodes[merged_idx]]), axis=0, weights=w
         )
-
-        # move their surface vertices into node-0 and soma.verts
         for idx in merged_idx:
-            soma.verts = np.concatenate((soma.verts, node2verts[idx]))
-            node2_keep[0] = np.concatenate((node2_keep[0], node2verts[idx]))
+            # keep only the vertex subset that is *really* close to the soma
+            vidx   = node2verts[idx]
+            d_local = soma.distance_to_surface(mesh_vertices[vidx])
+            close   = d_local < near_factor * r_soma     # same factor as for centre test
+            if close.any():
+                soma.verts      = np.concatenate((soma.verts, vidx[close]))
+                node2_keep[0]   = np.concatenate((node2_keep[0], vidx[close]))
 
-    # -------- rebuild vert2node ----------------------------------------
     for nid, verts in enumerate(node2_keep):
         for v in verts:
             vert2node[int(v)] = nid
 
-    # -------- re-fit ellipsoid on the NEW soma surface -----------------
     soma.verts = np.unique(soma.verts).astype(np.int64)
     soma       = Soma.fit(mesh_vertices[soma.verts], verts=soma.verts)
-
-    # propagate refined centre & radius back to root node
     nodes_keep[0] = soma.centre
-    r_sphere = soma.spherical_radius
+    r_soma = soma.spherical_radius
     for k in radii_keep:
-        radii_keep[k][0] = r_sphere
+        radii_keep[k][0] = r_soma
 
     if log:
         centre_txt = ", ".join(f"{c:7.1f}" for c in soma.centre)
-        log(f"Moved soma to [{centre_txt}] (r = {r_sphere:6.1f})")
+        log(f"Moved soma to [{centre_txt}] (r={r_soma:6.1f})")
 
-    return (nodes_keep, radii_keep, node2_keep, vert2node,
-            soma.verts, edges_out, soma)
+    return (nodes_keep, radii_keep, node2_keep, vert2node, edges_out, soma)
+
 
 def _bridge_gaps(
     nodes: np.ndarray,
@@ -1053,44 +1063,38 @@ def _prune_neurites(
     edges: np.ndarray,
     *,
     soma: Soma,
-    d_max_tip  : float = 1.0,   # µm beyond ellipsoid for ordinary neurites
-    d_max_soma : float = 3.0,   # µm beyond ellipsoid for stems touching soma
+    tip_extent_factor : float = 1.2,   #   tip twigs  (<–× r_soma)
+    stem_extent_factor: float = 3.0,   #   stems touching soma
 ):
     """
-    Remove **entire neurites** that remain within an expanded ellipsoid
-    (distance-to-surface ≤ `d_max_*`).  Works with arbitrarily branched tips.
+    Remove **entire neurites** that never leave a narrow band around the
+    soma surface.  Distance is again measured with `Soma.distance`, which
+    is *sign-correct* even inside concave ellipsoids.
 
-    – A *neurite* is the entire connected component that hangs off the main
-      tree if you cut the unique edge that leads toward the soma (root 0).
+    A neurite is discarded if
 
-    – Two distance thresholds are used:
-        • components whose **root edge is NOT the soma** → `d_max_tip`
-        • components **directly attached** to the soma  → `d_max_soma`
+        max(d_component) ≤  tip_extent_factor  × r_soma     (ordinary tip)
+        max(d_component) ≤ stem_extent_factor × r_soma     (direct stem)
     """
-    N = len(nodes)
-    parent = _bfs_parents(edges, N, root=0)        # 0-based IDs, −1 at root
+    r_soma   = soma.spherical_radius
+    d2s      = np.asarray(soma.distance_to_surface(nodes))
 
-    # 1. build adjacency once
+    N = len(nodes)
+    parent = _bfs_parents(edges, N, root=0)
+
     adj = [[] for _ in range(N)]
     for a, b in edges:
         adj[a].append(b)
         adj[b].append(a)
 
-    # 2. components reachable after cutting each edge (except cycles → forest)
-    to_drop = set()
-    visited = np.zeros(N, bool)
+    to_drop, visited = set(), np.zeros(N, bool)
 
-    for child in range(1, N):                      # node 0 is soma
+    for child in adj[0]:
         if visited[child]:
             continue
 
-        par = parent[child]
-        if par == -1:                              # should not happen in a tree
-            continue
-
-        # ----- walk away from soma collecting the component -------------
         comp = []
-        stack = [child]
+        stack, prev = [child], 0
         while stack:
             v = stack.pop()
             if visited[v]:
@@ -1098,21 +1102,16 @@ def _prune_neurites(
             visited[v] = True
             comp.append(v)
             for nb in adj[v]:
-                if nb == par:                      # do not step back toward soma
-                    continue
-                if parent[nb] == v or parent[v] == nb:
+                if nb != prev and (parent[nb] == v or parent[v] == nb):
                     stack.append(nb)
+            prev = v
 
-        # maximum outward distance of *this* component
-        max_d = soma.distance(nodes[comp]).max()
-
-        # decide which threshold to use
-        thr = d_max_soma if par == 0 else d_max_tip
+        max_d = d2s[comp].max()
+        thr   = stem_extent_factor * r_soma if parent[child] == 0 else tip_extent_factor * r_soma
         if max_d <= thr:
             to_drop.update(comp)
 
-    # 3. rebuild the tables exactly like in the legacy routine -----------
-    if not to_drop:
+    if not to_drop:                         # nothing pruned
         vert2node = {int(v): i for i, vs in enumerate(node2verts) for v in vs}
         return nodes, radii_dict, node2verts, vert2node, edges
 
@@ -1132,126 +1131,6 @@ def _prune_neurites(
     vert2node = {int(v): i for i, vs in enumerate(node2verts_new) for v in vs}
 
     return nodes_new, radii_new, node2verts_new, vert2node, edges_new
-
-
-# def _prune_tiny_neurites(
-#     nodes: np.ndarray,
-#     radii_dict: dict[str, np.ndarray],
-#     node2verts: list[np.ndarray],
-#     edges: np.ndarray,
-#     *,
-#     r_soma: float,
-#     extent_factor_tip: float  = 1.2,   #  tip twigs  (<–× r_soma)
-#     extent_factor_soma: float = 3.0,   #  soma stems (<–× r_soma)
-#     fallback: bool = True,            # also honour min_*_stem_nodes
-#     min_twig_stem_nodes: int = 5,
-#     min_soma_stem_nodes: int = 30,
-# ) -> tuple[np.ndarray, dict[str, np.ndarray],
-#            list[np.ndarray], dict[int, int], np.ndarray]:
-#     """
-#     Drop terminal sub-trees that do **not** exit a small sphere around the
-#     soma.  A sub-tree is considered *tiny* when
-
-#         max‖x_sub – x_root‖  <  R_lim
-
-#     with
-
-#         R_lim = { extent_factor_tip  × r_soma   (ordinary terminals)
-#                 { extent_factor_soma × r_soma   (direct soma stems)
-
-#     Parameters
-#     ----------
-#     r_soma
-#         Envelope radius of the soma (already refined in step 3).
-#     extent_factor_tip / _soma
-#         Multipliers that set the allowed extent.  Increase them if you keep
-#         deleting spines or stubby branches you actually need.
-#     fallback
-#         Apply the *old* node-count heuristic **in addition** – useful if you
-#         want behaviour identical to the legacy code.
-
-#     Returns
-#     -------
-#     Updated  (nodes, radii_dict, node2verts, vert2node, edges)
-#     """
-#     N = len(nodes)
-#     degree  = np.bincount(edges.ravel(), minlength=N)
-#     parent  = _bfs_parents(edges, N, root=0)
-
-#     # build adjacency list once
-#     adj: list[list[int]] = [[] for _ in range(N)]
-#     for a, b in edges:
-#         adj[a].append(b)
-#         adj[b].append(a)
-
-#     to_drop: set[int] = set()
-#     todo    : list[int] = [v for v in range(1, N) if degree[v] == 1]
-
-#     while todo:
-#         leaf = todo.pop()
-#         if leaf in to_drop or degree[leaf] != 1:
-#             continue
-
-#         # -------- climb up the stem ----------------------------------
-#         stem = []
-#         v = leaf
-#         while v != 0 and degree[v] <= 2:        # straight shaft
-#             stem.append(v)
-#             v = parent[v]
-
-#         if not stem:            # <── bail out early
-#             continue
-
-#         touches_soma = (v == 0)
-#         pts          = nodes[stem]
-#         extent       = np.linalg.norm(pts - nodes[0], axis=1).max()
-#         if touches_soma:
-#             tiny = extent < extent_factor_soma * r_soma
-#             if fallback:
-#                 tiny &= len(stem) < min_soma_stem_nodes
-#         else:
-#             tiny = extent < extent_factor_tip * r_soma
-#             if fallback:
-#                 tiny &= len(stem) < min_twig_stem_nodes
-
-#         if not tiny:
-#             continue
-
-#         # mark for deletion & update degrees
-#         for n in stem:
-#             if n in to_drop:
-#                 continue
-#             to_drop.add(n)
-#             for nb in adj[n]:
-#                 degree[nb] -= 1
-#                 if degree[nb] == 1 and nb not in to_drop:
-#                     todo.append(nb)
-#             degree[n] = 0                     # fully removed
-
-#     # ---- nothing pruned ------------------------------------------------
-#     if not to_drop:
-#         return nodes, radii_dict, node2verts, {v: i for i, vs in enumerate(node2verts) for v in vs}, edges
-
-#     # ---- rebuild all tables -------------------------------------------
-#     keep = np.ones(N, bool)
-#     keep[list(to_drop)] = False
-#     keep[0] = True                              # never drop the soma
-
-#     remap = {old: new for new, old in enumerate(np.where(keep)[0])}
-
-#     nodes     = nodes[keep]
-#     node2_new = [node2verts[i] for i in np.where(keep)[0]]
-#     radii_new = {k: v[keep].copy() for k, v in radii_dict.items()}
-#     edges_new = np.asarray(
-#         [(remap[a], remap[b]) for a, b in edges if keep[a] and keep[b]],
-#         dtype=np.int64,
-#     )
-
-#     vert2node = {int(v): int(i)
-#                  for i, verts in enumerate(node2_new)
-#                  for v in verts}
-
-#     return nodes, radii_new, node2_new, vert2node, edges_new
 
 def _extreme_vertex(mesh: trimesh.Trimesh,
                     axis: str = "z",
@@ -1421,6 +1300,7 @@ def _detect_soma(
     *,
     detect_soma,
     radius_key,
+    mesh_vertices,
     log=None,
 ):
     """
@@ -1469,8 +1349,10 @@ def _detect_soma(
     # ------------------------------------------------------------------
     # D. collect surface vertices that belong to the soma envelope
     # ------------------------------------------------------------------
+    # quick hack fix, might need a better solution within _find_soma()
+    all_close = soma.distance_to_center(nodes[soma_nodes]) < soma.spherical_radius * 2
     soma_vert_ids = np.unique(
-        np.concatenate([node2verts[i] for i in soma_nodes])
+        np.concatenate([node2verts[i] for i in soma_nodes[all_close]])
     ).astype(np.int64)
     soma.verts = soma_vert_ids
 
@@ -1479,6 +1361,11 @@ def _detect_soma(
     r_sphere = soma.spherical_radius
     for k in radii: 
         radii[k][0] = r_sphere
+
+    soma = Soma.fit(
+        mesh_vertices[soma.verts],
+        verts=soma.verts,
+    )
 
     return nodes, radii, node2verts, vert2node, soma, True
 
@@ -1519,10 +1406,6 @@ def skeletonize(
     collapse_soma_radius_factor: float = 0.2,
     # --- prune tiny neurites ---
     prune_tiny_neurites: bool = True,
-    prune_extent_factor_tip: float = 1.2,  # tip twigs (<–× r_soma)
-    prune_extent_factor_soma: float = 3.0, # soma stems (<–× r_soma)
-    prune_min_twig_stem_nodes: int = 1,
-    prune_min_soma_stem_nodes: int = 50,
     # --- misc ---
     verbose: bool = False,
 ) -> Skeleton:
@@ -1630,7 +1513,7 @@ def skeletonize(
         avg_edge = float(mesh.edges_unique_length.mean())
         soma = Soma.from_sphere(mesh_vertices[seed_vid],
                                 radius=avg_edge,
-                                verts=np.array([seed_vid], dtype=np.int64))
+                                verts=None)
 
 
         all_shells = _bin_geodesic_shells(
@@ -1663,6 +1546,7 @@ def skeletonize(
             soma_radius_distance_factor=soma_radius_distance_factor,
             soma_min_nodes=soma_min_nodes,
             detect_soma=detect_soma,
+            mesh_vertices=mesh_vertices,
             radius_key=radius_estimators[0],
             log=log,
         )
@@ -1681,14 +1565,14 @@ def skeletonize(
         _t0 = time.perf_counter() 
 
         with _timed("↳  merge redundant near-soma nodes") as log:
-            (nodes_arr, radii_dict, node2verts, vert2node,
-         soma_verts, edges_arr, soma) = _merge_near_soma_nodes(
+            (nodes_arr, radii_dict, node2verts, vert2node, 
+                edges_arr, soma) = _merge_near_soma_nodes(
                     nodes_arr, radii_dict, edges_arr, node2verts,
                     soma=soma,
                     radius_key=radius_estimators[0],
                     mesh_vertices=mesh_vertices,
-                    fat_scale =collapse_soma_radius_factor,
-                    near_scale=collapse_soma_dist_factor,
+                    fat_factor =collapse_soma_radius_factor,
+                    near_factor=collapse_soma_dist_factor,
                     log=log,
                 )
 
@@ -1717,21 +1601,11 @@ def skeletonize(
     if has_soma and prune_tiny_neurites:
         _t0 = time.perf_counter()
         with _timed("↳  prune tiny neurites"):
-            # (nodes_arr, radii_dict, node2verts, vert2node,
-            #     edges_mst) = _prune_tiny_neurites(
-            #         nodes_arr, radii_dict, node2verts, edges_mst,
-            #         soma=soma,
-            #         tip_max_dist = prune_extent_factor_tip,
-            #         soma_max_dist = prune_extent_factor_soma,
-            #         fallback=True,                       # keep legacy check too
-            #         min_twig_stem_nodes = prune_min_twig_stem_nodes,
-            #         min_soma_stem_nodes = prune_min_soma_stem_nodes,
-            #     )
+
             (nodes_arr, radii_dict, node2verts, vert2node,
                 edges_mst) = _prune_neurites(
                     nodes_arr, radii_dict, node2verts, edges_mst,
                     soma=soma,
-                    d_max_tip=1.0, d_max_soma=2.0,
                 )
         if verbose:
             post_ms += time.perf_counter() - _t0
