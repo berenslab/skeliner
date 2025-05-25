@@ -4,11 +4,12 @@ import numpy as np
 import trimesh
 from matplotlib.axes import Axes
 from matplotlib.collections import LineCollection
+from matplotlib.patches import Ellipse
 from scipy.stats import binned_statistic_2d
 
 from .core import Skeleton
 
-__all__ = ["plot_projection"]
+__all__ = ["projection", "threeviews", "diagnostic"]
 
 
 _PLANE_AXES = {
@@ -56,6 +57,44 @@ def _radii_to_sizes(rr: np.ndarray, ax: Axes) -> tuple[np.ndarray, float]:
     r_pt = r_px * 72.0 / dpi
     return np.pi * r_pt**2, ppd
 
+def _soma_ellipse2d(soma, plane: str, *, scale: float = 1.0) -> Ellipse:
+    """
+    Exact orthographic projection of a 3-D ellipsoid onto *plane*.
+
+    The ellipse is given by   (x-c)ᵀ Q (x-c) = 1
+    with       Q = B_pp − B_pq B_qp / B_qq
+    where      B = R diag(1/a²) Rᵀ   is the quadric matrix in world coords
+    and the indices p,q denote the kept/dropped coordinate.
+    """
+    if plane not in _PLANE_AXES:
+        raise ValueError(f"plane must be one of {_PLANE_AXES.keys()}")
+
+    ix, iy = _PLANE_AXES[plane]
+    k      = 3 - ix - iy                      # the coordinate we project away
+
+    # inverse shape matrix of the ellipsoid
+    B = soma.R @ np.diag(1.0 / soma.axes**2) @ soma.R.T
+
+    B_pp = B[[ix, iy]][:, [ix, iy]]           # 2×2
+    B_pq = B[[ix, iy], k].reshape(2, 1)       # 2×1
+    B_qq = B[k, k]
+
+    Q = B_pp - (B_pq @ B_pq.T) / B_qq         # 2×2 positive-definite
+
+    # eigen-decomposition → half-axes in the projection plane
+    eigval, eigvec = np.linalg.eigh(Q)        # λ₁, λ₂ > 0
+    half_axes      = 1.0 / np.sqrt(eigval)    # r₁, r₂
+    order          = np.argsort(-half_axes)   # big → small
+
+    width, height  = 2 * half_axes[order] * scale
+    angle_deg      = np.degrees(np.arctan2(eigvec[1, order[0]],
+                                           eigvec[0, order[0]]))
+    centre_xy      = soma.centre[[ix, iy]] * scale
+
+    return Ellipse(centre_xy, width, height, angle=angle_deg,
+                   linewidth=.8, linestyle="--",
+                   facecolor="none", edgecolor="k", alpha=.9)
+
 def _make_lut(name: str, n: int) -> np.ndarray:
     """
     Return an ``(n, 4)`` RGBA array from *name* colormap, shuffled so that
@@ -71,7 +110,7 @@ def _make_lut(name: str, n: int) -> np.ndarray:
     return cmap(idx)
 
 
-def plot_projection(
+def projection(
     skel: Skeleton,
     mesh: "trimesh.Trimesh",
     *,
@@ -172,15 +211,7 @@ def plot_projection(
     )
     hist = hist.T  # transpose for imshow (row = y)
 
-    # ─────────────────── optional soma overlay ────────────────────────────
-    if draw_soma_mask and skel.soma_verts is not None:
-        xy_soma = _project(
-            mesh.vertices[np.asarray(skel.soma_verts, dtype=np.int64)], ix, iy
-        ) * scale[1]                                 # note: mesh scale!
-        keep_soma = _apply_window(xy_soma)           # respect crop
-        xy_soma   = xy_soma[keep_soma]
-    else:
-        xy_soma = None
+
 
     # ─────────────────── figure / axes ────────────────────────────────────
     if ax is None:
@@ -200,10 +231,12 @@ def plot_projection(
     # ─────────────────── circles ──────────────────────────────────────────
     if draw_skel:
         sizes, ppd = _radii_to_sizes(rr, ax)
+
+        slicing = 0 if skel.soma.verts is None else 1
         ax.scatter(
-            xy_skel[:, 0],
-            xy_skel[:, 1],
-            s=sizes,
+            xy_skel[:, 0][slicing:],
+            xy_skel[:, 1][slicing:],
+            s=sizes[slicing:],
             facecolors="none",
             edgecolors="red",
             linewidths=1.0,
@@ -212,7 +245,14 @@ def plot_projection(
         )
 
     # ─── highlight the soma if requested ───────────────────────────────────
-    if draw_soma_mask and xy_soma is not None and len(xy_soma):
+    if draw_soma_mask and skel.soma is not None and skel.soma.verts is not None:
+
+        xy_soma = _project(
+            mesh.vertices[np.asarray(skel.soma.verts, dtype=np.int64)], ix, iy
+        ) * scale[1]                                 # note: mesh scale!
+        keep_soma = _apply_window(xy_soma)           # respect crop
+        xy_soma   = xy_soma[keep_soma]
+
         ax.scatter(
             xy_soma[:, 0], xy_soma[:, 1],
             s=1, c="pink", marker="o",
@@ -223,10 +263,15 @@ def plot_projection(
         c_xy = _project(skel.nodes[[0]] * scale[0], ix, iy).ravel()
         ax.scatter(*c_xy, c="k", s=15, zorder=3, label="soma centre")
 
-        r_px = skel.radii[radius_metric][0] * scale[0] * ppd # pixels
-        r_pt = r_px * 72.0 / fig.dpi # points
-        ax.scatter(*c_xy, edgecolors="k", facecolors="none", s=np.pi*r_pt**2) # identical to scatter
-    
+        ell = _soma_ellipse2d(skel.soma, plane, scale=scale[0])
+                            # dashed outline as before
+        ell.set_edgecolor("k")
+        ell.set_facecolor("none")
+        ell.set_linestyle("--")
+        ell.set_linewidth(0.8)
+        ell.set_alpha(0.9)
+        ax.add_patch(ell)
+
     # ─────────────────── optional edges ───────────────────────────────────
     if draw_skel and draw_edges and skel.edges.size:
         keep = keep_skel                              # local alias
@@ -274,8 +319,8 @@ def plot_projection(
 
 
 def diagnostic(
-    mesh: "trimesh.Trimesh",
     skel: Skeleton,
+    mesh: "trimesh.Trimesh",
     *,
     plane: str = "xy",
     # background histogram --------------------------------------------------- #
@@ -441,9 +486,11 @@ def diagnostic(
         node_colors = lut[node_comp]
 
         # circles (facecolor none, coloured edge)
+        slicing = 0 if skel.soma.verts is None else 1
         ax.scatter(
-            xy_skel[:, 0], xy_skel[:, 1],
-            s=sizes, facecolors="none", edgecolors=node_colors,
+            xy_skel[:, 0][slicing:], 
+            xy_skel[:, 1][slicing:],
+            s=sizes[slicing:], facecolors="none", edgecolors=node_colors[slicing:],
             linewidths=0.9, alpha=circle_alpha, zorder=3,
         )
         # centre points
@@ -486,9 +533,9 @@ def diagnostic(
             ax.add_collection(lc)
 
     # ------------- optional soma shell --------------------------------------
-    if draw_soma_mask and skel.soma_verts is not None and len(skel.soma_verts):
+    if draw_soma_mask and skel.soma is not None and skel.soma.verts is not None:
         xy_soma = _project(
-            mesh.vertices[np.asarray(skel.soma_verts, dtype=np.int64)], ix, iy
+            mesh.vertices[np.asarray(skel.soma.verts, dtype=np.int64)], ix, iy
         ) * scl_mesh
         soma_keep = _mask_window(xy_soma)
         xy_soma   = xy_soma[soma_keep]
@@ -503,10 +550,12 @@ def diagnostic(
         ax.scatter(*c_xy, c="k", s=16, zorder=9)
 
         # dashed outline matching circle size
-        r_px = skel.radii[radius_metric][0] * scl_skel * ppd
-        r_pt = r_px * 72.0 / fig.dpi
-        ax.scatter(*c_xy, facecolors="none", edgecolors="k",
-                   linestyle="--", s=np.pi * r_pt**2, zorder=10)
+        ell = _soma_ellipse2d(skel.soma, plane, scale=scale[0])
+        ell.set_edgecolor("k")
+        ell.set_facecolor("none")
+        ell.set_linestyle("--")
+        ell.set_linewidth(0.8)
+        ax.add_patch(ell)                         # dashed outline as before
 
     # ------------- cosmetics -------------------------------------------------
     ax.set_aspect("equal")
@@ -635,7 +684,7 @@ def threeviews(
     # ── 2. render every occupied panel ─────────────────────────────────────
     for label, plane in zip(("A", "B", "C"), planes):
         xlim, ylim = _limits(plane)
-        plot_projection(
+        projection(
             skel,
             mesh,
             plane=plane,
