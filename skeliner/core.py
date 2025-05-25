@@ -156,6 +156,13 @@ class Soma:
     def spherical_radius(self) -> float:
         """Radius of the sphere which encloses the ellipsoid."""
         return max(self.axes) 
+    
+    @property
+    def equiv_radius(self) -> float:
+        """Equivalent radius of the ellipsoid (mean of semi-axes)."""
+        """Sphere radius of equal volume ( (abc)^{1/3} )."""
+        a, b, c = self.axes
+        return float((a * b * c) ** (1.0 / 3.0))
 
     # ---------------------------------------------------------------------
     # constructors
@@ -425,14 +432,12 @@ def _find_soma(
         # -------------------------------------------------------------
         # 4. envelope geometry 
         # -------------------------------------------------------------
-        centre = nodes[soma_idx].mean(0)
-        # quick PCA (= same logic you used in Soma.fit)
-        pts   = nodes[soma_idx] - centre
-        evals, evecs = np.linalg.eigh(np.cov(pts, rowvar=False))
-        axes  = np.sqrt(evals * 5.0)[::-1]        # 95 % mass
-        R     = evecs[:, ::-1]    
+        soma  = Soma.from_sphere(
+            centre=nodes[soma_idx].mean(0),
+            radius=R_max,
+            verts=None,
+        )
 
-        soma  = Soma(centre, axes, R, verts=None)
         return soma, soma_idx, has_soma
 
 # -----------------------------------------------------------------------------
@@ -772,7 +777,7 @@ def _merge_near_soma_nodes(
 ):
     """
     Collapse every skeleton node whose sphere would overlap the soma
-    **according to strictly geometric tests based on `Soma.distance`.**
+    **according to strictly geometric tests based on `Soma.distance_`.**
 
     *Inside test*  
         `d < −inside_tol`  (negative ➜ centre is strictly inside)
@@ -780,12 +785,12 @@ def _merge_near_soma_nodes(
     *Near-and-fat test*  
         `d <  near_factor × r_soma   AND   r ≥ fat_factor × r_soma`
 
-    All factors are *dimension­less* and therefore unit-safe.
+    All factors are *dimensionless* and therefore unit-safe.
     """
     # ------------------------------------------------------------------
     r_soma     = soma.spherical_radius
     r_primary  = radii_dict[radius_key]
-    d2s        = soma.distance_to_center(nodes)
+    d2s        = soma.distance_to_surface(nodes)  # signed distance
     inside     = d2s < -inside_tol
     near       = d2s < near_factor * r_soma
     fat        = r_primary > fat_factor * r_soma
@@ -837,7 +842,14 @@ def _merge_near_soma_nodes(
             vert2node[int(v)] = nid
 
     soma.verts = np.unique(soma.verts).astype(np.int64)
-    soma       = Soma.fit(mesh_vertices[soma.verts], verts=soma.verts)
+    try:
+        soma = Soma.fit(mesh_vertices[soma.verts], verts=soma.verts)
+    except ValueError:
+        if log:
+            log("Soma fitting failed, using spherical approximation instead.")
+        # fallback to spherical approximation
+        soma = Soma.from_sphere(soma.centre, soma.spherical_radius, verts=soma.verts)
+
     nodes_keep[0] = soma.centre
     r_soma = soma.spherical_radius
     for k in radii_keep:
@@ -1065,6 +1077,7 @@ def _prune_neurites(
     soma: Soma,
     tip_extent_factor : float = 1.2,   #   tip twigs  (<–× r_soma)
     stem_extent_factor: float = 3.0,   #   stems touching soma
+    log: Callable | None = None,
 ):
     """
     Remove **entire neurites** that never leave a narrow band around the
@@ -1129,6 +1142,9 @@ def _prune_neurites(
         dtype=np.int64,
     )
     vert2node = {int(v): i for i, vs in enumerate(node2verts_new) for v in vs}
+
+    if log:
+        log(f"Pruned {len(to_drop)} nodes and {len(edges) - len(edges_new)} edges.")
 
     return nodes_new, radii_new, node2verts_new, vert2node, edges_new
 
@@ -1350,6 +1366,7 @@ def _detect_soma(
     # D. collect surface vertices that belong to the soma envelope
     # ------------------------------------------------------------------
     # quick hack fix, might need a better solution within _find_soma()
+    
     all_close = soma.distance_to_center(nodes[soma_nodes]) < soma.spherical_radius * 2
     soma_vert_ids = np.unique(
         np.concatenate([node2verts[i] for i in soma_nodes[all_close]])
@@ -1362,10 +1379,16 @@ def _detect_soma(
     for k in radii: 
         radii[k][0] = r_sphere
 
-    soma = Soma.fit(
-        mesh_vertices[soma.verts],
-        verts=soma.verts,
-    )
+    try:
+        soma = Soma.fit(
+            mesh_vertices[soma.verts],
+            verts=soma.verts,
+        )
+    except ValueError:
+        if log:
+            log("Soma fitting failed, using spherical approximation instead.")
+        # fallback to spherical approximation
+        soma = Soma.from_sphere(soma.centre, r_sphere, verts=soma.verts)
 
     return nodes, radii, node2verts, vert2node, soma, True
 
@@ -1406,6 +1429,8 @@ def skeletonize(
     collapse_soma_radius_factor: float = 0.2,
     # --- prune tiny neurites ---
     prune_tiny_neurites: bool = True,
+    prune_tip_extent_factor: float = 1.2,   # tip twigs (<–× r_soma)
+    prune_stem_extent_factor: float = 3.0,  # stems touching soma
     # --- misc ---
     verbose: bool = False,
 ) -> Skeleton:
@@ -1600,12 +1625,15 @@ def skeletonize(
     # 8. prune tiny sub-trees near the soma
     if has_soma and prune_tiny_neurites:
         _t0 = time.perf_counter()
-        with _timed("↳  prune tiny neurites"):
+        with _timed("↳  prune tiny neurites") as log:
 
             (nodes_arr, radii_dict, node2verts, vert2node,
                 edges_mst) = _prune_neurites(
                     nodes_arr, radii_dict, node2verts, edges_mst,
-                    soma=soma,
+                    soma=soma, 
+                    tip_extent_factor=prune_tip_extent_factor,
+                    stem_extent_factor=prune_stem_extent_factor,
+                    log=log,
                 )
         if verbose:
             post_ms += time.perf_counter() - _t0

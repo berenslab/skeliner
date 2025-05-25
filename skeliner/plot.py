@@ -319,8 +319,8 @@ def projection(
 
 
 def diagnostic(
-    mesh: "trimesh.Trimesh",
     skel: Skeleton,
+    mesh: "trimesh.Trimesh",
     *,
     plane: str = "xy",
     # background histogram --------------------------------------------------- #
