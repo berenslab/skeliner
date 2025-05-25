@@ -231,10 +231,12 @@ def projection(
     # ─────────────────── circles ──────────────────────────────────────────
     if draw_skel:
         sizes, ppd = _radii_to_sizes(rr, ax)
+
+        slicing = 0 if skel.soma.verts is None else 1
         ax.scatter(
-            xy_skel[:, 0],
-            xy_skel[:, 1],
-            s=sizes,
+            xy_skel[:, 0][slicing:],
+            xy_skel[:, 1][slicing:],
+            s=sizes[slicing:],
             facecolors="none",
             edgecolors="red",
             linewidths=1.0,
@@ -484,9 +486,11 @@ def diagnostic(
         node_colors = lut[node_comp]
 
         # circles (facecolor none, coloured edge)
+        slicing = 0 if skel.soma.verts is None else 1
         ax.scatter(
-            xy_skel[:, 0], xy_skel[:, 1],
-            s=sizes, facecolors="none", edgecolors=node_colors,
+            xy_skel[:, 0][slicing:], 
+            xy_skel[:, 1][slicing:],
+            s=sizes[slicing:], facecolors="none", edgecolors=node_colors[slicing:],
             linewidths=0.9, alpha=circle_alpha, zorder=3,
         )
         # centre points
