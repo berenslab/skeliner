@@ -1075,22 +1075,26 @@ def _prune_neurites(
     edges: np.ndarray,
     *,
     soma: Soma,
-    tip_extent_factor : float = 1.2,   #   tip twigs  (<–× r_soma)
-    stem_extent_factor: float = 3.0,   #   stems touching soma
+    tip_extent_factor: float = 1.2,
+    stem_extent_factor: float = 3.0,
+    drop_single_node_branches: bool = True,      # NEW
     log: Callable | None = None,
 ):
     """
-    Remove **entire neurites** that never leave a narrow band around the
-    soma surface.  Distance is again measured with `Soma.distance`, which
-    is *sign-correct* even inside concave ellipsoids.
+    Prune two kinds of neurites:
 
-    A neurite is discarded if
+    1. **Short peri-soma branches** (legacy behaviour) –
+       entire sub-trees that never leave a thin band around the soma
+       surface (controlled by *tip_extent_factor* / *stem_extent_factor*).
 
-        max(d_component) ≤  tip_extent_factor  × r_soma     (ordinary tip)
-        max(d_component) ≤ stem_extent_factor × r_soma     (direct stem)
+    2. **One-node branches** (NEW) – every leaf whose branch is literally a
+       single node.  Set *drop_single_node_branches=False* to disable.
     """
-    r_soma   = soma.spherical_radius
-    d2s      = np.asarray(soma.distance_to_surface(nodes))
+    # ------------------------------------------------------------------
+    # A. legacy extent-based pruning (unchanged)
+    # ------------------------------------------------------------------
+    r_soma  = soma.spherical_radius
+    d2s     = np.asarray(soma.distance_to_surface(nodes))
 
     N = len(nodes)
     parent = _bfs_parents(edges, N, root=0)
@@ -1102,7 +1106,7 @@ def _prune_neurites(
 
     to_drop, visited = set(), np.zeros(N, bool)
 
-    for child in adj[0]:
+    for child in adj[0]:                          # one neurite at a time
         if visited[child]:
             continue
 
@@ -1120,31 +1124,50 @@ def _prune_neurites(
             prev = v
 
         max_d = d2s[comp].max()
-        thr   = stem_extent_factor * r_soma if parent[child] == 0 else tip_extent_factor * r_soma
+        thr   = (stem_extent_factor if parent[child] == 0
+                 else tip_extent_factor) * r_soma
         if max_d <= thr:
             to_drop.update(comp)
 
-    if not to_drop:                         # nothing pruned
+    # ------------------------------------------------------------------
+    # B. *new* one-node branch pruning
+    # ------------------------------------------------------------------
+    if drop_single_node_branches:
+        min_node_radius = np.percentile(radii_dict["median"], 50)
+        deg = np.zeros(N, dtype=int)
+        for a, b in edges:
+            deg[a] += 1
+            deg[b] += 1
+        singles = {i for i, d in enumerate(deg) if d == 1 and i != 0 and radii_dict["median"][i] < min_node_radius}
+        to_drop.update(singles)
+
+    # ------------------------------------------------------------------
+    # C. keep / rebuild skeleton if anything was pruned
+    # ------------------------------------------------------------------
+    if not to_drop:
         vert2node = {int(v): i for i, vs in enumerate(node2verts) for v in vs}
         return nodes, radii_dict, node2verts, vert2node, edges
 
     keep = np.ones(N, bool)
     keep[list(to_drop)] = False
-    keep[0] = True
+    keep[0] = True                                 # never drop soma
 
     remap = {old: new for new, old in enumerate(np.where(keep)[0])}
 
-    nodes_new     = nodes[keep]
+    nodes_new = nodes[keep]
     node2verts_new = [node2verts[i] for i in np.where(keep)[0]]
-    radii_new     = {k: v[keep].copy() for k, v in radii_dict.items()}
-    edges_new     = np.asarray(
+    radii_new = {k: v[keep].copy() for k, v in radii_dict.items()}
+    edges_new = np.asarray(
         [(remap[a], remap[b]) for a, b in edges if keep[a] and keep[b]],
         dtype=np.int64,
     )
-    vert2node = {int(v): i for i, vs in enumerate(node2verts_new) for v in vs}
+    vert2node = {int(v): i
+                    for i, vs in enumerate(node2verts_new)
+                    for v in vs}
 
     if log:
-        log(f"Pruned {len(to_drop)} nodes and {len(edges) - len(edges_new)} edges.")
+        log(f"Pruned {len(to_drop)} nodes "
+            f"({len(edges) - len(edges_new)} edges).")
 
     return nodes_new, radii_new, node2verts_new, vert2node, edges_new
 
@@ -1431,6 +1454,7 @@ def skeletonize(
     prune_tiny_neurites: bool = True,
     prune_tip_extent_factor: float = 1.2,   # tip twigs (<–× r_soma)
     prune_stem_extent_factor: float = 3.0,  # stems touching soma
+    prune_drop_single_node_branches: bool = True,
     # --- misc ---
     verbose: bool = False,
 ) -> Skeleton:
@@ -1633,6 +1657,7 @@ def skeletonize(
                     soma=soma, 
                     tip_extent_factor=prune_tip_extent_factor,
                     stem_extent_factor=prune_stem_extent_factor,
+                    drop_single_node_branches=prune_drop_single_node_branches,
                     log=log,
                 )
         if verbose:
