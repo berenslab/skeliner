@@ -1,3 +1,5 @@
+from typing import Sequence
+
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,7 +11,7 @@ from scipy.stats import binned_statistic_2d
 
 from .core import Skeleton
 
-__all__ = ["projection", "threeviews", "diagnostic"]
+__all__ = ["projection", "threeviews", "details"]
 
 
 _PLANE_AXES = {
@@ -318,7 +320,7 @@ def projection(
     return fig, ax
 
 
-def diagnostic(
+def details(
     skel: Skeleton,
     mesh: "trimesh.Trimesh",
     *,
@@ -348,6 +350,10 @@ def diagnostic(
     # title ------------------------------------------------------------------ #
     title: str | None = None,
     unit: str | None = None,
+    # -------------highlight -----------------------
+    highlight_nodes: int | Sequence[int] | None = None,
+    highlight_face_alpha: float = 0.5,
+    highlight_id_color: str = "red",
     # axes                                                                     #
     ax: Axes | None = None,
 ):
@@ -386,6 +392,11 @@ def diagnostic(
 
     if radius_metric is None:
         radius_metric = skel.recommend_radius()[0]
+
+    if highlight_nodes is not None:
+        highlight_nodes = {int(n) for n in np.atleast_1d(highlight_nodes)}
+    else:
+        highlight_nodes = set()
 
     # ------------- project & crop -------------------------------------------
     xy_mesh_all = _project(mesh.vertices.view(np.ndarray), ix, iy) * scl_mesh
@@ -505,11 +516,17 @@ def diagnostic(
         if show_node_ids:
             orig_ids = np.flatnonzero(keep_skel)
             dx, dy   = id_offset
-            for nid, (x, y) in zip(orig_ids, xy_skel):
+            for i_compressed, nid in enumerate(orig_ids):
+                color = (highlight_id_color if nid in highlight_nodes
+                         else id_color)                 
+                x, y  = xy_skel[i_compressed]
                 ax.text(
                     x + dx, y + dy, str(nid),
-                    fontsize=id_fontsize, color=id_color,
-                    ha="center", va="center", zorder=5)
+                    fontsize=id_fontsize,
+                    color=color,                         
+                    ha="center", va="center",
+                    zorder=5,
+                )
 
     # ------------- edges -----------------------------------------------------
     if draw_edges and skel.edges.size:
@@ -556,6 +573,31 @@ def diagnostic(
         ell.set_linestyle("--")
         ell.set_linewidth(0.8)
         ax.add_patch(ell)                         # dashed outline as before
+
+    # ---------------- skeleton circles & centres ----------------------------
+    if draw_nodes and len(xy_skel):
+
+        # … existing scatter for outline + centre …
+
+        # ---------- extra pass: fill highlighted circles --------------------
+        if highlight_nodes:
+            # ‘orig_ids’ are the node IDs *before* cropping,
+            # we computed them two lines above when show_node_ids was handled.
+            # Re-compute here to ensure availability:
+            orig_ids = np.flatnonzero(keep_skel)
+            hilite_mask = np.isin(orig_ids, list(highlight_nodes))
+
+            if hilite_mask.any():
+                ax.scatter(
+                    xy_skel[hilite_mask, 0],
+                    xy_skel[hilite_mask, 1],
+                    s=sizes[hilite_mask],              
+                    facecolors=node_colors[hilite_mask],
+                    edgecolors=node_colors[hilite_mask],
+                    linewidths=0.9,
+                    alpha=highlight_face_alpha,
+                    zorder=4.5,                       
+                )
 
     # ------------- cosmetics -------------------------------------------------
     ax.set_aspect("equal")
@@ -709,3 +751,86 @@ def threeviews(
 
     fig.tight_layout()
     return fig, axd
+
+## Zoomed-in details on a single node
+
+def _window_for_node(
+    skel: Skeleton,
+    node_id: int,
+    plane: str = "xy",
+    *,
+    multiplier: float = 1.0,
+    scl_skel: float = 1.0,          # ← same scale you pass to `details`
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """
+    Return (xlim, ylim) that encloses *multiplier × soma_radius* around
+    *node_id* in the requested 2-D plane, **after** applying `scl_skel`.
+    """
+    if plane not in _PLANE_AXES:
+        raise ValueError(f"plane must be one of {tuple(_PLANE_AXES)}")
+
+    ix, iy = _PLANE_AXES[plane]          # which coordinates are horizontal / vertical?
+    r = skel.soma.spherical_radius * multiplier * scl_skel
+    node = skel.nodes[node_id] * scl_skel
+
+    xlim = (node[ix] - r, node[ix] + r)
+    ylim = (node[iy] - r, node[iy] + r)
+    return xlim, ylim
+
+def node_details(
+    skel: Skeleton,
+    mesh: trimesh.Trimesh,
+    node_id: int,
+    *,
+    plane: str = "xy",      
+    multiplier: float = .25,
+    scale: float | tuple[float, float] | list[float] = 1.0,
+    highlight_alpha: float = 0.5,
+    **kwargs
+) -> tuple[plt.Figure, Axes]:
+    """
+    Plot a zoomed-in view of a specific skeleton node with its soma.
+
+    Parameters
+    ----------
+    skel : Skeleton
+        The skeleton object.
+    mesh : trimesh.Trimesh
+        The mesh object.
+    node_id : int
+        The ID of the skeleton node to zoom in on.
+    multiplier : float, default 1.0
+        How much to zoom in on the node's soma radius.
+    **kwargs
+        Additional keyword arguments passed to `projection`.
+
+    Returns
+    -------
+    fig, ax : tuple[plt.Figure, Axes]
+        The figure and axes objects.
+    """
+    if isinstance(scale, (int, float)):
+        scl_skel, _ = float(scale), float(scale)
+    else:                                  # pair/list → (skel_scale, mesh_scale)
+        if len(scale) != 2:
+            raise ValueError("scale must be a scalar or a pair/list of two scalars")
+        scl_skel = float(scale[0])
+
+    xlim, ylim = _window_for_node(
+        skel, node_id,
+        plane=plane,
+        multiplier=multiplier,
+        scl_skel=scl_skel,
+    )
+
+    fig, ax = details(
+        skel,
+        mesh,
+        plane=plane,
+        xlim=xlim,
+        ylim=ylim,
+        highlight_nodes=node_id,          # ← new feature
+        highlight_face_alpha=highlight_alpha,
+        **kwargs,
+    )    
+    return fig, ax
