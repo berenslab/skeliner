@@ -1669,7 +1669,7 @@ def skeletonize(
         if verbose:
             post_ms += time.perf_counter() - _t0
 
-    # # 7. global minimum-spanning tree ------------------------------------
+    # 7. global minimum-spanning tree ------------------------------------
     with _timed("↳  build global minimum-spanning tree"):
         edges_mst = _build_mst(nodes_arr, edges_arr)
         if verbose:
