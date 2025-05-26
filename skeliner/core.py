@@ -1149,7 +1149,7 @@ def _prune_neurites(
         adj[a].append(b)
         adj[b].append(a)
 
-    to_drop, visited = set(), np.zeros(N, bool)
+    merge2soma, visited = set(), np.zeros(N, bool)
 
     for child in adj[0]:                          # one neurite at a time
         if visited[child]:
@@ -1172,14 +1172,34 @@ def _prune_neurites(
         thr   = (stem_extent_factor if parent[child] == 0
                  else tip_extent_factor) * r_soma
         if max_d <= thr:
-            to_drop.update(comp)
+            merge2soma.update(comp)
+    # ------------------------------------------------------------------
+    # B. merge the selected branches *into* soma (node 0)
+    # ------------------------------------------------------------------
+    if merge2soma:
+        # 1. move vertices
+        for nid in merge2soma:
+            node2verts[0] = np.concatenate((node2verts[0], node2verts[nid]))
+
+        node2verts[0] = np.unique(node2verts[0])          # dedup
+
+        # 2. recompute soma radii from the enlarged vertex set
+        d0 = np.linalg.norm(mesh_vertices[node2verts[0]] - nodes[0], axis=1)
+        for k in radii_dict:
+            radii_dict[k][0] = _estimate_radius(d0, method=k)
+
+        # (optional) keep the verbose trail intact
+        if log:
+            log(f"Merged {len(merge2soma)} peri-soma nodes into soma ")
+             
 
     # ------------------------------------------------------------------
-    # B. build a *single* keep-mask (works even if `to_drop` is empty)
+    # C. build the keep-mask (drop the now-empty helper nodes)
     # ------------------------------------------------------------------
+
     keep = np.ones(N, dtype=bool)
-    if to_drop:
-        keep[list(to_drop)] = False
+    if merge2soma:
+        keep[list(merge2soma)] = False
     keep[0] = True                              # never drop soma
 
     remap = {old: new for new, old
@@ -1195,9 +1215,15 @@ def _prune_neurites(
                        for i, vs in enumerate(node2verts_new)
                        for v in vs}
 
-    if log and to_drop:
-        log(f"Pruned {len(to_drop)} nodes "
-            f"({len(edges) - len(edges_new)} edges).")
+    soma.verts = np.unique(node2verts_new[0]).astype(np.int64)
+    pts = mesh_vertices[soma.verts]
+    soma = soma.fit(pts, verts=soma.verts)
+
+    if log:
+        centre_txt = ", ".join(f"{c:7.1f}" for c in soma.centre)
+        radii_txt = ",".join(f"{c:7.1f}" for c in soma.axes)
+        log(f"Moved soma to [{centre_txt}]")
+        log(f"(r = {radii_txt})")
 
     # ------------------------------------------------------------------
     # C. optional one-node branch merge (runs on the rebuilt skeleton)
@@ -1217,8 +1243,8 @@ def _prune_neurites(
         if log and merged_n:
             log(f"Merged {merged_n} single-node branches "
                 f"({merged_e} edges).")
-
-    return nodes_new, radii_new, node2verts_new, vert2node, edges_new
+            
+    return nodes_new, radii_new, node2verts_new, vert2node, edges_new, soma
 
 def _extreme_vertex(mesh: trimesh.Trimesh,
                     axis: str = "z",
@@ -1705,7 +1731,7 @@ def skeletonize(
         with _timed("↳  prune tiny neurites") as log:
 
             (nodes_arr, radii_dict, node2verts, vert2node,
-                edges_mst) = _prune_neurites(
+                edges_mst, soma) = _prune_neurites(
                     nodes_arr, radii_dict, node2verts, edges_mst,
                     soma=soma, 
                     mesh_vertices=mesh_vertices,
