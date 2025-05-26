@@ -1047,6 +1047,71 @@ def _build_mst(nodes: np.ndarray, edges: np.ndarray) -> np.ndarray:
     mst = g.spanning_tree(weights="weight")
     return np.asarray(sorted(tuple(sorted(e)) for e in mst.get_edgelist()), dtype=np.int64)
 
+def _merge_single_node_branches(
+    nodes: np.ndarray,
+    radii_dict: dict[str, np.ndarray],
+    node2verts: list[np.ndarray],
+    edges: np.ndarray,
+    *,
+    mesh_vertices: np.ndarray,
+    min_parent_degree: int = 3,
+) -> tuple[np.ndarray, dict[str, np.ndarray],
+           list[np.ndarray], dict[int, int], np.ndarray]:
+    """
+    Iteratively merge every leaf whose *parent* has degree ≥ `min_parent_degree`.
+    Terminates when no such leaves are left.
+    """
+    while True:
+        # --- current degree -------------------------------------------
+        deg = np.zeros(len(nodes), dtype=int)
+        for a, b in edges:
+            deg[a] += 1
+            deg[b] += 1
+
+        # --- leaves that qualify --------------------------------------
+        leaves = [i for i, d in enumerate(deg) if d == 1 and i != 0]
+        parent = _bfs_parents(edges, len(nodes), root=0)
+        singles = [leaf for leaf in leaves if deg[parent[leaf]] >= min_parent_degree]
+
+        if not singles:
+            break   # fixed-point reached – nothing more to merge
+
+        # --- merge all singles in *one* shot ---------------------------
+        to_drop = set()
+        for leaf in singles:
+            par = parent[leaf]
+
+            # move vertices to parent
+            node2verts[par] = np.concatenate((node2verts[par],
+                                              node2verts[leaf]))
+
+            # re-fit radii
+            pts = mesh_vertices[node2verts[par]]
+            d   = np.linalg.norm(pts - nodes[par], axis=1)
+            for k in radii_dict:
+                radii_dict[k][par] = _estimate_radius(d, method=k)
+
+            to_drop.add(leaf)
+
+        # rebuild arrays after this sweep
+        keep          = np.ones(len(nodes), bool)
+        keep[list(to_drop)] = False
+        remap         = {old: new for new, old in enumerate(np.where(keep)[0])}
+
+        nodes         = nodes[keep]
+        node2verts    = [node2verts[i] for i in np.where(keep)[0]]
+        radii_dict    = {k: v[keep].copy() for k, v in radii_dict.items()}
+        edges         = np.asarray([(remap[a], remap[b])
+                                    for a, b in edges if keep[a] and keep[b]],
+                                   dtype=np.int64)
+
+    # final vert-to-node map
+    vert2node = {int(v): i
+                 for i, vs in enumerate(node2verts)
+                 for v in vs}
+    return nodes, radii_dict, node2verts, vert2node, edges
+
+
 def _prune_neurites(
     nodes: np.ndarray,
     radii_dict: dict[str, np.ndarray],
@@ -1054,6 +1119,7 @@ def _prune_neurites(
     edges: np.ndarray,
     *,
     soma: Soma,
+    mesh_vertices: np.ndarray,
     tip_extent_factor: float = 1.2,
     stem_extent_factor: float = 3.0,
     drop_single_node_branches: bool = True, 
@@ -1109,16 +1175,15 @@ def _prune_neurites(
             to_drop.update(comp)
 
     # ------------------------------------------------------------------
-    # B. *new* one-node branch pruning
+    # B. *new* one-node branch *merging*
     # ------------------------------------------------------------------
     if drop_single_node_branches:
-        min_node_radius = np.percentile(radii_dict["median"], 50)
-        deg = np.zeros(N, dtype=int)
-        for a, b in edges:
-            deg[a] += 1
-            deg[b] += 1
-        singles = {i for i, d in enumerate(deg) if d == 1 and i != 0 and radii_dict["median"][i] < min_node_radius}
-        to_drop.update(singles)
+        nodes, radii_dict, node2verts, vert2node, edges = \
+            _merge_single_node_branches(
+                nodes, radii_dict, node2verts, edges,
+                mesh_vertices=mesh_vertices,   # already available
+                min_parent_degree=3,
+            )
 
     # ------------------------------------------------------------------
     # C. keep / rebuild skeleton if anything was pruned
@@ -1637,6 +1702,7 @@ def skeletonize(
                 edges_mst) = _prune_neurites(
                     nodes_arr, radii_dict, node2verts, edges_mst,
                     soma=soma, 
+                    mesh_vertices=mesh_vertices,
                     tip_extent_factor=prune_tip_extent_factor,
                     stem_extent_factor=prune_stem_extent_factor,
                     drop_single_node_branches=prune_drop_single_node_branches,
