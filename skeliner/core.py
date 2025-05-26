@@ -86,6 +86,29 @@ class Soma:
         ρ2 = (ξ ** 2).sum(axis=-1)
         return ρ2 <= inside_frac ** 2
     
+    def distance(self, x, to="center"):
+        """
+        Compute the distance from *x* to the soma.
+
+        Parameters
+        ----------
+        x : (N, 3) or (3,) array-like
+            Points in world coordinates.
+        to : {'center', 'surface'}
+            Whether to compute the distance to the centre or to the surface.
+
+        Returns
+        -------
+        (N,) or float
+            Unsigned Euclidean distance from *x* to the soma.
+        """
+        if to == "center":
+            return self.distance_to_center(x)
+        elif to == "surface":
+            return self.distance_to_surface(x)
+        else:
+            raise ValueError(f"Unknown distance target '{to}'.")
+
     def distance_to_center(self, x: np.ndarray) -> np.ndarray | float:
         """Unsigned Euclidean distance from *x* to the soma *centre*."""
         x = np.asanyarray(x, dtype=np.float32)
@@ -771,8 +794,8 @@ def _merge_near_soma_nodes(
     mesh_vertices: np.ndarray,
     # ---- new, all relative to the fitted spherical radius -------------
     inside_tol: float = 0.0,        # anything with d < 0 − tol is *inside*
-    near_factor: float = 1.0,       # “near” if d < near_factor × r_soma
-    fat_factor : float = 0.25,      # “fat” if r ≥ fat_factor  × r_soma
+    near_factor: float = 1.2,       # “near” if d < near_factor × r_soma
+    fat_factor : float = 0.20,      # “fat” if r ≥ fat_factor  × r_soma
     log: Callable | None = None,
 ):
     """
@@ -790,9 +813,10 @@ def _merge_near_soma_nodes(
     # ------------------------------------------------------------------
     r_soma     = soma.spherical_radius
     r_primary  = radii_dict[radius_key]
-    d2s        = soma.distance_to_surface(nodes)  # signed distance
+    d2s        = soma.distance(nodes, to="surface")  # signed distance
+    d2c        = soma.distance(nodes, to="center")  # unsigned distance
     inside     = d2s < -inside_tol
-    near       = d2s < near_factor * r_soma
+    near       = d2c < near_factor * r_soma
     fat        = r_primary > fat_factor * r_soma
 
     keep_mask  = ~(inside | (near & fat))
@@ -857,7 +881,9 @@ def _merge_near_soma_nodes(
 
     if log:
         centre_txt = ", ".join(f"{c:7.1f}" for c in soma.centre)
-        log(f"Moved soma to [{centre_txt}] (r={r_soma:6.1f})")
+        radii_txt = ",".join(f"{c:7.1f}" for c in soma.axes)
+        log(f"Moved soma to [{centre_txt}]")
+        log(f"(r = {radii_txt})")
 
     return (nodes_keep, radii_keep, node2_keep, vert2node, edges_out, soma)
 
@@ -1077,7 +1103,7 @@ def _prune_neurites(
     soma: Soma,
     tip_extent_factor: float = 1.2,
     stem_extent_factor: float = 3.0,
-    drop_single_node_branches: bool = True,      # NEW
+    drop_single_node_branches: bool = True, 
     log: Callable | None = None,
 ):
     """
@@ -1381,16 +1407,13 @@ def _detect_soma(
         node2verts[0], node2verts[new_root] = node2verts[new_root], node2verts[0]
         for vid, nid in list(vert2node.items()):
             vert2node[vid] = {0: new_root, new_root: 0}.get(nid, nid)
-        if log:
-            centre_txt = ", ".join(f"{c:7.1f}" for c in soma.centre)
-            log(f"Found soma at [{centre_txt}] (r={soma.spherical_radius:.2f}) ")
 
     # ------------------------------------------------------------------
     # D. collect surface vertices that belong to the soma envelope
     # ------------------------------------------------------------------
     # quick hack fix, might need a better solution within _find_soma()
     
-    all_close = soma.distance_to_center(nodes[soma_nodes]) < soma.spherical_radius * 2
+    all_close = soma.distance(nodes[soma_nodes], to="center") < soma.spherical_radius * 2
     soma_vert_ids = np.unique(
         np.concatenate([node2verts[i] for i in soma_nodes[all_close]])
     ).astype(np.int64)
@@ -1412,6 +1435,12 @@ def _detect_soma(
             log("Soma fitting failed, using spherical approximation instead.")
         # fallback to spherical approximation
         soma = Soma.from_sphere(soma.centre, r_sphere, verts=soma.verts)
+
+    if log:
+        centre_txt = ", ".join(f"{c:7.1f}" for c in soma.centre)
+        radii_txt = ",".join(f"{c:7.1f}" for c in soma.axes)
+        log(f"Found soma at [{centre_txt}]")
+        log(f"(r = {radii_txt})")
 
     return nodes, radii, node2verts, vert2node, soma, True
 
@@ -1504,8 +1533,8 @@ def skeletonize(
     # ------------------------------------------------------------------
     if verbose:
         _global_start = time.perf_counter()
-        print(f"[skeliner] starting skeletonisation ({len(mesh.vertices)} vertices, "
-              f"{len(mesh.faces)} faces)")
+        print(f"[skeliner] starting skeletonisation ({len(mesh.vertices):,} vertices, "
+              f"{len(mesh.faces):,} faces)")
         soma_ms = 0.0 # soma detection time
         post_ms = 0.0 # post-processing time
 
@@ -1640,7 +1669,7 @@ def skeletonize(
         if verbose:
             post_ms += time.perf_counter() - _t0
 
-    # 7. global minimum-spanning tree ------------------------------------
+    # # 7. global minimum-spanning tree ------------------------------------
     with _timed("↳  build global minimum-spanning tree"):
         edges_mst = _build_mst(nodes_arr, edges_arr)
         if verbose:
