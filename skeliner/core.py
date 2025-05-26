@@ -367,7 +367,7 @@ def _find_soma(
     *,
     pct_large : float = 99.9,
     dist_factor: float = 3.0,   # keep nodes within dist_factor × R_max
-    min_keep: int = 3,
+    min_keep: int = 2,
 ) -> tuple[Soma, np.ndarray, bool]:
     """
     Soma = {  nodes whose radius ≥ pct_large-percentile
@@ -489,7 +489,7 @@ def _split_comp_if_elongated(
     v: np.ndarray,
     *,
     aspect_thr: float = 2.0,          # “acceptable” λ1 / λ2
-    min_cluster_vertices: int = 6,
+    min_shell_vertices: int = 6,
     max_vertices_per_slice: int | None = None,
 ):
     """
@@ -502,7 +502,7 @@ def _split_comp_if_elongated(
     an aspect ratio ≤ aspect_thr** (plus a small safety margin).
     """
 
-    if comp_idx.size < min_cluster_vertices:
+    if comp_idx.size < min_shell_vertices:
         yield comp_idx
         return
 
@@ -520,7 +520,7 @@ def _split_comp_if_elongated(
     n_split = int(np.ceil(elong / aspect_thr))
 
     # 1. never make more slices than vertices allow
-    n_split = min(n_split, comp_idx.size // min_cluster_vertices)
+    n_split = min(n_split, comp_idx.size // min_shell_vertices)
 
     # 2. optional extra guard: cap by absolute slice size
     if max_vertices_per_slice is not None:
@@ -537,7 +537,7 @@ def _split_comp_if_elongated(
 
     for lo, hi in zip(cuts[:-1], cuts[1:]):
         m = (proj >= lo) & (proj <= hi)
-        if m.sum() >= min_cluster_vertices:
+        if m.sum() >= min_shell_vertices:
             yield comp_idx[m]
 
 def _bin_geodesic_shells(
@@ -545,13 +545,14 @@ def _bin_geodesic_shells(
     gsurf: ig.Graph,
     *,
     soma: Soma,
+    step_size: float | None = None,
     target_shell_count: int        = 500,
-    min_cluster_vertices: int      = 6,
+    min_shell_vertices: int      = 6,
     max_shell_width_factor: float  = 50.0,
     # -- split elongated shells (optional) ------------------------
     split_elongated_shells: bool = True,
     split_aspect_thr: float = 3.0,             # λ1 / λ2
-    split_min_cluster_vertices: int = 50,       # minimum size of a cluster to split
+    split_min_shell_vertices: int = 50,       # minimum size of a cluster to split
     split_max_vertices_per_slice: int | None = None,  # max size of a slice
 ) -> List[List[np.ndarray]]:
     """
@@ -576,7 +577,7 @@ def _bin_geodesic_shells(
     target_shell_count
         Requested number of shells per connected component.  The actual width
         is adapted to mesh resolution.
-    min_cluster_vertices
+    min_shell_vertices
         Discard clusters smaller than this size; they usually represent noise.
     max_shell_width_factor
         Upper limit for the shell width expressed as a multiple of the mean
@@ -637,8 +638,11 @@ def _bin_geodesic_shells(
             continue
 
         # shell width: max(edge × 2, arc_len / target_shell_count)
-        arc_len = max(dist_sub.values())
-        step    = max(e_m * 2.0, arc_len / target_shell_count)
+        if step_size is None:
+            arc_len = max(dist_sub.values())
+            step    = max(e_m * 2.0, arc_len / target_shell_count)
+        else:
+            step = float(step_size)
 
         # ------------------------------------------------------------------
         # increase the step until we get at least one non-empty shell
@@ -661,7 +665,7 @@ def _bin_geodesic_shells(
             sub   = gsurf.induced_subgraph(inner)
             comps = []
             for comp in sub.components():
-                if len(comp) < min_cluster_vertices:
+                if len(comp) < min_shell_vertices:
                     continue      # too small ➜ ignore
                 comp_idx = np.fromiter(
                     (inner[i] for i in comp), dtype=np.int64
@@ -670,7 +674,7 @@ def _bin_geodesic_shells(
                 if split_elongated_shells and len(comp) < 1500: # hard-coded for now, if too large, might be a soma
                     for part in _split_comp_if_elongated(comp_idx, v, 
                                                             aspect_thr=split_aspect_thr, 
-                                                            min_cluster_vertices=split_min_cluster_vertices,
+                                                            min_shell_vertices=split_min_shell_vertices,
                                                             max_vertices_per_slice=split_max_vertices_per_slice):
                         comps.append(part)
                 else:
@@ -1120,26 +1124,62 @@ def _prune_neurites(
     *,
     soma: Soma,
     mesh_vertices: np.ndarray,
-    tip_extent_factor: float = 1.2,
-    stem_extent_factor: float = 3.0,
+    tip_extent_factor: float = 1.1,
+    stem_extent_factor: float = 5.0,
     drop_single_node_branches: bool = True, 
     log: Callable | None = None,
 ):
     """
-    Prune two kinds of neurites:
+    Collapse obvious mesh-artefact branches into the soma (node 0) in
+    two independent passes.
 
-    1. **Short peri-soma branches** (legacy behaviour) –
-       entire sub-trees that never leave a thin band around the soma
-       surface (controlled by *tip_extent_factor* / *stem_extent_factor*).
+    Parameters
+    ----------
+    tip_extent_factor : float, default 1.2
+        Maximum allowed *tip* distance from the soma **surface**,
+        expressed in multiples of the fitted spherical soma radius
+        ``r_soma``.  For every branch grown from a soma-adjacent node
+        (“stem”), we compute
 
-    2. **One-node branches** (NEW) – every leaf whose branch is literally a
-       single node.  Set *drop_single_node_branches=False* to disable.
+            ``max(d_tip_to_surface)``
+
+        over all nodes in that branch.  If the value never exceeds
+        ``tip_extent_factor * r_soma`` we classify the whole branch as a
+        peri-soma artefact and merge it into the soma.
+
+    stem_extent_factor : float, default 3.0
+        Companion threshold applied *only* to the stem node itself.
+        This reproduces legacy behaviour where anything whose very first
+        segment hugs the soma is considered expendable, even if its
+        children wander further out.  Set to a smaller number to be more
+        permissive (keep short stems), or larger to remove more.
+
+    drop_single_node_branches : bool, default True
+        After extent-based pruning, merge every remaining leaf whose
+        branch consists of a **single node** (degree-1 child hanging off
+        a parent with degree ≥ 3).  Disable if one-node twigs are
+        meaningful for your downstream pipeline.
+
+    Returns
+    -------
+    nodes_new, radii_new, node2verts_new, vert2node, edges_new, soma
+        Skeleton arrays with the selected branches collapsed into
+        the soma; see original function for exact formats.
+
+    Notes
+    -----
+    * Both extent thresholds are relative to the soma *surface*,
+      **not** its centre.
+    * Setting both extent factors ≤ 1 collapses any branch that never
+      leaves the soma sphere at all.
+    * The hard-coded ``min_parent_degree`` for one-node pruning is 3—
+      adjust inside :func:`_merge_single_node_branches` if needed.
     """
     # ------------------------------------------------------------------
     # A. legacy extent-based pruning (unchanged)
     # ------------------------------------------------------------------
     r_soma  = soma.spherical_radius
-    d2s     = np.asarray(soma.distance_to_surface(nodes))
+    d2c     = np.asarray(soma.distance(nodes, to="center"))
 
     N = len(nodes)
     parent = _bfs_parents(edges, N, root=0)
@@ -1168,7 +1208,7 @@ def _prune_neurites(
                     stack.append(nb)
             prev = v
 
-        max_d = d2s[comp].max()
+        max_d = d2c[comp].max()
         thr   = (stem_extent_factor if parent[child] == 0
                  else tip_extent_factor) * r_soma
         if max_d <= thr:
@@ -1267,7 +1307,7 @@ def _merge_nested_nodes(
     radii: np.ndarray,              # primary estimator (e.g. "median")
     node2verts: list[np.ndarray],
     *,
-    inside_frac: float = 0.6,       # 1.0 = 100 % (strict), 0.99 ≈ 99 %, …
+    inside_frac: float = 0.9,       # 1.0 = 100 % (strict), 0.99 ≈ 99 %, …
     keep_root: bool = True,
     tol: float = 1e-6,
 ) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
@@ -1512,14 +1552,15 @@ def skeletonize(
     soma_init_guess_axis: str  = "z",   # "x" | "y" | "z"
     soma_init_guess_mode: str  = "min", # "min" | "max"
     # --- geodesic binning ---
-    target_shell_count: int = 1000, # higher = more bins, smaller bin size
-    min_cluster_vertices: int = 6,
+    geodesic_step_size: float | None = None,
+    geodesic_shell_count: int = 1000, # higher = more bins, smaller bin size
+    min_shell_vertices: int = 6,
     max_shell_width_factor: int = 50,
     split_elongated_shells: bool = False,
     split_aspect_thr: float = 3.0,  # λ1 / λ2
-    split_min_cluster_vertices: int = 15,
+    split_min_shell_vertices: int = 15,
     split_max_vertices_per_slice: int | None = None,
-    merge_nodes_fractor: float = 0.6,  # merge nested nodes if inside_frac ≥ this
+    merge_nodes_overlap_fraction: float = 0.8,  # merge nested nodes if inside_frac ≥ this
     # --- bridging disconnected patches ---
     bridge_gaps: bool = True,
     bridge_max_factor: float | None = None,
@@ -1646,13 +1687,14 @@ def skeletonize(
 
         all_shells = _bin_geodesic_shells(
             mesh, gsurf,
-            soma=soma,                           
-            target_shell_count=target_shell_count,
-            min_cluster_vertices=min_cluster_vertices,
+            soma=soma,     
+            step_size=geodesic_step_size,                      
+            target_shell_count=geodesic_shell_count,
+            min_shell_vertices=min_shell_vertices,
             max_shell_width_factor=max_shell_width_factor,
             split_elongated_shells=split_elongated_shells,
             split_aspect_thr=split_aspect_thr,
-            split_min_cluster_vertices=split_min_cluster_vertices,
+            split_min_shell_vertices=split_min_shell_vertices,
             split_max_vertices_per_slice=split_max_vertices_per_slice,
         )
 
@@ -1662,7 +1704,7 @@ def skeletonize(
             all_shells, mesh_vertices,
             radius_estimators=radius_estimators,
             merge_nested=True,
-            merge_kwargs={"inside_frac": merge_nodes_fractor},        # tune `inside_frac`/`keep_root` here if needed
+            merge_kwargs={"inside_frac": merge_nodes_overlap_fraction},        # tune `inside_frac`/`keep_root` here if needed
         )
 
     # 3. soma detection (optional) -----------------------------------

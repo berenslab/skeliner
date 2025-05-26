@@ -161,29 +161,134 @@ def degree_distribution(
         "high_degree_nodes": high_dict,
     }
 
+def degree_eq(skel, k: int):
+    """Return *all* node IDs whose degree == *k* (soma excluded).
 
-# def degree_distribution(
-#     skel,
-#     *,
-#     high_deg_percentile: float = 99.5,
-# ) -> Dict[str, Union[np.ndarray, Dict[int, int]]]:
-#     """Return degree histogram and *high‑degree* outliers.
+    Examples
+    --------
+    >>> leaves = sk.dx.degree_eq(skel, 1)
+    >>> hubs   = sk.dx.degree_eq(skel, 4)
+    """
+    if k < 0:
+        raise ValueError("k must be non‑negative")
+    g = _graph(skel)
+    deg = np.asarray(g.degree())
+    idx = np.where(deg == k)[0]
+    if k == deg[0]:  # avoid returning the soma
+        idx = idx[idx != 0]
+    return idx.astype(int)
 
-#     The 99.5‑th percentile is flagged by default; override the percentile to
-#     tune sensitivity.
-#     """
-#     g = _graph(skel)
-#     deg = np.asarray(g.degree())
+def branches_of_length(
+    skel,
+    k: int,
+    *,
+    include_endpoints: bool = True,
+) -> List[List[int]]:
+    """Return every *branch* (sequence of degree‑2 vertices) whose length == k.
 
-#     hist = np.bincount(deg)
-#     thresh = np.percentile(deg, high_deg_percentile)
-#     high_nodes = {int(i): int(deg[i]) for i in np.where(deg > thresh)[0]}
+    Definition of a *branch*
+    ------------------------
+    A maximal simple path **P** such that:
+    * the two endpoints have degree ≠ 2 (soma, bifurcation, or leaf), and
+    * every interior vertex (if any) has degree == 2.
 
-#     return {
-#         "hist": hist,
-#         "threshold": float(thresh),
-#         "high_degree_nodes": high_nodes,
-#     }
+    Example – degree pattern ``1‑2‑2‑3``::
+
+        0‑1‑2‑3
+        ^   ^   ^
+        |   |   +—— endpoint (deg != 2)
+        |   +—— interior (deg == 2)
+        +—— endpoint (leaf)
+
+    ``branches_of_length(skel, k=3)`` would return ``[[0,1,2]]``.
+
+    Parameters
+    ----------
+    k
+        Desired branch length *in number of nodes* (``len(path)``).
+    include_endpoints
+        If *True* endpoints are counted as part of the path and therefore
+        contribute to *k*.  If *False* only the *interior* degree‑2 vertices
+        are counted.
+    """
+    g = _graph(skel)
+    deg = np.asarray(g.degree())
+    N = len(deg)
+
+    # Mark endpoints = vertices with degree != 2 OR soma (0) even if deg==2
+    endpoints: Set[int] = {i for i, d in enumerate(deg) if d != 2}
+    endpoints.add(0)
+
+    visited_edges: Set[Tuple[int, int]] = set()
+    branches: List[List[int]] = []
+
+    for ep in endpoints:
+        for nb in g.neighbors(ep):
+            edge = tuple(sorted((ep, nb)))
+            if edge in visited_edges:
+                continue
+
+            path = [ep]
+            prev, curr = ep, nb
+            while True:
+                path.append(curr)
+                visited_edges.add(tuple(sorted((prev, curr))) )
+                if curr in endpoints:
+                    break
+                # internal vertex (deg==2) → continue straight
+                nxts = [v for v in g.neighbors(curr) if v != prev]
+                if not nxts:
+                    break  # should not happen in a well‑formed tree
+                prev, curr = curr, nxts[0]
+
+            length = len(path) if include_endpoints else len(path) - 2
+            if length == k:
+                branches.append([int(v) for v in path])
+
+    return branches
+
+
+def terminal_branches_of_length(
+    skel,
+    k: int,
+    *,
+    include_endpoints: bool = True,
+) -> List[List[int]]:
+    """Return *terminal* branches whose node count == ``k``.
+
+    A terminal branch is a simple path that starts at a bifurcation (or the
+    soma) and ends at a **leaf** (degree == 1).  Interior vertices (if any)
+    have degree == 2.
+
+    Parameters
+    ----------
+    skel : Skeleton
+        Input skeleton.
+    k : int
+        Desired length in **nodes**.  Endpoints are included when
+        ``include_endpoints`` is *True*.
+    include_endpoints : bool, default ``True``
+        Whether endpoints contribute to *k*.
+
+    Returns
+    -------
+    list[list[int]]
+        Ordered node‑ID paths of every matching branch.
+    """
+    all_branches = branches_of_length(
+        skel, k, include_endpoints=include_endpoints)
+
+    g = _graph(skel)
+    deg = np.asarray(g.degree())
+
+    term = []
+    for path in all_branches:
+        # exactly one endpoint must be a leaf (degree==1)
+        leaf_count = int(deg[path[0]] == 1) + int(deg[path[-1]] == 1)
+        if leaf_count == 1:
+            term.append(path)
+    return term
+
 
 # -----------------------------------------------------------------------------
 # 3. leaf depths (BFS distance in *edges* from soma)
@@ -203,7 +308,6 @@ def leaf_depths(skel) -> np.ndarray:
 # -----------------------------------------------------------------------------
 # 4. path‑length monotonicity vs. node id order
 # -----------------------------------------------------------------------------
-
 
 def path_length_monotonicity(
     skel,
