@@ -4,7 +4,7 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Set, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import igraph as ig
 import numpy as np
@@ -1175,43 +1175,48 @@ def _prune_neurites(
             to_drop.update(comp)
 
     # ------------------------------------------------------------------
-    # B. *new* one-node branch *merging*
+    # B. build a *single* keep-mask (works even if `to_drop` is empty)
     # ------------------------------------------------------------------
-    if drop_single_node_branches:
-        nodes, radii_dict, node2verts, vert2node, edges = \
-            _merge_single_node_branches(
-                nodes, radii_dict, node2verts, edges,
-                mesh_vertices=mesh_vertices,   # already available
-                min_parent_degree=3,
-            )
+    keep = np.ones(N, dtype=bool)
+    if to_drop:
+        keep[list(to_drop)] = False
+    keep[0] = True                              # never drop soma
 
-    # ------------------------------------------------------------------
-    # C. keep / rebuild skeleton if anything was pruned
-    # ------------------------------------------------------------------
-    if not to_drop:
-        vert2node = {int(v): i for i, vs in enumerate(node2verts) for v in vs}
-        return nodes, radii_dict, node2verts, vert2node, edges
+    remap = {old: new for new, old
+             in enumerate(np.where(keep)[0])}
 
-    keep = np.ones(N, bool)
-    keep[list(to_drop)] = False
-    keep[0] = True                                 # never drop soma
+    nodes_new       = nodes[keep]
+    node2verts_new  = [node2verts[i] for i in np.where(keep)[0]]
+    radii_new       = {k: v[keep].copy() for k, v in radii_dict.items()}
+    edges_new       = np.asarray([(remap[a], remap[b])
+                                  for a, b in edges if keep[a] and keep[b]],
+                                 dtype=np.int64)
+    vert2node       = {int(v): i
+                       for i, vs in enumerate(node2verts_new)
+                       for v in vs}
 
-    remap = {old: new for new, old in enumerate(np.where(keep)[0])}
-
-    nodes_new = nodes[keep]
-    node2verts_new = [node2verts[i] for i in np.where(keep)[0]]
-    radii_new = {k: v[keep].copy() for k, v in radii_dict.items()}
-    edges_new = np.asarray(
-        [(remap[a], remap[b]) for a, b in edges if keep[a] and keep[b]],
-        dtype=np.int64,
-    )
-    vert2node = {int(v): i
-                    for i, vs in enumerate(node2verts_new)
-                    for v in vs}
-
-    if log:
+    if log and to_drop:
         log(f"Pruned {len(to_drop)} nodes "
             f"({len(edges) - len(edges_new)} edges).")
+
+    # ------------------------------------------------------------------
+    # C. optional one-node branch merge (runs on the rebuilt skeleton)
+    # ------------------------------------------------------------------
+    if drop_single_node_branches:
+        before_n, before_e = len(nodes_new), edges_new.shape[0]
+
+        (nodes_new, radii_new, node2verts_new,
+         vert2node, edges_new) = _merge_single_node_branches(
+                nodes_new, radii_new, node2verts_new, edges_new,
+                mesh_vertices=mesh_vertices,
+                min_parent_degree=3,
+        )
+
+        merged_n = before_n - len(nodes_new)
+        merged_e = before_e - edges_new.shape[0]
+        if log and merged_n:
+            log(f"Merged {merged_n} single-node branches "
+                f"({merged_e} edges).")
 
     return nodes_new, radii_new, node2verts_new, vert2node, edges_new
 
@@ -1236,7 +1241,7 @@ def _merge_nested_nodes(
     radii: np.ndarray,              # primary estimator (e.g. "median")
     node2verts: list[np.ndarray],
     *,
-    inside_frac: float = 0.9,       # 1.0 = 100 % (strict), 0.99 ≈ 99 %, …
+    inside_frac: float = 0.6,       # 1.0 = 100 % (strict), 0.99 ≈ 99 %, …
     keep_root: bool = True,
     tol: float = 1e-6,
 ) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
@@ -1488,6 +1493,7 @@ def skeletonize(
     split_aspect_thr: float = 3.0,  # λ1 / λ2
     split_min_cluster_vertices: int = 15,
     split_max_vertices_per_slice: int | None = None,
+    merge_nodes_fractor: float = 0.6,  # merge nested nodes if inside_frac ≥ this
     # --- bridging disconnected patches ---
     bridge_gaps: bool = True,
     bridge_max_factor: float | None = None,
@@ -1630,7 +1636,7 @@ def skeletonize(
             all_shells, mesh_vertices,
             radius_estimators=radius_estimators,
             merge_nested=True,
-            merge_kwargs={},        # tune `inside_frac`/`keep_root` here if needed
+            merge_kwargs={"inside_frac": merge_nodes_fractor},        # tune `inside_frac`/`keep_root` here if needed
         )
 
     # 3. soma detection (optional) -----------------------------------
