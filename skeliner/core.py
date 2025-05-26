@@ -296,53 +296,6 @@ class Skeleton:
             Output filename.
         """
         io.to_npz(self, path)
-    # ------------------------------------------------------------------
-    # validation
-    # ------------------------------------------------------------------
-    def check_connectivity(self, *, return_isolated: bool = False):
-        """Verify that all nodes are reachable from the soma (node 0).
-
-        Parameters
-        ----------
-        return_isolated
-            If True return the list of orphan node indices instead of a
-            boolean flag.
-
-        Returns
-        -------
-        bool | list[int]
-            True when the skeleton is connected, otherwise False or a
-            list of isolated nodes if return_isolated=True.
-        """
-        g = self._igraph()
-        order, _, _ = g.bfs(0, mode="ALL")  # returns -1 for unreachable
-        reachable: Set[int] = {v for v in order if v != -1}
-        if return_isolated:
-            return [i for i in range(len(self.nodes)) if i not in reachable]
-        return len(reachable) == len(self.nodes)
-
-    def check_acyclic(self, *, return_cycle: bool = False) -> bool | list[tuple[int, int]]:
-        """Detect cycles in the edge list.
-
-        The skeleton is expected to be a forest (collection of trees).  This
-        method verifies :math:`|E| = |V| - C` where C is the number of
-        connected components.
-
-        Parameters
-        ----------
-        return_cycle
-            When True a representative cycle is returned if one exists; an
-            empty list means the graph is acyclic.
-        """
-        g = self._igraph()                        # helper that builds igraph
-        num_comp = len(g.components())            # instead of .nc
-        acyclic  = g.ecount() == g.vcount() - num_comp
-        if acyclic or not return_cycle:
-            return acyclic
-
-        # -- find a concrete cycle (slow but rare) -----------------------
-        cyc = g.cycle_basis()[0]                  # list of vertex ids
-        return [(cyc[i], cyc[(i + 1) % len(cyc)]) for i in range(len(cyc))]
 
     # ------------------------------------------------------------------
     # radius recommendation
