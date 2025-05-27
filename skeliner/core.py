@@ -3,15 +3,16 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Sequence, Tuple
 
 import igraph as ig
 import numpy as np
 import trimesh
 from scipy.spatial import KDTree
 
-from . import io
+from . import dx, io
 
 __all__ = [
     "Skeleton",
@@ -240,6 +241,16 @@ class Skeleton:
     node2verts: list[np.ndarray] | None = None
     vert2node: dict[int, int] | None = None
 
+    def __getattr__(self, name: str):
+        try:
+            f = getattr(dx, name)
+        except AttributeError as e:
+            raise AttributeError(name) from e
+        if callable(f):
+            # curry self
+            return lambda *a, **kw: f(self, *a, **kw)
+        raise AttributeError(name)
+
     # ---------------------------------------------------------------------
     # sanity checks
     # ---------------------------------------------------------------------
@@ -340,6 +351,28 @@ class Skeleton:
         """Just the estimator name chosen by :py:meth:`recommend_radius`."""
         choice = self.recommend_radius()[0]
         return self.radii[choice]
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+    # def connectivity(self, *, return_isolated: bool = False):
+    #     return dx.connectivity(self, return_isolated=return_isolated)
+
+    # def acyclicity(self, *, return_cycles: bool = False):
+    #     return dx.acyclicity(self, return_cycles=return_cycles)
+    
+    # def degree(self, node_id: int | Sequence[int]):
+    #     return dx.degree(self, node_id)
+
+# attach every callable in dx.__skeleton__ as a method to Skeleton
+for _name in dx.__skeleton__:
+    _f = getattr(dx, _name)
+
+    @wraps(_f)                 # keeps the original doc-string & signature
+    def _m(self, *args, _f=_f, **kw):
+        return _f(self, *args, **kw)
+
+    setattr(Skeleton, _name, _m)
 
 # -----------------------------------------------------------------------------
 #  Graph helpers 

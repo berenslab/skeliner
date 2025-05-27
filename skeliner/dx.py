@@ -1,17 +1,19 @@
 """skeliner.dx – graph‑theoretic diagnostics for a single Skeleton
 """
-from typing import Any, Dict, List, Sequence, Tuple, Union
+from typing import Any, Dict, List, Sequence, Set, Tuple, Union
 
 import igraph as ig
 import numpy as np
 from scipy.stats import spearmanr
 
-__all__ = [
+__skeleton__ = [
     "connectivity",
     "acyclicity",
-    "degree_distribution",
-    "leaf_depths",
-    "path_length_monotonicity",
+    "degree",
+    "neighbors", 
+    "nodes_of_degree",
+    "branches_of_length",
+    "terminal_branches_of_length",
 ]
 
 # -----------------------------------------------------------------------------
@@ -46,7 +48,7 @@ def connectivity(skel, *, return_isolated: bool = False):
     return len(reachable) == g.vcount()
 
 
-def acyclicity(skel, *, return_cycle: bool = False):
+def acyclicity(skel, *, return_cycles: bool = False):
     """Check that the skeleton is a *forest* (|E| = |V| − components).
 
     If a cycle exists and ``return_cycle`` is *True*, a representative list of
@@ -55,7 +57,7 @@ def acyclicity(skel, *, return_cycle: bool = False):
     g = _graph(skel)
     n_comp = len(g.components())
     acyclic = g.ecount() == g.vcount() - n_comp
-    if acyclic or not return_cycle:
+    if acyclic or not return_cycles:
         return acyclic
     cyc = g.cycle_basis()[0]  # list of vertex ids
     return [(cyc[i], cyc[(i + 1) % len(cyc)]) for i in range(len(cyc))]
@@ -161,7 +163,7 @@ def degree_distribution(
         "high_degree_nodes": high_dict,
     }
 
-def degree_eq(skel, k: int):
+def nodes_of_degree(skel, k: int):
     """Return *all* node IDs whose degree == *k* (soma excluded).
 
     Examples

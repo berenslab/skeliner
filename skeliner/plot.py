@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import trimesh
 from matplotlib.axes import Axes
-from matplotlib.collections import LineCollection
+from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.patches import Ellipse
 from scipy.stats import binned_statistic_2d
 
@@ -19,6 +19,16 @@ _PLANE_AXES = {
     "xz": (0, 2), "zx": (2, 0),
     "yz": (1, 2), "zy": (2, 1),  
 }
+
+_PLANE_NORMAL = {
+    "xy": np.array([0, 0, 1.0]),
+    "yx": np.array([0, 0, 1.0]),
+    "xz": np.array([0, 1.0, 0]),
+    "zx": np.array([0, 1.0, 0]),
+    "yz": np.array([1.0, 0, 0]),
+    "zy": np.array([1.0, 0, 0]),
+}
+
 
 _GOLDEN_RATIO = 0.618033988749895          # for visually distinct colours
 
@@ -58,6 +68,44 @@ def _radii_to_sizes(rr: np.ndarray, ax: Axes) -> tuple[np.ndarray, float]:
     r_px = rr * ppd
     r_pt = r_px * 72.0 / dpi
     return np.pi * r_pt**2, ppd
+
+
+def _trapezoid_3d(
+    p0_3d: np.ndarray, p1_3d: np.ndarray,
+    r0: float, r1: float,
+    plane: str,
+) -> np.ndarray | None:
+    """
+    Return 4×2 vertices of the projected trapezoid that joins the two circles
+    centred at *p0_3d* and *p1_3d* with radii *r0*, *r1*.
+
+    The bases are perpendicular to the true 3-D axis, so their projected
+    length equals the node diameters.  Returns **None** for zero-length edges.
+    """
+    v = p1_3d - p0_3d
+    if not np.any(v):                 # degenerate edge
+        return None
+
+    n3 = np.cross(v, _PLANE_NORMAL[plane])
+    L  = np.linalg.norm(n3)
+    if L == 0:                        # edge is parallel to the projection normal
+        return None
+    n3 /= L                           # now unit length in 3-D
+
+    # project to 2-D
+    ix, iy = _PLANE_AXES[plane]
+    n2 = n3[[ix, iy]]
+
+    p0 = p0_3d[[ix, iy]]
+    p1 = p1_3d[[ix, iy]]
+
+    return np.array([
+        p0 + n2 * r0,
+        p0 - n2 * r0,
+        p1 - n2 * r1,
+        p1 + n2 * r1,
+    ], dtype=float)
+
 
 def _soma_ellipse2d(soma, plane: str, *, scale: float = 1.0) -> Ellipse:
     """
@@ -124,11 +172,12 @@ def projection(
     ylim: tuple[float, float] | None = None,
     draw_skel: bool = True,
     draw_edges: bool = False,
+    draw_cylinders: bool = False,  
     ax: Axes | None = None,
     cmap: str = "Blues",
     vmax_fraction: float = 0.10,
     circle_alpha: float = 0.25,
-    line_alpha: float = 0.8,
+    cylinder_alpha: float = 0.5,
     unit: str | None = None,
     # --- soma ---
     draw_soma_mask: bool = True,
@@ -150,11 +199,14 @@ def projection(
         Spatial extent to keep **before** plotting.
     draw_edges : bool
         If True, draw the skeleton graph edges.
+    draw_cylinders : bool, default False
+        Draw thickness-scaled cylinders (as variable-width lines)
+        between connected nodes.
     ax : matplotlib.axes.Axes or None
         Existing axes to draw into (created automatically if ``None``).
     vmax_fraction : float, default 0.10
         Upper colour-limit for the histogram (as a fraction of its max).
-    circle_alpha, line_alpha : float
+    circle_alpha, cylinder_alpha : float
         Transparencies of the skeleton glyphs.
     **imshow_kwargs
         Extra options passed to :pyfunc:`matplotlib.axes.Axes.imshow`.
@@ -232,6 +284,8 @@ def projection(
 
     # ─────────────────── circles ──────────────────────────────────────────
     if draw_skel:
+        ax.set_xlim(xlim if xlim is not None else (xy_mesh[:,0].min(), xy_mesh[:,0].max()))
+        ax.set_ylim(ylim if ylim is not None else (xy_mesh[:,1].min(), xy_mesh[:,1].max()))
         sizes, ppd = _radii_to_sizes(rr, ax)
 
         slicing = 0 if skel.soma.verts is None else 1
@@ -296,9 +350,48 @@ def projection(
                 segments.tolist(),
                 colors="black",
                 linewidths=.5,
-                alpha=line_alpha,
+                alpha=cylinder_alpha,
             )
             ax.add_collection(lc)
+
+    # ─────────────────── cylinders as trapezoids (proper 3-D widths) ──────
+    # ─────────── cylinders as trapezoids (proper 3-D widths) ────────────
+    if draw_skel and draw_cylinders and skel.edges.size:
+        ekeep      = keep_skel[skel.edges[:, 0]] & keep_skel[skel.edges[:, 1]]
+        edges_kept = skel.edges[ekeep]
+        skel_scale = float(scale[0]) 
+        if edges_kept.size:
+            idx_map = -np.ones(len(keep_skel), dtype=int)
+            idx_map[np.flatnonzero(keep_skel)] = np.arange(keep_skel.sum())
+
+            quads = []
+            
+            for n0, n1 in edges_kept:
+                i0, i1 = idx_map[[n0, n1]]
+                quad = _trapezoid_3d(
+                    skel.nodes[n0] * skel_scale, skel.nodes[n1] * skel_scale,
+                    rr[i0], rr[i1],
+                    plane,
+                )
+                if quad is not None:
+                    quads.append(quad)
+
+            print(f"[projection] built {len(quads)} trapezoids")  # ← DEBUG
+
+            if quads:
+                # 1️⃣  make sure limits are fixed **before** adding the collection
+                if xlim is not None: ax.set_xlim(xlim)
+                if ylim is not None: ax.set_ylim(ylim)
+
+                pc = PolyCollection(
+                    quads,
+                    facecolors="red",
+                    edgecolors="red",
+                    alpha=cylinder_alpha,
+                    zorder=10,          # 2️⃣  above image & circles
+                )
+                ax.add_collection(pc)
+
     # ─────────────────── final tweaks ─────────────────────────────────────
     ax.set_aspect("equal")
     if unit is None:
@@ -332,12 +425,14 @@ def details(
     # overlays --------------------------------------------------------------- #
     draw_nodes: bool = True,
     draw_edges: bool = False,
+    draw_cylinders: bool = False,
     draw_soma_mask: bool = True,
     show_node_ids: bool = False,
     radius_metric: str | None = None,
     # appearance ------------------------------------------------------------- #
     cluster_cmap: str = "tab20",
     circle_alpha: float = 0.9,
+    cylinder_alpha: float = 0.5,
     edge_color: str = "0.25",
     edge_lw: float = 0.8,
     id_fontsize: int = 6,
@@ -483,11 +578,12 @@ def details(
         s=1.0, c=colours, alpha=0.75, linewidths=0, zorder=9
     )
 
+    ax.set_xlim(xlim if xlim is not None else (xy_mesh_scatter[:,0].min(), xy_mesh_scatter[:,0].max()))
+    ax.set_ylim(ylim if ylim is not None else (xy_mesh_scatter[:,1].min(), xy_mesh_scatter[:,1].max()))
     sizes, ppd = _radii_to_sizes(rr, ax)
     # ------------- skeleton circles & centres -------------------------------
     if draw_nodes and len(xy_skel):
         
-
         # per-node colour uses *first vertex* of the cluster as label
         node_comp   = np.array([
             lab_full[skel.node2verts[i][0]] if len(skel.node2verts[i]) else -1
@@ -528,6 +624,26 @@ def details(
                     zorder=5,
                 )
 
+        # ---------- extra pass: fill highlighted circles --------------------
+        if highlight_nodes:
+            # ‘orig_ids’ are the node IDs *before* cropping,
+            # we computed them two lines above when show_node_ids was handled.
+            # Re-compute here to ensure availability:
+            orig_ids = np.flatnonzero(keep_skel)
+            hilite_mask = np.isin(orig_ids, list(highlight_nodes))
+
+            if hilite_mask.any():
+                ax.scatter(
+                    xy_skel[hilite_mask, 0],
+                    xy_skel[hilite_mask, 1],
+                    s=sizes[hilite_mask],              
+                    facecolors=node_colors[hilite_mask],
+                    edgecolors=node_colors[hilite_mask],
+                    linewidths=0.9,
+                    alpha=highlight_face_alpha,
+                    zorder=4.5,                       
+                )
+
     # ------------- edges -----------------------------------------------------
     if draw_edges and skel.edges.size:
         # keep edges whose *both* endpoints survived cropping
@@ -548,6 +664,42 @@ def details(
                 segs, colors=edge_color, linewidths=edge_lw,
                 alpha=circle_alpha * 0.9, zorder=2)
             ax.add_collection(lc)
+
+    # ─────────────────── optional cylinders ────────────────────────────────
+    if draw_nodes and draw_cylinders and skel.edges.size:
+        # keep only edges whose *both* ends survived cropping
+        skel_scale = float(scale[0])  # skeleton scale
+        ekeep      = keep_skel[skel.edges[:, 0]] & keep_skel[skel.edges[:, 1]]
+        edges_kept = skel.edges[ekeep]
+        if edges_kept.size:
+            # build compressed index map (orig-id  →  kept-array index)
+            idx_map = -np.ones(len(keep_skel), dtype=int)
+            idx_map[np.flatnonzero(keep_skel)] = np.arange(keep_skel.sum())
+
+            quads, facecols = [], []
+            for n0, n1 in edges_kept:
+                i0, i1 = idx_map[[n0, n1]]
+
+                quad = _trapezoid_3d(
+                    skel.nodes[n0] * skel_scale, skel.nodes[n1] * skel_scale,   # 3-D coords
+                    rr[i0], rr[i1],                   # radii in data units
+                    plane,
+                )
+                if quad is None:          # skip zero-length artefacts
+                    continue
+
+                quads.append(quad)
+                facecols.append(node_colors[i0] if n_comp else "0.25")
+
+            if quads:                                  # guard against empty list
+                pc = PolyCollection(
+                    quads,
+                    facecolors=facecols,
+                    edgecolors="none",
+                    alpha=cylinder_alpha,      # ← new kwarg you added in signature
+                    zorder=2.8,            # beneath circle outlines
+                )
+                ax.add_collection(pc)
 
     # ------------- optional soma shell --------------------------------------
     if draw_soma_mask and skel.soma is not None and skel.soma.verts is not None:
@@ -573,31 +725,6 @@ def details(
         ell.set_linestyle("--")
         ell.set_linewidth(0.8)
         ax.add_patch(ell)                         # dashed outline as before
-
-    # ---------------- skeleton circles & centres ----------------------------
-    if draw_nodes and len(xy_skel):
-
-        # … existing scatter for outline + centre …
-
-        # ---------- extra pass: fill highlighted circles --------------------
-        if highlight_nodes:
-            # ‘orig_ids’ are the node IDs *before* cropping,
-            # we computed them two lines above when show_node_ids was handled.
-            # Re-compute here to ensure availability:
-            orig_ids = np.flatnonzero(keep_skel)
-            hilite_mask = np.isin(orig_ids, list(highlight_nodes))
-
-            if hilite_mask.any():
-                ax.scatter(
-                    xy_skel[hilite_mask, 0],
-                    xy_skel[hilite_mask, 1],
-                    s=sizes[hilite_mask],              
-                    facecolors=node_colors[hilite_mask],
-                    edgecolors=node_colors[hilite_mask],
-                    linewidths=0.9,
-                    alpha=highlight_face_alpha,
-                    zorder=4.5,                       
-                )
 
     # ------------- cosmetics -------------------------------------------------
     ax.set_aspect("equal")
@@ -645,6 +772,7 @@ def threeviews(
     title: str | None = None,
     figsize: tuple[int, int] = (8, 8),
     draw_edges: bool = True,
+    draw_cylinders: bool = False,
     draw_soma_mask: bool = True,
     **plot_kwargs,
 ):
@@ -735,6 +863,7 @@ def threeviews(
             xlim=xlim,
             ylim=ylim,
             draw_edges=draw_edges,
+            draw_cylinders=draw_cylinders,
             draw_soma_mask=draw_soma_mask,
             **plot_kwargs,
         )
@@ -829,6 +958,7 @@ def node_details(
         plane=plane,
         xlim=xlim,
         ylim=ylim,
+        scale=scale,
         highlight_nodes=node_id,          # ← new feature
         highlight_face_alpha=highlight_alpha,
         **kwargs,
