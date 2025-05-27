@@ -352,19 +352,7 @@ class Skeleton:
         choice = self.recommend_radius()[0]
         return self.radii[choice]
 
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
-    # def connectivity(self, *, return_isolated: bool = False):
-    #     return dx.connectivity(self, return_isolated=return_isolated)
-
-    # def acyclicity(self, *, return_cycles: bool = False):
-    #     return dx.acyclicity(self, return_cycles=return_cycles)
-    
-    # def degree(self, node_id: int | Sequence[int]):
-    #     return dx.degree(self, node_id)
-
-# attach every callable in dx.__skeleton__ as a method to Skeleton
+# attach every diagnostic callable in dx.__skeleton__ as a method to Skeleton
 for _name in dx.__skeleton__:
     _f = getattr(dx, _name)
 

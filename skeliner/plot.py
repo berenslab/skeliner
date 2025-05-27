@@ -178,6 +178,8 @@ def projection(
     vmax_fraction: float = 0.10,
     circle_alpha: float = 0.25,
     cylinder_alpha: float = 0.5,
+    highlight_nodes: int | Sequence[int] | None = None,
+    highlight_face_alpha: float = 0.5,
     unit: str | None = None,
     # --- soma ---
     draw_soma_mask: bool = True,
@@ -226,6 +228,11 @@ def projection(
 
     if radius_metric is None:
         radius_metric = skel.recommend_radius()[0]
+
+    if highlight_nodes is not None:
+        highlight_nodes = {int(n) for n in np.atleast_1d(highlight_nodes)}
+    else:
+        highlight_nodes = set()
 
     # ─────────────────── project & scale ──────────────────────────────────
     xy_mesh = _project(mesh.vertices, ix, iy) * scale[1]
@@ -299,6 +306,23 @@ def projection(
             alpha=circle_alpha,
             zorder=2,
         )
+
+        if highlight_nodes:
+            orig_ids     = np.flatnonzero(keep_skel)          # ids before cropping
+            hilite_mask  = np.isin(orig_ids, list(highlight_nodes))
+
+            if hilite_mask.any():
+                ax.scatter(
+                    xy_skel[hilite_mask, 0],
+                    xy_skel[hilite_mask, 1],
+                    s=sizes[hilite_mask],
+                    facecolors="green",          # or node-colours if you prefer
+                    edgecolors="green",
+                    linewidths=0.9,
+                    alpha=highlight_face_alpha,
+                    zorder=3.5,
+                )
+
 
     # ─── highlight the soma if requested ───────────────────────────────────
     if draw_soma_mask and skel.soma is not None and skel.soma.verts is not None:
@@ -432,7 +456,7 @@ def details(
     # appearance ------------------------------------------------------------- #
     cluster_cmap: str = "tab20",
     circle_alpha: float = 0.9,
-    cylinder_alpha: float = 0.5,
+    cylinder_alpha: float = 0.25,
     edge_color: str = "0.25",
     edge_lw: float = 0.8,
     id_fontsize: int = 6,

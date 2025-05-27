@@ -1,10 +1,9 @@
 """skeliner.dx – graph‑theoretic diagnostics for a single Skeleton
 """
-from typing import Any, Dict, List, Sequence, Set, Tuple, Union
+from typing import Any, Dict, List, Sequence, Set, Tuple
 
 import igraph as ig
 import numpy as np
-from scipy.stats import spearmanr
 
 __skeleton__ = [
     "connectivity",
@@ -13,7 +12,8 @@ __skeleton__ = [
     "neighbors", 
     "nodes_of_degree",
     "branches_of_length",
-    "terminal_branches_of_length",
+    "twigs_of_length",
+    "suspicious_tips",
 ]
 
 # -----------------------------------------------------------------------------
@@ -158,7 +158,8 @@ def degree_distribution(
                 skel, int(idx), radius_metric=radius_metric)
 
     return {
-        "hist": hist,
+        "degree": np.arange(hist.size),
+        "counts": hist,
         "threshold": float(thresh),
         "high_degree_nodes": high_dict,
     }
@@ -250,7 +251,7 @@ def branches_of_length(
     return branches
 
 
-def terminal_branches_of_length(
+def twigs_of_length(
     skel,
     k: int,
     *,
@@ -307,31 +308,101 @@ def leaf_depths(skel) -> np.ndarray:
     depths = np.asarray(g.shortest_paths(source=0))[0]
     return depths[leaves].astype(int)
 
-# -----------------------------------------------------------------------------
-# 4. path‑length monotonicity vs. node id order
-# -----------------------------------------------------------------------------
-
-def path_length_monotonicity(
+def suspicious_tips(
     skel,
     *,
-    return_pvalue: bool = False,
-) -> Union[float, Tuple[float, float]]:
-    """Spearman ρ between node *id* and metric *path length* from soma.
+    near_factor: float = 1.2,
+    path_ratio_thresh: float = 2.0,
+    return_stats: bool = False,
+) -> List[int] | Tuple[List[int], Dict[int, Dict[str, float]]]:
+    """Identify *tip* nodes suspiciously close to the soma.
 
-    Nodes are typically created in roughly increasing distance order, so a
-    high positive correlation (ρ ≫ 0) is expected.  Values ≲ 0.6 often hint
-    at mis‑ordered nodes produced by disconnected components or aggressive
-    bridging.
+    A *tip* is a node with graph degree = 1 (i.e. a leaf) and **not** the soma
+    itself.  A leaf *i* is flagged when
+
+    1. Its Euclidean distance to the soma centre is *small*::
+
+           d\_euclid(i) \le near\_factor × max(soma.axes)
+
+    2. Yet the shortest‑path length along the skeleton is *long*::
+
+           d\_graph(i) / d\_euclid(i) \ge path\_ratio\_thresh
+
+    Parameters
+    ----------
+    skel
+        A fully‑constructed :class:`skeliner.Skeleton` instance.
+    near_factor
+        Multiplicative factor applied to the largest soma semi‑axis to set the
+        *Euclidean* proximity threshold.
+    path_ratio_thresh
+        Minimum ratio between graph‑path length and straight‑line distance for
+        a leaf to be considered suspicious.
+    return_stats
+        If *True*, a per‑node diagnostic dictionary is returned in addition to
+        the sorted list of suspicious node IDs.
 
     Returns
     -------
-    ρ  — or *(ρ, p‑value)* when ``return_pvalue=True``.
-    """
-    g = _graph(skel)
-    coords = skel.nodes.view(np.ndarray)
-    weights = [float(np.linalg.norm(coords[a] - coords[b])) for a, b in skel.edges]
-    dists = np.asarray(g.shortest_paths(source=0, weights=weights))[0]
+    suspicious
+        ``list[int]`` – tip node indices, sorted by decreasing *path/straight*
+        ratio (most suspicious first).
+    stats
+        *Optional* ``dict[int, dict]`` where each entry contains::
 
-    ids = np.arange(len(dists))
-    rho, p = spearmanr(ids, dists)
-    return (float(rho), float(p)) if return_pvalue else float(rho)
+            {"d_center", "d_surface", "path_len", "ratio"}
+    """
+    if skel.nodes.size == 0 or skel.edges.size == 0:
+        return [] if not return_stats else ([], {})
+
+    soma_c = skel.soma.centre.astype(np.float64)
+    r_max = float(skel.soma.axes.max())
+    near_thr = near_factor * r_max
+
+    # Build an igraph view with edge‑length weights (Euclidean)
+    g: ig.Graph = skel._igraph()
+    g.es["weight"] = [
+        float(np.linalg.norm(skel.nodes[a] - skel.nodes[b]))
+        for a, b in skel.edges
+    ]
+
+    # Tip detection – degree = 1, excluding the soma (node 0)
+    deg = np.bincount(skel.edges.flatten(), minlength=len(skel.nodes))
+    tips = np.where(deg == 1)[0]
+    tips = tips[tips != 0]  # exclude soma itself
+    if tips.size == 0:
+        return [] if not return_stats else ([], {})
+
+    # Shortest path (edge‑weighted) length to soma for every tip
+    path_d = np.asarray(
+        g.distances(source=list(tips), target=[0], weights="weight"),
+        dtype=np.float64,
+    ).reshape(-1)
+
+    # Straight‑line metrics
+    eucl_d = np.linalg.norm(skel.nodes[tips] - soma_c, axis=1)
+    surf_d = skel.soma.distance_to_surface(skel.nodes[tips])
+
+    # Robust guard against division by zero (very unlikely)
+    ratio = path_d / np.maximum(eucl_d, 1e-9)
+
+    sus_mask = (eucl_d <= near_thr) & (ratio >= path_ratio_thresh)
+    suspicious = tips[sus_mask]
+
+    if not return_stats:
+        # sort by descending ratio (most egregious first)
+        return sorted(map(int, suspicious), key=lambda nid: -ratio[np.where(tips == nid)[0][0]])
+
+    stats: Dict[int, Dict[str, float]] = {
+        int(nid): {
+            "d_center": float(eucl_d[i]),
+            "d_surface": float(surf_d[i]),
+            "path_len": float(path_d[i]),
+            "ratio": float(ratio[i]),
+        }
+        for i, nid in enumerate(tips)
+        if sus_mask[i]
+    }
+
+    suspicious_sorted = sorted(suspicious, key=lambda nid: -stats[int(nid)]["ratio"])
+    return suspicious_sorted, stats
