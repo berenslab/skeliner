@@ -5,14 +5,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
-from typing import Callable, Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import igraph as ig
 import numpy as np
 import trimesh
 from scipy.spatial import KDTree
 
-from . import dx, io
+from . import dx, io, post
 
 __all__ = [
     "Skeleton",
@@ -242,14 +242,13 @@ class Skeleton:
     vert2node: dict[int, int] | None = None
 
     def __getattr__(self, name: str):
-        try:
-            f = getattr(dx, name)
-        except AttributeError as e:
-            raise AttributeError(name) from e
-        if callable(f):
-            # curry self
-            return lambda *a, **kw: f(self, *a, **kw)
+        for mod in (dx, post):        
+            f = getattr(mod, name, None)
+            if callable(f):
+                return lambda *a, _f=f, **kw: _f(self, *a, **kw)
+        # nothing found
         raise AttributeError(name)
+
 
     # ---------------------------------------------------------------------
     # sanity checks
@@ -355,6 +354,15 @@ class Skeleton:
 # attach every diagnostic callable in dx.__skeleton__ as a method to Skeleton
 for _name in dx.__skeleton__:
     _f = getattr(dx, _name)
+
+    @wraps(_f)                 # keeps the original doc-string & signature
+    def _m(self, *args, _f=_f, **kw):
+        return _f(self, *args, **kw)
+
+    setattr(Skeleton, _name, _m)
+
+for _name in post.__skeleton__:
+    _f = getattr(post, _name)
 
     @wraps(_f)                 # keeps the original doc-string & signature
     def _m(self, *args, _f=_f, **kw):

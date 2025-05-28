@@ -14,6 +14,7 @@ __skeleton__ = [
     "branches_of_length",
     "twigs_of_length",
     "suspicious_tips",
+    "node_summary",
 ]
 
 # -----------------------------------------------------------------------------
