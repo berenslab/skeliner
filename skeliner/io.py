@@ -90,13 +90,13 @@ def load_swc(
             parts = line.split()
             if len(parts) < 7:
                 continue
-            _id, _type = int(parts[0]), int(parts[1])
+            _id, _type = int(float(parts[0])), int(float(parts[1]))
             if keep_types is not None and _type not in keep_types:
                 continue
             ids.append(_id)
             xyz.append([float(parts[2]), float(parts[3]), float(parts[4])])
             radii.append(float(parts[5]))
-            parent.append(int(parts[6]))
+            parent.append(int(float(parts[6])))
 
     if not ids:
         raise ValueError(f"No usable nodes found in {path}")

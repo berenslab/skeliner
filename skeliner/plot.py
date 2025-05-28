@@ -1,4 +1,4 @@
-from typing import Sequence
+from typing import Optional, Sequence, Tuple, Union
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -13,6 +13,8 @@ from .core import Skeleton
 
 __all__ = ["projection", "threeviews", "details"]
 
+
+Number = Union[int, float]
 
 _PLANE_AXES = {
     "xy": (0, 1), "yx": (1, 0),
@@ -162,17 +164,17 @@ def _make_lut(name: str, n: int) -> np.ndarray:
 
 def projection(
     skel: Skeleton,
-    mesh: "trimesh.Trimesh",
+    mesh: Optional["trimesh.Trimesh"] = None,
     *,
     plane: str = "xy",
     radius_metric: str | None = None,
-    bins: int | tuple[int, int] = 800,
-    scale: float | list = 1.0,
-    xlim: tuple[float, float] | None = None,
-    ylim: tuple[float, float] | None = None,
+    bins: int | Tuple[int, int] = 800,
+    scale: float | Sequence[Number] = 1.0,
+    xlim: Tuple[float, float] | None = None,
+    ylim: Tuple[float, float] | None = None,
     draw_skel: bool = True,
     draw_edges: bool = False,
-    draw_cylinders: bool = False,  
+    draw_cylinders: bool = False,
     ax: Axes | None = None,
     cmap: str = "Blues",
     vmax_fraction: float = 0.10,
@@ -181,66 +183,78 @@ def projection(
     highlight_nodes: int | Sequence[int] | None = None,
     highlight_face_alpha: float = 0.5,
     unit: str | None = None,
-    # --- soma ---
+    # soma --------------------------------------------------------------- #
     draw_soma_mask: bool = True,
-) -> tuple:
-    """
-    Plot a 2-D density map of *mesh* and overlay *skel* circles (and optionally
-    edges) in the chosen *plane*.
+) -> Tuple[plt.Figure, Axes]:
+    """Orthographic 2‑D overview of a skeleton with an **optional** mesh‑density
+    background.
 
     Parameters
     ----------
-    plane : {\"xy\", \"xz\", \"yz\"}
+    skel : Skeleton
+        The centre‑line skeleton to visualise.
+    mesh : trimesh.Trimesh | None, default *None*
+        Surface mesh used to draw a vertex‑density heat‑map and (optionally) the
+        soma surface.  Pass *None* to **omit** the background histogram and any
+        mesh‑based overlays.
+    plane : {"xy", "xz", "yz", "yx", "zx", "zy"}
         Projection plane.
-    bins : int | (int,int)
-        Resolution of the background histogram.
-    scale : float or list, default 1
-        Multiply coordinates & radii by this factor (e.g. ``1e-3`` for nm→µm).
-        if a list, the first element is used for the skel and the second for the mesh.
-    xlim, ylim : (min, max) or None
-        Spatial extent to keep **before** plotting.
-    draw_edges : bool
-        If True, draw the skeleton graph edges.
-    draw_cylinders : bool, default False
-        Draw thickness-scaled cylinders (as variable-width lines)
-        between connected nodes.
-    ax : matplotlib.axes.Axes or None
-        Existing axes to draw into (created automatically if ``None``).
-    vmax_fraction : float, default 0.10
-        Upper colour-limit for the histogram (as a fraction of its max).
-    circle_alpha, cylinder_alpha : float
-        Transparencies of the skeleton glyphs.
-    **imshow_kwargs
-        Extra options passed to :pyfunc:`matplotlib.axes.Axes.imshow`.
+    bins : int | (int,int), default *800*
+        Resolution of the background histogram.  Ignored when *mesh* is *None*.
+    scale : float | (float, float), default *1*
+        Multiplicative scale(s).  Either a scalar applied to both skeleton and
+        mesh or a pair ``(s_skel, s_mesh)``.
+    xlim, ylim : (min, max) or *None*
+        Spatial extent **before** plotting.  If not given, limits are inferred
+        from the histogram (when *mesh* is available) or the skeleton.
+    draw_skel, draw_edges, draw_cylinders : bool
+        Toggles for skeleton glyphs.
+    ax : matplotlib.axes.Axes | None
+        Existing *Axes* to draw into.  When *None*, a new figure is created.
+    cmap, vmax_fraction : appearance of the histogram – see original docs.
+    circle_alpha, cylinder_alpha : transparencies of skeleton glyphs.
+    highlight_nodes : node IDs to highlight.
+    unit : str | None
+        Axis‑label unit.
+    draw_soma_mask : bool, default *True*
+        Draw the soma shell when both *mesh* **and** soma vertices are
+        available.
 
     Returns
     -------
-    (fig, ax)
-        Figure and axes objects.
+    fig, ax : matplotlib Figure and Axes
     """
+
+    # ───────────────────────────────── validation & setup ──────────────────
     if plane not in _PLANE_AXES:
         raise ValueError(f"plane must be one of {tuple(_PLANE_AXES)}")
 
     ix, iy = _PLANE_AXES[plane]
 
-    if type(scale) is not list:
+    # normalise *scale* → [skel_scale, mesh_scale]
+    if not isinstance(scale, Sequence):
         scale = [scale, scale]
+    if len(scale) != 2:
+        raise ValueError("scale must be a scalar or a pair of two scalars")
+    scl_skel, scl_mesh = map(float, scale)
 
     if radius_metric is None:
         radius_metric = skel.recommend_radius()[0]
 
-    if highlight_nodes is not None:
-        highlight_nodes = {int(n) for n in np.atleast_1d(highlight_nodes)}
-    else:
-        highlight_nodes = set()
+    highlight_set = (set(map(int, np.atleast_1d(highlight_nodes)))
+                     if highlight_nodes is not None else set())
 
-    # ─────────────────── project & scale ──────────────────────────────────
-    xy_mesh = _project(mesh.vertices, ix, iy) * scale[1]
-    xy_skel = _project(skel.nodes, ix, iy) * scale[0]
-    rr      = skel.radii[radius_metric] * scale[0]
+    # ───────────────────────────── project (and optionally crop) ───────────
+    xy_skel = _project(skel.nodes, ix, iy) * scl_skel
+    rr      = skel.radii[radius_metric] * scl_skel
 
-    # ─────────────────── crop early to save work ──────────────────────────
-    def _apply_window(xy: np.ndarray) -> np.ndarray:
+    if mesh is not None:
+        xy_mesh = _project(mesh.vertices, ix, iy) * scl_mesh
+    else:  # empty placeholder for unified code‑path
+        xy_mesh = np.empty((0, 2), dtype=float)
+
+    # helper – applies *xlim/ylim* cropping on a 2‑column array
+    def _crop_window(xy: np.ndarray) -> np.ndarray:
         keep = np.ones(len(xy), dtype=bool)
         if xlim is not None:
             keep &= (xy[:, 0] >= xlim[0]) & (xy[:, 0] <= xlim[1])
@@ -248,53 +262,64 @@ def projection(
             keep &= (xy[:, 1] >= ylim[0]) & (xy[:, 1] <= ylim[1])
         return keep
 
-    keep_mesh = _apply_window(xy_mesh)
-    xy_mesh   = xy_mesh[keep_mesh]
-
-    keep_skel = _apply_window(xy_skel)
+    # crop *before* heavy lifting
+    keep_skel = _crop_window(xy_skel)
     xy_skel   = xy_skel[keep_skel]
     rr        = rr[keep_skel]
 
-    # ─────────────────── density histogram ────────────────────────────────
-    # Ensure bins is either an int or a tuple of two ints
-    if isinstance(bins, int):
-        bins_arg: int | tuple[int, int] = bins
-    elif isinstance(bins, tuple) and len(bins) == 2 and all(isinstance(b, int) for b in bins):
-        bins_arg = (int(bins[0]), int(bins[1]))
+    if mesh is not None and xy_mesh.size:
+        keep_mesh = _crop_window(xy_mesh)
+        xy_mesh   = xy_mesh[keep_mesh]
+
+    # ─────────────────────────────── histogram (mesh may be None) ──────────
+    if mesh is not None and xy_mesh.size:
+        # ensure bins argument correct
+        if isinstance(bins, int):
+            bins_arg: int | Tuple[int, int] = bins
+        elif (isinstance(bins, tuple) and len(bins) == 2 and
+              all(isinstance(b, int) for b in bins)):
+            bins_arg = (int(bins[0]), int(bins[1]))
+        else:
+            raise ValueError("bins must be an int or a tuple of two ints")
+
+        hist, xedges, yedges, _ = binned_statistic_2d(
+            xy_mesh[:, 0], xy_mesh[:, 1], None,
+            statistic="count", bins=bins_arg,
+        )
+        hist = hist.T  # imshow expects (rows = y)
     else:
-        raise ValueError("bins must be an int or a tuple of two ints")
-    hist, xedges, yedges, _ = binned_statistic_2d(
-        xy_mesh[:, 0],
-        xy_mesh[:, 1],
-        None,
-        statistic="count",
-        bins=bins_arg,  # type: ignore
-    )
-    hist = hist.T  # transpose for imshow (row = y)
+        hist = None
 
-
-
-    # ─────────────────── figure / axes ────────────────────────────────────
+    # ───────────────────────────── figure / axes boilerplate ───────────────
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 6))
     else:
         fig = ax.figure
 
-    ax.imshow(
-        hist,
-        extent=(xedges[0], xedges[-1], yedges[0], yedges[-1]),
-        origin="lower",
-        cmap=cmap,
-        vmax=hist.max() * vmax_fraction,
-        alpha=1.0,
-    )
+    # background image – only when we do have a histogram
+    if hist is not None:
+        ax.imshow(
+            hist,
+            extent=(xedges[0], xedges[-1], yedges[0], yedges[-1]),
+            origin="lower",
+            cmap=cmap,
+            vmax=hist.max() * vmax_fraction,
+            alpha=1.0,
+        )
 
-    # ─────────────────── circles ──────────────────────────────────────────
-    if draw_skel:
-        ax.set_xlim(xlim if xlim is not None else (xy_mesh[:,0].min(), xy_mesh[:,0].max()))
-        ax.set_ylim(ylim if ylim is not None else (xy_mesh[:,1].min(), xy_mesh[:,1].max()))
-        sizes, ppd = _radii_to_sizes(rr, ax)
+    # ──────────────────────── draw skeleton circles (always) ───────────────
+    if draw_skel and xy_skel.size:
+        # limits need to be defined before converting radii → scatter sizes
+        if xlim is not None and ylim is not None:
+            ax.set_xlim(xlim)
+            ax.set_ylim(ylim)
+        elif hist is None:  # fallback to skeleton extents
+            ax.set_xlim((xy_skel[:, 0].min(), xy_skel[:, 0].max()))
+            ax.set_ylim((xy_skel[:, 1].min(), xy_skel[:, 1].max()))
 
+        sizes, _ppd = _radii_to_sizes(rr, ax)
+
+        # skip the very first node when it is the soma centre and has a mesh
         slicing = 0 if skel.soma.verts is None else 1
         ax.scatter(
             xy_skel[:, 0][slicing:],
@@ -307,44 +332,38 @@ def projection(
             zorder=2,
         )
 
-        if highlight_nodes:
-            orig_ids     = np.flatnonzero(keep_skel)          # ids before cropping
-            hilite_mask  = np.isin(orig_ids, list(highlight_nodes))
-
+        # highlighted nodes – filled circles
+        if highlight_set:
+            orig_ids = np.flatnonzero(keep_skel)
+            hilite_mask = np.isin(orig_ids, list(highlight_set))
             if hilite_mask.any():
                 ax.scatter(
                     xy_skel[hilite_mask, 0],
                     xy_skel[hilite_mask, 1],
                     s=sizes[hilite_mask],
-                    facecolors="green",          # or node-colours if you prefer
+                    facecolors="green",
                     edgecolors="green",
                     linewidths=0.9,
                     alpha=highlight_face_alpha,
                     zorder=3.5,
                 )
 
+    # ───────────────────────── soma shell & centre (if possible) ───────────
+    if (draw_soma_mask and mesh is not None and skel.soma is not None and
+            skel.soma.verts is not None):
+        xy_soma = _project(mesh.vertices[np.asarray(skel.soma.verts, int)], ix, iy)
+        xy_soma = xy_soma * scl_mesh
+        xy_soma = xy_soma[_crop_window(xy_soma)]  # respect crop
 
-    # ─── highlight the soma if requested ───────────────────────────────────
-    if draw_soma_mask and skel.soma is not None and skel.soma.verts is not None:
+        ax.scatter(xy_soma[:, 0], xy_soma[:, 1], s=1, c="pink", alpha=0.5,
+                   linewidths=0, label="soma surface")
 
-        xy_soma = _project(
-            mesh.vertices[np.asarray(skel.soma.verts, dtype=np.int64)], ix, iy
-        ) * scale[1]                                 # note: mesh scale!
-        keep_soma = _apply_window(xy_soma)           # respect crop
-        xy_soma   = xy_soma[keep_soma]
+        # soma centre (node 0)
+        c_xy = _project(skel.nodes[[0]] * scl_skel, ix, iy).ravel()
+        ax.scatter(*c_xy, c="k", s=15, zorder=3)
 
-        ax.scatter(
-            xy_soma[:, 0], xy_soma[:, 1],
-            s=1, c="pink", marker="o",
-            linewidths=0, alpha=0.5, label="soma surface"
-        )
-
-        # centroid + dashed outline for radius readability
-        c_xy = _project(skel.nodes[[0]] * scale[0], ix, iy).ravel()
-        ax.scatter(*c_xy, c="k", s=15, zorder=3, label="soma centre")
-
-        ell = _soma_ellipse2d(skel.soma, plane, scale=scale[0])
-                            # dashed outline as before
+        # dashed ellipse outline
+        ell = _soma_ellipse2d(skel.soma, plane, scale=scl_skel)
         ell.set_edgecolor("k")
         ell.set_facecolor("none")
         ell.set_linestyle("--")
@@ -352,82 +371,66 @@ def projection(
         ell.set_alpha(0.9)
         ax.add_patch(ell)
 
-    # ─────────────────── optional edges ───────────────────────────────────
-    if draw_skel and draw_edges and skel.edges.size:
-        keep = keep_skel                              # local alias
-        # 1. filter edge list to kept endpoints
-        ekeep = keep[skel.edges[:, 0]] & keep[skel.edges[:, 1]]
-        edges_kept = skel.edges[ekeep]
+    # ─────────────────────── draw edges & cylinders (unchanged) ────────────
+    if draw_skel and skel.edges.size:
+        keep = keep_skel  # alias
+        if draw_edges:
+            ekeep = keep[skel.edges[:, 0]] & keep[skel.edges[:, 1]]
+            edges_kept = skel.edges[ekeep]
+            if edges_kept.size:
+                # original → compressed index map
+                idx_map = -np.ones(len(keep), int)
+                idx_map[np.flatnonzero(keep)] = np.arange(keep.sum())
 
-        if edges_kept.size:
-            # 2. build old-id → compressed-id lookup once
-            idx_map = -np.ones(len(keep), dtype=int)
-            idx_map[np.flatnonzero(keep)] = np.arange(keep.sum())
+                seg_start = xy_skel[idx_map[edges_kept[:, 0]]]
+                seg_end   = xy_skel[idx_map[edges_kept[:, 1]]]
+                segments  = np.stack((seg_start, seg_end), axis=1)
 
-            # 3. gather coordinates for both endpoints in one NumPy call
-            seg_start = xy_skel[idx_map[edges_kept[:, 0]]]   # (E', 2)
-            seg_end   = xy_skel[idx_map[edges_kept[:, 1]]]   # (E', 2)
-            segments  = np.stack((seg_start, seg_end), axis=1)  # (E', 2, 2)
+                lc = LineCollection(segments.tolist(), colors="black",
+                                    linewidths=0.5, alpha=cylinder_alpha)
+                ax.add_collection(lc)
 
-            # 4. hand over to Matplotlib
-            lc = LineCollection(
-                segments.tolist(),
-                colors="black",
-                linewidths=.5,
-                alpha=cylinder_alpha,
-            )
-            ax.add_collection(lc)
+        if draw_cylinders:
+            ekeep = keep_skel[skel.edges[:, 0]] & keep_skel[skel.edges[:, 1]]
+            edges_kept = skel.edges[ekeep]
+            if edges_kept.size:
+                idx_map = -np.ones(len(keep_skel), int)
+                idx_map[np.flatnonzero(keep_skel)] = np.arange(keep_skel.sum())
 
-    # ─────────────────── cylinders as trapezoids (proper 3-D widths) ──────
-    # ─────────── cylinders as trapezoids (proper 3-D widths) ────────────
-    if draw_skel and draw_cylinders and skel.edges.size:
-        ekeep      = keep_skel[skel.edges[:, 0]] & keep_skel[skel.edges[:, 1]]
-        edges_kept = skel.edges[ekeep]
-        skel_scale = float(scale[0]) 
-        if edges_kept.size:
-            idx_map = -np.ones(len(keep_skel), dtype=int)
-            idx_map[np.flatnonzero(keep_skel)] = np.arange(keep_skel.sum())
+                quads = []
+                for n0, n1 in edges_kept:
+                    i0, i1 = idx_map[[n0, n1]]
+                    quad = _trapezoid_3d(
+                        skel.nodes[n0] * scl_skel,
+                        skel.nodes[n1] * scl_skel,
+                        rr[i0], rr[i1],
+                        plane,
+                    )
+                    if quad is not None:
+                        quads.append(quad)
 
-            quads = []
-            
-            for n0, n1 in edges_kept:
-                i0, i1 = idx_map[[n0, n1]]
-                quad = _trapezoid_3d(
-                    skel.nodes[n0] * skel_scale, skel.nodes[n1] * skel_scale,
-                    rr[i0], rr[i1],
-                    plane,
-                )
-                if quad is not None:
-                    quads.append(quad)
+                if quads:
+                    # make sure axes limits are already set before adding
+                    if xlim is not None: ax.set_xlim(xlim)
+                    if ylim is not None: ax.set_ylim(ylim)
 
-            print(f"[projection] built {len(quads)} trapezoids")  # ← DEBUG
+                    pc = PolyCollection(quads, facecolors="red",
+                                         edgecolors="red", alpha=cylinder_alpha,
+                                         zorder=10)
+                    ax.add_collection(pc)
 
-            if quads:
-                # 1️⃣  make sure limits are fixed **before** adding the collection
-                if xlim is not None: ax.set_xlim(xlim)
-                if ylim is not None: ax.set_ylim(ylim)
-
-                pc = PolyCollection(
-                    quads,
-                    facecolors="red",
-                    edgecolors="red",
-                    alpha=cylinder_alpha,
-                    zorder=10,          # 2️⃣  above image & circles
-                )
-                ax.add_collection(pc)
-
-    # ─────────────────── final tweaks ─────────────────────────────────────
+    # ────────────────────────────── final cosmetics ────────────────────────
     ax.set_aspect("equal")
+
     if unit is None:
-        if scale[0] == 1.0:
-            unit_str = ""
-        else:
-            unit_str = f"(Scaled by {scale[0]})"
+        unit_str = "" if scl_skel == 1.0 else f"(×{scl_skel:g})"
     else:
         unit_str = f"({unit})"
+
     ax.set_xlabel(f"{plane[0]} {unit_str}")
     ax.set_ylabel(f"{plane[1]} {unit_str}")
 
+    # guarantee limits if user requested specific window
     if xlim is not None:
         ax.set_xlim(xlim)
     if ylim is not None:
@@ -789,7 +792,7 @@ def _plane_axes(plane: str) -> tuple[str, str]:
 
 def threeviews(
     skel: Skeleton,
-    mesh: trimesh.Trimesh,
+    mesh: trimesh.Trimesh|None = None,
     *,
     planes: tuple[str, str, str] | list[str] = ["xy", "xz", "zy"],
     scale: float = 1e-3,                 # nm → µm by default
@@ -842,14 +845,20 @@ def threeviews(
     if len(planes) != 3:
         raise ValueError("planes must be a sequence of exactly three plane strings")
 
-    # ── 0. global bounding box (already scaled) ────────────────────────────
-    v_scaled = mesh.vertices.view(np.ndarray) * scale
-    lims, spans = _axis_extents(v_scaled)
 
-    # helper: pick limits for a given plane string
+    # ── 0. global bounding box (already scaled) ────────────────────────────
+    if mesh is not None and mesh.vertices.size:
+        v_mesh = mesh.vertices.view(np.ndarray) * scale
+        v_all  = np.vstack((v_mesh, skel.nodes * scale))
+    else:
+        v_all = skel.nodes * scale
+
+    lims, spans = _axis_extents(v_all)
+
+    # helper – pick window limits for a given plane string
     def _limits(p: str):
         h, v = _plane_axes(p)
-        return lims[h], lims[v]            # (xlim, ylim)
+        return lims[h], lims[v]  # returns (xlim, ylim)
 
     # ── 1. gridspec ratios derived from the chosen planes ──────────────────
     A, B, C = planes                           # unpack for readability
