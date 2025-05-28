@@ -158,8 +158,8 @@ def degree_distribution(
                 skel, int(idx), radius_metric=radius_metric)
 
     return {
-        "degree": np.arange(hist.size),
-        "counts": hist,
+        "degree": np.arange(hist.size)[1:],
+        "counts": hist[1:],
         "threshold": float(thresh),
         "high_degree_nodes": high_dict,
     }
@@ -255,42 +255,62 @@ def twigs_of_length(
     skel,
     k: int,
     *,
-    include_endpoints: bool = True,
+    include_branching_node: bool = False,
 ) -> List[List[int]]:
-    """Return *terminal* branches whose node count == ``k``.
+    """
+    Return every *terminal twig* whose **chain length** == k.
 
-    A terminal branch is a simple path that starts at a bifurcation (or the
-    soma) and ends at a **leaf** (degree == 1).  Interior vertices (if any)
-    have degree == 2.
+    *Twig length* counts the leaf (deg==1) and all intermediate deg==2
+    vertices **up to but NOT including** the branching point (deg>2 or soma).
 
     Parameters
     ----------
-    skel : Skeleton
-        Input skeleton.
-    k : int
-        Desired length in **nodes**.  Endpoints are included when
-        ``include_endpoints`` is *True*.
-    include_endpoints : bool, default ``True``
-        Whether endpoints contribute to *k*.
+    k  : int
+        Number of vertices in the terminal chain *excluding* the branching
+        node.  Example::
+
+            soma-B-1-2-L        # degrees  >2-2-2-1
+                 └─┬──────      k = 3   (1-2-L)
+                   `- returned path length is 3 or 4
+                      depending on include_branching_node
+    include_branching_node : bool, default ``False``
+        If *True*, the branching node is prepended to each returned path.
 
     Returns
     -------
     list[list[int]]
-        Ordered node‑ID paths of every matching branch.
+        Each sub-list is ordered **proximal ➜ leaf**.
+        * Length == k              when include_branching_node=False  
+        * Length == k + 1          when include_branching_node=True
     """
-    all_branches = branches_of_length(
-        skel, k, include_endpoints=include_endpoints)
-
-    g = _graph(skel)
+    g  = _graph(skel)
     deg = np.asarray(g.degree())
 
-    term = []
-    for path in all_branches:
-        # exactly one endpoint must be a leaf (degree==1)
-        leaf_count = int(deg[path[0]] == 1) + int(deg[path[-1]] == 1)
-        if leaf_count == 1:
-            term.append(path)
-    return term
+    twigs: List[List[int]] = []
+
+    # candidates = all leaves (deg==1, exclude soma)
+    leaves = [v for v in range(1, len(deg)) if deg[v] == 1]
+    parent = g.bfs(0, mode="ALL")[2]
+
+    for leaf in leaves:
+        chain = [leaf]
+        curr = leaf
+        while True:
+            par = parent[curr]
+            if par == -1:
+                break                     # should not happen – disconnected
+            if deg[par] == 2 and par != 0:
+                chain.append(par)
+                curr = par
+                continue
+            # par is branching point (deg!=2 or soma)
+            if len(chain) == k:
+                if include_branching_node:
+                    chain.append(par)
+                twigs.append(chain[::-1])   # proximal➜distal order
+            break
+
+    return twigs
 
 
 # -----------------------------------------------------------------------------
