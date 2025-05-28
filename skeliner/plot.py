@@ -14,7 +14,7 @@ from .core import Skeleton
 __all__ = ["projection", "threeviews", "details"]
 
 
-Number = Union[int, float]
+Number = int | float
 
 _PLANE_AXES = {
     "xy": (0, 1), "yx": (1, 0),
@@ -442,21 +442,21 @@ def projection(
 
 def details(
     skel: Skeleton,
-    mesh: "trimesh.Trimesh",
+    mesh: trimesh.Trimesh | None = None,
     *,
     plane: str = "xy",
-    # background histogram --------------------------------------------------- #
-    bins: int | tuple[int, int] = 800,
+    # background histogram ------------------------------------------------- #
+    bins: int | Tuple[int, int] = 800,
     hist_cmap: str = "Blues",
     vmax_fraction: float = 0.10,
-    # overlays --------------------------------------------------------------- #
+    # overlays ------------------------------------------------------------- #
     draw_nodes: bool = True,
     draw_edges: bool = False,
     draw_cylinders: bool = False,
     draw_soma_mask: bool = True,
     show_node_ids: bool = False,
     radius_metric: str | None = None,
-    # appearance ------------------------------------------------------------- #
+    # appearance ----------------------------------------------------------- #
     cluster_cmap: str = "tab20",
     circle_alpha: float = 0.9,
     cylinder_alpha: float = 0.25,
@@ -464,67 +464,57 @@ def details(
     edge_lw: float = 0.8,
     id_fontsize: int = 6,
     id_color: str = "black",
-    id_offset: tuple[float, float] = (0.0, 0.0),
-    # geometry ---------------------------------------------------------------- #
-    scale: float | tuple[float, float] | list[float] = 1.0,
-    xlim: tuple[float, float] | None = None,
-    ylim: tuple[float, float] | None = None,
-    # title ------------------------------------------------------------------ #
+    id_offset: Tuple[float, float] = (0.0, 0.0),
+    # geometry ------------------------------------------------------------- #
+    scale: Union[Number, Tuple[Number, Number], Sequence[Number]] = 1.0,
+    xlim: Tuple[float, float] | None = None,
+    ylim: Tuple[float, float] | None = None,
+    # title --------------------------------------------------------------- #
     title: str | None = None,
     unit: str | None = None,
-    # -------------highlight -----------------------
+    # highlight ------------------------------------------------------------ #
     highlight_nodes: int | Sequence[int] | None = None,
     highlight_face_alpha: float = 0.5,
     highlight_id_color: str = "red",
-    # axes                                                                     #
+    # axes ----------------------------------------------------------------- #
     ax: Axes | None = None,
 ):
-    """
-    2-D overview plot – mesh density + coloured clusters + optional skeleton.
+    """Mesh‑optional cluster overview.
 
-    Parameters
-    ----------
-    plane
-        Projection plane, one of ``{"xy","xz","yz","yx","zx","zy"}``.
-    bins
-        Background histogram resolution (passed to
-        :pyfunc:`scipy.stats.binned_statistic_2d`).
-    scale
-        Either a single factor applied to *both* mesh and skeleton or a pair
-        ``(skel_scale, mesh_scale)``.
-    draw_nodes, draw_edges
-        Overlay the skeleton circles and/or edges.
-    cluster_cmap
-        Matplotlib colormap for the clusters (colours are shuffled using the
-        golden-ratio trick so neighbouring IDs differ).
-    xlim, ylim
-        Optional crop window **before** any rendering work is done.
+    Pass ``mesh=None`` to skip the vertex cloud & soma shell.  All skeleton
+    overlays still work.  Other parameters keep their legacy meaning; see the
+    original docs.
     """
-    # ------------- housekeeping / defaults ----------------------------------
+
+    # ────────────── housekeeping / defaults ───────────────────────────────
     if plane not in _PLANE_AXES:
         raise ValueError(f"plane must be one of {tuple(_PLANE_AXES)}")
-
     ix, iy = _PLANE_AXES[plane]
 
     if isinstance(scale, (int, float)):
         scale = (float(scale),) * 2
     if len(scale) != 2:
-        raise ValueError("scale must be a scalar or a pair/list of two scalars")
+        raise ValueError("scale must be a scalar or a pair of two scalars")
     scl_skel, scl_mesh = map(float, scale)
 
     if radius_metric is None:
         radius_metric = skel.recommend_radius()[0]
 
-    if highlight_nodes is not None:
-        highlight_nodes = {int(n) for n in np.atleast_1d(highlight_nodes)}
-    else:
-        highlight_nodes = set()
+    highlight_set = (set(map(int, np.atleast_1d(highlight_nodes)))
+                     if highlight_nodes is not None else set())
 
-    # ------------- project & crop -------------------------------------------
-    xy_mesh_all = _project(mesh.vertices.view(np.ndarray), ix, iy) * scl_mesh
+    # ────────────── project skeleton (mandatory) ──────────────────────────
     xy_skel = _project(skel.nodes, ix, iy) * scl_skel
     rr      = skel.radii[radius_metric] * scl_skel
 
+    # ────────────── optional mesh handling ────────────────────────────────
+    have_mesh = mesh is not None and mesh.vertices.size
+    if have_mesh:
+        xy_mesh_all = _project(mesh.vertices.view(np.ndarray), ix, iy) * scl_mesh
+    else:
+        xy_mesh_all = np.empty((0, 2), dtype=float)
+
+    # crop helper
     def _mask_window(xy: np.ndarray) -> np.ndarray:
         keep = np.ones(len(xy), bool)
         if xlim is not None:
@@ -533,55 +523,55 @@ def details(
             keep &= (xy[:, 1] >= ylim[0]) & (xy[:, 1] <= ylim[1])
         return keep
 
-    keep_mesh     = _mask_window(xy_mesh_all)
-    xy_mesh_crop  = xy_mesh_all[keep_mesh]
-
     keep_skel = _mask_window(xy_skel)
     xy_skel   = xy_skel[keep_skel]
     rr        = rr[keep_skel]
 
-    # ------------- density histogram ----------------------------------------
-    # Import here to keep hard deps minimal
-    from scipy.stats import binned_statistic_2d  # local import
-
-    if isinstance(bins, int):
-        bins_arg: int | tuple[int, int] = bins
+    if have_mesh:
+        keep_mesh     = _mask_window(xy_mesh_all)
+        xy_mesh_crop  = xy_mesh_all[keep_mesh]
     else:
-        if (not isinstance(bins, tuple)) or len(bins) != 2:
-            raise ValueError("bins must be int or (int, int)")
-        bins_arg = tuple(map(int, bins))
+        xy_mesh_crop = np.empty((0, 2), dtype=float)
 
-    hist, xedges, yedges, _ = binned_statistic_2d(
-        xy_mesh_crop[:, 0], xy_mesh_crop[:, 1], None,
-        statistic="count", bins=bins_arg,
-    )
-    hist = hist.T                                      # imshow(rows=y)
+    # ────────────── density histogram (mesh may be absent) ────────────────
+    if have_mesh and xy_mesh_crop.size:
+        if isinstance(bins, int):
+            bins_arg: int | Tuple[int, int] = bins
+        else:
+            if (not isinstance(bins, tuple)) or len(bins) != 2:
+                raise ValueError("bins must be int or (int, int)")
+            bins_arg = tuple(map(int, bins))
 
-    # -------- component labels for every *mesh* vertex ----------------------
-    # -------- prepare vertex–cluster labels (if we have a skeleton) ---------
-    if skel is not None and skel.node2verts is not None:
+        from scipy.stats import binned_statistic_2d  # heavy import lazily
+        hist, xedges, yedges, _ = binned_statistic_2d(
+            xy_mesh_crop[:, 0], xy_mesh_crop[:, 1], None,
+            statistic="count", bins=bins_arg,
+        )
+        hist = hist.T  # imshow rows=y
+    else:
+        hist = None
+
+    # ────────────── component / cluster labels (optional) ─────────────────
+    if have_mesh and skel.node2verts is not None and len(xy_mesh_crop):
         lab_full   = _component_labels(len(mesh.vertices), skel.node2verts)
-        # restrict to vertices that belong to *some* node
         in_cluster = lab_full >= 0
         mask_mesh  = keep_mesh & in_cluster
-
         xy_mesh_scatter = xy_mesh_all[mask_mesh]
         lab_mesh        = lab_full[mask_mesh]
         n_comp          = int(lab_full.max() + 1)
     else:
-        # no skeleton → fall back to “plot-everything” but colour uniformly
-        xy_mesh_scatter = xy_mesh_crop
-        lab_mesh        = None          # single colour
-        n_comp          = 0             # disables LUT
- 
-    # ------------- figure / axes --------------------------------------------
+        xy_mesh_scatter = xy_mesh_crop  # possibly empty
+        lab_mesh        = None
+        n_comp          = 0
+
+    # ────────────── figure / axes ─────────────────────────────────────────
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 6))
     else:
         fig = ax.figure
 
-    # Show the blue density map only if we do NOT have node-based clusters
-    if skel is None or skel.node2verts is None:
+    # background density image
+    if hist is not None:
         ax.imshow(
             hist,
             extent=(xedges[0], xedges[-1], yedges[0], yedges[-1]),
@@ -592,168 +582,136 @@ def details(
             zorder=0,
         )
 
-   # ------------- vertex cloud overlay -------------------------------------
-    if n_comp:                               # skeleton → coloured clusters
-        lut = _make_lut(cluster_cmap, n_comp)
-        colours = lut[lab_mesh]
-    else:                                    # plain mesh → uniform grey
-        colours = "0.6"
+    # ────────────── mesh vertex cloud overlay (if any) ────────────────────
+    if xy_mesh_scatter.size:
+        if n_comp:
+            lut = _make_lut(cluster_cmap, n_comp)
+            colours = lut[lab_mesh]
+        else:
+            colours = "0.6"
 
+        ax.scatter(
+            xy_mesh_scatter[:, 0], xy_mesh_scatter[:, 1],
+            s=1.0, c=colours, alpha=0.75, linewidths=0, zorder=9,
+        )
 
-    ax.scatter(
-        xy_mesh_scatter[:, 0], xy_mesh_scatter[:, 1],
-        s=1.0, c=colours, alpha=0.75, linewidths=0, zorder=9
-    )
+    # ────────────── axis limits before scatter‑size calc ──────────────────
+    if xlim is not None and ylim is not None:
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+    elif xy_mesh_scatter.size:
+        ax.set_xlim((xy_mesh_scatter[:, 0].min(), xy_mesh_scatter[:, 0].max()))
+        ax.set_ylim((xy_mesh_scatter[:, 1].min(), xy_mesh_scatter[:, 1].max()))
+    else:  # fallback to skeleton extents
+        ax.set_xlim((xy_skel[:, 0].min(), xy_skel[:, 0].max()))
+        ax.set_ylim((xy_skel[:, 1].min(), xy_skel[:, 1].max()))
 
-    ax.set_xlim(xlim if xlim is not None else (xy_mesh_scatter[:,0].min(), xy_mesh_scatter[:,0].max()))
-    ax.set_ylim(ylim if ylim is not None else (xy_mesh_scatter[:,1].min(), xy_mesh_scatter[:,1].max()))
-    sizes, ppd = _radii_to_sizes(rr, ax)
-    # ------------- skeleton circles & centres -------------------------------
-    if draw_nodes and len(xy_skel):
-        
-        # per-node colour uses *first vertex* of the cluster as label
-        node_comp   = np.array([
-            lab_full[skel.node2verts[i][0]] if len(skel.node2verts[i]) else -1
-            for i in range(len(skel.nodes))
-        ])
-        node_comp   = node_comp[keep_skel]
-        node_colors = lut[node_comp]
+    sizes, _ppd = _radii_to_sizes(rr, ax)
 
-        # circles (facecolor none, coloured edge)
+    # ────────────── skeleton circles & centres ────────────────────────────
+    if draw_nodes and xy_skel.size:
+        if n_comp:
+            # per‑node colour maps to cluster of its first vertex
+            node_comp = np.array([
+                lab_full[skel.node2verts[i][0]] if len(skel.node2verts[i]) else -1
+                for i in range(len(skel.nodes))
+            ])
+            node_comp   = node_comp[keep_skel]
+            node_colors = lut[node_comp]
+        else:
+            node_colors = "red"  # simple fallback
+
         slicing = 0 if skel.soma.verts is None else 1
         ax.scatter(
-            xy_skel[:, 0][slicing:], 
-            xy_skel[:, 1][slicing:],
+            xy_skel[:, 0][slicing:], xy_skel[:, 1][slicing:],
             s=sizes[slicing:], facecolors="none", edgecolors=node_colors[slicing:],
             linewidths=0.9, alpha=circle_alpha, zorder=3,
         )
-        # centre points
         ax.scatter(
             xy_skel[:, 0], xy_skel[:, 1],
-            s=10, c=node_colors, alpha=circle_alpha, zorder=4,
-            linewidths=0,
+            s=10, c=node_colors, alpha=circle_alpha, zorder=4, linewidths=0,
         )
 
-
-        # optional node-ID labels
+        # optional node‑ID labels
         if show_node_ids:
             orig_ids = np.flatnonzero(keep_skel)
             dx, dy   = id_offset
             for i_compressed, nid in enumerate(orig_ids):
-                color = (highlight_id_color if nid in highlight_nodes
-                         else id_color)                 
-                x, y  = xy_skel[i_compressed]
+                color = highlight_id_color if nid in highlight_set else id_color
+                x, y = xy_skel[i_compressed]
                 ax.text(
                     x + dx, y + dy, str(nid),
-                    fontsize=id_fontsize,
-                    color=color,                         
-                    ha="center", va="center",
-                    zorder=5,
+                    fontsize=id_fontsize, color=color,
+                    ha="center", va="center", zorder=5,
                 )
 
-        # ---------- extra pass: fill highlighted circles --------------------
-        if highlight_nodes:
-            # ‘orig_ids’ are the node IDs *before* cropping,
-            # we computed them two lines above when show_node_ids was handled.
-            # Re-compute here to ensure availability:
+        # fill highlighted nodes
+        if highlight_set:
             orig_ids = np.flatnonzero(keep_skel)
-            hilite_mask = np.isin(orig_ids, list(highlight_nodes))
-
+            hilite_mask = np.isin(orig_ids, list(highlight_set))
             if hilite_mask.any():
                 ax.scatter(
-                    xy_skel[hilite_mask, 0],
-                    xy_skel[hilite_mask, 1],
-                    s=sizes[hilite_mask],              
-                    facecolors=node_colors[hilite_mask],
-                    edgecolors=node_colors[hilite_mask],
-                    linewidths=0.9,
-                    alpha=highlight_face_alpha,
-                    zorder=4.5,                       
+                    xy_skel[hilite_mask, 0], xy_skel[hilite_mask, 1],
+                    s=sizes[hilite_mask], facecolors=node_colors[hilite_mask] if n_comp else "green",
+                    edgecolors=node_colors[hilite_mask] if n_comp else "green",
+                    linewidths=0.9, alpha=highlight_face_alpha, zorder=4.5,
                 )
 
-    # ------------- edges -----------------------------------------------------
+    # ────────────── edges & cylinders (use skeleton only) ─────────────────
     if draw_edges and skel.edges.size:
-        # keep edges whose *both* endpoints survived cropping
         keep_flags = keep_skel
         ekeep      = keep_flags[skel.edges[:, 0]] & keep_flags[skel.edges[:, 1]]
         edges_kept = skel.edges[ekeep]
-
         if edges_kept.size:
-            # compress indices once
-            idx_map = -np.ones(len(keep_flags), dtype=int)
+            idx_map = -np.ones(len(keep_flags), int)
             idx_map[np.flatnonzero(keep_flags)] = np.arange(keep_flags.sum())
-
             seg_start = xy_skel[idx_map[edges_kept[:, 0]]]
             seg_end   = xy_skel[idx_map[edges_kept[:, 1]]]
             segs      = np.stack((seg_start, seg_end), axis=1)
-
-            lc = LineCollection(
-                segs, colors=edge_color, linewidths=edge_lw,
-                alpha=circle_alpha * 0.9, zorder=2)
+            lc = LineCollection(segs, colors=edge_color, linewidths=edge_lw,
+                                alpha=circle_alpha * 0.9, zorder=2)
             ax.add_collection(lc)
 
-    # ─────────────────── optional cylinders ────────────────────────────────
     if draw_nodes and draw_cylinders and skel.edges.size:
-        # keep only edges whose *both* ends survived cropping
-        skel_scale = float(scale[0])  # skeleton scale
         ekeep      = keep_skel[skel.edges[:, 0]] & keep_skel[skel.edges[:, 1]]
         edges_kept = skel.edges[ekeep]
         if edges_kept.size:
-            # build compressed index map (orig-id  →  kept-array index)
-            idx_map = -np.ones(len(keep_skel), dtype=int)
+            idx_map = -np.ones(len(keep_skel), int)
             idx_map[np.flatnonzero(keep_skel)] = np.arange(keep_skel.sum())
-
             quads, facecols = [], []
             for n0, n1 in edges_kept:
                 i0, i1 = idx_map[[n0, n1]]
-
                 quad = _trapezoid_3d(
-                    skel.nodes[n0] * skel_scale, skel.nodes[n1] * skel_scale,   # 3-D coords
-                    rr[i0], rr[i1],                   # radii in data units
-                    plane,
+                    skel.nodes[n0] * scl_skel,
+                    skel.nodes[n1] * scl_skel,
+                    rr[i0], rr[i1], plane,
                 )
-                if quad is None:          # skip zero-length artefacts
+                if quad is None:
                     continue
-
                 quads.append(quad)
-                facecols.append(node_colors[i0] if n_comp else "0.25")
+                facecols.append(node_colors[i0] if draw_nodes and n_comp else "0.25")
 
-            if quads:                                  # guard against empty list
-                pc = PolyCollection(
-                    quads,
-                    facecolors=facecols,
-                    edgecolors="none",
-                    alpha=cylinder_alpha,      # ← new kwarg you added in signature
-                    zorder=2.8,            # beneath circle outlines
-                )
+            if quads:
+                pc = PolyCollection(quads, facecolors=facecols, edgecolors="none",
+                                     alpha=cylinder_alpha, zorder=2.8)
                 ax.add_collection(pc)
 
-    # ------------- optional soma shell --------------------------------------
-    if draw_soma_mask and skel.soma is not None and skel.soma.verts is not None:
-        xy_soma = _project(
-            mesh.vertices[np.asarray(skel.soma.verts, dtype=np.int64)], ix, iy
-        ) * scl_mesh
+    # ────────────── optional soma shell (need mesh) ───────────────────────
+    if (draw_soma_mask and have_mesh and skel.soma is not None and
+            skel.soma.verts is not None):
+        xy_soma = _project(mesh.vertices[np.asarray(skel.soma.verts, int)], ix, iy)
+        xy_soma = xy_soma * scl_mesh
         soma_keep = _mask_window(xy_soma)
         xy_soma   = xy_soma[soma_keep]
-
-        ax.scatter(
-            xy_soma[:, 0], xy_soma[:, 1],
-            s=1.0, c="C0", alpha=0.45, linewidths=0, zorder=9,
-            label="soma surface",
-        )
-        # centre + outline
+        ax.scatter(xy_soma[:, 0], xy_soma[:, 1], s=1.0, c="C0", alpha=0.45,
+                   linewidths=0, zorder=9)
         c_xy = _project(skel.nodes[[0]] * scl_skel, ix, iy).ravel()
         ax.scatter(*c_xy, c="k", s=16, zorder=9)
+        ell = _soma_ellipse2d(skel.soma, plane, scale=scl_skel)
+        ell.set_edgecolor("k"); ell.set_facecolor("none"); ell.set_linestyle("--"); ell.set_linewidth(0.8)
+        ax.add_patch(ell)
 
-        # dashed outline matching circle size
-        ell = _soma_ellipse2d(skel.soma, plane, scale=scale[0])
-        ell.set_edgecolor("k")
-        ell.set_facecolor("none")
-        ell.set_linestyle("--")
-        ell.set_linewidth(0.8)
-        ax.add_patch(ell)                         # dashed outline as before
-
-    # ------------- cosmetics -------------------------------------------------
+    # ────────────── cosmetics & labels ────────────────────────────────────
     ax.set_aspect("equal")
     if unit is None:
         ax.set_xlabel(f"{plane[0]}")
@@ -766,7 +724,6 @@ def details(
         ax.set_xlim(xlim)
     if ylim is not None:
         ax.set_ylim(ylim)
-
     if title is not None:
         ax.set_title(title)
 
@@ -941,39 +898,27 @@ def _window_for_node(
 
 def node_details(
     skel: Skeleton,
-    mesh: trimesh.Trimesh,
-    node_id: int,
+    mesh: Optional["trimesh.Trimesh"] = None,
+    node_id: int = 0,
     *,
-    plane: str = "xy",      
-    multiplier: float = .25,
-    scale: float | tuple[float, float] | list[float] = 1.0,
+    plane: str = "xy",
+    multiplier: float = 0.25,
+    scale: Union[Number, Tuple[Number, Number], Sequence[Number]] = 1.0,
     highlight_alpha: float = 0.5,
-    **kwargs
-) -> tuple[plt.Figure, Axes]:
-    """
-    Plot a zoomed-in view of a specific skeleton node with its soma.
+    **kwargs,
+) -> Tuple[plt.Figure, plt.Axes]:
+    """Zoomed‑in view of a specific skeleton node (mesh optional).
 
-    Parameters
-    ----------
-    skel : Skeleton
-        The skeleton object.
-    mesh : trimesh.Trimesh
-        The mesh object.
-    node_id : int
-        The ID of the skeleton node to zoom in on.
-    multiplier : float, default 1.0
-        How much to zoom in on the node's soma radius.
-    **kwargs
-        Additional keyword arguments passed to `projection`.
-
-    Returns
-    -------
-    fig, ax : tuple[plt.Figure, Axes]
-        The figure and axes objects.
+    A surface `mesh` can now be omitted.  The zoom window is derived purely
+    from the node coordinates and soma radius inside the skeleton; if a mesh is
+    provided, coloured clusters and the soma shell will be drawn as in the
+    full‑overview plot.
     """
+
+    # normalise *scale* into (s_skel, s_mesh)
     if isinstance(scale, (int, float)):
         scl_skel, _ = float(scale), float(scale)
-    else:                                  # pair/list → (skel_scale, mesh_scale)
+    else:
         if len(scale) != 2:
             raise ValueError("scale must be a scalar or a pair/list of two scalars")
         scl_skel = float(scale[0])
@@ -987,13 +932,13 @@ def node_details(
 
     fig, ax = details(
         skel,
-        mesh,
+        mesh,  # may be None – handled by refactored `details()`
         plane=plane,
         xlim=xlim,
         ylim=ylim,
         scale=scale,
-        highlight_nodes=node_id,          # ← new feature
+        highlight_nodes=node_id,
         highlight_face_alpha=highlight_alpha,
         **kwargs,
-    )    
+    )
     return fig, ax
