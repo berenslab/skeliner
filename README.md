@@ -6,5 +6,5 @@ A lightweight skeletonizer that converts neuron meshes into biophysical‑modell
 
 ```bash
 git clone https://github.com/berenslab/skeliner.git
-pip install "skeliner[dev]"
+pip install -e "skeliner[dev]"
 ```

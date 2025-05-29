@@ -9,6 +9,10 @@ from .core import Skeleton, Soma, _bfs_parents
 
 __all__ = ["load_mesh", "load_swc"]
 
+# ------------
+# --- Mesh ---
+# ------------
+
 def load_mesh(filepath: str | Path) -> trimesh.Trimesh:
 
     filepath = Path(filepath)
@@ -20,6 +24,20 @@ def load_mesh(filepath: str | Path) -> trimesh.Trimesh:
         mesh = trimesh.load_mesh(filepath, process=False)
 
     return mesh
+
+def to_ctm(mesh: trimesh.Trimesh, path: str | Path) -> None:
+    path = Path(path)
+    if path.suffix.lower() != ".ctm":
+        mesh.export(path, file_type=path.suffix.lstrip("."))
+        raise ValueError(
+            f"Expected a .ctm file, got {path.suffix}. "
+        )
+
+    verts  = mesh.vertices.astype(np.float32, copy=False)
+    faces  = mesh.faces.astype(np.uint32,  copy=False)
+
+    ctm_mesh = openctm.CTM(verts, faces, None)
+    openctm.export_mesh(ctm_mesh, path)
 
 # -----------
 # --- SWC ---
@@ -72,13 +90,13 @@ def load_swc(
             parts = line.split()
             if len(parts) < 7:
                 continue
-            _id, _type = int(parts[0]), int(parts[1])
+            _id, _type = int(float(parts[0])), int(float(parts[1]))
             if keep_types is not None and _type not in keep_types:
                 continue
             ids.append(_id)
             xyz.append([float(parts[2]), float(parts[3]), float(parts[4])])
             radii.append(float(parts[5]))
-            parent.append(int(parts[6]))
+            parent.append(int(float(parts[6])))
 
     if not ids:
         raise ValueError(f"No usable nodes found in {path}")
@@ -112,7 +130,7 @@ def load_swc(
         vert2node=None,
     )
 
-def to_swc(self, 
+def to_swc(skeleton, 
             path: str | Path,
             include_header: bool = True, 
             scale: float = 1.0,
@@ -141,14 +159,14 @@ def to_swc(self,
     if not path.suffix:
         path = path.with_suffix(".swc")
 
-    parent = _bfs_parents(self.edges, len(self.nodes), root=0)
-    nodes = self.nodes
+    parent = _bfs_parents(skeleton.edges, len(skeleton.nodes), root=0)
+    nodes = skeleton.nodes
     if radius_metric is None:
-        radii = self.r
+        radii = skeleton.r
     else:
-        if radius_metric not in self.radii:
+        if radius_metric not in skeleton.radii:
             raise ValueError(f"Unknown radius estimator '{radius_metric}'")
-        radii = self.radii[radius_metric]
+        radii = skeleton.radii[radius_metric]
     with path.open("w", encoding="utf8") as fh:
         if include_header:
             fh.write("# id type x y z radius parent\n")
@@ -194,7 +212,7 @@ def load_npz(path: str | Path) -> Skeleton:
     return Skeleton(nodes, radii, edges, soma=soma,
                     node2verts=node2verts, vert2node=vert2node)
 
-def to_npz(skel: Skeleton, path: str | Path, *, compress: bool = True) -> None:
+def to_npz(skeleton: Skeleton, path: str | Path, *, compress: bool = True) -> None:
     """
     Write the skeleton to a compressed `.npz` archive.
     """
@@ -207,24 +225,24 @@ def to_npz(skel: Skeleton, path: str | Path, *, compress: bool = True) -> None:
     c = {} if not compress else {"compress": True}
 
     # radii_<name>  : one array per estimator
-    radii_flat = {f"r_{k}": v for k, v in skel.radii.items()}
+    radii_flat = {f"r_{k}": v for k, v in skeleton.radii.items()}
 
     # ragged node2verts  → index + offset
-    if skel.node2verts is not None:
-        n2v_idx = np.concatenate(skel.node2verts)
-        n2v_off = np.cumsum([0, *map(len, skel.node2verts)]).astype(np.int64)
+    if skeleton.node2verts is not None:
+        n2v_idx = np.concatenate(skeleton.node2verts)
+        n2v_off = np.cumsum([0, *map(len, skeleton.node2verts)]).astype(np.int64)
     else:
         n2v_idx = np.array([], dtype=np.int64)
         n2v_off = np.array([0], dtype=np.int64)
 
     np.savez(
         path, 
-        nodes=skel.nodes,
-        edges=skel.edges,
-        soma_centre=skel.soma.centre,
-        soma_axes=skel.soma.axes,
-        soma_R=skel.soma.R,
-        soma_verts=skel.soma.verts if skel.soma.verts is not None else np.array([], dtype=np.int64),
+        nodes=skeleton.nodes,
+        edges=skeleton.edges,
+        soma_centre=skeleton.soma.centre,
+        soma_axes=skeleton.soma.axes,
+        soma_R=skeleton.soma.R,
+        soma_verts=skeleton.soma.verts if skeleton.soma.verts is not None else np.array([], dtype=np.int64),
         node2verts_idx=n2v_idx,
         node2verts_off=n2v_off,
         **radii_flat,
