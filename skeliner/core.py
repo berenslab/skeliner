@@ -1694,7 +1694,7 @@ def skeletonize(
         post_ms = 0.0 # post-processing time
 
     @contextmanager
-    def _timed(label: str, *, verbose: bool = True):      # keep the signature you like
+    def _timed(label: str, *, verbose: bool = verbose):      # keep the signature you like
         """
         Context manager that prints
 
@@ -1727,12 +1727,12 @@ def skeletonize(
                 print(f"      └─ {m}")
 
     # 0. soma vertices ---------------------------------------------------
-    with _timed("↳  build surface graph"):
+    with _timed("↳  build surface graph", verbose=verbose):
         gsurf = _surface_graph(mesh)
 
 
     # 1. binning surface vertices by geodesic distance ----------------------------------
-    with _timed("↳  bin surface vertices by geodesic distance"):
+    with _timed("↳  bin surface vertices by geodesic distance", verbose=verbose):
         mesh_vertices = mesh.vertices.view(np.ndarray)
         
         # pseudo-random soma seed point for kick-starting the binning
@@ -1763,7 +1763,7 @@ def skeletonize(
         )
 
     # 2. create skeleton nodes ------------------------------------------
-    with _timed("↳  compute bin centroids and radii"):
+    with _timed("↳  compute bin centroids and radii", verbose=verbose):
         (nodes_arr, radii_dict, node2verts, vert2node) = _make_nodes(
             all_shells, mesh_vertices,
             radius_estimators=radius_estimators,
@@ -1787,7 +1787,7 @@ def skeletonize(
         soma_ms = time.perf_counter() - _t0
 
     # 4. edges from mesh connectivity -----------------------------------
-    with _timed("↳  map mesh faces to skeleton edges"):
+    with _timed("↳  map mesh faces to skeleton edges", verbose=verbose):
         edges_arr = _edges_from_mesh(
             mesh.edges_unique,
             vert2node,
@@ -1798,7 +1798,7 @@ def skeletonize(
     if has_soma and collapse_soma:
         _t0 = time.perf_counter() 
 
-        with _timed("↳  merge redundant near-soma nodes") as log:
+        with _timed("↳  merge redundant near-soma nodes", verbose=verbose) as log:
             (nodes_arr, radii_dict, node2verts, vert2node, 
                 edges_arr, soma) = _merge_near_soma_nodes(
                     nodes_arr, radii_dict, edges_arr, node2verts,
@@ -1816,7 +1816,7 @@ def skeletonize(
     # 6. Connect all components ------------------------------
     if bridge_gaps:
         _t0 = time.perf_counter() 
-        with _timed("↳  bridge skeleton gaps")  as log:
+        with _timed("↳  bridge skeleton gaps", verbose=verbose)  as log:
             edges_arr = _bridge_gaps(
                 nodes_arr, edges_arr, 
                 bridge_max_factor = bridge_max_factor,
@@ -1826,7 +1826,7 @@ def skeletonize(
             post_ms += time.perf_counter() - _t0
 
     # 7. global minimum-spanning tree ------------------------------------
-    with _timed("↳  build global minimum-spanning tree"):
+    with _timed("↳  build global minimum-spanning tree", verbose=verbose):
         edges_mst = _build_mst(nodes_arr, edges_arr)
         if verbose:
             post_ms += time.perf_counter() - _t0
@@ -1834,7 +1834,7 @@ def skeletonize(
     # 8. prune tiny sub-trees near the soma
     if has_soma and prune_tiny_neurites:
         _t0 = time.perf_counter()
-        with _timed("↳  prune tiny neurites") as log:
+        with _timed("↳  prune tiny neurites", verbose=verbose) as log:  
 
             (nodes_arr, radii_dict, node2verts, vert2node,
                 edges_mst, soma) = _prune_neurites(
