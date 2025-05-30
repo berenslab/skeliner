@@ -7,7 +7,14 @@ import trimesh
 
 from .core import Skeleton, Soma, _bfs_parents
 
-__all__ = ["load_mesh", "load_swc"]
+__all__ = [
+    "load_mesh",
+    "to_ctm",
+    "load_swc",
+    "to_swc",
+    "load_npz",
+    "to_npz",
+]
 
 # ------------
 # --- Mesh ---
@@ -82,6 +89,7 @@ def load_swc(
     xyz: List[List[float]] = []
     radii: List[float] = []
     parent: List[int]  = []
+    ntype: List[int] = []
 
     with path.open("r", encoding="utf8") as fh:
         for line in fh:
@@ -97,6 +105,7 @@ def load_swc(
             xyz.append([float(parts[2]), float(parts[3]), float(parts[4])])
             radii.append(float(parts[5]))
             parent.append(int(float(parts[6])))
+            ntype.append(_type)
 
     if not ids:
         raise ValueError(f"No usable nodes found in {path}")
@@ -105,7 +114,7 @@ def load_swc(
     nodes_arr  = np.asarray(xyz, dtype=np.float32) * scale
     radii_arr  = np.asarray(radii, dtype=np.float32) * scale
     radii_dict = {"median": radii_arr}          # only one estimator available
-
+    ntype_arr = np.asarray(ntype, dtype=np.int8)
     # --- edges (parent IDs → 0-based indices) ---------------------------
     id_map = {old: new for new, old in enumerate(ids)}
     edges = [
@@ -125,6 +134,7 @@ def load_swc(
         nodes=nodes_arr,
         radii=radii_dict,
         edges=edges_arr,
+        ntype=ntype_arr,
         soma=soma,
         node2verts=None,
         vert2node=None,
@@ -167,12 +177,28 @@ def to_swc(skeleton,
         if radius_metric not in skeleton.radii:
             raise ValueError(f"Unknown radius estimator '{radius_metric}'")
         radii = skeleton.radii[radius_metric]
+
+    # ------------------------------------------------------------------
+    # Node types (guarantee soma = 1, others = 3 as default if not set)
+    # ------------------------------------------------------------------
+    if skeleton.ntype is not None:
+        ntype = skeleton.ntype.astype(int, copy=False)
+    else:
+        ntype = np.full(len(skeleton.nodes), 3, dtype=int)
+        if len(ntype):
+            ntype[0] = 1
+
     with path.open("w", encoding="utf8") as fh:
         if include_header:
             fh.write("# id type x y z radius parent\n")
-        for idx, (p, r, pa) in enumerate(zip(nodes * scale, radii * scale, parent), start=1):
-            swc_type = 1 if idx == 1 else 0
-            fh.write(f"{idx} {swc_type} {p[0]} {p[1]} {p[2]} {r} {pa + 1 if pa != -1 else -1}\n")
+        for idx, (coord, r, pa, t) in enumerate(
+            zip(skeleton.nodes * scale, radii * scale, parent, ntype), start=1
+        ):
+            fh.write(
+                f"{idx} {int(t if idx != 1 else 1)} "  # ensure soma has type 1
+                f"{coord[0]} {coord[1]} {coord[2]} {r} "
+                f"{(pa + 1) if pa != -1 else -1}\n"
+            )
 
 # -----------
 # --- npz ---
@@ -193,6 +219,14 @@ def load_npz(path: str | Path) -> Skeleton:
             k[2:]: z[k].astype(np.float32) for k in z.files if k.startswith("r_")
         }
 
+        # node types (optional in older archives)
+        if "ntype" in z:
+            ntype = z["ntype"].astype(np.int8)
+        else:
+            ntype = np.full(len(nodes), 3, dtype=np.int8)
+            if len(ntype):
+                ntype[0] = 1
+
         # reconstruct ragged node2verts
         idx = z["node2verts_idx"].astype(np.int64)
         off = z["node2verts_off"].astype(np.int64)
@@ -209,7 +243,7 @@ def load_npz(path: str | Path) -> Skeleton:
             ),
         )
 
-    return Skeleton(nodes, radii, edges, soma=soma,
+    return Skeleton(nodes=nodes, radii=radii, edges=edges, ntype=ntype, soma=soma,
                     node2verts=node2verts, vert2node=vert2node)
 
 def to_npz(skeleton: Skeleton, path: str | Path, *, compress: bool = True) -> None:
@@ -239,6 +273,7 @@ def to_npz(skeleton: Skeleton, path: str | Path, *, compress: bool = True) -> No
         path, 
         nodes=skeleton.nodes,
         edges=skeleton.edges,
+        ntype=skeleton.ntype if skeleton.ntype is not None else np.array([], dtype=np.int8),
         soma_centre=skeleton.soma.centre,
         soma_axes=skeleton.soma.axes,
         soma_R=skeleton.soma.R,

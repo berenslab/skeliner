@@ -234,10 +234,25 @@ class Skeleton:
         Optional 1D int64 array of mesh-vertex IDs belonging to the soma surface.
         Optional. None when loaded from SWC.
     """
+
+    # ---- mandatory soma data ---------------------------------
+    soma: Soma
+
+    # ---- mandatory skeleton data (except ntype)---------------------------------
     nodes: np.ndarray  # (N, 3) float32
     radii:  dict[str, np.ndarray]  # (N,)  float32
     edges: np.ndarray  # (E, 2) int64  – undirected, **sorted** pairs
-    soma: Soma
+    ntype: np.ndarray | None # (N,) int64, node type
+        # SWC type codes we will follow by default
+        #   1 – soma (already enforced for node 0)
+        #   2 – axon
+        #   3 – (basal / generic) dendrite
+        #   4 – apical dendrite
+        #   5 – fork point
+        #   6 – end point
+        #   0 – undefined / other
+        
+    # ---- optional mesh data ----------------------------------------
     node2verts: list[np.ndarray] | None = None
     vert2node: dict[int, int] | None = None
 
@@ -255,10 +270,30 @@ class Skeleton:
     # ---------------------------------------------------------------------
     def __post_init__(self) -> None:
         """Validate basic shape constraints."""
-        if self.nodes.shape[0] != self.r.shape[0]:
-            raise ValueError("nodes and radii length mismatch")
+        N = self.nodes.shape[0]
+
+        # ---- radii ---------------------------------------------------
+        if any(len(r) != N for r in self.radii.values()):
+            raise ValueError("All radius arrays must match the number of nodes")
+
+        # ---- edges ---------------------------------------------------
         if self.edges.ndim != 2 or self.edges.shape[1] != 2:
-            raise ValueError("edges must be (E, 2)")
+            raise ValueError("Edges must be of shape (E, 2)")
+
+        # ---- ntype ---------------------------------------------------
+        if self.ntype is None:
+            # create default label vector: soma=1, rest=dendrite (3)
+            ntype = np.full(N, 3, dtype=np.int8)
+            if N:
+                ntype[0] = 1
+                self.ntype = ntype
+        else:
+            self.ntype = np.asanyarray(self.ntype, dtype=np.int8).reshape(-1)
+            if len(self.ntype) != N:
+                raise ValueError("ntype length must match number of nodes")
+            self.ntype[0] = 1  # always enforce soma label
+
+
         if self.soma is not None:
             if self.soma.verts is not None and self.soma.verts.ndim != 1:
                 raise ValueError("soma_verts must be 1-D")
@@ -1828,9 +1863,10 @@ def skeletonize(
                   f"… {total_ms:.2f} s "
                   f"({soma_ms:.2f} + {core_ms:.2f})")
 
-    return Skeleton(nodes_arr, 
-                    radii_dict, 
-                    edges_mst, 
+    return Skeleton(nodes=nodes_arr, 
+                    radii=radii_dict, 
+                    edges=edges_mst, 
+                    ntype=None,
                     soma=soma,
                     node2verts=node2verts,
                     vert2node=vert2node,
