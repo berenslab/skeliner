@@ -238,7 +238,7 @@ def branches_of_length(
             prev, curr = ep, nb
             while True:
                 path.append(curr)
-                visited_edges.add(tuple(sorted((prev, curr))) )
+                visited_edges.add((min(int(prev), int(curr)), max(int(prev), int(curr))))
                 if curr in endpoints:
                     break
                 # internal vertex (deg==2) → continue straight

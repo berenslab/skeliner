@@ -879,15 +879,15 @@ def _merge_near_soma_nodes(
             vidx   = node2verts[idx]
             d_local = soma.distance_to_surface(mesh_vertices[vidx])
             close   = d_local < near_factor * r_soma     # same factor as for centre test
-            if close.any():
-                soma.verts      = np.concatenate((soma.verts, vidx[close]))
+            if np.any(close):
+                soma.verts = np.concatenate((soma.verts, vidx[close])) if soma.verts is not None else vidx[close]
                 node2_keep[0]   = np.concatenate((node2_keep[0], vidx[close]))
 
     for nid, verts in enumerate(node2_keep):
         for v in verts:
             vert2node[int(v)] = nid
 
-    soma.verts = np.unique(soma.verts).astype(np.int64)
+    soma.verts = np.unique(soma.verts).astype(np.int64) if soma.verts is not None else None
     try:
         soma = Soma.fit(mesh_vertices[soma.verts], verts=soma.verts)
     except ValueError:
