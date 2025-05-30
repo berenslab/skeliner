@@ -6,9 +6,12 @@ import numpy as np
 from . import dx
 
 __skeleton__ = [
+    # editing edges
     "graft",
     "clip",
     "prune",
+    # editing ntype
+    "set_ntype",
 ]
 
 # -----------------------------------------------------------------------------
@@ -27,7 +30,7 @@ def _refresh_igraph(skel) -> ig.Graph:  # type: ignore[valid-type]
     return ig.Graph(n=len(skel.nodes), edges=[tuple(map(int, e)) for e in skel.edges], directed=False)
 
 # -----------------------------------------------------------------------------
-# local edits: graft / clip
+# editing edges: graft / clip
 # -----------------------------------------------------------------------------
 
 def graft(skel, u: int, v: int, *, allow_cycle: bool = True) -> None:
@@ -84,10 +87,6 @@ def clip(skel, u: int, v: int, *, drop_orphans: bool = False) -> None:
 
         _rebuild_keep_subset(skel, reachable)
 
-# -----------------------------------------------------------------------------
-#  bulk pruning helpers
-# -----------------------------------------------------------------------------
-
 def prune(
     skel,
     *,
@@ -113,10 +112,6 @@ def prune(
         _prune_twigs(skel, num_nodes=num_nodes)
     else:
         raise ValueError(f"Unknown kind '{kind}'")
-
-# -----------------------------------------------------------------------------
-#  internal pruning implementations
-# -----------------------------------------------------------------------------
 
 def _collect_twig_nodes(skel, num_nodes: int) -> Set[int]:
     """
@@ -176,3 +171,67 @@ def _rebuild_keep_subset(skel, keep_set: Set[int]):
     keep_mask = np.zeros(len(skel.nodes), dtype=bool)
     keep_mask[list(keep_set)] = True
     _rebuild_drop_set(skel, np.where(~keep_mask)[0])
+
+# -----------------------------------------------------------------------------
+#  ntype editing
+# -----------------------------------------------------------------------------
+
+def set_ntype(
+    skel,
+    *,
+    root: int | Iterable[int] | None = None,
+    node_ids: Iterable[int] | None = None,
+    code: int = 3,
+    subtree: bool = True,
+    include_root: bool = True,
+) -> None:
+    """
+    Label nodes with SWC *code*.
+
+    Exactly one of ``root`` or ``node_ids`` must be provided.
+
+    Parameters
+    ----------
+    root
+        Base node(s) whose neurite(s) will be coloured.  Requires
+        ``node_ids is None``.  If *subtree* is True (default) every base
+        node is expanded with :pyfunc:`dx.extract_neurites`.
+    node_ids
+        Explicit collection of node indices to label.  Requires
+        ``root is None``; no expansion is performed.
+    code
+        SWC integer code to assign (2 = axon, 3 = dendrite, …).
+    subtree, include_root
+        Control how the neurite expansion behaves (ignored when
+        ``node_ids`` is given).
+    """
+   # ----------------------------------------------------------- #
+    # argument sanity                                             #
+    # ----------------------------------------------------------- #
+    if (root is None) == (node_ids is None):
+        raise ValueError("supply exactly one of 'root' or 'node_ids'")
+
+    # ----------------------------------------------------------- #
+    # gather the target set                                       #
+    # ----------------------------------------------------------- #
+    if node_ids is not None:
+        target = set(map(int, node_ids))
+    else:
+        bases = np.atleast_1d(root).astype(int)
+        target: set[int] = set()
+        if subtree:
+            for nid in bases:
+                target.update(
+                    dx.extract_neurites(skel, int(nid), include_root=include_root)
+                )
+        else:
+            target.update(bases)
+
+    target.discard(0)          # never overwrite soma
+    if not target:
+        return
+
+    # ----------------------------------------------------------- #
+    # fast vectorised assignment                                  #
+    # ----------------------------------------------------------- #
+    skel.ntype[np.fromiter(target, dtype=int)] = int(code)

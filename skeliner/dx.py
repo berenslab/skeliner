@@ -15,6 +15,7 @@ __skeleton__ = [
     "twigs_of_length",
     "suspicious_tips",
     "node_summary",
+    "extract_neurites",
 ]
 
 # -----------------------------------------------------------------------------
@@ -427,3 +428,70 @@ def suspicious_tips(
 
     suspicious_sorted = sorted(suspicious, key=lambda nid: -stats[int(nid)]["ratio"])
     return suspicious_sorted, stats
+
+def extract_neurites(
+    skel,
+    root: int,
+    *,
+    include_root: bool = True,
+) -> List[int]:
+    """Return the full *neurite subtree* emerging distally from ``root``.
+
+The routine uses *graph distance* to the soma (node 0) to orient edges:
+for every edge ``(u, v)`` the direction is from the **closer** vertex to
+soma → **further** vertex.  All vertices whose shortest path to soma passes
+through ``root`` (including any downstream bifurcations) are returned.
+
+    The skeleton is assumed to be a tree (acyclic).  *Distal* means all
+    descendants of ``root`` when the soma (vertex 0) is treated as the
+    root.
+
+    Examples
+    --------
+    >>> skel.dx.extract_neurite(skel, 2)
+    [2, 3, 4, 5, ...]   # entire subtree starting at 2
+    >>> skel.dx.extract_neurite(skel, 0, include_root=False)
+    list(range(1, len(skel.nodes)))  # every non‑soma node
+
+    Parameters
+    ----------
+    skel
+        A :class:`skeliner.Skeleton` instance.
+    root
+        Index of the *proximal* node that defines the neurite base.
+    include_root : bool, default ``True``
+        Whether ``root`` itself should be included in the returned list.
+
+    Returns
+    -------
+    list[int]
+        Sorted vertex IDs belonging to the neurite.
+    """
+    N = len(skel.nodes)
+    if root < 0 or root >= N:
+        raise ValueError("root is out of range")
+
+    # 1. shortest‑path distance from soma to EVERY node (unweighted graph)
+    g = skel._igraph()
+    dists = np.asarray(g.shortest_paths(source=[0])[0], dtype=int)
+
+    # 2. build children[]: edge directed along *increasing* distance
+    children: List[List[int]] = [[] for _ in range(N)]
+    for a, b in skel.edges:
+        da, db = dists[a], dists[b]
+        if da == db:
+            # should not happen in a tree, but guard anyway
+            continue
+        parent, child = (a, b) if da < db else (b, a)
+        children[parent].append(child)
+
+    # 3. DFS from root collecting all downstream vertices
+    out: List[int] = []
+    stack = [root]
+    while stack:
+        v = stack.pop()
+        if v != root or include_root:
+            out.append(v)
+        stack.extend(children[v])
+
+    return sorted(out)

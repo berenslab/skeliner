@@ -11,7 +11,7 @@ from scipy.stats import binned_statistic_2d
 
 from .core import Skeleton
 
-__all__ = ["projection", "threeviews", "details"]
+__all__ = ["projection", "threeviews", "details", "node_details"]
 
 
 Number = int | float
