@@ -16,6 +16,7 @@ __skeleton__ = [
     "suspicious_tips",
     "node_summary",
     "extract_neurites",
+    "neurites_out_of_bounds",
 ]
 
 # -----------------------------------------------------------------------------
@@ -495,3 +496,63 @@ through ``root`` (including any downstream bifurcations) are returned.
         stack.extend(children[v])
 
     return sorted(out)
+
+def neurites_out_of_bounds(
+    skel,
+    bounds: tuple[np.ndarray, np.ndarray] | tuple[Sequence[float], Sequence[float]],
+    *,
+    include_root: bool = True,
+) -> list[int]:
+    """
+    Return all node IDs that belong to a *distal* subtree whose **root is the
+    first node that leaves the axis-aligned bounding box** ``bounds``.
+
+    Parameters
+    ----------
+    bounds
+        ``(lo, hi)`` – each a 3-vector.  A node is inside iff
+        ``lo <= coord <= hi`` component-wise.
+    include_root
+        Whether the very first out-of-bounds node should be included in the
+        output.  (Default: ``True``.)
+
+    Notes
+    -----
+    * Works on acyclic skeletons (trees).
+    * Uses only igraph helpers; no custom BFS routine.
+    """
+    lo, hi = np.asarray(bounds[0], float), np.asarray(bounds[1], float)
+    if lo.shape != (3,) or hi.shape != (3,):
+        raise ValueError("bounds must be two length-3 vectors")
+
+    coords  = skel.nodes
+    outside = np.any((coords < lo) | (coords > hi), axis=1)
+    if not outside.any():
+        return []
+
+    # ------------------------------------------------------------------
+    # one igraph shortest-path pass from soma (vertex 0)
+    # ------------------------------------------------------------------
+    g      = skel._igraph()
+    dists  = np.asarray(g.shortest_paths(source=[0])[0], dtype=int)
+
+    # For every edge (u,v) orient from proximal→distal
+    children: list[list[int]] = [[] for _ in range(len(coords))]
+    for u, v in skel.edges:
+        parent, child = (u, v) if dists[u] < dists[v] else (v, u)
+        children[parent].append(child)
+
+    # ------------------------------------------------------------------
+    # Treat each *first* out-of-bounds node as a neurite root
+    # ------------------------------------------------------------------
+    targets: set[int] = set()
+    for nid in np.where(outside)[0]:
+        # ensure nid is indeed the *first* outside node on its path
+        par = g.bfs(0, mode="ALL")[2][nid]
+        if par != -1 and outside[par]:
+            continue                        # ancestor already outside – skip
+        targets.update(
+            extract_neurites(skel, int(nid), include_root=include_root)
+        )
+
+    return sorted(targets)

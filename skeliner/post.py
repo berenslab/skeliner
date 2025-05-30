@@ -1,4 +1,6 @@
-from typing import Iterable, Literal, Set
+"""skeliner.post – post-processing functions for skeletons.
+"""
+from typing import Iterable, Set
 
 import igraph as ig
 import numpy as np
@@ -92,24 +94,29 @@ def prune(
     *,
     kind: str= "twigs",
     num_nodes: int | None = None,
+    nodes: Iterable[int] | None = None,
 ) -> None:
     """Rule-based removal of sub-trees or hubs.
 
     Parameters
     ----------
-    kind : {"twigs", "degree"}
+    kind : {"twigs", "nodes"}
         * ``"twigs"``  – delete all terminal branches (twigs) whose node count
           ≤ ``max_nodes``.
-        * ``"degree"`` – excise nodes with degree ≥ ``min_degree``.
+        * ``"nodes"`` – delete all specified nodes along with their incident edges.
     max_nodes
         Threshold for *twigs* pruning (ignored otherwise).
-    min_degree
-        Threshold for *degree* pruning (ignored otherwise).
+    nodes:
+        Iterable of node indices to prune (ignored for *twigs* pruning).
     """
     if kind == "twigs":
         if num_nodes is None:
             raise ValueError("num_nodes must be given for kind='twigs'")
         _prune_twigs(skel, num_nodes=num_nodes)
+    elif kind == "nodes":
+        if nodes is None:
+            raise ValueError("nodes must be given for kind='nodes'")
+        _prune_nodes(skel, nodes=nodes)
     else:
         raise ValueError(f"Unknown kind '{kind}'")
 
@@ -132,6 +139,25 @@ def _prune_twigs(skel, *, num_nodes: int):
     drop = _collect_twig_nodes(skel, num_nodes=num_nodes)
     if not drop:
         return  # nothing to do
+    _rebuild_drop_set(skel, drop)
+
+def _prune_nodes(
+    skel,
+    nodes: Iterable[int],
+) -> None:
+    drop = set(int(n) for n in nodes if n != 0)  # never drop soma
+    if not drop:
+        return
+
+    g = skel._igraph()
+    deg = np.asarray(g.degree())
+    for n in list(drop):
+        if deg[n] <= 2:
+            continue
+        neigh = [v for v in g.neighbors(n) if v not in drop]
+        if len(neigh) >= 2:
+            drop.remove(n)
+
     _rebuild_drop_set(skel, drop)
 
 # -----------------------------------------------------------------------------
