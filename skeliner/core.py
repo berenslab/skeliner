@@ -312,7 +312,8 @@ class Skeleton:
                path: str | Path,
                include_header: bool = True, 
                scale: float = 1.0,
-               radius_metric: str | None = None
+               radius_metric: str | None = None,
+               axis_order: tuple[int, int, int] | str = (0, 1, 2)
     ) -> None:
         """Write the skeleton to SWC.
 
@@ -330,7 +331,7 @@ class Skeleton:
             Unit conversion factor applied to *both* coordinates and radii when
             writing; useful e.g. for nm→µm conversion.
         """        
-        io.to_swc(self, path, include_header=include_header, scale=scale, radius_metric=radius_metric)
+        io.to_swc(self, path, include_header=include_header, scale=scale, radius_metric=radius_metric, axis_order=axis_order)
 
     def to_npz(self, path: str | Path) -> None:
         """Write the skeleton to a compressed NumPy archive.

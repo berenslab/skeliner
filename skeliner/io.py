@@ -144,7 +144,8 @@ def to_swc(skeleton,
             path: str | Path,
             include_header: bool = True, 
             scale: float = 1.0,
-            radius_metric: str | None = None
+            radius_metric: str | None = None,
+            axis_order: tuple[int, int, int] | str = (0, 1, 2)
 ) -> None:
     """Write the skeleton to SWC.
 
@@ -163,12 +164,25 @@ def to_swc(skeleton,
         writing; useful e.g. for nm→µm conversion.
     """        
     
+    # --- normalise axis_order ------------------------------------------
+    if isinstance(axis_order, str):
+        axis_map = {"x": 0, "y": 1, "z": 2}
+        try:
+            axis_order = tuple(axis_map[c.lower()] for c in axis_order)
+        except KeyError:
+            raise ValueError("axis_order string must be a permutation of 'xyz'")
+    axis_order = tuple(map(int, axis_order))
+    if sorted(axis_order) != [0, 1, 2]:
+        raise ValueError("axis_order must be a permutation of (0,1,2)")
+
+    # --- check suffix and convert path -------------------------------
     path = Path(path)
 
     # add .swc to the path if not present
     if not path.suffix:
         path = path.with_suffix(".swc")
 
+    # --- prepare arrays -----------------------------------------------
     parent = _bfs_parents(skeleton.edges, len(skeleton.nodes), root=0)
     nodes = skeleton.nodes
     if radius_metric is None:
@@ -178,21 +192,20 @@ def to_swc(skeleton,
             raise ValueError(f"Unknown radius estimator '{radius_metric}'")
         radii = skeleton.radii[radius_metric]
 
-    # ------------------------------------------------------------------
-    # Node types (guarantee soma = 1, others = 3 as default if not set)
-    # ------------------------------------------------------------------
+    # --- Node types (guarantee soma = 1, others = 3 as default if not set)
     if skeleton.ntype is not None:
         ntype = skeleton.ntype.astype(int, copy=False)
     else:
-        ntype = np.full(len(skeleton.nodes), 3, dtype=int)
+        ntype = np.full(len(nodes), 3, dtype=int)
         if len(ntype):
             ntype[0] = 1
-
+    
+    # --- write SWC file -----------------------------------------------
     with path.open("w", encoding="utf8") as fh:
         if include_header:
             fh.write("# id type x y z radius parent\n")
         for idx, (coord, r, pa, t) in enumerate(
-            zip(skeleton.nodes * scale, radii * scale, parent, ntype), start=1
+            zip(nodes[:, axis_order] * scale, radii * scale, parent, ntype), start=1
         ):
             fh.write(
                 f"{idx} {int(t if idx != 1 else 1)} "  # ensure soma has type 1
