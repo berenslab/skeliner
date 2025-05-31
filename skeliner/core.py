@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import igraph as ig
 import numpy as np
@@ -255,6 +255,8 @@ class Skeleton:
     # ---- optional mesh data ----------------------------------------
     node2verts: list[np.ndarray] | None = None
     vert2node: dict[int, int] | None = None
+    # ---- optional dictionary for extra data expansion --------------
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def __getattr__(self, name: str):
         for mod in (dx, post):        
@@ -358,10 +360,21 @@ class Skeleton:
         stats : dict
             Diagnostic numbers {"p50", "p75", "max"} of mean/median ratio.
         """
-        mean = self.radii.get("mean")
+        mean   = self.radii.get("mean")
         median = self.radii.get("median")
         if mean is None or median is None:
             return "median", "Only one radius column available; using it.", {}
+
+        # ── mask bogus radii ------------------------------------------------
+        ok = (mean > 0) & (median > 0)
+        if not np.all(ok):
+            bad = np.count_nonzero(~ok)
+            print(f"[skeliner] Warning: {bad} nodes have zero radius; "
+                "they were ignored when picking the estimator.")
+            mean, median = mean[ok], median[ok]
+
+        if mean.size == 0:                          # nothing left → fallback
+            return "median", "All radii are zero; using median by convention.", {}
 
         ratio = mean / median
         p50 = float(np.percentile(ratio, 50))
