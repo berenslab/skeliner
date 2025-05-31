@@ -36,3 +36,5 @@ dev/
 # Temporary files
 *copy*
 *draft*
+
+.python-version

@@ -943,6 +943,20 @@ wheels = [
 ]
 
 [[package]]
+name = "openctm"
+version = "0.0.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", marker = "python_full_version >= '3.12'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ff/bc/827403f7456405b07cc051f9c84271427a1f56261448856f6ed99f9d2c6f/openctm-0.0.6-py3-none-macosx_10_9_x86_64.whl", hash = "sha256:338be75c72076031d41ffe707ebdbc48b61c0a740497c572510e1bd4533d6057", size = 129105 },
+    { url = "https://files.pythonhosted.org/packages/1b/2d/3231734252aab2d60841be8fce8d31a6ff6b7dbdc9c3a434c3b1fee1e0ef/openctm-0.0.6-py3-none-manylinux2014_i686.whl", hash = "sha256:d185c4d9f21ccdeab51ca85fa10556c5787b7a24a1e0a285dab281a66410e4fd", size = 101491 },
+    { url = "https://files.pythonhosted.org/packages/4d/96/9996538318d05d5dd558743800ccfd0a36ee92040e50f36486b0186b0851/openctm-0.0.6-py3-none-manylinux2014_x86_64.whl", hash = "sha256:c4b3df08e95da6795c65209829090b766db65c476a313f8d66bfed6217f39009", size = 102459 },
+    { url = "https://files.pythonhosted.org/packages/8e/14/f573f1f99eb813120925e52f736da83e2627f1df73dc8f014e53b1030e65/openctm-0.0.6-py3-none-win_amd64.whl", hash = "sha256:8af2b04d869d7dc2216f4ca4199f2f65ea0a9a693905ef27724682f903cc273c", size = 224804 },
+]
+
+[[package]]
 name = "packaging"
 version = "25.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1173,7 +1187,7 @@ name = "python-openctm"
 version = "1.0.12"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy" },
+    { name = "numpy", marker = "python_full_version < '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/52/16/b169b47321f31ba30bfe5410a48e374b4e12cd7e52685cc6efe97ae46642/python-openctm-1.0.12.tar.gz", hash = "sha256:e348d7df9375ea405df0e85c6b7b9d182d185dd54f21954bed6660d6629c06d9", size = 5069 }
 wheels = [
@@ -1514,7 +1528,8 @@ dependencies = [
     { name = "igraph" },
     { name = "matplotlib" },
     { name = "numpy" },
-    { name = "python-openctm" },
+    { name = "openctm", marker = "python_full_version >= '3.12'" },
+    { name = "python-openctm", marker = "python_full_version < '3.12'" },
     { name = "scipy", version = "1.13.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "trimesh" },
@@ -1537,8 +1552,9 @@ requires-dist = [
     { name = "matplotlib", specifier = ">=3.10.3" },
     { name = "maturin", marker = "extra == 'dev'" },
     { name = "numpy", specifier = ">=2.0.2" },
+    { name = "openctm", marker = "python_full_version >= '3.12'", specifier = ">=0.0.6" },
     { name = "pytest", marker = "extra == 'dev'" },
-    { name = "python-openctm", specifier = ">=1.0.12" },
+    { name = "python-openctm", marker = "python_full_version < '3.12'", specifier = ">=1.0.12" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "scipy", specifier = ">=1.13.1" },
     { name = "trimesh", specifier = ">=4.6.9" },
