@@ -234,10 +234,25 @@ class Skeleton:
         Optional 1D int64 array of mesh-vertex IDs belonging to the soma surface.
         Optional. None when loaded from SWC.
     """
+
+    # ---- mandatory soma data ---------------------------------
+    soma: Soma
+
+    # ---- mandatory skeleton data (except ntype)---------------------------------
     nodes: np.ndarray  # (N, 3) float32
     radii:  dict[str, np.ndarray]  # (N,)  float32
     edges: np.ndarray  # (E, 2) int64  – undirected, **sorted** pairs
-    soma: Soma
+    ntype: np.ndarray | None # (N,) int64, node type
+        # SWC type codes we will follow by default
+        #   1 – soma (already enforced for node 0)
+        #   2 – axon
+        #   3 – (basal / generic) dendrite
+        #   4 – apical dendrite
+        #   5 – fork point
+        #   6 – end point
+        #   0 – undefined / other
+        
+    # ---- optional mesh data ----------------------------------------
     node2verts: list[np.ndarray] | None = None
     vert2node: dict[int, int] | None = None
 
@@ -255,10 +270,30 @@ class Skeleton:
     # ---------------------------------------------------------------------
     def __post_init__(self) -> None:
         """Validate basic shape constraints."""
-        if self.nodes.shape[0] != self.r.shape[0]:
-            raise ValueError("nodes and radii length mismatch")
+        N = self.nodes.shape[0]
+
+        # ---- radii ---------------------------------------------------
+        if any(len(r) != N for r in self.radii.values()):
+            raise ValueError("All radius arrays must match the number of nodes")
+
+        # ---- edges ---------------------------------------------------
         if self.edges.ndim != 2 or self.edges.shape[1] != 2:
-            raise ValueError("edges must be (E, 2)")
+            raise ValueError("Edges must be of shape (E, 2)")
+
+        # ---- ntype ---------------------------------------------------
+        if self.ntype is None:
+            # create default label vector: soma=1, rest=dendrite (3)
+            ntype = np.full(N, 3, dtype=np.int8)
+            if N:
+                ntype[0] = 1
+                self.ntype = ntype
+        else:
+            self.ntype = np.asanyarray(self.ntype, dtype=np.int8).reshape(-1)
+            if len(self.ntype) != N:
+                raise ValueError("ntype length must match number of nodes")
+            self.ntype[0] = 1  # always enforce soma label
+
+
         if self.soma is not None:
             if self.soma.verts is not None and self.soma.verts.ndim != 1:
                 raise ValueError("soma_verts must be 1-D")
@@ -277,7 +312,8 @@ class Skeleton:
                path: str | Path,
                include_header: bool = True, 
                scale: float = 1.0,
-               radius_metric: str | None = None
+               radius_metric: str | None = None,
+               axis_order: tuple[int, int, int] | str = (0, 1, 2)
     ) -> None:
         """Write the skeleton to SWC.
 
@@ -295,7 +331,7 @@ class Skeleton:
             Unit conversion factor applied to *both* coordinates and radii when
             writing; useful e.g. for nm→µm conversion.
         """        
-        io.to_swc(self, path, include_header=include_header, scale=scale, radius_metric=radius_metric)
+        io.to_swc(self, path, include_header=include_header, scale=scale, radius_metric=radius_metric, axis_order=axis_order)
 
     def to_npz(self, path: str | Path) -> None:
         """Write the skeleton to a compressed NumPy archive.
@@ -843,15 +879,15 @@ def _merge_near_soma_nodes(
             vidx   = node2verts[idx]
             d_local = soma.distance_to_surface(mesh_vertices[vidx])
             close   = d_local < near_factor * r_soma     # same factor as for centre test
-            if close.any():
-                soma.verts      = np.concatenate((soma.verts, vidx[close]))
+            if np.any(close):
+                soma.verts = np.concatenate((soma.verts, vidx[close])) if soma.verts is not None else vidx[close]
                 node2_keep[0]   = np.concatenate((node2_keep[0], vidx[close]))
 
     for nid, verts in enumerate(node2_keep):
         for v in verts:
             vert2node[int(v)] = nid
 
-    soma.verts = np.unique(soma.verts).astype(np.int64)
+    soma.verts = np.unique(soma.verts).astype(np.int64) if soma.verts is not None else None
     try:
         soma = Soma.fit(mesh_vertices[soma.verts], verts=soma.verts)
     except ValueError:
@@ -1659,7 +1695,7 @@ def skeletonize(
         post_ms = 0.0 # post-processing time
 
     @contextmanager
-    def _timed(label: str, *, verbose: bool = True):      # keep the signature you like
+    def _timed(label: str, *, verbose: bool = verbose):      # keep the signature you like
         """
         Context manager that prints
 
@@ -1692,12 +1728,12 @@ def skeletonize(
                 print(f"      └─ {m}")
 
     # 0. soma vertices ---------------------------------------------------
-    with _timed("↳  build surface graph"):
+    with _timed("↳  build surface graph", verbose=verbose):
         gsurf = _surface_graph(mesh)
 
 
     # 1. binning surface vertices by geodesic distance ----------------------------------
-    with _timed("↳  bin surface vertices by geodesic distance"):
+    with _timed("↳  bin surface vertices by geodesic distance", verbose=verbose):
         mesh_vertices = mesh.vertices.view(np.ndarray)
         
         # pseudo-random soma seed point for kick-starting the binning
@@ -1728,7 +1764,7 @@ def skeletonize(
         )
 
     # 2. create skeleton nodes ------------------------------------------
-    with _timed("↳  compute bin centroids and radii"):
+    with _timed("↳  compute bin centroids and radii", verbose=verbose):
         (nodes_arr, radii_dict, node2verts, vert2node) = _make_nodes(
             all_shells, mesh_vertices,
             radius_estimators=radius_estimators,
@@ -1752,7 +1788,7 @@ def skeletonize(
         soma_ms = time.perf_counter() - _t0
 
     # 4. edges from mesh connectivity -----------------------------------
-    with _timed("↳  map mesh faces to skeleton edges"):
+    with _timed("↳  map mesh faces to skeleton edges", verbose=verbose):
         edges_arr = _edges_from_mesh(
             mesh.edges_unique,
             vert2node,
@@ -1763,7 +1799,7 @@ def skeletonize(
     if has_soma and collapse_soma:
         _t0 = time.perf_counter() 
 
-        with _timed("↳  merge redundant near-soma nodes") as log:
+        with _timed("↳  merge redundant near-soma nodes", verbose=verbose) as log:
             (nodes_arr, radii_dict, node2verts, vert2node, 
                 edges_arr, soma) = _merge_near_soma_nodes(
                     nodes_arr, radii_dict, edges_arr, node2verts,
@@ -1781,7 +1817,7 @@ def skeletonize(
     # 6. Connect all components ------------------------------
     if bridge_gaps:
         _t0 = time.perf_counter() 
-        with _timed("↳  bridge skeleton gaps")  as log:
+        with _timed("↳  bridge skeleton gaps", verbose=verbose)  as log:
             edges_arr = _bridge_gaps(
                 nodes_arr, edges_arr, 
                 bridge_max_factor = bridge_max_factor,
@@ -1791,7 +1827,7 @@ def skeletonize(
             post_ms += time.perf_counter() - _t0
 
     # 7. global minimum-spanning tree ------------------------------------
-    with _timed("↳  build global minimum-spanning tree"):
+    with _timed("↳  build global minimum-spanning tree", verbose=verbose):
         edges_mst = _build_mst(nodes_arr, edges_arr)
         if verbose:
             post_ms += time.perf_counter() - _t0
@@ -1799,7 +1835,7 @@ def skeletonize(
     # 8. prune tiny sub-trees near the soma
     if has_soma and prune_tiny_neurites:
         _t0 = time.perf_counter()
-        with _timed("↳  prune tiny neurites") as log:
+        with _timed("↳  prune tiny neurites", verbose=verbose) as log:  
 
             (nodes_arr, radii_dict, node2verts, vert2node,
                 edges_mst, soma) = _prune_neurites(
@@ -1828,9 +1864,10 @@ def skeletonize(
                   f"… {total_ms:.2f} s "
                   f"({soma_ms:.2f} + {core_ms:.2f})")
 
-    return Skeleton(nodes_arr, 
-                    radii_dict, 
-                    edges_mst, 
+    return Skeleton(nodes=nodes_arr, 
+                    radii=radii_dict, 
+                    edges=edges_mst, 
+                    ntype=None,
                     soma=soma,
                     node2verts=node2verts,
                     vert2node=vert2node,
