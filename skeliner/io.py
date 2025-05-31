@@ -25,8 +25,12 @@ def load_mesh(filepath: str | Path) -> trimesh.Trimesh:
     filepath = Path(filepath)
 
     if filepath.suffix == ".ctm":
-        mesh = openctm.import_mesh(filepath)
-        mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, process=False)
+        try:
+            mesh = openctm.import_mesh(filepath)
+            mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, process=False)
+        except AttributeError:
+            # trimesh should work out-of-box for py>=3.12 on non-intel mac 
+            mesh = trimesh.load_mesh(filepath, process=False)
     else:
         mesh = trimesh.load_mesh(filepath, process=False)
 
