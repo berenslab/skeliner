@@ -117,7 +117,7 @@ def load_swc(
     # --- core arrays ----------------------------------------------------
     nodes_arr  = np.asarray(xyz, dtype=np.float32) * scale
     radii_arr  = np.asarray(radii, dtype=np.float32) * scale
-    radii_dict = {"median": radii_arr}          # only one estimator available
+    radii_dict = {"median": radii_arr, "mean": radii_arr, "trim": radii_arr} 
     ntype_arr = np.asarray(ntype, dtype=np.int8)
     # --- edges (parent IDs → 0-based indices) ---------------------------
     id_map = {old: new for new, old in enumerate(ids)}
