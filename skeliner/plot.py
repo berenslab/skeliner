@@ -6,7 +6,7 @@ import numpy as np
 import trimesh
 from matplotlib.axes import Axes
 from matplotlib.collections import LineCollection, PolyCollection
-from matplotlib.patches import Ellipse
+from matplotlib.patches import Circle, Ellipse
 from scipy.stats import binned_statistic_2d
 
 from .core import Skeleton
@@ -173,11 +173,13 @@ def projection(
     xlim: Tuple[float, float] | None = None,
     ylim: Tuple[float, float] | None = None,
     draw_skel: bool = True,
-    draw_edges: bool = False,
+    draw_edges: bool = True,
     draw_cylinders: bool = False,
     ax: Axes | None = None,
-    cmap: str = "Blues",
+    mesh_cmap: str = "Blues", # mesh color map
+    skel_cmap: str = "Pastel2",  # skeleton color map
     vmax_fraction: float = 0.10,
+    edge_lw: float = 0.5,
     circle_alpha: float = 0.25,
     cylinder_alpha: float = 0.5,
     highlight_nodes: int | Sequence[int] | None = None,
@@ -185,6 +187,8 @@ def projection(
     unit: str | None = None,
     # soma --------------------------------------------------------------- #
     draw_soma_mask: bool = True,
+    # colors
+    color_by: str = "fixed",  # "ntype" or "fixed"
 ) -> Tuple[plt.Figure, Axes]:
     """Orthographic 2‑D overview of a skeleton with an **optional** mesh‑density
     background.
@@ -211,7 +215,7 @@ def projection(
         Toggles for skeleton glyphs.
     ax : matplotlib.axes.Axes | None
         Existing *Axes* to draw into.  When *None*, a new figure is created.
-    cmap, vmax_fraction : appearance of the histogram – see original docs.
+    mesh_cmap, vmax_fraction : appearance of the histogram – see original docs.
     circle_alpha, cylinder_alpha : transparencies of skeleton glyphs.
     highlight_nodes : node IDs to highlight.
     unit : str | None
@@ -244,6 +248,23 @@ def projection(
     highlight_set = (set(map(int, np.atleast_1d(highlight_nodes)))
                      if highlight_nodes is not None else set())
 
+    # ─────────────────────────────colormap ─────────────
+    # grab the full Dark2 cmap (8 colours)
+    cmap = mpl.colormaps.get_cmap(skel_cmap).resampled(8)
+    # convenience: lambda i -> RGBA row
+    dc = lambda i: cmap(i)               # noqa: E731
+
+    # build SWC-indexed palette (row 0..N).  Feel free to extend >6 if you need.
+    swc_colors = np.vstack([
+        dc(7),      # 0  undefined   – grey
+        dc(0),      # 1  soma        – green-teal
+        dc(1),      # 2  axon        – orange
+        dc(2),      # 3  dendrite    – olive-green
+        dc(3),      # 4  apical      – purple
+        dc(4),      # 5  fork point  – yellow-orange
+        dc(5),      # 6  end point   – brown
+    ])
+
     # ───────────────────────────── project (and optionally crop) ───────────
     xy_skel = _project(skel.nodes, ix, iy) * scl_skel
     rr      = skel.radii[radius_metric] * scl_skel
@@ -264,8 +285,16 @@ def projection(
 
     # crop *before* heavy lifting
     keep_skel = _crop_window(xy_skel)
-    xy_skel   = xy_skel[keep_skel]
-    rr        = rr[keep_skel]
+    keep_mask = keep_skel                # ← keep the original name for edges
+    idx_keep  = np.flatnonzero(keep_mask)   # 1-D array of kept node IDs
+    xy_skel   = xy_skel[keep_mask]          # already done
+    rr        = rr[keep_mask]               # already done
+
+    # colour array for the *kept* nodes
+    if color_by == "ntype" and skel.ntype is not None:
+        col_nodes = swc_colors[skel.ntype[idx_keep]]
+    else:
+        col_nodes = "red"
 
     if mesh is not None and xy_mesh.size:
         keep_mesh = _crop_window(xy_mesh)
@@ -302,7 +331,7 @@ def projection(
             hist,
             extent=(xedges[0], xedges[-1], yedges[0], yedges[-1]),
             origin="lower",
-            cmap=cmap,
+            cmap=mesh_cmap,
             vmax=hist.max() * vmax_fraction,
             alpha=1.0,
         )
@@ -319,14 +348,13 @@ def projection(
 
         sizes, _ppd = _radii_to_sizes(rr, ax)
 
-        # skip the very first node when it is the soma centre and has a mesh
         slicing = 0 if skel.soma.verts is None else 1
         ax.scatter(
             xy_skel[:, 0][slicing:],
             xy_skel[:, 1][slicing:],
             s=sizes[slicing:],
             facecolors="none",
-            edgecolors="red",
+            edgecolors=col_nodes[slicing:] if isinstance(col_nodes, np.ndarray) else col_nodes,
             linewidths=1.0,
             alpha=circle_alpha,
             zorder=2,
@@ -349,18 +377,28 @@ def projection(
                 )
 
     # ───────────────────────── soma shell & centre (if possible) ───────────
+    c_xy = _project(skel.nodes[[0]] * scl_skel, ix, iy).ravel()
+    centre_col = swc_colors[1] if color_by == "ntype" else "k"
+    ax.scatter(*c_xy, color=[centre_col], s=15, zorder=3)
+
     if (draw_soma_mask and mesh is not None and skel.soma is not None and
             skel.soma.verts is not None):
         xy_soma = _project(mesh.vertices[np.asarray(skel.soma.verts, int)], ix, iy)
         xy_soma = xy_soma * scl_mesh
         xy_soma = xy_soma[_crop_window(xy_soma)]  # respect crop
 
-        ax.scatter(xy_soma[:, 0], xy_soma[:, 1], s=1, c="pink", alpha=0.5,
-                   linewidths=0, label="soma surface")
+        col_soma = swc_colors[1] if color_by == "ntype" else "pink"
 
+        ax.scatter(
+            xy_soma[:, 0], xy_soma[:, 1],
+            s=1,
+            c=[col_soma],
+            alpha=0.5, linewidths=0,
+            label="soma surface"
+        )
         # soma centre (node 0)
-        c_xy = _project(skel.nodes[[0]] * scl_skel, ix, iy).ravel()
-        ax.scatter(*c_xy, c="k", s=15, zorder=3)
+        # c_xy = _project(skel.nodes[[0]] * scl_skel, ix, iy).ravel()
+        # ax.scatter(*c_xy, c="k", s=15, zorder=3)
 
         # dashed ellipse outline
         ell = _soma_ellipse2d(skel.soma, plane, scale=scl_skel)
@@ -370,7 +408,15 @@ def projection(
         ell.set_linewidth(0.8)
         ell.set_alpha(0.9)
         ax.add_patch(ell)
-
+    else:
+        r_sph = skel.soma.spherical_radius * scl_skel
+        circ = Circle(c_xy, r_sph,
+                    facecolor="none",
+                    edgecolor=centre_col,
+                    linestyle="--",
+                    linewidth=0.8,
+                    alpha=0.9)
+        ax.add_patch(circ)
     # ─────────────────────── draw edges & cylinders (unchanged) ────────────
     if draw_skel and skel.edges.size:
         keep = keep_skel  # alias
@@ -387,7 +433,7 @@ def projection(
                 segments  = np.stack((seg_start, seg_end), axis=1)
 
                 lc = LineCollection(segments.tolist(), colors="black",
-                                    linewidths=0.5, alpha=cylinder_alpha)
+                                    linewidths=edge_lw, alpha=cylinder_alpha)
                 ax.add_collection(lc)
 
         if draw_cylinders:
