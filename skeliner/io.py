@@ -227,7 +227,7 @@ def load_npz(path: str | Path) -> Skeleton:
     """
     path = Path(path)
 
-    with np.load(path, allow_pickle=False) as z:
+    with np.load(path, allow_pickle=True) as z:
         nodes  = z["nodes"].astype(np.float32)
         edges  = z["edges"].astype(np.int64)
 
@@ -260,8 +260,15 @@ def load_npz(path: str | Path) -> Skeleton:
             ),
         )
 
+        # ----------- NEW: arbitrary, user-defined metadata ---------------
+        extra = {}
+        if "extra" in z.files:                 
+            # stored as length-1 object array; .item() unwraps the dict
+            extra = z["extra"].item()
+
+
     return Skeleton(nodes=nodes, radii=radii, edges=edges, ntype=ntype, soma=soma,
-                    node2verts=node2verts, vert2node=vert2node)
+                    node2verts=node2verts, vert2node=vert2node, extra=extra)
 
 def to_npz(skeleton: Skeleton, path: str | Path, *, compress: bool = True) -> None:
     """
@@ -286,17 +293,23 @@ def to_npz(skeleton: Skeleton, path: str | Path, *, compress: bool = True) -> No
         n2v_idx = np.array([], dtype=np.int64)
         n2v_off = np.array([0], dtype=np.int64)
 
+    # ----------- NEW: persist the metadata dict -------------------------
+    # We wrap it in a 0-D object array because np.savez can only store
+    # ndarrays — this keeps the archive a single *.npz* with no sidecars.
+    extra = {"extra": np.array(skeleton.extra, dtype=object)}
+
     np.savez(
         path, 
         nodes=skeleton.nodes,
         edges=skeleton.edges,
         ntype=skeleton.ntype if skeleton.ntype is not None else np.array([], dtype=np.int8),
-        soma_centre=skeleton.soma.centre,
+        soma_centre=skeleton.nodes[0],
         soma_axes=skeleton.soma.axes,
         soma_R=skeleton.soma.R,
         soma_verts=skeleton.soma.verts if skeleton.soma.verts is not None else np.array([], dtype=np.int64),
         node2verts_idx=n2v_idx,
         node2verts_off=n2v_off,
         **radii_flat,
-        **c
+        **extra,
+        **c,
     )
