@@ -16,3 +16,7 @@ or
 git clone https://github.com/berenslab/skeliner.git
 pip install -e "skeliner[dev]"
 ```
+
+## Usage
+
+See [example notebooks](https://github.com/berenslab/skeliner/tree/main/notebooks) for usage. 
