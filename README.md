@@ -2,7 +2,15 @@
 
 A lightweight skeletonizer that converts neuron meshes into biophysical‑modelling‑ready SWC morphologies. It heuristically detects the soma, extracts an acyclic centre‑line skeleton, estimates per‑node radii, and bridges small gaps.
 
+![](./.github/banner.png)
+
 ## Installation
+
+```bash
+pip install skeliner
+```
+
+or
 
 ```bash
 git clone https://github.com/berenslab/skeliner.git
