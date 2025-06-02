@@ -348,7 +348,12 @@ def projection(
 
         sizes, _ppd = _radii_to_sizes(rr, ax)
 
-        slicing = 0 if skel.soma.verts is None else 1
+        if skel.soma.verts is None or len(skel.soma.verts) == 0:
+            has_soma_verts = False
+        else:
+            has_soma_verts = True
+
+        slicing = 1 if has_soma_verts else 0
         ax.scatter(
             xy_skel[:, 0][slicing:],
             xy_skel[:, 1][slicing:],
@@ -397,8 +402,8 @@ def projection(
             label="soma surface"
         )
         # soma centre (node 0)
-        # c_xy = _project(skel.nodes[[0]] * scl_skel, ix, iy).ravel()
-        # ax.scatter(*c_xy, c="k", s=15, zorder=3)
+        c_xy = _project(skel.nodes[[0]] * scl_skel, ix, iy).ravel()
+        ax.scatter(*c_xy, c="k", s=15, zorder=3)
 
         # dashed ellipse outline
         ell = _soma_ellipse2d(skel.soma, plane, scale=scl_skel)
@@ -408,15 +413,7 @@ def projection(
         ell.set_linewidth(0.8)
         ell.set_alpha(0.9)
         ax.add_patch(ell)
-    else:
-        r_sph = skel.soma.spherical_radius * scl_skel
-        circ = Circle(c_xy, r_sph,
-                    facecolor="none",
-                    edgecolor=centre_col,
-                    linestyle="--",
-                    linewidth=0.8,
-                    alpha=0.9)
-        ax.add_patch(circ)
+
     # ─────────────────────── draw edges & cylinders (unchanged) ────────────
     if draw_skel and skel.edges.size:
         keep = keep_skel  # alias
