@@ -674,9 +674,9 @@ def _bin_geodesic_shells(
     v   = mesh.vertices.view(np.ndarray)
     e_m = float(mesh.edges_unique_length.mean())     # mean mesh-edge length
 
-    c_soma       = soma.centre
-    soma_verts   = set() if soma.verts is None else set(map(int, soma.verts))
-    soma_vids    = np.fromiter(soma_verts, dtype=np.int64)
+    c_soma = soma.centre
+    soma_verts = set() if soma.verts is None else set(map(int, soma.verts))
+    soma_vids = np.fromiter(soma_verts, dtype=np.int64)
 
     # ------------------------------------------------------------------
     # build a vertex list for every connected surface patch
@@ -684,8 +684,6 @@ def _bin_geodesic_shells(
     comp_vertices = [
         np.asarray(c, dtype=np.int64) for c in gsurf.components()
     ]
-
-    soma_vids = np.fromiter(soma_verts, dtype=np.int64)
     all_shells: List[List[np.ndarray]] = []
 
     for cid, verts in enumerate(comp_vertices):
@@ -748,7 +746,6 @@ def _bin_geodesic_shells(
                 comp_idx = np.fromiter(
                     (inner[i] for i in comp), dtype=np.int64
                 )
-                # comps.append(comp_idx)
                 if split_elongated_shells and len(comp) < 1500: # hard-coded for now, if too large, might be a soma
                     for part in _split_comp_if_elongated(comp_idx, v, 
                                                             aspect_thr=split_aspect_thr, 
@@ -1660,10 +1657,9 @@ def skeletonize(
 
     The algorithm proceeds in eight conceptual stages:
 
-      0. optional pre-skeletonization soma detection>
       1. geodesic shell binning of every connected surface patch
       2. cluster each shell ⇒ interior node with local radius
-      3. optional post-skeletonization soma detection>
+      3. optional post-skeletonization soma detection
       4. project mesh edges ⇒ graph edges between nodes
       5. optional collapsing of soma-like/fat nodes near the centroid
       6. optional bridging of disconnected components
