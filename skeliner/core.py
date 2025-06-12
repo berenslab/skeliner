@@ -36,11 +36,11 @@ class Soma:
 
     Parameters
     ----------
-    centre : (3,) float32
+    centre : (3,) float
         XYZ world-space coordinates of the ellipsoid centre.
-    axes   : (3,) float32
+    axes   : (3,) float
         Semi-axis lengths **sorted** as  a ≥ b ≥ c.
-    R      : (3,3) float32
+    R      : (3,3) float
         Right-handed rotation matrix whose *columns* are the principal
         axes expressed in world space.
     verts  : optional (N,) int64
@@ -59,23 +59,23 @@ class Soma:
     # dataclass life-cycle
     # ---------------------------------------------------------------------
     def __post_init__(self) -> None:
-        self.centre = np.asarray(self.centre, dtype=np.float32).reshape(3)
-        self.axes   = np.asarray(self.axes,   dtype=np.float32).reshape(3)
-        self.R      = np.asarray(self.R,      dtype=np.float32).reshape(3, 3)
+        self.centre = np.asarray(self.centre, dtype=np.float64).reshape(3)
+        self.axes   = np.asarray(self.axes,   dtype=np.float64).reshape(3)
+        self.R      = np.asarray(self.R,      dtype=np.float64).reshape(3, 3)
 
         # ---- fast safety checks -----------------------------------------
         if not np.all(np.diff(self.axes) <= 0):
             raise ValueError("axes must be sorted a ≥ b ≥ c")
 
         # ---- pre-compute affine map  ξ = (x−c) @ W -----------------------
-        self._W = (self.R / self.axes).astype(np.float32)
+        self._W = (self.R / self.axes).astype(np.float64)
 
     # ---------------------------------------------------------------------
     # geometry
     # ---------------------------------------------------------------------
     def _body_coords(self, x: np.ndarray) -> np.ndarray:
         """World ➜ body coords where the ellipsoid becomes the *unit sphere*."""
-        x = np.asarray(x, dtype=np.float32)
+        x = np.asarray(x, dtype=np.float64)
         return (x - self.centre) @ self._W
 
     def contains(self, x: np.ndarray, *, inside_frac: float = 1.0) -> np.ndarray:
@@ -112,7 +112,7 @@ class Soma:
 
     def distance_to_center(self, x: np.ndarray) -> np.ndarray | float:
         """Unsigned Euclidean distance from *x* to the soma *centre*."""
-        x = np.asanyarray(x, dtype=np.float32)
+        x = np.asanyarray(x, dtype=np.float64)
         single_input = x.ndim == 1
         if single_input:
             x = x[None, :]
@@ -197,7 +197,7 @@ class Soma:
         Fast PCA-based ellipsoid fit to ≥ 3×`axes` sample points.
         Rough 95 %-mass envelope, same idea as the original *sphere* fit.
         """
-        pts = np.asarray(pts, dtype=np.float32)
+        pts = np.asarray(pts, dtype=np.float64)
         centre = pts.mean(axis=0)
         cov = np.cov(pts - centre, rowvar=False)
         evals, evecs = np.linalg.eigh(cov)           # λ₁ ≤ λ₂ ≤ λ₃
@@ -208,9 +208,9 @@ class Soma:
     @classmethod
     def from_sphere(cls, centre: np.ndarray, radius: float, verts: np.ndarray | None) -> "Soma":
         """Backward-compat helper – treat a sphere as a = b = c = radius."""
-        centre = np.asarray(centre, dtype=np.float32)
-        axes   = np.full(3, float(radius), dtype=np.float32)
-        R      = np.eye(3, dtype=np.float32)
+        centre = np.asarray(centre, dtype=np.float64)
+        axes   = np.full(3, float(radius), dtype=np.float64)
+        R      = np.eye(3, dtype=np.float64)
         return cls(centre, axes, R, verts=verts)
 
 
@@ -225,9 +225,9 @@ class Skeleton:
     Parameters
     ----------
     nodes
-        (N, 3) float32 Cartesian coordinates.
+        (N, 3) float64 Cartesian coordinates.
     radii
-        (N,) float32 local radii.
+        (N,) float64 local radii.
     edges
         (E, 2) int64 undirected sorted vertex pairs.
     soma_verts 
@@ -239,8 +239,8 @@ class Skeleton:
     soma: Soma
 
     # ---- mandatory skeleton data (except ntype)---------------------------------
-    nodes: np.ndarray  # (N, 3) float32
-    radii:  dict[str, np.ndarray]  # (N,)  float32
+    nodes: np.ndarray  # (N, 3) float64
+    radii:  dict[str, np.ndarray]  # (N,)  float64
     edges: np.ndarray  # (E, 2) int64  – undirected, **sorted** pairs
     ntype: np.ndarray | None # (N,) int64, node type
         # SWC type codes we will follow by default
@@ -585,7 +585,7 @@ def _split_comp_if_elongated(
         return
 
     # ── fast 3-D PCA ----------------------------------------------------
-    pts        = v[comp_idx].astype(np.float32)
+    pts        = v[comp_idx].astype(np.float64)
     cov        = np.cov(pts, rowvar=False)
     evals, vec = np.linalg.eigh(cov)           # ascending order
     elong      = evals[-1] / (evals[-2] + 1e-9)
@@ -880,7 +880,7 @@ def _merge_near_soma_nodes(
 
     if merged_idx.size:
         w = np.array([len(node2verts[0]), *[len(node2verts[i])
-                     for i in merged_idx]], dtype=np.float32)
+                     for i in merged_idx]], dtype=np.float64)
         nodes_keep[0] = np.average(
             np.vstack([nodes[0], nodes[merged_idx]]), axis=0, weights=w
         )
@@ -969,7 +969,7 @@ def _bridge_gaps(
     Parameters
     ----------
     nodes
-        ``(N, 3)`` float32 array of mesh-vertex coordinates.
+        ``(N, 3)`` float64 array of mesh-vertex coordinates.
     edges
         ``(E, 2)`` int64 array of **undirected, sorted** mesh edges.
     bridge_max_factor
@@ -1455,7 +1455,7 @@ def _make_nodes(
     all_shells
         Output of `_bin_geodesic_shells()`.
     vertices
-        `mesh.vertices` as `(N,3) float32`.
+        `mesh.vertices` as `(N,3) float64`.
     radius_estimators
         Names understood by `_estimate_radius()`.
     merge_nested
@@ -1488,13 +1488,13 @@ def _make_nodes(
                     _estimate_radius(d, method=est, trim_fraction=0.05)
                 )
 
-            nodes.append(centre.astype(np.float32))
+            nodes.append(centre.astype(np.float64))
             node2verts.append(bin_ids)
             for vid in bin_ids:
                 vert2node[int(vid)] = next_id
             next_id += 1
 
-    nodes_arr = np.asarray(nodes, dtype=np.float32)
+    nodes_arr = np.asarray(nodes, dtype=np.float64)
     radii_dict = {k: np.asarray(v) for k, v in radii_dict.items()}
 
     # ---- optional containment-based merge ----------------------------

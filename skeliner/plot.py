@@ -6,7 +6,8 @@ import numpy as np
 import trimesh
 from matplotlib.axes import Axes
 from matplotlib.collections import LineCollection, PolyCollection
-from matplotlib.patches import Circle, Ellipse
+from matplotlib.figure import Figure
+from matplotlib.patches import Ellipse
 from scipy.stats import binned_statistic_2d
 
 from .core import Skeleton
@@ -189,7 +190,7 @@ def projection(
     draw_soma_mask: bool = True,
     # colors
     color_by: str = "fixed",  # "ntype" or "fixed"
-) -> Tuple[plt.Figure, Axes]:
+) -> Tuple[Figure, Axes]:
     """Orthographic 2‑D overview of a skeleton with an **optional** mesh‑density
     background.
 
@@ -949,7 +950,7 @@ def node_details(
     scale: Union[Number, Tuple[Number, Number], Sequence[Number]] = 1.0,
     highlight_alpha: float = 0.5,
     **kwargs,
-) -> Tuple[plt.Figure, plt.Axes]:
+) -> Tuple[Figure, plt.Axes]:
     """Zoomed‑in view of a specific skeleton node (mesh optional).
 
     A surface `mesh` can now be omitted.  The zoom window is derived purely

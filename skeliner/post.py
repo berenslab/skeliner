@@ -1,9 +1,10 @@
 """skeliner.post – post-processing functions for skeletons.
 """
-from typing import Iterable, Set
+from typing import Iterable, Set, cast
 
 import igraph as ig
 import numpy as np
+from numpy.typing import ArrayLike
 
 from . import dx
 
@@ -243,7 +244,11 @@ def set_ntype(
     if node_ids is not None:
         target = set(map(int, node_ids))
     else:
-        bases = np.atleast_1d(root).astype(int)
+        bases_arr = np.atleast_1d(
+            cast(ArrayLike, root)
+        ).astype(int)
+
+        bases: set[int] = set(bases_arr)
         target: set[int] = set()
         if subtree:
             for nid in bases:
@@ -257,7 +262,4 @@ def set_ntype(
     if not target:
         return
 
-    # ----------------------------------------------------------- #
-    # fast vectorised assignment                                  #
-    # ----------------------------------------------------------- #
     skel.ntype[np.fromiter(target, dtype=int)] = int(code)
