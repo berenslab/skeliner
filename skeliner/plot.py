@@ -1057,15 +1057,37 @@ def trimesh_to_zmesh(tm):
     return zm
 
 
-def view3d(skel, trimesh_mesh, include_soma:bool=False):
+def view3d(skel, trimesh_mesh, 
+           include_soma:bool=False, 
+           box:list[float]|None = None # bounding box in [x0, y0, z0, x1, y1, z1] format
+):
     try:
         from microviewer import objects
     except ImportError:
         raise ImportError(
             "microviewer is not installed. "
-            "Please install it with `pip install --upgrade skeliner[3d]`."
+            "Please install all dependencies with `pip install --upgrade skeliner[3d]`."
+        )
+    try:
+        from osteoid.lib import Bbox
+    except ImportError:
+        raise ImportError(
+            "osteoid is not installed. "
+            "Please install all dependencies with `pip install --upgrade skeliner[3d]`."
         )
 
     ost_skel = skeliner_to_osteoid(skel, include_soma=include_soma)
     zm_mesh  = trimesh_to_zmesh(trimesh_mesh)
-    objects([zm_mesh, ost_skel])  
+
+    if box is None:
+        # use the mesh extents as the bounding box
+        box = Bbox(zm_mesh.vertices.min(axis=0), zm_mesh.vertices.max(axis=0))
+    else:
+        if len(box) == 6:
+            box = Bbox(box[:3], box[3:])
+        elif len(box) == 3:
+            box = Bbox([0, 0, 0], box)
+        else:
+            raise ValueError("Invalid bounding box format. Expected [x0, y0, z0, x1, y1, z1].")
+
+    objects([box, zm_mesh, ost_skel])
