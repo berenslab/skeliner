@@ -992,6 +992,7 @@ def node_details(
 def skeliner_to_osteoid(
     skel,
     *,
+    segid: int | None = None,
     include_soma: bool = True,   # ← switch it on/off here
     scale: float = 1e-3          # nm → µm by default; set to 1.0 if you work in µm already
 ):
@@ -1034,9 +1035,13 @@ def skeliner_to_osteoid(
 
     edges = edges.astype(np.uint32)
 
-    return osteoid.Skeleton(verts, edges, radii=radii)
+    return osteoid.Skeleton(
+            verts, edges, 
+            radii=radii,
+            segid=segid if segid is not None else 0,  
+        )
 
-def trimesh_to_zmesh(tm):
+def trimesh_to_zmesh(tm, segid: int | None = None):
     """
     Convert a trimesh.Trimesh → zmesh.Mesh and
     bake the desired opacity into the RGBA colour.
@@ -1052,12 +1057,14 @@ def trimesh_to_zmesh(tm):
     zm = zmesh.Mesh(
         vertices = tm.vertices.astype(np.float32) / 1000, 
         faces    = tm.faces.astype(np.uint32),
-        normals  = None,   
+        normals  = None,
+        id       = segid if segid is not None else 0,
     )
     return zm
 
 
 def view3d(skel, trimesh_mesh, 
+           segid: int | None = None,
            include_soma:bool=False, 
            box:list[float]|None = None # bounding box in [x0, y0, z0, x1, y1, z1] format
 ):
@@ -1076,8 +1083,8 @@ def view3d(skel, trimesh_mesh,
             "Please install all dependencies with `pip install --upgrade skeliner[3d]`."
         )
 
-    ost_skel = skeliner_to_osteoid(skel, include_soma=include_soma)
-    zm_mesh  = trimesh_to_zmesh(trimesh_mesh)
+    ost_skel = skeliner_to_osteoid(skel, segid=segid, include_soma=include_soma)
+    zm_mesh  = trimesh_to_zmesh(trimesh_mesh, segid=segid)
 
     if box is None:
         # use the mesh extents as the bounding box
