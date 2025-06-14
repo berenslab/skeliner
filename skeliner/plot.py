@@ -986,3 +986,115 @@ def node_details(
         **kwargs,
     )
     return fig, ax
+
+#### 3D Visualization
+
+def skeliner_to_osteoid(
+    skel,
+    *,
+    segid: int | None = None,
+    include_soma: bool = True,   # ← switch it on/off here
+    scale: float = 1e-3          # nm → µm by default; set to 1.0 if you work in µm already
+):
+    """
+    Convert a Skeliner Skeleton → osteoid.Skeleton.
+
+    Parameters
+    ----------
+    include_soma
+        If *False*, drop node 0 and every edge that references it,
+        then compact the indices so the new vertex array starts at 0.
+    scale
+        Multiplicative factor applied to coordinates & radii
+        (e.g. 1 nm → 0.001 µm).
+
+    Returns
+    -------
+    osteoid.Skeleton  ready for microviewer.
+    """
+    try:
+        import osteoid
+    except ImportError:
+        raise ImportError(
+            "`osteoid` is not installed. "
+            "Please install it with `pip install --upgrade skeliner[3d]`."
+        )
+
+    # --- copy & scale raw data --------------------------------------------
+    verts  = (skel.nodes  * scale).astype(np.float32)
+    radii  = (skel.r      * scale).astype(np.float32)
+    edges  = skel.edges.astype(np.int64)          
+
+    if not include_soma and len(verts):
+        keep = (edges[:, 0] != 0) & (edges[:, 1] != 0)
+        edges = edges[keep]
+
+        edges -= 1
+        verts  = verts[1:]
+        radii  = radii[1:]
+
+    edges = edges.astype(np.uint32)
+
+    return osteoid.Skeleton(
+            verts, edges, 
+            radii=radii,
+            segid=segid if segid is not None else 0,  
+        )
+
+def trimesh_to_zmesh(tm, segid: int | None = None):
+    """
+    Convert a trimesh.Trimesh → zmesh.Mesh and
+    bake the desired opacity into the RGBA colour.
+    """
+    try:
+        import zmesh
+    except ImportError:
+        raise ImportError(
+            "`zmesh` is not installed. "
+            "Please install it with `pip install --upgrade skeliner[3d]`."
+        )
+
+    zm = zmesh.Mesh(
+        vertices = tm.vertices.astype(np.float32) / 1000, 
+        faces    = tm.faces.astype(np.uint32),
+        normals  = None,
+        id       = segid if segid is not None else 0,
+    )
+    return zm
+
+
+def view3d(skel, trimesh_mesh, 
+           segid: int | None = None,
+           include_soma:bool=False, 
+           box:list[float]|None = None # bounding box in [x0, y0, z0, x1, y1, z1] format
+):
+    try:
+        from microviewer import objects
+    except ImportError:
+        raise ImportError(
+            "microviewer is not installed. "
+            "Please install all dependencies with `pip install --upgrade skeliner[3d]`."
+        )
+    try:
+        from osteoid.lib import Bbox
+    except ImportError:
+        raise ImportError(
+            "osteoid is not installed. "
+            "Please install all dependencies with `pip install --upgrade skeliner[3d]`."
+        )
+
+    ost_skel = skeliner_to_osteoid(skel, segid=segid, include_soma=include_soma)
+    zm_mesh  = trimesh_to_zmesh(trimesh_mesh, segid=segid)
+
+    if box is None:
+        # use the mesh extents as the bounding box
+        box = Bbox(zm_mesh.vertices.min(axis=0), zm_mesh.vertices.max(axis=0))
+    else:
+        if len(box) == 6:
+            box = Bbox(box[:3], box[3:])
+        elif len(box) == 3:
+            box = Bbox([0, 0, 0], box)
+        else:
+            raise ValueError("Invalid bounding box format. Expected [x0, y0, z0, x1, y1, z1].")
+
+    objects([box, zm_mesh, ost_skel])
