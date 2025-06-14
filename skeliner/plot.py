@@ -986,3 +986,86 @@ def node_details(
         **kwargs,
     )
     return fig, ax
+
+#### 3D Visualization
+
+def skeliner_to_osteoid(
+    skel,
+    *,
+    include_soma: bool = True,   # ← switch it on/off here
+    scale: float = 1e-3          # nm → µm by default; set to 1.0 if you work in µm already
+):
+    """
+    Convert a Skeliner Skeleton → osteoid.Skeleton.
+
+    Parameters
+    ----------
+    include_soma
+        If *False*, drop node 0 and every edge that references it,
+        then compact the indices so the new vertex array starts at 0.
+    scale
+        Multiplicative factor applied to coordinates & radii
+        (e.g. 1 nm → 0.001 µm).
+
+    Returns
+    -------
+    osteoid.Skeleton  ready for microviewer.
+    """
+    try:
+        import osteoid
+    except ImportError:
+        raise ImportError(
+            "`osteoid` is not installed. "
+            "Please install it with `pip install --upgrade skeliner[3d]`."
+        )
+
+    # --- copy & scale raw data --------------------------------------------
+    verts  = (skel.nodes  * scale).astype(np.float32)
+    radii  = (skel.r      * scale).astype(np.float32)
+    edges  = skel.edges.astype(np.int64)          
+
+    if not include_soma and len(verts):
+        keep = (edges[:, 0] != 0) & (edges[:, 1] != 0)
+        edges = edges[keep]
+
+        edges -= 1
+        verts  = verts[1:]
+        radii  = radii[1:]
+
+    edges = edges.astype(np.uint32)
+
+    return osteoid.Skeleton(verts, edges, radii=radii)
+
+def trimesh_to_zmesh(tm):
+    """
+    Convert a trimesh.Trimesh → zmesh.Mesh and
+    bake the desired opacity into the RGBA colour.
+    """
+    try:
+        import zmesh
+    except ImportError:
+        raise ImportError(
+            "`zmesh` is not installed. "
+            "Please install it with `pip install --upgrade skeliner[3d]`."
+        )
+
+    zm = zmesh.Mesh(
+        vertices = tm.vertices.astype(np.float32) / 1000, 
+        faces    = tm.faces.astype(np.uint32),
+        normals  = None,   
+    )
+    return zm
+
+
+def view3d(skel, trimesh_mesh, include_soma:bool=False):
+    try:
+        from microviewer import objects
+    except ImportError:
+        raise ImportError(
+            "microviewer is not installed. "
+            "Please install it with `pip install --upgrade skeliner[3d]`."
+        )
+
+    ost_skel = skeliner_to_osteoid(skel, include_soma=include_soma)
+    zm_mesh  = trimesh_to_zmesh(trimesh_mesh)
+    objects([zm_mesh, ost_skel])  
