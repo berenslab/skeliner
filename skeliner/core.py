@@ -432,12 +432,18 @@ class Skeleton:
         # Define a simple conversion table
         conversion_factors = {
             "nm": 1e-9,
-            "μm": 1e-6,
+            "nanometer": 1e-9,  # full name
+            "µm": 1e-6, # U+00B5, alias for micrometer
+            "μm": 1e-6,  # U+03BC, alias for micrometer
             "um": 1e-6,  # alias for micrometer
             "micron": 1e-6,  # alias for micrometer
+            "micrometer": 1e-6,  # full name
             "mm": 1e-3,
+            "millimeter": 1e-3,  # full name
             "cm": 1e-2,
+            "centimeter": 1e-2,  # full name
             "m": 1.0,
+            "meter": 1.0,  # full name
         }
         
         if current_unit not in conversion_factors or target_unit not in conversion_factors:
@@ -1710,6 +1716,7 @@ def skeletonize(
     prune_drop_single_node_branches: bool = True,
     # --- misc ---
     unit: str = "nm",
+    id: str | int | None = None,
     verbose: bool = False,
 ) -> Skeleton:
     """Compute a center-line skeleton with radii of a neuronal mesh .
@@ -1943,5 +1950,6 @@ def skeletonize(
                         "skeliner_version": _SKELINER_VERSION,
                         "skeletonized_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                         "unit": unit,
+                        "id": id,
                     }
             )

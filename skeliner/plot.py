@@ -864,6 +864,9 @@ def threeviews(
         raise ValueError("scale must be a scalar or a pair of two scalars")
     scl_skel, scl_mesh = map(float, scale)
 
+    if title is None:
+        title = skel.meta.get("id", None)
+
     # ── 0. global bounding box (already scaled) ────────────────────────────
     if mesh is not None and mesh.vertices.size:
         v_mesh = mesh.vertices.view(np.ndarray) * scl_mesh
