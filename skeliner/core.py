@@ -395,6 +395,59 @@ class Skeleton:
 
         return choice, reason, {"p50": p50, "p75": p75, "max": pmax}
 
+    def set_unit(self, unit: str | None = None):
+        """Set the unit of the skeleton."""
+        
+        if unit is None:
+            raise ValueError("unit must be specified")
+        self.meta["unit"] = unit
+
+    def convert_unit(self, target_unit: str, current_unit: str | None = None):
+
+        if current_unit is None:
+            current_unit = self.meta.get("unit", None)
+
+            if current_unit is None:
+                raise ValueError("current_unit must be specified")
+            
+        if current_unit == target_unit:
+            return
+        
+        # conversion factor from current to target unit
+        factor = self._get_unit_conversion_factor(current_unit, target_unit)
+        if factor is None:
+            raise ValueError(f"Cannot convert from {current_unit} to {target_unit}")
+
+        self.nodes *= factor
+        for key in self.radii.keys():
+            self.radii[key] *= factor
+        if self.soma is not None:
+            self.soma.center *= factor
+            self.soma.axes *= factor
+
+        self.meta["unit"] = target_unit
+
+    def _get_unit_conversion_factor(self, current_unit: str, target_unit: str) -> float | None:
+        """Return the conversion factor from current_unit to target_unit."""
+        # Define a simple conversion table
+        conversion_factors = {
+            "nm": 1e-9,
+            "μm": 1e-6,
+            "um": 1e-6,  # alias for micrometer
+            "micron": 1e-6,  # alias for micrometer
+            "mm": 1e-3,
+            "cm": 1e-2,
+            "m": 1.0,
+        }
+        
+        if current_unit not in conversion_factors or target_unit not in conversion_factors:
+            raise ValueError(
+                f"Unsupported unit conversion from {current_unit} to {target_unit}. "
+                "Supported units: " + ", ".join(conversion_factors.keys())
+            )
+        
+        return conversion_factors[current_unit] / conversion_factors[target_unit]
+        
 
     # ------------------------------------------------------------------
     # Properties
@@ -1656,6 +1709,7 @@ def skeletonize(
     prune_stem_extent_factor: float = 3.0,  # stems touching soma
     prune_drop_single_node_branches: bool = True,
     # --- misc ---
+    unit: str = "nm",
     verbose: bool = False,
 ) -> Skeleton:
     """Compute a center-line skeleton with radii of a neuronal mesh .
@@ -1888,5 +1942,6 @@ def skeletonize(
                     meta = {
                         "skeliner_version": _SKELINER_VERSION,
                         "skeletonized_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "unit": unit,
                     }
             )

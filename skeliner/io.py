@@ -234,7 +234,7 @@ def to_swc(skeleton,
     # --- write SWC file -----------------------------------------------
     with path.open("w", encoding="utf8") as fh:
         if include_meta and skeleton.meta:
-            blob = json.dumps(skeleton.meta, separators=(",", ":"))
+            blob = json.dumps(skeleton.meta, separators=(",", ":"), ensure_ascii=False)
             fh.write(f"# meta {blob}\n")
 
         if include_header:

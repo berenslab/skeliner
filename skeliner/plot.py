@@ -246,6 +246,9 @@ def projection(
     if radius_metric is None:
         radius_metric = skel.recommend_radius()[0]
 
+    if unit is None: # try to grab from metadata
+        unit = skel.meta.get("unit", None)
+
     highlight_set = (set(map(int, np.atleast_1d(highlight_nodes)))
                      if highlight_nodes is not None else set())
 
@@ -381,7 +384,7 @@ def projection(
     # ───────────────────────── soma shell & center (if possible) ───────────
     c_xy = _project(skel.nodes[[0]] * scl_skel, ix, iy).ravel()
     centre_col = swc_colors[1] if color_by == "ntype" else "k"
-    ax.scatter(*c_xy, color=[centre_col], s=15, zorder=3)
+    ax.scatter(*c_xy, color="black", s=15, zorder=3)
 
     if (draw_soma_mask and mesh is not None and skel.soma is not None and
             skel.soma.verts is not None):
@@ -546,6 +549,9 @@ def details(
     if len(scale) != 2:
         raise ValueError("scale must be a scalar or a pair of two scalars")
     scl_skel, scl_mesh = map(float, scale)
+
+    if unit is None: # try to grab from metadata
+        unit = skel.meta.get("unit", None)
 
     if radius_metric is None:
         radius_metric = skel.recommend_radius()[0]
@@ -802,7 +808,7 @@ def threeviews(
     mesh: trimesh.Trimesh|None = None,
     *,
     planes: tuple[str, str, str] | list[str] = ["xy", "xz", "zy"],
-    scale: float = 1.,                 # nm → µm by default
+    scale: float | tuple[float, float] = 1.,                 # nm → µm by default
     title: str | None = None,
     figsize: tuple[int, int] = (8, 8),
     draw_edges: bool = True,
@@ -852,13 +858,18 @@ def threeviews(
     if len(planes) != 3:
         raise ValueError("planes must be a sequence of exactly three plane strings")
 
+    if not isinstance(scale, Sequence):
+        scale = [scale, scale]
+    if len(scale) != 2:
+        raise ValueError("scale must be a scalar or a pair of two scalars")
+    scl_skel, scl_mesh = map(float, scale)
 
     # ── 0. global bounding box (already scaled) ────────────────────────────
     if mesh is not None and mesh.vertices.size:
-        v_mesh = mesh.vertices.view(np.ndarray) * scale
-        v_all  = np.vstack((v_mesh, skel.nodes * scale))
+        v_mesh = mesh.vertices.view(np.ndarray) * scl_mesh
+        v_all  = np.vstack((v_mesh, skel.nodes * scl_skel))
     else:
-        v_all = skel.nodes * scale
+        v_all = skel.nodes * scl_skel
 
     lims, spans = _axis_extents(v_all)
 
