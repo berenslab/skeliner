@@ -7,7 +7,7 @@ import trimesh
 from matplotlib.axes import Axes
 from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.figure import Figure
-from matplotlib.patches import Ellipse
+from matplotlib.patches import Circle, Ellipse
 from scipy.stats import binned_statistic_2d
 
 from .core import Skeleton
@@ -142,7 +142,7 @@ def _soma_ellipse2d(soma, plane: str, *, scale: float = 1.0) -> Ellipse:
     width, height  = 2 * half_axes[order] * scale
     angle_deg      = np.degrees(np.arctan2(eigvec[1, order[0]],
                                            eigvec[0, order[0]]))
-    centre_xy      = soma.centre[[ix, iy]] * scale
+    centre_xy      = soma.center[[ix, iy]] * scale
 
     return Ellipse(centre_xy, width, height, angle=angle_deg,
                    linewidth=.8, linestyle="--",
@@ -246,6 +246,9 @@ def projection(
     if radius_metric is None:
         radius_metric = skel.recommend_radius()[0]
 
+    if unit is None: # try to grab from metadata
+        unit = skel.meta.get("unit", None)
+
     highlight_set = (set(map(int, np.atleast_1d(highlight_nodes)))
                      if highlight_nodes is not None else set())
 
@@ -343,24 +346,20 @@ def projection(
         if xlim is not None and ylim is not None:
             ax.set_xlim(xlim)
             ax.set_ylim(ylim)
-        elif hist is None:  # fallback to skeleton extents
+        # elif hist is None:  # fallback to skeleton extents
+        else:
             ax.set_xlim((xy_skel[:, 0].min(), xy_skel[:, 0].max()))
             ax.set_ylim((xy_skel[:, 1].min(), xy_skel[:, 1].max()))
 
+        ax.set_aspect("equal", adjustable="box")
         sizes, _ppd = _radii_to_sizes(rr, ax)
 
-        if skel.soma.verts is None or len(skel.soma.verts) == 0:
-            has_soma_verts = False
-        else:
-            has_soma_verts = True
-
-        slicing = 1 if has_soma_verts else 0
         ax.scatter(
-            xy_skel[:, 0][slicing:],
-            xy_skel[:, 1][slicing:],
-            s=sizes[slicing:],
+            xy_skel[:, 0][1:],
+            xy_skel[:, 1][1:],
+            s=sizes[1:],
             facecolors="none",
-            edgecolors=col_nodes[slicing:] if isinstance(col_nodes, np.ndarray) else col_nodes,
+            edgecolors=col_nodes[1:] if isinstance(col_nodes, np.ndarray) else col_nodes,
             linewidths=1.0,
             alpha=circle_alpha,
             zorder=2,
@@ -382,10 +381,10 @@ def projection(
                     zorder=3.5,
                 )
 
-    # ───────────────────────── soma shell & centre (if possible) ───────────
+    # ───────────────────────── soma shell & center (if possible) ───────────
     c_xy = _project(skel.nodes[[0]] * scl_skel, ix, iy).ravel()
     centre_col = swc_colors[1] if color_by == "ntype" else "k"
-    ax.scatter(*c_xy, color=[centre_col], s=15, zorder=3)
+    ax.scatter(*c_xy, color="black", s=15, zorder=3)
 
     if (draw_soma_mask and mesh is not None and skel.soma is not None and
             skel.soma.verts is not None):
@@ -402,9 +401,9 @@ def projection(
             alpha=0.5, linewidths=0,
             label="soma surface"
         )
-        # soma centre (node 0)
-        c_xy = _project(skel.nodes[[0]] * scl_skel, ix, iy).ravel()
-        ax.scatter(*c_xy, c="k", s=15, zorder=3)
+        # soma center (node 0)
+        # c_xy = _project(skel.nodes[[0]] * scl_skel, ix, iy).ravel()
+        # ax.scatter(*c_xy, c="k", s=15, zorder=3)
 
         # dashed ellipse outline
         ell = _soma_ellipse2d(skel.soma, plane, scale=scl_skel)
@@ -414,6 +413,14 @@ def projection(
         ell.set_linewidth(0.8)
         ell.set_alpha(0.9)
         ax.add_patch(ell)
+    else:
+        soma_circle = Circle(
+            c_xy, skel.soma.equiv_radius * scl_skel,
+            facecolor="none", edgecolor=centre_col, linewidth=0.8,
+            linestyle="--", alpha=0.9,
+        )
+        ax.add_patch(soma_circle)
+
 
     # ─────────────────────── draw edges & cylinders (unchanged) ────────────
     if draw_skel and skel.edges.size:
@@ -455,8 +462,10 @@ def projection(
 
                 if quads:
                     # make sure axes limits are already set before adding
-                    if xlim is not None: ax.set_xlim(xlim)
-                    if ylim is not None: ax.set_ylim(ylim)
+                    if xlim is not None: 
+                        ax.set_xlim(xlim)
+                    if ylim is not None: 
+                        ax.set_ylim(ylim)
 
                     pc = PolyCollection(quads, facecolors="red",
                                          edgecolors="red", alpha=cylinder_alpha,
@@ -464,7 +473,7 @@ def projection(
                     ax.add_collection(pc)
 
     # ────────────────────────────── final cosmetics ────────────────────────
-    ax.set_aspect("equal")
+    # ax.set_aspect("equal")
 
     if unit is None:
         unit_str = "" if scl_skel == 1.0 else f"(×{scl_skel:g})"
@@ -540,6 +549,9 @@ def details(
     if len(scale) != 2:
         raise ValueError("scale must be a scalar or a pair of two scalars")
     scl_skel, scl_mesh = map(float, scale)
+
+    if unit is None: # try to grab from metadata
+        unit = skel.meta.get("unit", None)
 
     if radius_metric is None:
         radius_metric = skel.recommend_radius()[0]
@@ -796,7 +808,7 @@ def threeviews(
     mesh: trimesh.Trimesh|None = None,
     *,
     planes: tuple[str, str, str] | list[str] = ["xy", "xz", "zy"],
-    scale: float = 1e-3,                 # nm → µm by default
+    scale: float | tuple[float, float] = 1.,                 # nm → µm by default
     title: str | None = None,
     figsize: tuple[int, int] = (8, 8),
     draw_edges: bool = True,
@@ -846,13 +858,21 @@ def threeviews(
     if len(planes) != 3:
         raise ValueError("planes must be a sequence of exactly three plane strings")
 
+    if not isinstance(scale, Sequence):
+        scale = [scale, scale]
+    if len(scale) != 2:
+        raise ValueError("scale must be a scalar or a pair of two scalars")
+    scl_skel, scl_mesh = map(float, scale)
+
+    if title is None:
+        title = skel.meta.get("id", None)
 
     # ── 0. global bounding box (already scaled) ────────────────────────────
     if mesh is not None and mesh.vertices.size:
-        v_mesh = mesh.vertices.view(np.ndarray) * scale
-        v_all  = np.vstack((v_mesh, skel.nodes * scale))
+        v_mesh = mesh.vertices.view(np.ndarray) * scl_mesh
+        v_all  = np.vstack((v_mesh, skel.nodes * scl_skel))
     else:
-        v_all = skel.nodes * scale
+        v_all = skel.nodes * scl_skel
 
     lims, spans = _axis_extents(v_all)
 
@@ -994,7 +1014,7 @@ def skeliner_to_osteoid(
     *,
     segid: int | None = None,
     include_soma: bool = True,   # ← switch it on/off here
-    scale: float = 1e-3          # nm → µm by default; set to 1.0 if you work in µm already
+    scale: float = 1.          # nm → µm by default; set to 1.0 if you work in µm already
 ):
     """
     Convert a Skeliner Skeleton → osteoid.Skeleton.

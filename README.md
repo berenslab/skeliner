@@ -1,6 +1,6 @@
 # skeliner
 
-A lightweight skeletonizer that converts neuron meshes into biophysical‑modelling‑ready SWC morphologies. It heuristically detects the soma, extracts an acyclic centre‑line skeleton, estimates per‑node radii, and bridges small gaps.
+A lightweight skeletonizer that converts neuron meshes into biophysical‑modelling‑ready SWC morphologies. It heuristically detects the soma, extracts an acyclic center‑line skeleton, estimates per‑node radii, and bridges small gaps.
 
 ![](./.github/banner.png)
 

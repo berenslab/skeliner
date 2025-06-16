@@ -113,8 +113,8 @@ def test_swc_roundtrip_exact(fname: str, tmp_path: Path):
     ), "soma radius changed"
 
     assert np.allclose(
-        skel_rt.soma.centre, skel_ref.soma.centre, rtol=1e-6
-    ), "soma centre changed"
+        skel_rt.soma.center, skel_ref.soma.center, rtol=1e-6
+    ), "soma center changed"
 
 def test_skeleton_roundtrip(tmp_path, reference_mesh):
     skel0 = skeletonize(reference_mesh, verbose=False)

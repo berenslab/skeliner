@@ -1,3 +1,5 @@
+import json
+import re
 from pathlib import Path
 from typing import Iterable, List
 
@@ -15,6 +17,10 @@ __all__ = [
     "load_npz",
     "to_npz",
 ]
+
+_META_KV   = re.compile(r"#\s*([^:]+)\s*:\s*(.+)")         #  key: value
+_META_JSON = re.compile(r"#\s*meta\s+(\{.*\})")   #  single-line JSON
+
 
 # ------------
 # --- Mesh ---
@@ -95,8 +101,27 @@ def load_swc(
     parent: List[int]  = []
     ntype: List[int] = []
 
+    meta = {}
+
     with path.open("r", encoding="utf8") as fh:
         for line in fh:
+
+            # ------- 1) try single-line JSON -------------------------
+            j = _META_JSON.match(line)
+            if j:
+                try:
+                    meta.update(json.loads(j.group(1)))
+                except json.JSONDecodeError:
+                    pass
+                continue
+
+            # ------- 2) try simple "key: value" ----------------------
+            m = _META_KV.match(line)
+            if m:
+                key, val = m.groups()
+                meta[key.strip()] = val.strip()
+                continue
+
             if not line.strip() or line.lstrip().startswith("#"):
                 continue
             parts = line.split()
@@ -142,11 +167,13 @@ def load_swc(
         soma=soma,
         node2verts=None,
         vert2node=None,
+        meta=meta,
     )
 
 def to_swc(skeleton, 
             path: str | Path,
             include_header: bool = True, 
+            include_meta: bool = True,          
             scale: float = 1.0,
             radius_metric: str | None = None,
             axis_order: tuple[int, int, int] | str = (0, 1, 2)
@@ -206,8 +233,13 @@ def to_swc(skeleton,
     
     # --- write SWC file -----------------------------------------------
     with path.open("w", encoding="utf8") as fh:
+        if include_meta and skeleton.meta:
+            blob = json.dumps(skeleton.meta, separators=(",", ":"), ensure_ascii=False)
+            fh.write(f"# meta {blob}\n")
+
         if include_header:
             fh.write("# id type x y z radius parent\n")
+
         for idx, (coord, r, pa, t) in enumerate(
             zip(nodes[:, axis_order] * scale, radii * scale, parent, ntype), start=1
         ):
@@ -252,7 +284,7 @@ def load_npz(path: str | Path) -> Skeleton:
         vert2node = {int(v): i for i, vs in enumerate(node2verts) for v in vs}
 
         soma = Soma(
-            centre=z["soma_centre"],
+            center=z["soma_centre"],
             axes=z["soma_axes"],
             R=z["soma_R"],
             verts=(
@@ -266,9 +298,13 @@ def load_npz(path: str | Path) -> Skeleton:
             # stored as length-1 object array; .item() unwraps the dict
             extra = z["extra"].item()
 
+        meta = {}
+        if "meta" in z.files:
+            # stored as length-1 object array; .item() unwraps the dict
+            meta = z["meta"].item()
 
     return Skeleton(nodes=nodes, radii=radii, edges=edges, ntype=ntype, soma=soma,
-                    node2verts=node2verts, vert2node=vert2node, extra=extra)
+                    node2verts=node2verts, vert2node=vert2node, extra=extra, meta=meta)
 
 def to_npz(skeleton: Skeleton, path: str | Path, *, compress: bool = True) -> None:
     """
@@ -297,6 +333,7 @@ def to_npz(skeleton: Skeleton, path: str | Path, *, compress: bool = True) -> No
     # We wrap it in a 0-D object array because np.savez can only store
     # ndarrays — this keeps the archive a single *.npz* with no sidecars.
     extra = {"extra": np.array(skeleton.extra, dtype=object)}
+    meta = {"meta": np.array(skeleton.meta, dtype=object)} if skeleton.meta else {}
 
     np.savez(
         path, 
@@ -311,5 +348,6 @@ def to_npz(skeleton: Skeleton, path: str | Path, *, compress: bool = True) -> No
         node2verts_off=n2v_off,
         **radii_flat,
         **extra,
+        **meta,
         **c,
     )
