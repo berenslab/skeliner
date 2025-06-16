@@ -4,6 +4,7 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
+from importlib import metadata as _metadata
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 
@@ -13,6 +14,9 @@ import trimesh
 from scipy.spatial import KDTree
 
 from . import dx, io, post
+
+_SKELINER_VERSION = _metadata.version("skeliner")
+
 
 __all__ = [
     "Skeleton",
@@ -28,16 +32,16 @@ class Soma:
     Ellipsoidal soma model.
 
     The ellipsoid is defined in *world coordinates* by the triple
-    `(centre, axes, R)` that satisfies
+    `(center, axes, R)` that satisfies
 
-        **world = R @ body + centre**
+        **world = R @ body + center**
 
     where *body* points live inside the unit sphere ``‖body‖ ≤ 1``.
 
     Parameters
     ----------
-    centre : (3,) float
-        XYZ world-space coordinates of the ellipsoid centre.
+    center : (3,) float
+        XYZ world-space coordinates of the ellipsoid center.
     axes   : (3,) float
         Semi-axis lengths **sorted** as  a ≥ b ≥ c.
     R      : (3,3) float
@@ -47,7 +51,7 @@ class Soma:
         Mesh-vertex IDs belonging to the soma surface.
     """
 
-    centre: np.ndarray                # (3,)
+    center: np.ndarray                # (3,)
     axes:   np.ndarray                # (3,)
     R:      np.ndarray                # (3,3)
     verts:  np.ndarray | None = None  # (N,)
@@ -59,7 +63,7 @@ class Soma:
     # dataclass life-cycle
     # ---------------------------------------------------------------------
     def __post_init__(self) -> None:
-        self.centre = np.asarray(self.centre, dtype=np.float64).reshape(3)
+        self.center = np.asarray(self.center, dtype=np.float64).reshape(3)
         self.axes   = np.asarray(self.axes,   dtype=np.float64).reshape(3)
         self.R      = np.asarray(self.R,      dtype=np.float64).reshape(3, 3)
 
@@ -76,7 +80,7 @@ class Soma:
     def _body_coords(self, x: np.ndarray) -> np.ndarray:
         """World ➜ body coords where the ellipsoid becomes the *unit sphere*."""
         x = np.asarray(x, dtype=np.float64)
-        return (x - self.centre) @ self._W
+        return (x - self.center) @ self._W
 
     def contains(self, x: np.ndarray, *, inside_frac: float = 1.0) -> np.ndarray:
         """
@@ -96,7 +100,7 @@ class Soma:
         x : (N, 3) or (3,) array-like
             Points in world coordinates.
         to : {'center', 'surface'}
-            Whether to compute the distance to the centre or to the surface.
+            Whether to compute the distance to the center or to the surface.
 
         Returns
         -------
@@ -111,12 +115,12 @@ class Soma:
             raise ValueError(f"Unknown distance target '{to}'.")
 
     def distance_to_center(self, x: np.ndarray) -> np.ndarray | float:
-        """Unsigned Euclidean distance from *x* to the soma *centre*."""
+        """Unsigned Euclidean distance from *x* to the soma *center*."""
         x = np.asanyarray(x, dtype=np.float64)
         single_input = x.ndim == 1
         if single_input:
             x = x[None, :]
-        d = np.linalg.norm(x - self.centre, axis=1)
+        d = np.linalg.norm(x - self.center, axis=1)
         return d[0] if single_input else d
 
     def distance_to_surface(
@@ -132,7 +136,7 @@ class Soma:
             x = x[None, :]
 
         # --- body-coordinates: align to principal axes --------------------
-        p   = (x - self.centre) @ self.R          # (N,3)
+        p   = (x - self.center) @ self.R          # (N,3)
         a   = self.axes
         a2  = a * a
         r2  = (p**2 / a2).sum(axis=1)             # ‖p‖² in unit-sphere space
@@ -160,14 +164,14 @@ class Soma:
             idx_inn = np.where(inn)[0]
             pi      = p[inn]
             s       = np.sqrt(r2[inn])            # radial factor
-            nz      = s > atol                    # not at exact centre
+            nz      = s > atol                    # not at exact center
 
             # general interior points
             if nz.any():
                 xs   = pi[nz] / s[nz, None]       # radial projection
                 dist[idx_inn[nz]] = -np.linalg.norm(xs - pi[nz], axis=1)
 
-            # exact centre → shortest half-axis
+            # exact center → shortest half-axis
             if (~nz).any():
                 dist[idx_inn[~nz]] = -a.min()
 
@@ -198,20 +202,20 @@ class Soma:
         Rough 95 %-mass envelope, same idea as the original *sphere* fit.
         """
         pts = np.asarray(pts, dtype=np.float64)
-        centre = pts.mean(axis=0)
-        cov = np.cov(pts - centre, rowvar=False)
+        center = pts.mean(axis=0)
+        cov = np.cov(pts - center, rowvar=False)
         evals, evecs = np.linalg.eigh(cov)           # λ₁ ≤ λ₂ ≤ λ₃
         axes = np.sqrt(evals * 5.0)[::-1]            # 95 % of mass → 2 σ ≈ √5
         R = evecs[:, ::-1]                           # reorder to a ≥ b ≥ c
-        return cls(centre, axes, R, verts=verts)
+        return cls(center, axes, R, verts=verts)
 
     @classmethod
-    def from_sphere(cls, centre: np.ndarray, radius: float, verts: np.ndarray | None) -> "Soma":
+    def from_sphere(cls, center: np.ndarray, radius: float, verts: np.ndarray | None) -> "Soma":
         """Backward-compat helper – treat a sphere as a = b = c = radius."""
-        centre = np.asarray(centre, dtype=np.float64)
+        center = np.asarray(center, dtype=np.float64)
         axes   = np.full(3, float(radius), dtype=np.float64)
         R      = np.eye(3, dtype=np.float64)
-        return cls(centre, axes, R, verts=verts)
+        return cls(center, axes, R, verts=verts)
 
 
 @dataclass(slots=True)
@@ -219,7 +223,7 @@ class Skeleton:
     """Light-weight skeleton graph.
 
     The skeleton is a forest-shaped graph (acyclic, undirected) whose vertices
-    sit on the centre-line of a mesh representation of a neurone. Node 0 is
+    sit on the center-line of a mesh representation of a neurone. Node 0 is
     reserved for the soma centroid; all other vertices belong to neurites.
 
     Parameters
@@ -255,7 +259,8 @@ class Skeleton:
     # ---- optional mesh data ----------------------------------------
     node2verts: list[np.ndarray] | None = None
     vert2node: dict[int, int] | None = None
-    # ---- optional dictionary for extra data expansion --------------
+    # ---- optional dictionary for meta data and future extra data--------------
+    meta: dict[str, Any] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
 
     def __getattr__(self, name: str):
@@ -487,7 +492,7 @@ def _find_soma(
         # 4. envelope geometry 
         # -------------------------------------------------------------
         soma  = Soma.from_sphere(
-            centre=nodes[soma_idx].mean(0),
+            center=nodes[soma_idx].mean(0),
             radius=R_max,
             verts=None,
         )
@@ -674,7 +679,7 @@ def _bin_geodesic_shells(
     v   = mesh.vertices.view(np.ndarray)
     e_m = float(mesh.edges_unique_length.mean())     # mean mesh-edge length
 
-    c_soma = soma.centre
+    c_soma = soma.center
     soma_verts = set() if soma.verts is None else set(map(int, soma.verts))
     soma_vids = np.fromiter(soma_verts, dtype=np.int64)
 
@@ -733,7 +738,7 @@ def _bin_geodesic_shells(
         # for every shell: split it into connected sub-clusters
         # --------------------------------------------------------------
         for shell_verts in shells:
-            # exclude explicit soma vertices to keep the centre clean
+            # exclude explicit soma vertices to keep the center clean
             inner = [vid for vid in shell_verts if vid not in soma_verts]
             if not inner:
                 continue
@@ -835,7 +840,7 @@ def _merge_near_soma_nodes(
     **according to strictly geometric tests based on `Soma.distance_`.**
 
     *Inside test*  
-        `d < −inside_tol`  (negative ➜ centre is strictly inside)
+        `d < −inside_tol`  (negative ➜ center is strictly inside)
 
     *Near-and-fat test*  
         `d <  near_factor × r_soma   AND   r ≥ fat_factor × r_soma`
@@ -888,7 +893,7 @@ def _merge_near_soma_nodes(
             # keep only the vertex subset that is *really* close to the soma
             vidx   = node2verts[idx]
             d_local = soma.distance_to_surface(mesh_vertices[vidx])
-            close   = d_local < near_factor * r_soma     # same factor as for centre test
+            close   = d_local < near_factor * r_soma     # same factor as for center test
             if np.any(close):
                 soma.verts = np.concatenate((soma.verts, vidx[close])) if soma.verts is not None else vidx[close]
                 node2_keep[0]   = np.concatenate((node2_keep[0], vidx[close]))
@@ -904,15 +909,15 @@ def _merge_near_soma_nodes(
         if log:
             log("Soma fitting failed, using spherical approximation instead.")
         # fallback to spherical approximation
-        soma = Soma.from_sphere(soma.centre, soma.spherical_radius, verts=soma.verts)
+        soma = Soma.from_sphere(soma.center, soma.spherical_radius, verts=soma.verts)
 
-    nodes_keep[0] = soma.centre
+    nodes_keep[0] = soma.center
     r_soma = soma.spherical_radius
     for k in radii_keep:
         radii_keep[k][0] = r_soma
 
     if log:
-        centre_txt = ", ".join(f"{c:7.1f}" for c in soma.centre)
+        centre_txt = ", ".join(f"{c:7.1f}" for c in soma.center)
         radii_txt = ",".join(f"{c:7.1f}" for c in soma.axes)
         log(f"Moved soma to [{centre_txt}]")
         log(f"(r = {radii_txt})")
@@ -1244,7 +1249,7 @@ def _prune_neurites(
     Notes
     -----
     * Both extent thresholds are relative to the soma *surface*,
-      **not** its centre.
+      **not** its center.
     * Setting both extent factors ≤ 1 collapses any branch that never
       leaves the soma sphere at all.
     * The hard-coded ``min_parent_degree`` for one-node pruning is 3—
@@ -1335,7 +1340,7 @@ def _prune_neurites(
     soma = soma.fit(pts, verts=soma.verts)
 
     if log:
-        centre_txt = ", ".join(f"{c:7.1f}" for c in soma.centre)
+        centre_txt = ", ".join(f"{c:7.1f}" for c in soma.center)
         radii_txt = ",".join(f"{c:7.1f}" for c in soma.axes)
         log(f"Moved soma to [{centre_txt}]")
         log(f"(r = {radii_txt})")
@@ -1479,16 +1484,16 @@ def _make_nodes(
     for shells in all_shells:                 # outer = distance order
         for bin_ids in shells:                # inner = connected patch
             pts    = vertices[bin_ids]
-            centre = pts.mean(axis=0)
+            center = pts.mean(axis=0)
 
-            d = np.linalg.norm(pts - centre, axis=1)      # distances → radii
+            d = np.linalg.norm(pts - center, axis=1)      # distances → radii
             for est in radius_estimators:
                 radii_dict[est] = np.append(
                     radii_dict[est],
                     _estimate_radius(d, method=est, trim_fraction=0.05)
                 )
 
-            nodes.append(centre.astype(np.float64))
+            nodes.append(center.astype(np.float64))
             node2verts.append(bin_ids)
             for vid in bin_ids:
                 vert2node[int(vid)] = next_id
@@ -1584,7 +1589,7 @@ def _detect_soma(
     soma.verts = soma_vert_ids
 
     # update centroid & spherical_radius written to node 0
-    nodes[0] = soma.centre
+    nodes[0] = soma.center
     r_sphere = soma.spherical_radius
     for k in radii: 
         radii[k][0] = r_sphere
@@ -1598,10 +1603,10 @@ def _detect_soma(
         if log:
             log("Soma fitting failed, using spherical approximation instead.")
         # fallback to spherical approximation
-        soma = Soma.from_sphere(soma.centre, r_sphere, verts=soma.verts)
+        soma = Soma.from_sphere(soma.center, r_sphere, verts=soma.verts)
 
     if log:
-        centre_txt = ", ".join(f"{c:7.1f}" for c in soma.centre)
+        centre_txt = ", ".join(f"{c:7.1f}" for c in soma.center)
         radii_txt = ",".join(f"{c:7.1f}" for c in soma.axes)
         log(f"Found soma at [{centre_txt}]")
         log(f"(r = {radii_txt})")
@@ -1653,7 +1658,7 @@ def skeletonize(
     # --- misc ---
     verbose: bool = False,
 ) -> Skeleton:
-    """Compute a centre-line skeleton with radii of a neuronal mesh .
+    """Compute a center-line skeleton with radii of a neuronal mesh .
 
     The algorithm proceeds in eight conceptual stages:
 
@@ -1880,4 +1885,8 @@ def skeletonize(
                     soma=soma,
                     node2verts=node2verts,
                     vert2node=vert2node,
+                    meta = {
+                        "skeliner_version": _SKELINER_VERSION,
+                        "skeletonized_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    }
             )

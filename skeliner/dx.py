@@ -338,12 +338,12 @@ def suspicious_tips(
     path_ratio_thresh: float = 2.0,
     return_stats: bool = False,
 ) -> List[int] | Tuple[List[int], Dict[int, Dict[str, float]]]:
-    """Identify *tip* nodes suspiciously close to the soma.
+    r"""Identify *tip* nodes suspiciously close to the soma.
 
     A *tip* is a node with graph degree = 1 (i.e. a leaf) and **not** the soma
     itself.  A leaf *i* is flagged when
 
-    1. Its Euclidean distance to the soma centre is *small*::
+    1. Its Euclidean distance to the soma center is *small*::
 
            d\_euclid(i) \le near\_factor × max(soma.axes)
 
@@ -378,7 +378,7 @@ def suspicious_tips(
     if skel.nodes.size == 0 or skel.edges.size == 0:
         return [] if not return_stats else ([], {})
 
-    soma_c = skel.soma.centre.astype(np.float64)
+    soma_c = skel.soma.center.astype(np.float64)
     r_max = float(skel.soma.axes.max())
     near_thr = near_factor * r_max
 
