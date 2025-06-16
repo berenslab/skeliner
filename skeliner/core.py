@@ -422,7 +422,6 @@ class Skeleton:
         for key in self.radii.keys():
             self.radii[key] *= factor
         if self.soma is not None:
-            self.soma.center *= factor
             self.soma.axes *= factor
 
         self.meta["unit"] = target_unit
