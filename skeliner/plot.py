@@ -1085,7 +1085,7 @@ def trimesh_to_zmesh(tm, segid: int | None = None, scale: float = 1.0):
 
 def view3d(skels: list[Skeleton] | Skeleton, meshes: list[trimesh.Trimesh] | trimesh.Trimesh,
            include_soma:bool=False, 
-           scale: float = 1.0,
+           scale: float | tuple | list = 1.0,
            box: "Bbox | list[float] | None" = None, # noqa: F821 
                 # bounding box in [x0, y0, z0, x1, y1, z1] format
 ):
@@ -1132,7 +1132,7 @@ def view3d(skels: list[Skeleton] | Skeleton, meshes: list[trimesh.Trimesh] | tri
         skel_scale, mesh_scale = map(float, scale)
 
     ost_skels = [skeliner_to_osteoid(skel, segid=segid, include_soma=include_soma, scale=skel_scale) for (segid, skel) in enumerate(skels)]
-    zm_meshes  = [trimesh_to_zmesh(mesh, segid=segid, scale=mesh_scale) for (segid, mesh) in enumerate(meshes)]
+    zm_meshes = [trimesh_to_zmesh(mesh, segid=segid, scale=mesh_scale) for (segid, mesh) in enumerate(meshes)]
 
     if box is None:
         # use the min and max of all vertices in the meshes
