@@ -4,7 +4,7 @@ from . import dx, io
 from .core import Skeleton, skeletonize
 from .plot import projection as plot2d
 from .plot import threeviews as plot3v
-from .plot import view3d as plot3d
+from .plot import view3d
 
 try:
     __version__ = version(__name__)       
@@ -16,7 +16,7 @@ __all__ = [
     "skeletonize",
     "plot2d",
     "plot3v",
-    "plot3d",
+    "view3d",
     "io",
     "dx",
 ]

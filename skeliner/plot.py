@@ -1,4 +1,4 @@
-from typing import Optional, Sequence, Tuple, Union
+from typing import Sequence
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -165,14 +165,14 @@ def _make_lut(name: str, n: int) -> np.ndarray:
 
 def projection(
     skel: Skeleton,
-    mesh: Optional["trimesh.Trimesh"] = None,
+    mesh: trimesh.Trimesh | None= None,
     *,
     plane: str = "xy",
     radius_metric: str | None = None,
-    bins: int | Tuple[int, int] = 800,
+    bins: int | tuple[int, int] = 800,
     scale: float | Sequence[Number] = 1.0,
-    xlim: Tuple[float, float] | None = None,
-    ylim: Tuple[float, float] | None = None,
+    xlim: tuple[float, float] | None = None,
+    ylim: tuple[float, float] | None = None,
     draw_skel: bool = True,
     draw_edges: bool = True,
     draw_cylinders: bool = False,
@@ -190,7 +190,7 @@ def projection(
     draw_soma_mask: bool = True,
     # colors
     color_by: str = "fixed",  # "ntype" or "fixed"
-) -> Tuple[Figure, Axes]:
+) -> tuple[Figure, Axes]:
     """Orthographic 2‑D overview of a skeleton with an **optional** mesh‑density
     background.
 
@@ -308,7 +308,7 @@ def projection(
     if mesh is not None and xy_mesh.size:
         # ensure bins argument correct
         if isinstance(bins, int):
-            bins_arg: int | Tuple[int, int] = bins
+            bins_arg: int | tuple[int, int] = bins
         elif (isinstance(bins, tuple) and len(bins) == 2 and
               all(isinstance(b, int) for b in bins)):
             bins_arg = (int(bins[0]), int(bins[1]))
@@ -499,7 +499,7 @@ def details(
     *,
     plane: str = "xy",
     # background histogram ------------------------------------------------- #
-    bins: int | Tuple[int, int] = 800,
+    bins: int | tuple[int, int] = 800,
     hist_cmap: str = "Blues",
     vmax_fraction: float = 0.10,
     # overlays ------------------------------------------------------------- #
@@ -517,11 +517,11 @@ def details(
     edge_lw: float = 0.8,
     id_fontsize: int = 6,
     id_color: str = "black",
-    id_offset: Tuple[float, float] = (0.0, 0.0),
+    id_offset: tuple[float, float] = (0.0, 0.0),
     # geometry ------------------------------------------------------------- #
-    scale: Union[Number, Tuple[Number, Number], Sequence[Number]] = 1.0,
-    xlim: Tuple[float, float] | None = None,
-    ylim: Tuple[float, float] | None = None,
+    scale: Number | tuple[Number, Number] | Sequence[Number] = 1.0,
+    xlim: tuple[float, float] | None = None,
+    ylim: tuple[float, float] | None = None,
     # title --------------------------------------------------------------- #
     title: str | None = None,
     unit: str | None = None,
@@ -592,7 +592,7 @@ def details(
     # ────────────── density histogram (mesh may be absent) ────────────────
     if have_mesh and xy_mesh_crop.size:
         if isinstance(bins, int):
-            bins_arg: int | Tuple[int, int] = bins
+            bins_arg: int | tuple[int, int] = bins
         else:
             if (not isinstance(bins, tuple)) or len(bins) != 2:
                 raise ValueError("bins must be int or (int, int)")
@@ -962,15 +962,15 @@ def _window_for_node(
 
 def node_details(
     skel: Skeleton,
-    mesh: Optional["trimesh.Trimesh"] = None,
+    mesh: trimesh.Trimesh | None = None,
     node_id: int = 0,
     *,
     plane: str = "xy",
     multiplier: float = 0.25,
-    scale: Union[Number, Tuple[Number, Number], Sequence[Number]] = 1.0,
+    scale: Number | tuple[Number, Number] | Sequence[Number] = 1.0,
     highlight_alpha: float = 0.5,
     **kwargs,
-) -> Tuple[Figure, plt.Axes]:
+) -> tuple[Figure, Axes]:
     """Zoomed‑in view of a specific skeleton node (mesh optional).
 
     A surface `mesh` can now be omitted.  The zoom window is derived purely
@@ -1061,7 +1061,7 @@ def skeliner_to_osteoid(
             segid=segid if segid is not None else 0,  
         )
 
-def trimesh_to_zmesh(tm, segid: int | None = None):
+def trimesh_to_zmesh(tm, segid: int | None = None, scale: float = 1.0):
     """
     Convert a trimesh.Trimesh → zmesh.Mesh and
     bake the desired opacity into the RGBA colour.
@@ -1075,7 +1075,7 @@ def trimesh_to_zmesh(tm, segid: int | None = None):
         )
 
     zm = zmesh.Mesh(
-        vertices = tm.vertices.astype(np.float32) / 1000, 
+        vertices = tm.vertices.astype(np.float32) * scale, 
         faces    = tm.faces.astype(np.uint32),
         normals  = None,
         id       = segid if segid is not None else 0,
@@ -1083,11 +1083,26 @@ def trimesh_to_zmesh(tm, segid: int | None = None):
     return zm
 
 
-def view3d(skel, trimesh_mesh, 
-           segid: int | None = None,
+def view3d(skels: list[Skeleton] | Skeleton, meshes: list[trimesh.Trimesh] | trimesh.Trimesh,
            include_soma:bool=False, 
-           box:list[float]|None = None # bounding box in [x0, y0, z0, x1, y1, z1] format
+           scale: float | tuple | list = 1.0,
+           box: "Bbox | list[float] | None" = None, # noqa: F821 
+                # bounding box in [x0, y0, z0, x1, y1, z1] format
 ):
+    """
+    Visualise a list of skeletons and meshes in 3D using microviewer>=1.16.0.
+    
+    Examples
+    --------
+    import skeliner as sk
+
+    name = [720575940550605504, 720575940573924400]
+    meshes = [sk.io.load_mesh(f"../temp_io/{n}.ctm") for n in name]
+    skels = [sk.io.load_npz(f"../temp_io/{n}.npz") for n in name]
+
+    sk.view3d(skels, meshes, scale=1e-3)
+    """
+
     try:
         from microviewer import objects
     except ImportError:
@@ -1103,12 +1118,28 @@ def view3d(skel, trimesh_mesh,
             "Please install all dependencies with `pip install --upgrade skeliner[3d]`."
         )
 
-    ost_skel = skeliner_to_osteoid(skel, segid=segid, include_soma=include_soma)
-    zm_mesh  = trimesh_to_zmesh(trimesh_mesh, segid=segid)
+    if isinstance(skels, Skeleton):
+        skels = [skels]
+    if isinstance(meshes, trimesh.Trimesh):
+        meshes = [meshes]
+
+    if isinstance(scale, (int, float)):
+        skel_scale = float(scale)
+        mesh_scale = float(scale)
+    else:
+        if len(scale) != 2:
+            raise ValueError("scale must be a scalar or a pair/list of two scalars")
+        skel_scale, mesh_scale = map(float, scale)
+
+    ost_skels = [skeliner_to_osteoid(skel, segid=segid, include_soma=include_soma, scale=skel_scale) for (segid, skel) in enumerate(skels)]
+    zm_meshes = [trimesh_to_zmesh(mesh, segid=segid, scale=mesh_scale) for (segid, mesh) in enumerate(meshes)]
 
     if box is None:
-        # use the mesh extents as the bounding box
-        box = Bbox(zm_mesh.vertices.min(axis=0), zm_mesh.vertices.max(axis=0))
+        # use the min and max of all vertices in the meshes
+        box = Bbox(
+            np.min([mesh.vertices.min(axis=0) for mesh in zm_meshes], axis=0),
+            np.max([mesh.vertices.max(axis=0) for mesh in zm_meshes], axis=0)
+        )
     else:
         if len(box) == 6:
             box = Bbox(box[:3], box[3:])
@@ -1117,4 +1148,4 @@ def view3d(skel, trimesh_mesh,
         else:
             raise ValueError("Invalid bounding box format. Expected [x0, y0, z0, x1, y1, z1].")
 
-    objects([box, zm_mesh, ost_skel])
+    objects([box, *zm_meshes, *ost_skels])

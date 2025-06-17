@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "skeliner"
-version = "0.1.6"
+version = "0.1.7"
 description = "A lightweight neuromorphological mesh skeletonizer."
 authors = []
 requires-python = ">=3.10.0"
@@ -30,7 +30,7 @@ dev = [
     "watermark>=2.5.0",
 ]
 3d = [
-    "microviewer>=1.15.1",
+    "microviewer>=1.16.0",
     "osteoid>=0.3.2",
     "vtk>=9.4.2",
     "zmesh>=1.8.0",
