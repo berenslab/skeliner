@@ -1,7 +1,4 @@
-from typing import TYPE_CHECKING, Optional, Sequence, Tuple, Union
-
-if TYPE_CHECKING:                 
-    from osteoid.lib import Bbox
+from typing import Sequence
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -168,14 +165,14 @@ def _make_lut(name: str, n: int) -> np.ndarray:
 
 def projection(
     skel: Skeleton,
-    mesh: Optional["trimesh.Trimesh"] = None,
+    mesh: trimesh.Trimesh | None= None,
     *,
     plane: str = "xy",
     radius_metric: str | None = None,
-    bins: int | Tuple[int, int] = 800,
+    bins: int | tuple[int, int] = 800,
     scale: float | Sequence[Number] = 1.0,
-    xlim: Tuple[float, float] | None = None,
-    ylim: Tuple[float, float] | None = None,
+    xlim: tuple[float, float] | None = None,
+    ylim: tuple[float, float] | None = None,
     draw_skel: bool = True,
     draw_edges: bool = True,
     draw_cylinders: bool = False,
@@ -193,7 +190,7 @@ def projection(
     draw_soma_mask: bool = True,
     # colors
     color_by: str = "fixed",  # "ntype" or "fixed"
-) -> Tuple[Figure, Axes]:
+) -> tuple[Figure, Axes]:
     """Orthographic 2‑D overview of a skeleton with an **optional** mesh‑density
     background.
 
@@ -311,7 +308,7 @@ def projection(
     if mesh is not None and xy_mesh.size:
         # ensure bins argument correct
         if isinstance(bins, int):
-            bins_arg: int | Tuple[int, int] = bins
+            bins_arg: int | tuple[int, int] = bins
         elif (isinstance(bins, tuple) and len(bins) == 2 and
               all(isinstance(b, int) for b in bins)):
             bins_arg = (int(bins[0]), int(bins[1]))
@@ -502,7 +499,7 @@ def details(
     *,
     plane: str = "xy",
     # background histogram ------------------------------------------------- #
-    bins: int | Tuple[int, int] = 800,
+    bins: int | tuple[int, int] = 800,
     hist_cmap: str = "Blues",
     vmax_fraction: float = 0.10,
     # overlays ------------------------------------------------------------- #
@@ -520,11 +517,11 @@ def details(
     edge_lw: float = 0.8,
     id_fontsize: int = 6,
     id_color: str = "black",
-    id_offset: Tuple[float, float] = (0.0, 0.0),
+    id_offset: tuple[float, float] = (0.0, 0.0),
     # geometry ------------------------------------------------------------- #
-    scale: Union[Number, Tuple[Number, Number], Sequence[Number]] = 1.0,
-    xlim: Tuple[float, float] | None = None,
-    ylim: Tuple[float, float] | None = None,
+    scale: Number | tuple[Number, Number] | Sequence[Number] = 1.0,
+    xlim: tuple[float, float] | None = None,
+    ylim: tuple[float, float] | None = None,
     # title --------------------------------------------------------------- #
     title: str | None = None,
     unit: str | None = None,
@@ -595,7 +592,7 @@ def details(
     # ────────────── density histogram (mesh may be absent) ────────────────
     if have_mesh and xy_mesh_crop.size:
         if isinstance(bins, int):
-            bins_arg: int | Tuple[int, int] = bins
+            bins_arg: int | tuple[int, int] = bins
         else:
             if (not isinstance(bins, tuple)) or len(bins) != 2:
                 raise ValueError("bins must be int or (int, int)")
@@ -965,15 +962,15 @@ def _window_for_node(
 
 def node_details(
     skel: Skeleton,
-    mesh: Optional["trimesh.Trimesh"] = None,
+    mesh: trimesh.Trimesh | None = None,
     node_id: int = 0,
     *,
     plane: str = "xy",
     multiplier: float = 0.25,
-    scale: Union[Number, Tuple[Number, Number], Sequence[Number]] = 1.0,
+    scale: Number | tuple[Number, Number] | Sequence[Number] = 1.0,
     highlight_alpha: float = 0.5,
     **kwargs,
-) -> Tuple[Figure, plt.Axes]:
+) -> tuple[Figure, Axes]:
     """Zoomed‑in view of a specific skeleton node (mesh optional).
 
     A surface `mesh` can now be omitted.  The zoom window is derived purely
@@ -1089,7 +1086,8 @@ def trimesh_to_zmesh(tm, segid: int | None = None, scale: float = 1.0):
 def view3d(skels: list[Skeleton] | Skeleton, meshes: list[trimesh.Trimesh] | trimesh.Trimesh,
            include_soma:bool=False, 
            scale: float = 1.0,
-           box: Bbox | list[float] | None = None, # bounding box in [x0, y0, z0, x1, y1, z1] format
+           box: "Bbox | list[float] | None" = None, # noqa: F821 
+                # bounding box in [x0, y0, z0, x1, y1, z1] format
 ):
     """
     Visualise a list of skeletons and meshes in 3D using microviewer>=1.16.0.
