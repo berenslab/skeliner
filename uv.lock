@@ -904,15 +904,15 @@ wheels = [
 
 [[package]]
 name = "microviewer"
-version = "1.15.1"
+version = "1.16.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
     { name = "numpy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ef/ea/a2191495e0a0b9f9c1db118072d653f45578c1837251ee96ec48d8b1ca8c/microviewer-1.15.1.tar.gz", hash = "sha256:41cf0ff160476f18d01dd8b29b9637512d853ceece6ab9f4fb0abf45231520cd", size = 1483289, upload-time = "2025-06-11T22:15:00.059Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6d/2f/530fdc55669d32a67d3f21efe0f622d3639378be6370293b828a4ff923f6/microviewer-1.16.0.tar.gz", hash = "sha256:f74992bb09036004e7dc176705fe7cf404e48fd26360dbe7131bc9ea063466f8", size = 1483650, upload-time = "2025-06-17T04:03:23.82Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c4/81/ee600ebf113db617010ff18797531d6a4a5c2ad4af5eec4848b2b17e1b1b/microviewer-1.15.1-py3-none-any.whl", hash = "sha256:244df45b461dde9fd0509c64ea7f4482a9581572ff7557dbb4cc2601221b83e0", size = 159669, upload-time = "2025-06-11T22:14:58.901Z" },
+    { url = "https://files.pythonhosted.org/packages/9a/2a/91a7117adf6c0a7310420140390c980bee1c59b016f3b6966ef87f12988d/microviewer-1.16.0-py3-none-any.whl", hash = "sha256:2a66e9dec8e1d0c5e28fd34a8ac58d406ff8b3ec059be7938da0ee3232bcefc7", size = 159934, upload-time = "2025-06-17T04:03:22.318Z" },
 ]
 
 [[package]]
@@ -1657,7 +1657,7 @@ requires-dist = [
     { name = "ipykernel", marker = "extra == 'dev'", specifier = ">=6.29.5" },
     { name = "matplotlib", specifier = ">=3.10.3" },
     { name = "maturin", marker = "extra == 'dev'" },
-    { name = "microviewer", marker = "extra == '3d'", specifier = ">=1.15.1" },
+    { name = "microviewer", marker = "extra == '3d'", specifier = ">=1.16.0" },
     { name = "numpy", specifier = ">=2.0.2" },
     { name = "openctm", marker = "python_full_version >= '3.12'", specifier = ">=0.0.6" },
     { name = "osteoid", marker = "extra == '3d'", specifier = ">=0.3.2" },

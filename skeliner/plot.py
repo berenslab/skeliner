@@ -1061,7 +1061,7 @@ def skeliner_to_osteoid(
             segid=segid if segid is not None else 0,  
         )
 
-def trimesh_to_zmesh(tm, segid: int | None = None):
+def trimesh_to_zmesh(tm, segid: int | None = None, scale: float = 1.0):
     """
     Convert a trimesh.Trimesh → zmesh.Mesh and
     bake the desired opacity into the RGBA colour.
@@ -1075,7 +1075,7 @@ def trimesh_to_zmesh(tm, segid: int | None = None):
         )
 
     zm = zmesh.Mesh(
-        vertices = tm.vertices.astype(np.float32) / 1000, 
+        vertices = tm.vertices.astype(np.float32) * scale, 
         faces    = tm.faces.astype(np.uint32),
         normals  = None,
         id       = segid if segid is not None else 0,
@@ -1083,11 +1083,25 @@ def trimesh_to_zmesh(tm, segid: int | None = None):
     return zm
 
 
-def view3d(skel, trimesh_mesh, 
-           segid: int | None = None,
+def view3d(skels: list[Skeleton] | Skeleton, meshes: list[trimesh.Trimesh] | trimesh.Trimesh,
            include_soma:bool=False, 
-           box:list[float]|None = None # bounding box in [x0, y0, z0, x1, y1, z1] format
+           scale: float = 1.0,
+           box: 'Bbox | list[float] | None' = None # bounding box in [x0, y0, z0, x1, y1, z1] format
 ):
+    """
+    Visualise a list of skeletons and meshes in 3D using microviewer>=1.16.0.
+    
+    Examples
+    --------
+    import skeliner as sk
+
+    name = [720575940550605504, 720575940573924400]
+    meshes = [sk.io.load_mesh(f"../temp_io/{n}.ctm") for n in name]
+    skels = [sk.io.load_npz(f"../temp_io/{n}.npz") for n in name]
+
+    sk.view3d(skels, meshes, scale=1e-3)
+    """
+
     try:
         from microviewer import objects
     except ImportError:
@@ -1103,12 +1117,28 @@ def view3d(skel, trimesh_mesh,
             "Please install all dependencies with `pip install --upgrade skeliner[3d]`."
         )
 
-    ost_skel = skeliner_to_osteoid(skel, segid=segid, include_soma=include_soma)
-    zm_mesh  = trimesh_to_zmesh(trimesh_mesh, segid=segid)
+    if isinstance(skels, Skeleton):
+        skels = [skels]
+    if isinstance(meshes, trimesh.Trimesh):
+        meshes = [meshes]
+
+    if isinstance(scale, (int, float)):
+        skel_scale = float(scale)
+        mesh_scale = float(scale)
+    else:
+        if len(scale) != 2:
+            raise ValueError("scale must be a scalar or a pair/list of two scalars")
+        skel_scale, mesh_scale = map(float, scale)
+
+    ost_skels = [skeliner_to_osteoid(skel, segid=segid, include_soma=include_soma, scale=skel_scale) for (segid, skel) in enumerate(skels)]
+    zm_meshes  = [trimesh_to_zmesh(mesh, segid=segid, scale=mesh_scale) for (segid, mesh) in enumerate(meshes)]
 
     if box is None:
-        # use the mesh extents as the bounding box
-        box = Bbox(zm_mesh.vertices.min(axis=0), zm_mesh.vertices.max(axis=0))
+        # use the min and max of all vertices in the meshes
+        box = Bbox(
+            np.min([mesh.vertices.min(axis=0) for mesh in zm_meshes], axis=0),
+            np.max([mesh.vertices.max(axis=0) for mesh in zm_meshes], axis=0)
+        )
     else:
         if len(box) == 6:
             box = Bbox(box[:3], box[3:])
@@ -1117,4 +1147,4 @@ def view3d(skel, trimesh_mesh,
         else:
             raise ValueError("Invalid bounding box format. Expected [x0, y0, z0, x1, y1, z1].")
 
-    objects([box, zm_mesh, ost_skel])
+    objects([box, *zm_meshes, *ost_skels])
