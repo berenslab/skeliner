@@ -1,4 +1,7 @@
-from typing import Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Sequence, Tuple, Union
+
+if TYPE_CHECKING:                 
+    from osteoid.lib import Bbox
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -1086,7 +1089,7 @@ def trimesh_to_zmesh(tm, segid: int | None = None, scale: float = 1.0):
 def view3d(skels: list[Skeleton] | Skeleton, meshes: list[trimesh.Trimesh] | trimesh.Trimesh,
            include_soma:bool=False, 
            scale: float = 1.0,
-           box: 'Bbox | list[float] | None' = None # bounding box in [x0, y0, z0, x1, y1, z1] format
+           box: Bbox | list[float] | None = None, # bounding box in [x0, y0, z0, x1, y1, z1] format
 ):
     """
     Visualise a list of skeletons and meshes in 3D using microviewer>=1.16.0.
