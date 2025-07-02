@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "skeliner"
-version = "0.1.7"
+version = "0.1.8"
 description = "A lightweight neuromorphological mesh skeletonizer."
 authors = []
 requires-python = ">=3.10.0"
@@ -12,9 +12,7 @@ dependencies = [
     "igraph>=0.11.8",
     "numpy>=2.0.2",
     "scipy>=1.13.1",
-    "trimesh>=4.6.9",
-    "python-openctm>=1.0.12; python_version < '3.12'",
-    "openctm>=0.0.6; python_version >= '3.12'",
+    "trimesh>=4.6.13",
     "matplotlib>=3.10.3",
 ]
 license = "GPL-3.0-or-later"

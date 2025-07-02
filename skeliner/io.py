@@ -4,14 +4,12 @@ from pathlib import Path
 from typing import Iterable, List
 
 import numpy as np
-import openctm
 import trimesh
 
 from .core import Skeleton, Soma, _bfs_parents
 
 __all__ = [
     "load_mesh",
-    "to_ctm",
     "load_swc",
     "to_swc",
     "load_npz",
@@ -21,7 +19,7 @@ __all__ = [
 _META_KV   = re.compile(r"#\s*([^:]+)\s*:\s*(.+)")         #  key: value
 _META_JSON = re.compile(r"#\s*meta\s+(\{.*\})")   #  single-line JSON
 
-
+ 
 # ------------
 # --- Mesh ---
 # ------------
@@ -29,32 +27,23 @@ _META_JSON = re.compile(r"#\s*meta\s+(\{.*\})")   #  single-line JSON
 def load_mesh(filepath: str | Path) -> trimesh.Trimesh:
 
     filepath = Path(filepath)
-
-    if filepath.suffix == ".ctm":
-        try:
-            mesh = openctm.import_mesh(filepath)
-            mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, process=False)
-        except AttributeError:
-            # trimesh should work out-of-box for py>=3.12 on non-intel mac 
-            mesh = trimesh.load_mesh(filepath, process=False)
-    else:
-        mesh = trimesh.load_mesh(filepath, process=False)
+    if filepath.suffix.lower() == ".ctm":
+        print(
+            "CTM file detected.  skeliner no longer bundles explicit OpenCTM "
+            "support.  Loading will fall back to trimesh’s limited reader.\n"
+            "Full read/write support is still possible on compatible setups:\n"
+            "  • Python ≤ 3.11, x86-64  →  pip install python-openctm\n"
+            "Then load manually:\n"
+            "    import openctm, trimesh\n"
+            "    mesh = openctm.import_mesh(filepath)\n"
+            "    mesh = trimesh.Trimesh(vertices=mesh.vertices,\n"
+            "                            faces=mesh.faces,\n"
+            "                            process=False)\n"
+        )
+        
+    mesh = trimesh.load_mesh(filepath, process=False)
 
     return mesh
-
-def to_ctm(mesh: trimesh.Trimesh, path: str | Path) -> None:
-    path = Path(path)
-    if path.suffix.lower() != ".ctm":
-        mesh.export(path, file_type=path.suffix.lstrip("."))
-        raise ValueError(
-            f"Expected a .ctm file, got {path.suffix}. "
-        )
-
-    verts  = mesh.vertices.astype(np.float32, copy=False)
-    faces  = mesh.faces.astype(np.uint32,  copy=False)
-
-    ctm_mesh = openctm.CTM(verts, faces, None)
-    openctm.export_mesh(ctm_mesh, path)
 
 # -----------
 # --- SWC ---
