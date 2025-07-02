@@ -36,7 +36,7 @@ def _assert_skeleton_valid(skel):
 @pytest.fixture(scope="session")
 def reference_mesh():
     data_dir = Path(__file__).parent / "data"
-    mesh_path = data_dir / "60427.ctm"
+    mesh_path = data_dir / "60427.obj"
     return load_mesh(mesh_path)
 
 

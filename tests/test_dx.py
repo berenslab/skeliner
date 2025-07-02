@@ -21,7 +21,7 @@ from skeliner.io import load_mesh
 # ---------------------------------------------------------------------
 @pytest.fixture(scope="session")
 def skel():
-    mesh = load_mesh(Path(__file__).parent / "data" / "60427.ctm")
+    mesh = load_mesh(Path(__file__).parent / "data" / "60427.obj")
     return skeletonize(mesh, verbose=False)
 
 
