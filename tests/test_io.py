@@ -1,7 +1,7 @@
 """
 IO round-trip smoke tests.
 
-* load `.ctm`
+* load `.obj`
 * run skeletonize
 * save to SWC & NPZ
 * reload and compare a few coarse features
@@ -22,7 +22,7 @@ SAMPLE_SWCS = [
 
 @pytest.fixture(scope="session")
 def reference_mesh():
-    mesh_path = SAMPLES_DIR / "60427.ctm"
+    mesh_path = SAMPLES_DIR / "60427.obj"
     return load_mesh(mesh_path)
 
 
