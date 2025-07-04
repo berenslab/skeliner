@@ -1086,21 +1086,37 @@ def trimesh_to_zmesh(tm, segid: int | None = None, scale: float = 1.0):
 def view3d(skels: list[Skeleton] | Skeleton, meshes: list[trimesh.Trimesh] | trimesh.Trimesh,
            include_soma:bool=False, 
            scale: float | tuple | list = 1.0,
-           box: "Bbox | list[float] | None" = None, # noqa: F821 
-                # bounding box in [x0, y0, z0, x1, y1, z1] format
+           box: "Bbox | list[float] | None" = None,  # noqa: F821 # type: ignore
+           mesh_color: str | Sequence = "diff",  # "diff" or "same"
 ):
     """
     Visualise a list of skeletons and meshes in 3D using microviewer>=1.16.0.
-    
+
+    Parameters
+    ----------
+    skels : list[Skeleton] | Skeleton
+        A list of Skeleton objects or a single Skeleton object.
+    meshes : list[trimesh.Trimesh] | trimesh.Trimesh
+        A list of trimesh.Trimesh objects or a single trimesh.Trimesh object
+    include_soma : bool, optional
+        If True, include the skeleton soma in the visualization. Default is False.
+    scale : float | tuple[float, float] | list[float], optional
+        The scale factor(s) to apply to the skeletons and meshes. Default is 1.0.
+    box : Bbox | list[float] | None, optional
+        The bounding box ( [x0, y0, z0, x1, y1, z1])to use for the visualization. If None, it will be computed from the
+        vertices of the meshes. Default is None.
+    mesh_color : str, optional
+        The color scheme for the meshes. If "diff", each mesh will have a different color
     Examples
     --------
     import skeliner as sk
+    import matplotlib.cm as cm
 
     name = [720575940550605504, 720575940573924400]
     meshes = [sk.io.load_mesh(f"../temp_io/{n}.ctm") for n in name]
     skels = [sk.io.load_npz(f"../temp_io/{n}.npz") for n in name]
 
-    sk.view3d(skels, meshes, scale=1e-3)
+    sk.view3d(skels, meshes, scale=1e-3, mesh_color=cm.tab20.colors)
     """
 
     try:
@@ -1148,4 +1164,4 @@ def view3d(skels: list[Skeleton] | Skeleton, meshes: list[trimesh.Trimesh] | tri
         else:
             raise ValueError("Invalid bounding box format. Expected [x0, y0, z0, x1, y1, z1].")
 
-    objects([box, *zm_meshes, *ost_skels])
+    objects([box, *zm_meshes, *ost_skels], mesh_color=mesh_color)
