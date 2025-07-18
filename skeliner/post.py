@@ -315,10 +315,8 @@ def _find_soma(
     )
     return soma_est, soma_idx, has_soma
 
-# ----------------------------------------------------------------------------- 
-#  PUBLIC: detect_soma
-# -----------------------------------------------------------------------------
-def detect_soma(               # noqa: C901  (a bit long but self-contained)
+
+def detect_soma(          
     skel,
     *,
     radius_key: str = "median",
@@ -356,7 +354,7 @@ def detect_soma(               # noqa: C901  (a bit long but self-contained)
         *Either* the original instance (no change was necessary) *or* a new
         skeleton whose node 0 is the freshly detected soma centroid.
     """
-    from .core import Skeleton, Soma
+    from .core import Skeleton, Soma, _build_mst
     if radius_key not in skel.radii:
         raise KeyError(
             f"radius_key '{radius_key}' not found in skel.radii "
@@ -523,7 +521,7 @@ def detect_soma(               # noqa: C901  (a bit long but self-contained)
         soma=soma_new,
         nodes=nodes,
         radii=radii,
-        edges=edges,
+        edges=_build_mst(nodes, edges),
         ntype=ntype,
         node2verts=node2verts,
         vert2node=vert2node,
