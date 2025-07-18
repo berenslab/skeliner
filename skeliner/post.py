@@ -322,11 +322,10 @@ def detect_soma(               # noqa: C901  (a bit long but self-contained)
     skel,
     *,
     radius_key: str = "median",
-    pct_large: float = 99.9,
-    dist_factor: float = 4.0,
-    min_keep: int = 3,
-    merge: bool = True,
-    verbose: bool = False,
+    soma_radius_percentile_threshold: float = 99.9,
+    soma_radius_distance_factor: float = 4.0,
+    soma_min_nodes: int = 3,
+    verbose: bool = True,
 ):
     """
     Post-hoc soma detection **on an existing Skeleton**.
@@ -374,9 +373,9 @@ def detect_soma(               # noqa: C901  (a bit long but self-contained)
     # ------------------------------------------------------------------
     soma_est, soma_idx, has_soma = _find_soma(
         skel.nodes, skel.radii[radius_key],
-        pct_large=pct_large,
-        dist_factor=dist_factor,
-        min_keep=min_keep,
+        pct_large=soma_radius_percentile_threshold,
+        dist_factor=soma_radius_distance_factor,
+        min_keep=soma_min_nodes,
     )
 
     # Already fine?
@@ -404,7 +403,7 @@ def detect_soma(               # noqa: C901  (a bit long but self-contained)
     # ------------------------------------------------------------------ 
     # C. **collapse** of multiple soma nodes
     # ------------------------------------------------------------------
-    if merge and drop_nodes:
+    if drop_nodes:
         #
         # 1. move geometric centre to the keeper (new_root_old)
         #
@@ -514,7 +513,7 @@ def detect_soma(               # noqa: C901  (a bit long but self-contained)
     if verbose:
         centre_txt = ", ".join(f"{c:7.1f}" for c in nodes[0])
         merged = len(drop_nodes)
-        what = f"merged {merged} node{'s' if merged != 1 else ''}" if merge else "re-rooted"
+        what = f"merged {merged} node{'s' if merged != 1 else ''}"
         print(f"[skeliner] detect_soma – {what} → soma @ [{centre_txt}], r ≈ {r0:.1f}")
 
     # ------------------------------------------------------------------ 
@@ -531,5 +530,7 @@ def detect_soma(               # noqa: C901  (a bit long but self-contained)
         meta={**skel.meta},       # shallow copies are fine
         extra={**skel.extra},
     )
+
+    new_skel.prune(num_nodes=1)  # remove any remaining twigs
     return new_skel
 
