@@ -47,6 +47,7 @@ def find_contacts(
     *,
     delta: float = 0.0,
     radius_key: str | None = None,
+    exclude_soma: bool = True, 
 ) -> "ContactSet":
     """
     1) Filter (optional) soma / near-soma nodes.
@@ -60,6 +61,9 @@ def find_contacts(
     xa = np.asarray(A.nodes, float)
     xb = np.asarray(B.nodes, float)
 
+    if len(xa) == 0 or len(xb) == 0:
+        raise ValueError(f"Empty skeletons (len(A)={len(xa)}, len(B)={len(xb)})")
+
     key = radius_key or A.recommend_radius()[0]
     ra = np.asarray(A.radii[key], float)
     rb = np.asarray(B.radii[key], float)
@@ -67,14 +71,12 @@ def find_contacts(
     # --- optional soma filtering
     mask_a = np.ones(len(xa), bool)
     mask_b = np.ones(len(xb), bool)
-    mask_a[0] = False
-    mask_b[0] = False
+    if exclude_soma:
+        mask_a[0] = False
+        mask_b[0] = False
 
     idx_a0 = np.where(mask_a)[0]
     idx_b0 = np.where(mask_b)[0]
-    if idx_a0.size == 0 or idx_b0.size == 0:
-        return _empty_contactset(A.meta.get("unit"), key, delta)
-
     XA, RA = xa[idx_a0], ra[idx_a0]
     XB, RB = xb[idx_b0], rb[idx_b0]
 
@@ -172,5 +174,6 @@ def find_contacts(
         meta={"unit": A.meta.get("unit"),
               "delta": float(delta),
               "radius_key": key,
+              "exclude_soma": exclude_soma,
         }
     )
