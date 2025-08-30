@@ -12,7 +12,7 @@ dependencies = [
     "igraph>=0.11.8",
     "numpy>=2.0.2",
     "scipy>=1.13.1",
-    "trimesh>=4.6.13",
+    "trimesh==4.7.4",
     "matplotlib>=3.10.3",
     "rtree>=1.4.1",
 ]
