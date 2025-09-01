@@ -220,7 +220,7 @@ def _cap_area_and_chord_radius(r, cos_th):
     a = r * np.sqrt(np.maximum(0.0, 1.0 - cos_th*cos_th))
     return area, a
 
-def approximate_sites_from_seeds(
+def approximate_contact_sites(
     A: "Skeleton",
     B: "Skeleton",
     seeds: "ContactSeeds",
