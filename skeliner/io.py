@@ -16,16 +16,16 @@ __all__ = [
     "to_npz",
 ]
 
-_META_KV   = re.compile(r"#\s*([^:]+)\s*:\s*(.+)")         #  key: value
-_META_JSON = re.compile(r"#\s*meta\s+(\{.*\})")   #  single-line JSON
+_META_KV = re.compile(r"#\s*([^:]+)\s*:\s*(.+)")  #  key: value
+_META_JSON = re.compile(r"#\s*meta\s+(\{.*\})")  #  single-line JSON
 
- 
+
 # ------------
 # --- Mesh ---
 # ------------
 
-def load_mesh(filepath: str | Path) -> trimesh.Trimesh:
 
+def load_mesh(filepath: str | Path) -> trimesh.Trimesh:
     filepath = Path(filepath)
     if filepath.suffix.lower() == ".ctm":
         print(
@@ -40,14 +40,16 @@ def load_mesh(filepath: str | Path) -> trimesh.Trimesh:
             "                            faces=mesh.faces,\n"
             "                            process=False)\n"
         )
-        
+
     mesh = trimesh.load_mesh(filepath, process=False)
 
     return mesh
 
+
 # -----------
 # --- SWC ---
 # -----------
+
 
 def load_swc(
     path: str | Path,
@@ -84,17 +86,16 @@ def load_swc(
     """
     path = Path(path)
 
-    ids: List[int]     = []
+    ids: List[int] = []
     xyz: List[List[float]] = []
     radii: List[float] = []
-    parent: List[int]  = []
+    parent: List[int] = []
     ntype: List[int] = []
 
     meta = {}
 
     with path.open("r", encoding="utf8") as fh:
         for line in fh:
-
             # ------- 1) try single-line JSON -------------------------
             j = _META_JSON.match(line)
             if j:
@@ -129,9 +130,9 @@ def load_swc(
         raise ValueError(f"No usable nodes found in {path}")
 
     # --- core arrays ----------------------------------------------------
-    nodes_arr  = np.asarray(xyz, dtype=np.float64) * scale
-    radii_arr  = np.asarray(radii, dtype=np.float64) * scale
-    radii_dict = {"median": radii_arr, "mean": radii_arr, "trim": radii_arr} 
+    nodes_arr = np.asarray(xyz, dtype=np.float64) * scale
+    radii_arr = np.asarray(radii, dtype=np.float64) * scale
+    radii_dict = {"median": radii_arr, "mean": radii_arr, "trim": radii_arr}
     ntype_arr = np.asarray(ntype, dtype=np.int8)
     # --- edges (parent IDs → 0-based indices) ---------------------------
     id_map = {old: new for new, old in enumerate(ids)}
@@ -159,13 +160,15 @@ def load_swc(
         meta=meta,
     )
 
-def to_swc(skeleton, 
-            path: str | Path,
-            include_header: bool = True, 
-            include_meta: bool = True,          
-            scale: float = 1.0,
-            radius_metric: str | None = None,
-            axis_order: tuple[int, int, int] | str = (0, 1, 2)
+
+def to_swc(
+    skeleton,
+    path: str | Path,
+    include_header: bool = True,
+    include_meta: bool = True,
+    scale: float = 1.0,
+    radius_metric: str | None = None,
+    axis_order: tuple[int, int, int] | str = (0, 1, 2),
 ) -> None:
     """Write the skeleton to SWC.
 
@@ -182,8 +185,8 @@ def to_swc(skeleton,
     scale
         Unit conversion factor applied to *both* coordinates and radii when
         writing; useful e.g. for nm→µm conversion.
-    """        
-    
+    """
+
     # --- normalise axis_order ------------------------------------------
     if isinstance(axis_order, str):
         axis_map = {"x": 0, "y": 1, "z": 2}
@@ -219,7 +222,7 @@ def to_swc(skeleton,
         ntype = np.full(len(nodes), 3, dtype=int)
         if len(ntype):
             ntype[0] = 1
-    
+
     # --- write SWC file -----------------------------------------------
     with path.open("w", encoding="utf8") as fh:
         if include_meta and skeleton.meta:
@@ -238,9 +241,11 @@ def to_swc(skeleton,
                 f"{(pa + 1) if pa != -1 else -1}\n"
             )
 
+
 # -----------
 # --- npz ---
 # -----------
+
 
 def load_npz(path: str | Path) -> Skeleton:
     """
@@ -249,13 +254,11 @@ def load_npz(path: str | Path) -> Skeleton:
     path = Path(path)
 
     with np.load(path, allow_pickle=True) as z:
-        nodes  = z["nodes"].astype(np.float64)
-        edges  = z["edges"].astype(np.int64)
+        nodes = z["nodes"].astype(np.float64)
+        edges = z["edges"].astype(np.int64)
 
         # radii dict  (keys start with 'r_')
-        radii = {
-            k[2:]: z[k].astype(np.float64) for k in z.files if k.startswith("r_")
-        }
+        radii = {k[2:]: z[k].astype(np.float64) for k in z.files if k.startswith("r_")}
 
         # node types (optional in older archives)
         if "ntype" in z:
@@ -268,7 +271,7 @@ def load_npz(path: str | Path) -> Skeleton:
         # reconstruct ragged node2verts
         idx = z["node2verts_idx"].astype(np.int64)
         off = z["node2verts_off"].astype(np.int64)
-        node2verts = [idx[off[i]:off[i+1]] for i in range(len(off)-1)]
+        node2verts = [idx[off[i] : off[i + 1]] for i in range(len(off) - 1)]
 
         vert2node = {int(v): i for i, vs in enumerate(node2verts) for v in vs}
 
@@ -276,14 +279,12 @@ def load_npz(path: str | Path) -> Skeleton:
             center=z["soma_centre"],
             axes=z["soma_axes"],
             R=z["soma_R"],
-            verts=(
-                z["soma_verts"].astype(np.int64) if "soma_verts" in z else None
-            ),
+            verts=(z["soma_verts"].astype(np.int64) if "soma_verts" in z else None),
         )
 
         # ----------- NEW: arbitrary, user-defined metadata ---------------
         extra = {}
-        if "extra" in z.files:                 
+        if "extra" in z.files:
             # stored as length-1 object array; .item() unwraps the dict
             extra = z["extra"].item()
 
@@ -292,8 +293,18 @@ def load_npz(path: str | Path) -> Skeleton:
             # stored as length-1 object array; .item() unwraps the dict
             meta = z["meta"].item()
 
-    return Skeleton(nodes=nodes, radii=radii, edges=edges, ntype=ntype, soma=soma,
-                    node2verts=node2verts, vert2node=vert2node, extra=extra, meta=meta)
+    return Skeleton(
+        nodes=nodes,
+        radii=radii,
+        edges=edges,
+        ntype=ntype,
+        soma=soma,
+        node2verts=node2verts,
+        vert2node=vert2node,
+        extra=extra,
+        meta=meta,
+    )
+
 
 def to_npz(skeleton: Skeleton, path: str | Path, *, compress: bool = True) -> None:
     """
@@ -325,14 +336,18 @@ def to_npz(skeleton: Skeleton, path: str | Path, *, compress: bool = True) -> No
     meta = {"meta": np.array(skeleton.meta, dtype=object)} if skeleton.meta else {}
 
     np.savez(
-        path, 
+        path,
         nodes=skeleton.nodes,
         edges=skeleton.edges,
-        ntype=skeleton.ntype if skeleton.ntype is not None else np.array([], dtype=np.int8),
+        ntype=skeleton.ntype
+        if skeleton.ntype is not None
+        else np.array([], dtype=np.int8),
         soma_centre=skeleton.nodes[0],
         soma_axes=skeleton.soma.axes,
         soma_R=skeleton.soma.R,
-        soma_verts=skeleton.soma.verts if skeleton.soma.verts is not None else np.array([], dtype=np.int64),
+        soma_verts=skeleton.soma.verts
+        if skeleton.soma.verts is not None
+        else np.array([], dtype=np.int64),
         node2verts_idx=n2v_idx,
         node2verts_off=n2v_off,
         **radii_flat,
@@ -340,3 +355,141 @@ def to_npz(skeleton: Skeleton, path: str | Path, *, compress: bool = True) -> No
         **meta,
         **c,
     )
+
+
+# --------------------------
+# --- Mesh Contact Sites ---
+# --------------------------
+
+# --- shared helpers (feel free to move to serde.py if you prefer) -----
+
+
+def _json_encode_meta(meta: dict) -> np.ndarray:
+    import json
+
+    def default(o):
+        if isinstance(o, (np.floating, np.integer)):
+            return o.item()
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        return str(o)
+
+    return np.array(json.dumps(meta, default=default, sort_keys=True), dtype="U")
+
+
+def _json_decode_meta(meta_json: np.ndarray) -> dict:
+    import json
+
+    s = meta_json.item() if isinstance(meta_json, np.ndarray) else str(meta_json)
+    try:
+        return json.loads(s)
+    except Exception:
+        return {"_raw": s}
+
+
+def _pack_ragged_1d(
+    arrs: list[np.ndarray], dtype=np.int64
+) -> tuple[np.ndarray, np.ndarray]:
+    if not arrs:
+        return np.empty(0, dtype), np.zeros(1, np.int64)
+    lengths = np.fromiter((len(a) for a in arrs), np.int64, count=len(arrs))
+    ptr = np.concatenate(([0], np.cumsum(lengths)))
+    data = np.concatenate(arrs) if ptr[-1] else np.empty(0, dtype)
+    return data.astype(dtype, copy=False), ptr
+
+
+def _unpack_ragged_1d(data: np.ndarray, ptr: np.ndarray) -> list[np.ndarray]:
+    return [data[ptr[i] : ptr[i + 1]] for i in range(len(ptr) - 1)]
+
+
+def _pack_ragged_2d_fixed(
+    arrs: list[np.ndarray], width: int, dtype=np.float64
+) -> tuple[np.ndarray, np.ndarray]:
+    if not arrs:
+        return np.empty((0, width), dtype), np.zeros(1, np.int64)
+    rows = np.fromiter((a.shape[0] for a in arrs), np.int64, count=len(arrs))
+    ptr = np.concatenate(([0], np.cumsum(rows)))
+    stacked = np.vstack(arrs) if ptr[-1] else np.empty((0, width), dtype)
+    return stacked.astype(dtype, copy=False), ptr
+
+
+def _unpack_ragged_2d_fixed(stacked: np.ndarray, ptr: np.ndarray) -> list[np.ndarray]:
+    return [stacked[ptr[i] : ptr[i + 1], :] for i in range(len(ptr) - 1)]
+
+
+# --- public API for ContactSitesResult ---------------------------------
+
+
+def save_contact_sites_npz(res, path: str | Path, *, compress: bool = True) -> None:
+    """
+    Serialize ContactSitesResult to a pickle-free NPZ:
+      - faces_* and pairs_AB are ragged → packed as (data, ptr)
+      - meta is JSON string in 'meta_json'
+      - schema tag in '_schema'
+    """
+    path = Path(path)
+    if not path.suffix:
+        path = path.with_suffix(".npz")
+
+    # Ragged lists
+    fa_data, fa_ptr = _pack_ragged_1d(res.faces_A, dtype=np.int64)
+    fb_data, fb_ptr = _pack_ragged_1d(res.faces_B, dtype=np.int64)
+    if res.pairs_AB is None:
+        pairs_flag = np.array(0, np.uint8)
+        pab_data = np.empty((0, 3), np.float64)
+        pab_ptr = np.zeros(1, np.int64)
+    else:
+        pairs_flag = np.array(1, np.uint8)
+        pab_data, pab_ptr = _pack_ragged_2d_fixed(
+            res.pairs_AB, width=3, dtype=np.float64
+        )
+
+    payload = dict(
+        faces_A_data=fa_data,
+        faces_A_ptr=fa_ptr,
+        faces_B_data=fb_data,
+        faces_B_ptr=fb_ptr,
+        pairs_flag=pairs_flag,
+        pairs_AB_data=pab_data,
+        pairs_AB_ptr=pab_ptr,
+        area_A=np.asarray(res.area_A, np.float64),
+        area_B=np.asarray(res.area_B, np.float64),
+        area_mean=np.asarray(res.area_mean, np.float64),
+        seeds_A=np.asarray(res.seeds_A, np.float64),
+        seeds_B=np.asarray(res.seeds_B, np.float64),
+        meta_json=_json_encode_meta(res.meta),
+        _schema=np.array("ContactSitesResult@1", dtype="U"),
+    )
+    if compress:
+        np.savez_compressed(path, **payload)
+    else:
+        np.savez(path, **payload)
+
+
+def load_contact_sites_npz(path: str | Path):
+    """
+    Read a ContactSitesResult written by save_contact_sites_npz.
+    Returns a ContactSitesResult instance.
+    """
+    from .pair import ContactSitesResult  # local import avoids cycles
+
+    path = Path(path)
+    with np.load(path, allow_pickle=False) as z:
+        faces_A = _unpack_ragged_1d(z["faces_A_data"], z["faces_A_ptr"])
+        faces_B = _unpack_ragged_1d(z["faces_B_data"], z["faces_B_ptr"])
+        if "pairs_flag" in z and int(z["pairs_flag"]) == 1:
+            pairs_AB = _unpack_ragged_2d_fixed(z["pairs_AB_data"], z["pairs_AB_ptr"])
+        else:
+            pairs_AB = None
+
+        return ContactSitesResult(
+            faces_A=faces_A,
+            faces_B=faces_B,
+            area_A=z["area_A"].astype(np.float64, copy=False),
+            area_B=z["area_B"].astype(np.float64, copy=False),
+            area_mean=z["area_mean"].astype(np.float64, copy=False),
+            seeds_A=z["seeds_A"].astype(np.float64, copy=False),
+            seeds_B=z["seeds_B"].astype(np.float64, copy=False),
+            pairs_AB=pairs_AB,
+            meta=_json_decode_meta(z["meta_json"]),
+        )

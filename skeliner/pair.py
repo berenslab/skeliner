@@ -1,6 +1,7 @@
 """skeliner.pair – pairwise contact detection between two skeletons and meshes."""
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 
 import numpy as np
@@ -640,6 +641,12 @@ class ContactSitesResult:
     seeds_B: np.ndarray  # projected seed on B
     pairs_AB: list[np.ndarray] | None
     meta: dict[str, object]
+
+    def to_npz(self, path: str | Path, *, compress: bool = True) -> None:
+        # Lazy import to avoid module-level circular imports
+        from .io import save_contact_sites_npz
+
+        save_contact_sites_npz(self, path, compress=compress)
 
 
 # ------------------------ fast extractor --------------------------------
