@@ -29,10 +29,7 @@ dev = [
     "watermark>=2.5.0",
 ]
 3d = [
-    "microviewer>=1.17.0",
-    "osteoid>=0.3.2",
     "vtk>=9.4.2",
-    "zmesh>=1.8.0",
 ]
 
 [tool.setuptools]

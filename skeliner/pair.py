@@ -1,5 +1,5 @@
-"""skeliner.pair – pairwise contact detection between two skeletons and meshes.
-"""
+"""skeliner.pair – pairwise contact detection between two skeletons and meshes."""
+
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -15,6 +15,7 @@ from .core import Skeleton
 
 # --- contact seeds ---
 
+
 @dataclass(slots=True)
 class ContactSeeds:
     """
@@ -25,11 +26,12 @@ class ContactSeeds:
     center_gap  : (K,) float64   ||xa-xb|| - (ra+rb).
     meta        : dict           Aux info.
     """
+
     idx_a: np.ndarray
     idx_b: np.ndarray
     pos_a: np.ndarray
     pos_b: np.ndarray
-    pos:   np.ndarray
+    pos: np.ndarray
     center_gap: np.ndarray | None
     meta: dict[str, object]
 
@@ -37,18 +39,31 @@ class ContactSeeds:
     def n(self) -> int:
         return int(len(self.idx_a))
 
+
 # --- helpers -----------------------------------------------------------
+
 
 def _empty_contactset(unit: str | None, key: str, delta: float) -> ContactSeeds:
     z0 = np.zeros(0, np.int64)
     z3 = np.zeros((0, 3), np.float64)
     return ContactSeeds(
-        idx_a=z0, idx_b=z0, pos_a=z3, pos_b=z3, pos=z3,
+        idx_a=z0,
+        idx_b=z0,
+        pos_a=z3,
+        pos_b=z3,
+        pos=z3,
         center_gap=np.zeros(0, np.float64),
-        meta={"unit": unit, "delta": float(delta), "radius_key": key, "engine": "kdtree"}
+        meta={
+            "unit": unit,
+            "delta": float(delta),
+            "radius_key": key,
+            "engine": "kdtree",
+        },
     )
 
+
 # --- core: simple, robust node↔node contacts via KD-tree ---------------
+
 
 def find_contact_seeds(
     A: "Skeleton",
@@ -56,7 +71,7 @@ def find_contact_seeds(
     *,
     delta: float = 0.0,
     radius_key: str | None = None,
-    exclude_soma: bool = True, 
+    exclude_soma: bool = True,
 ) -> "ContactSeeds":
     """
     1) Filter (optional) soma / near-soma nodes.
@@ -110,7 +125,7 @@ def find_contact_seeds(
     # --- KD-tree superset search
     tree = KDTree(XB)
     rb_margin = float(RB.max())  # safe, tight-ish
-    radii_superset = RA + rb_margin + float(delta)    # per-A query radius
+    radii_superset = RA + rb_margin + float(delta)  # per-A query radius
 
     # query_ball_point supports vector radii when x is an array
     nbrs = tree.query_ball_point(XA, radii_superset)
@@ -130,8 +145,8 @@ def find_contact_seeds(
     RBj = RB[jj]
 
     # squared distances for stability
-    d2 = np.einsum('ij,ij->i', Ai - Bj, Ai - Bj)
-    thresh = (RAi + RBj + float(delta))**2
+    d2 = np.einsum("ij,ij->i", Ai - Bj, Ai - Bj)
+    thresh = (RAi + RBj + float(delta)) ** 2
     keep = d2 <= thresh
     if not keep.any():
         return _empty_contactset(A.meta.get("unit"), key, delta)
@@ -177,69 +192,84 @@ def find_contact_seeds(
     gap = d - (ra_sel + rb_sel)
 
     return ContactSeeds(
-        idx_a=ia, idx_b=ib,
-        pos_a=pa, pos_b=pb, pos=pos,
+        idx_a=ia,
+        idx_b=ib,
+        pos_a=pa,
+        pos_b=pb,
+        pos=pos,
         center_gap=gap.astype(np.float64),
-        meta={"unit": A.meta.get("unit"),
-              "delta": float(delta),
-              "radius_key": key,
-              "exclude_soma": exclude_soma,
-        }
-    ) 
+        meta={
+            "unit": A.meta.get("unit"),
+            "delta": float(delta),
+            "radius_key": key,
+            "exclude_soma": exclude_soma,
+        },
+    )
 
 
 # --- approximate contact sites purely based on skeleton
 
+
 @dataclass(slots=True)
 class ProxySites:
     seed_groups: list[np.ndarray]
-    center: np.ndarray              # (M,3) mean of seed midpoints (µm)
-    area_A: np.ndarray              # (M,) in chosen unit
-    area_B: np.ndarray              # (M,) in chosen unit
+    center: np.ndarray  # (M,3) mean of seed midpoints (µm)
+    area_A: np.ndarray  # (M,) in chosen unit
+    area_B: np.ndarray  # (M,) in chosen unit
     area_mean: np.ndarray
-    seed_to_site: np.ndarray        # (K,)
+    seed_to_site: np.ndarray  # (K,)
     meta: dict
+
 
 def _pairwise_dists(X: np.ndarray) -> np.ndarray:
     # stable ||xi-xj|| without pdist
     G = X @ X.T
-    n = np.einsum('ii->i', G)
-    D2 = (n[:,None] + n[None,:] - 2*G)
+    n = np.einsum("ii->i", G)
+    D2 = n[:, None] + n[None, :] - 2 * G
     np.maximum(D2, 0.0, out=D2)
     D = np.sqrt(D2, dtype=float)
     np.fill_diagonal(D, 0.0)
     return D
 
+
 def _cap_cos_theta(d, r, r_other_plus_tol):
-    num = d*d + r*r - r_other_plus_tol*r_other_plus_tol
+    num = d * d + r * r - r_other_plus_tol * r_other_plus_tol
     den = 2.0 * np.maximum(d * r, 1e-12)
-    return np.clip(num/den, -1.0, 1.0)
+    return np.clip(num / den, -1.0, 1.0)
+
 
 def _cap_area_and_chord_radius(r, cos_th):
-    area = 2.0 * np.pi * r*r * (1.0 - cos_th)
-    a = r * np.sqrt(np.maximum(0.0, 1.0 - cos_th*cos_th))
+    area = 2.0 * np.pi * r * r * (1.0 - cos_th)
+    a = r * np.sqrt(np.maximum(0.0, 1.0 - cos_th * cos_th))
     return area, a
+
 
 def approximate_contact_sites(
     A: "Skeleton",
     B: "Skeleton",
     seeds: "ContactSeeds",
     *,
-    tol_nm: float = 60.0,              # match your mesh tol if you have it
+    tol_nm: float = 60.0,  # match your mesh tol if you have it
     radius_key: str | None = None,
-    gamma_mid: float = 2.0,            # looseness for midpoint discs
-    gamma_side: float = 2.0,           # looseness for pos_a/pos_b discs
-    beta_node: float = 0.35,           # node-scale floor fraction
-    eps_floor_um: float = 0.08,        # absolute floor (~80 nm)
+    gamma_mid: float = 2.0,  # looseness for midpoint discs
+    gamma_side: float = 2.0,  # looseness for pos_a/pos_b discs
+    beta_node: float = 0.35,  # node-scale floor fraction
+    eps_floor_um: float = 0.08,  # absolute floor (~80 nm)
     theta_max_deg: float | None = None,  # set e.g. 60 for orientation gating
-    require_shared_node: str = "none", # "none" | "a" | "b" | "either"
+    require_shared_node: str = "none",  # "none" | "a" | "b" | "either"
     area_unit: str = "um^2",
 ) -> ProxySites:
     K = len(seeds.idx_a)
     if K == 0:
-        return ProxySites([], np.empty((0,3), float),
-                          np.zeros(0), np.zeros(0), np.zeros(0),
-                          -np.ones(0, np.int64), dict(K_seeds=0))
+        return ProxySites(
+            [],
+            np.empty((0, 3), float),
+            np.zeros(0),
+            np.zeros(0),
+            np.zeros(0),
+            -np.ones(0, np.int64),
+            dict(K_seeds=0),
+        )
 
     key = radius_key or seeds.meta.get("radius_key") or A.recommend_radius()[0]
     ia = np.asarray(seeds.idx_a, np.int64)
@@ -250,9 +280,9 @@ def approximate_contact_sites(
     rb = rb_all[ib]
 
     # seed geometry (µm)
-    Pm = np.asarray(seeds.pos, float)     # midpoints
-    Pa = np.asarray(seeds.pos_a, float)   # on sphere A
-    Pb = np.asarray(seeds.pos_b, float)   # on sphere B
+    Pm = np.asarray(seeds.pos, float)  # midpoints
+    Pa = np.asarray(seeds.pos_a, float)  # on sphere A
+    Pb = np.asarray(seeds.pos_b, float)  # on sphere B
     gap = np.asarray(seeds.center_gap, float)
     d = np.maximum(ra + rb + gap, 0.0)
 
@@ -275,17 +305,17 @@ def approximate_contact_sites(
     # --- merge radii (adaptive, never collapses) ---
     node_floorA = beta_node * ra
     node_floorB = beta_node * rb
-    R_mid = gamma_mid * (0.5*(aA + aB) + t_um)
+    R_mid = gamma_mid * (0.5 * (aA + aB) + t_um)
     R_mid = np.maximum(R_mid, np.maximum(node_floorA, node_floorB))
     R_mid = np.maximum(R_mid, eps_floor_um)
 
-    R_A   = gamma_side * (aA + t_um)
-    R_A   = np.maximum(R_A, node_floorA)
-    R_A   = np.maximum(R_A, eps_floor_um)
+    R_A = gamma_side * (aA + t_um)
+    R_A = np.maximum(R_A, node_floorA)
+    R_A = np.maximum(R_A, eps_floor_um)
 
-    R_B   = gamma_side * (aB + t_um)
-    R_B   = np.maximum(R_B, node_floorB)
-    R_B   = np.maximum(R_B, eps_floor_um)
+    R_B = gamma_side * (aB + t_um)
+    R_B = np.maximum(R_B, node_floorB)
+    R_B = np.maximum(R_B, eps_floor_um)
 
     # distances
     Dm = _pairwise_dists(Pm)
@@ -294,8 +324,8 @@ def approximate_contact_sites(
 
     # disc-overlap on any of the three spaces
     M_mid = Dm <= (R_mid[:, None] + R_mid[None, :])
-    M_a   = Da <= (R_A[:, None]   + R_A[None, :])
-    M_b   = Db <= (R_B[:, None]   + R_B[None, :])
+    M_a = Da <= (R_A[:, None] + R_A[None, :])
+    M_b = Db <= (R_B[:, None] + R_B[None, :])
     M_any = M_mid | M_a | M_b
     np.fill_diagonal(M_any, False)
 
@@ -306,39 +336,41 @@ def approximate_contact_sites(
         cb = np.asarray(B.nodes, float)[ib]
         v = cb - ca
         v /= np.linalg.norm(v, axis=1, keepdims=True) + 1e-12
-        C = v @ v.T                         # cosine matrix
+        C = v @ v.T  # cosine matrix
         C_ok = C >= np.cos(np.deg2rad(theta_max_deg))
         np.fill_diagonal(C_ok, False)
         M_any &= C_ok
 
     # optional node-sharing gating
     if require_shared_node != "none":
-        shareA = (ia[:, None] == ia[None, :])
-        shareB = (ib[:, None] == ib[None, :])
+        shareA = ia[:, None] == ia[None, :]
+        shareB = ib[:, None] == ib[None, :]
         if require_shared_node == "a":
             M_any &= shareA
         elif require_shared_node == "b":
             M_any &= shareB
         else:  # "either"
-            M_any &= (shareA | shareB)
+            M_any &= shareA | shareB
 
     # union-find from adjacency
     parent = np.arange(K, dtype=np.int64)
     rank = np.zeros(K, dtype=np.int8)
+
     def find(x):
         while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
-    def union(i,j):
+
+    def union(i, j):
         ri, rj = find(i), find(j)
-        if ri == rj: 
+        if ri == rj:
             return
         if rank[ri] < rank[rj]:
             parent[ri] = rj
         elif rank[ri] > rank[rj]:
             parent[rj] = ri
-        else: 
+        else:
             parent[rj] = ri
             rank[ri] += 1
 
@@ -363,8 +395,10 @@ def approximate_contact_sites(
             ia_s = ia_g[order]
             a_s = aA_g[order]
             starts = np.r_[0, 1 + np.flatnonzero(ia_s[1:] != ia_s[:-1])]
-            ends   = np.r_[starts[1:], ia_s.size]
-            areaA_site_um2.append(sum(float(np.max(a_s[s:e])) for s,e in zip(starts, ends)))
+            ends = np.r_[starts[1:], ia_s.size]
+            areaA_site_um2.append(
+                sum(float(np.max(a_s[s:e])) for s, e in zip(starts, ends))
+            )
         else:
             areaA_site_um2.append(0.0)
         # B side
@@ -374,25 +408,27 @@ def approximate_contact_sites(
         ib_s = ib_g[order]
         b_s = bB_g[order]
         starts = np.r_[0, 1 + np.flatnonzero(ib_s[1:] != ib_s[:-1])]
-        ends   = np.r_[starts[1:], ib_s.size]
-        areaB_site_um2.append(sum(float(np.max(b_s[s:e])) for s,e in zip(starts, ends)))
+        ends = np.r_[starts[1:], ib_s.size]
+        areaB_site_um2.append(
+            sum(float(np.max(b_s[s:e])) for s, e in zip(starts, ends))
+        )
 
     areaA_site_um2 = np.asarray(areaA_site_um2, float)
     areaB_site_um2 = np.asarray(areaB_site_um2, float)
-    area_mean_um2  = 0.5 * (areaA_site_um2 + areaB_site_um2)
-    centers = np.vstack(centers) if centers else np.empty((0,3), float)
+    area_mean_um2 = 0.5 * (areaA_site_um2 + areaB_site_um2)
+    centers = np.vstack(centers) if centers else np.empty((0, 3), float)
 
     # unit conversion
     if area_unit == "um^2":
         conv = 1.0
     elif area_unit == "nm^2":
-        conv = 1e6   # 1 µm² = 10^6 nm²
+        conv = 1e6  # 1 µm² = 10^6 nm²
     else:
         raise ValueError("area_unit must be 'um^2' or 'nm^2'")
 
     area_A = areaA_site_um2 * conv
     area_B = areaB_site_um2 * conv
-    area_M = area_mean_um2  * conv
+    area_M = area_mean_um2 * conv
 
     seed_to_site = -np.ones(K, np.int64)
     for s, g in enumerate(groups):
@@ -429,8 +465,10 @@ def approximate_contact_sites(
 
 # ------------------------ helpers --------------------------------------
 
-def _nearest_on_surface(mesh: trimesh.Trimesh, pts: np.ndarray
-                        ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+
+def _nearest_on_surface(
+    mesh: trimesh.Trimesh, pts: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Robust batched projection using one ProximityQuery, returns (points, dists, face_ids).
     """
@@ -439,8 +477,10 @@ def _nearest_on_surface(mesh: trimesh.Trimesh, pts: np.ndarray
     cp, dist, fid = pq.on_surface(pts)
     return np.asarray(cp, float), np.asarray(dist, float), np.asarray(fid, np.int64)
 
-def _sample_points_on_faces(mesh: trimesh.Trimesh, faces: np.ndarray, scheme: str = "7"
-                            ) -> tuple[np.ndarray, np.ndarray, int]:
+
+def _sample_points_on_faces(
+    mesh: trimesh.Trimesh, faces: np.ndarray, scheme: str = "7"
+) -> tuple[np.ndarray, np.ndarray, int]:
     """
     Return (points, local_face_index_per_point, S) for a list of face indices.
     scheme '7' = centroid + 3 verts + 3 edge midpoints.
@@ -466,11 +506,12 @@ def _sample_points_on_faces(mesh: trimesh.Trimesh, faces: np.ndarray, scheme: st
         S = 7
     else:
         raise ValueError("Unsupported sample_scheme")
-    
+
     F = pts.shape[0]
     P = pts.reshape(F * S, 3)
     face_of_point = np.repeat(np.arange(F, dtype=np.int64), S)
     return P, face_of_point, S
+
 
 def median_edge_length(mesh: trimesh.Trimesh, max_faces: int = 50000) -> float:
     """
@@ -486,14 +527,19 @@ def median_edge_length(mesh: trimesh.Trimesh, max_faces: int = 50000) -> float:
         idx = rng.choice(tri.shape[0], size=max_faces, replace=False)
         tri = tri[idx]
     a, b, c = tri[:, 0], tri[:, 1], tri[:, 2]
-    L = np.concatenate([
-        np.linalg.norm(b - a, axis=1),
-        np.linalg.norm(c - b, axis=1),
-        np.linalg.norm(a - c, axis=1)
-    ])
+    L = np.concatenate(
+        [
+            np.linalg.norm(b - a, axis=1),
+            np.linalg.norm(c - b, axis=1),
+            np.linalg.norm(a - c, axis=1),
+        ]
+    )
     return float(np.median(L)) if L.size else 1.0
 
-def _build_face_kdt(mesh: trimesh.Trimesh) -> tuple[KDTree, np.ndarray, np.ndarray, np.ndarray]:
+
+def _build_face_kdt(
+    mesh: trimesh.Trimesh,
+) -> tuple[KDTree, np.ndarray, np.ndarray, np.ndarray]:
     """
     KD-tree on triangle centroids + cached face normals/areas.
     """
@@ -503,8 +549,8 @@ def _build_face_kdt(mesh: trimesh.Trimesh) -> tuple[KDTree, np.ndarray, np.ndarr
     areas = mesh.area_faces
     return kdt, centers, normals, areas
 
-def _faces_within_radius(kdt: KDTree, points: np.ndarray, radius: float
-                         ) -> np.ndarray:
+
+def _faces_within_radius(kdt: KDTree, points: np.ndarray, radius: float) -> np.ndarray:
     """
     Union of face indices whose centroids fall within 'radius' of any point in 'points'.
     Robust to KDTree returning list-of-lists or numpy object arrays.
@@ -513,7 +559,9 @@ def _faces_within_radius(kdt: KDTree, points: np.ndarray, radius: float
         return np.empty(0, np.int64)
 
     pts = np.asarray(points, float)
-    out = kdt.query_ball_point(pts, r=float(radius))  # could be list-of-lists or ndarray(object)
+    out = kdt.query_ball_point(
+        pts, r=float(radius)
+    )  # could be list-of-lists or ndarray(object)
 
     # Normalize to python list-of-lists
     if isinstance(out, np.ndarray):
@@ -536,7 +584,9 @@ def _faces_within_radius(kdt: KDTree, points: np.ndarray, radius: float
     return np.unique(np.asarray(flat, np.int64))
 
 
-def _submesh_from_faces(mesh: trimesh.Trimesh, faces_idx: np.ndarray) -> tuple[trimesh.Trimesh, np.ndarray]:
+def _submesh_from_faces(
+    mesh: trimesh.Trimesh, faces_idx: np.ndarray
+) -> tuple[trimesh.Trimesh, np.ndarray]:
     """
     Build a submesh from explicit face indices and return (submesh, face_map_to_global).
     Ordering of submesh faces matches 'faces_idx' exactly.
@@ -547,6 +597,7 @@ def _submesh_from_faces(mesh: trimesh.Trimesh, faces_idx: np.ndarray) -> tuple[t
     # Use index list (not boolean mask) so face i in submesh == faces_idx[i]
     sub = mesh.submesh([faces_idx], append=True, repair=False)
     return sub, faces_idx
+
 
 def _cluster_points(P: np.ndarray, eps: float) -> list[np.ndarray]:
     """
@@ -574,30 +625,34 @@ def _cluster_points(P: np.ndarray, eps: float) -> list[np.ndarray]:
         clusters.append(np.asarray(cur, np.int64))
     return clusters
 
+
 # ------------------------ result struct ---------------------------------
+
 
 @dataclass(slots=True)
 class ContactSitesResult:
-    faces_A: list[np.ndarray]          # per-contact face indices on A
-    faces_B: list[np.ndarray]          # per-contact face indices on B
-    area_A:  np.ndarray                # per-contact area on A
-    area_B:  np.ndarray                # per-contact area on B
-    area_mean: np.ndarray              # (A+B)/2
-    seeds_A: np.ndarray                # projected seed on A
-    seeds_B: np.ndarray                # projected seed on B
+    faces_A: list[np.ndarray]  # per-contact face indices on A
+    faces_B: list[np.ndarray]  # per-contact face indices on B
+    area_A: np.ndarray  # per-contact area on A
+    area_B: np.ndarray  # per-contact area on B
+    area_mean: np.ndarray  # (A+B)/2
+    seeds_A: np.ndarray  # projected seed on A
+    seeds_B: np.ndarray  # projected seed on B
     pairs_AB: list[np.ndarray] | None
     meta: dict[str, object]
 
+
 # ------------------------ fast extractor --------------------------------
+
 
 def map_contact_sites(
     A: trimesh.Trimesh,
     B: trimesh.Trimesh,
     contact_pos: np.ndarray,
     *,
-    tol: float | None = None,                 # gap tolerance in mesh unit (nm in your case)
-    radius: float | None = None,              # search radius around each seed
-    sample_scheme: str = "1c",                # '1c', '4', or '7'
+    tol: float | None = None,  # gap tolerance in mesh unit (nm in your case)
+    radius: float | None = None,  # search radius around each seed
+    sample_scheme: str = "1c",  # '1c', '4', or '7'
     fractional: bool = True,
     normal_opposition_dot: float | None = -0.2,
     cluster_eps: float | None = None,
@@ -605,7 +660,7 @@ def map_contact_sites(
     return_pairs: bool = False,
     workers: int = 16,
     sides: str = "both",
-    unit: str = "nm^2"
+    unit: str = "nm^2",
 ) -> ContactSitesResult:
     """
     Extract touching-face patches near seeds, then MERGE overlapping per-seed patches
@@ -664,17 +719,32 @@ def map_contact_sites(
     # Per-seed outputs
     out_faces_A: list[np.ndarray] = [np.empty(0, np.int64) for _ in range(K)]
     out_faces_B: list[np.ndarray] = [np.empty(0, np.int64) for _ in range(K)]
-    out_frac_A:  list[np.ndarray] = [np.empty(0, np.float64) for _ in range(K)]  # per-face fractional cover
-    out_frac_B:  list[np.ndarray] = [np.empty(0, np.float64) for _ in range(K)]
+    out_frac_A: list[np.ndarray] = [
+        np.empty(0, np.float64) for _ in range(K)
+    ]  # per-face fractional cover
+    out_frac_B: list[np.ndarray] = [np.empty(0, np.float64) for _ in range(K)]
     out_area_A = np.zeros(K, float)
     out_area_B = np.zeros(K, float)
-    out_pairs: list[np.ndarray] | None = ([] if return_pairs else None)
+    out_pairs: list[np.ndarray] | None = [] if return_pairs else None
 
     # Seed clustering (reuse crops)
     clusters = _cluster_points(P, eps=cluster_eps)
 
     # ---- inner worker over one cluster ---------------------------------
-    def process_cluster(seed_idx: Iterable[int]) -> list[tuple[int, np.ndarray, np.ndarray, float, float, np.ndarray | None, np.ndarray, np.ndarray]]:
+    def process_cluster(
+        seed_idx: Iterable[int],
+    ) -> list[
+        tuple[
+            int,
+            np.ndarray,
+            np.ndarray,
+            float,
+            float,
+            np.ndarray | None,
+            np.ndarray,
+            np.ndarray,
+        ]
+    ]:
         seed_idx = np.asarray(list(seed_idx), np.int64)
         if seed_idx.size == 0:
             return []
@@ -685,7 +755,9 @@ def map_contact_sites(
         if doA:
             facesB_crop = _faces_within_radius(kdtB, cluster_pts, crop_r)
             subB, mapB = _submesh_from_faces(B, facesB_crop)
-            pq_subB = trimesh.proximity.ProximityQuery(subB) if len(subB.faces) else None
+            pq_subB = (
+                trimesh.proximity.ProximityQuery(subB) if len(subB.faces) else None
+            )
         else:
             mapB = np.empty(0, np.int64)
             pq_subB = None
@@ -693,21 +765,40 @@ def map_contact_sites(
         if doB:
             facesA_crop = _faces_within_radius(kdtA, cluster_pts, crop_r)
             subA, mapA = _submesh_from_faces(A, facesA_crop)
-            pq_subA = trimesh.proximity.ProximityQuery(subA) if len(subA.faces) else None
+            pq_subA = (
+                trimesh.proximity.ProximityQuery(subA) if len(subA.faces) else None
+            )
         else:
             mapA = np.empty(0, np.int64)
             pq_subA = None
 
-        results: list[tuple[int, np.ndarray, np.ndarray, float, float, np.ndarray | None, np.ndarray, np.ndarray]] = []
+        results: list[
+            tuple[
+                int,
+                np.ndarray,
+                np.ndarray,
+                float,
+                float,
+                np.ndarray | None,
+                np.ndarray,
+                np.ndarray,
+            ]
+        ] = []
 
         # ---------- A-side batch ----------
         if doA:
             fa_list, pts_list, face_of_pt_list, S_A_list = [], [], [], []
             for k in seed_idx:
-                fa = np.asarray(kdtA.query_ball_point(seeds_A[k], r=radius), np.int64) if kdtA is not None else np.empty(0, np.int64)
+                fa = (
+                    np.asarray(kdtA.query_ball_point(seeds_A[k], r=radius), np.int64)
+                    if kdtA is not None
+                    else np.empty(0, np.int64)
+                )
                 fa_list.append(fa)
                 if fa.size:
-                    ptsA, face_of_ptA, S_A = _sample_points_on_faces(A, fa, sample_scheme)
+                    ptsA, face_of_ptA, S_A = _sample_points_on_faces(
+                        A, fa, sample_scheme
+                    )
                 else:
                     ptsA = np.empty((0, 3), float)
                     face_of_ptA = np.empty(0, np.int64)
@@ -717,7 +808,11 @@ def map_contact_sites(
                 S_A_list.append(S_A)
 
             offs = np.cumsum([0] + [len(p) for p in pts_list[:-1]])
-            ptsA_all = np.vstack(pts_list) if len(pts_list) and len(pts_list[0]) else np.empty((0,3), float)
+            ptsA_all = (
+                np.vstack(pts_list)
+                if len(pts_list) and len(pts_list[0])
+                else np.empty((0, 3), float)
+            )
 
             if pq_subB is not None and len(ptsA_all):
                 _, dAB_all, fB_sub_all = pq_subB.on_surface(ptsA_all)
@@ -743,7 +838,7 @@ def map_contact_sites(
                     if normal_opposition_dot is not None and okA.any():
                         gfa = fa[face_of_pt_list[i]]
                         nd = np.einsum("ij,ij->i", nA[gfa], nB[mapB[fB_sub]])
-                        okA &= (nd <= float(normal_opposition_dot))
+                        okA &= nd <= float(normal_opposition_dot)
                     if okA.any():
                         # per-face fractions
                         src_faces = fa[face_of_pt_list[i][okA]]
@@ -758,24 +853,42 @@ def map_contact_sites(
                         prs = None
                         if return_pairs:
                             w = areaA[fa[face_of_pt_list[i][okA]]] / S_A
-                            prs = np.stack([fa[face_of_pt_list[i][okA]],
-                                            mapB[fB_sub[okA]],
-                                            w], axis=1).astype(np.float64)
+                            prs = np.stack(
+                                [fa[face_of_pt_list[i][okA]], mapB[fB_sub[okA]], w],
+                                axis=1,
+                            ).astype(np.float64)
                     else:
                         facesA_k = np.empty(0, np.int64)
                         fracA_k = np.empty(0, np.float64)
                         areaA_k = 0.0
                         prs = None
-                results.append((int(k), facesA_k, np.empty(0, np.int64), float(areaA_k), 0.0, prs, fracA_k, np.empty(0, np.float64)))
+                results.append(
+                    (
+                        int(k),
+                        facesA_k,
+                        np.empty(0, np.int64),
+                        float(areaA_k),
+                        0.0,
+                        prs,
+                        fracA_k,
+                        np.empty(0, np.float64),
+                    )
+                )
 
         # ---------- B-side batch ----------
         if doB:
             fb_list, pts_list, face_of_pt_list, S_B_list = [], [], [], []
             for k in seed_idx:
-                fb = np.asarray(kdtB.query_ball_point(seeds_B[k], r=radius), np.int64) if kdtB is not None else np.empty(0, np.int64)
+                fb = (
+                    np.asarray(kdtB.query_ball_point(seeds_B[k], r=radius), np.int64)
+                    if kdtB is not None
+                    else np.empty(0, np.int64)
+                )
                 fb_list.append(fb)
                 if fb.size:
-                    ptsB, face_of_ptB, S_B = _sample_points_on_faces(B, fb, sample_scheme)
+                    ptsB, face_of_ptB, S_B = _sample_points_on_faces(
+                        B, fb, sample_scheme
+                    )
                 else:
                     ptsB = np.empty((0, 3), float)
                     face_of_ptB = np.empty(0, np.int64)
@@ -785,7 +898,11 @@ def map_contact_sites(
                 S_B_list.append(S_B)
 
             offs = np.cumsum([0] + [len(p) for p in pts_list[:-1]])
-            ptsB_all = np.vstack(pts_list) if len(pts_list) and len(pts_list[0]) else np.empty((0,3), float)
+            ptsB_all = (
+                np.vstack(pts_list)
+                if len(pts_list) and len(pts_list[0])
+                else np.empty((0, 3), float)
+            )
 
             if pq_subA is not None and len(ptsB_all):
                 _, dBA_all, fA_sub_all = pq_subA.on_surface(ptsB_all)
@@ -811,7 +928,7 @@ def map_contact_sites(
                     if normal_opposition_dot is not None and okB.any():
                         gfb = fb[face_of_pt_list[i]]
                         nd = np.einsum("ij,ij->i", nB[gfb], nA[mapA[fA_sub]])
-                        okB &= (nd <= float(normal_opposition_dot))
+                        okB &= nd <= float(normal_opposition_dot)
                     if okB.any():
                         src_facesB = fb[face_of_pt_list[i][okB]]
                         uniqB, countsB = np.unique(src_facesB, return_counts=True)
@@ -824,28 +941,56 @@ def map_contact_sites(
                             areaB_k = float(areaB[facesB_k].sum())
                         if return_pairs:
                             w = areaB[fb[face_of_pt_list[i][okB]]] / S_B
-                            prs2 = np.stack([mapA[fA_sub[okB]],
-                                             fb[face_of_pt_list[i][okB]],
-                                             w], axis=1).astype(np.float64)
+                            prs2 = np.stack(
+                                [mapA[fA_sub[okB]], fb[face_of_pt_list[i][okB]], w],
+                                axis=1,
+                            ).astype(np.float64)
 
                 j = pos_by_seed.get(int(k))
                 if j is None:
-                    results.append((int(k), np.empty(0, np.int64), facesB_k, 0.0, float(areaB_k), prs2, np.empty(0, np.float64), fracB_k))
+                    results.append(
+                        (
+                            int(k),
+                            np.empty(0, np.int64),
+                            facesB_k,
+                            0.0,
+                            float(areaB_k),
+                            prs2,
+                            np.empty(0, np.float64),
+                            fracB_k,
+                        )
+                    )
                 else:
-                    k_id, fa_prev, fb_prev, aA_prev, aB_prev, prs_prev, frA_prev, frB_prev = results[j]
-                    results[j] = (k_id,
-                                  fa_prev,
-                                  facesB_k,
-                                  aA_prev,
-                                  float(areaB_k),
-                                  prs2 if prs_prev is None else (prs_prev if prs2 is None else np.vstack([prs_prev, prs2])),
-                                  frA_prev,
-                                  fracB_k)
+                    (
+                        k_id,
+                        fa_prev,
+                        fb_prev,
+                        aA_prev,
+                        aB_prev,
+                        prs_prev,
+                        frA_prev,
+                        frB_prev,
+                    ) = results[j]
+                    results[j] = (
+                        k_id,
+                        fa_prev,
+                        facesB_k,
+                        aA_prev,
+                        float(areaB_k),
+                        prs2
+                        if prs_prev is None
+                        else (
+                            prs_prev if prs2 is None else np.vstack([prs_prev, prs2])
+                        ),
+                        frA_prev,
+                        fracB_k,
+                    )
         return results
 
     # ---- run (optionally parallel) --------------------------------------
     if workers and len(clusters) > 1:
         import concurrent.futures as cf
+
         all_results = []
         with cf.ThreadPoolExecutor(max_workers=int(workers)) as ex:
             for res in ex.map(process_cluster, clusters):
@@ -859,25 +1004,29 @@ def map_contact_sites(
     for k, fa, fb, aA, aB, prs, frA, frB in all_results:
         out_faces_A[k] = fa
         out_faces_B[k] = fb
-        out_frac_A[k]  = frA
-        out_frac_B[k]  = frB
-        out_area_A[k]  = aA
-        out_area_B[k]  = aB
+        out_frac_A[k] = frA
+        out_frac_B[k] = frB
+        out_area_A[k] = aA
+        out_area_B[k] = aB
         if return_pairs:
-            out_pairs.append(prs if prs is not None else np.empty((0,3), np.float64))
+            out_pairs.append(prs if prs is not None else np.empty((0, 3), np.float64))
 
     # -------- EARLY PRUNE empty seeds (before merging) --------------------
     EPS = 1e-12
     if doA:
-        has_faces_A = np.fromiter((len(f) > 0 for f in out_faces_A), dtype=bool, count=K)
-        has_area_A  = out_area_A > EPS
+        has_faces_A = np.fromiter(
+            (len(f) > 0 for f in out_faces_A), dtype=bool, count=K
+        )
+        has_area_A = out_area_A > EPS
         keepA = has_faces_A & has_area_A
     else:
         keepA = np.zeros(K, dtype=bool)
 
     if doB:
-        has_faces_B = np.fromiter((len(f) > 0 for f in out_faces_B), dtype=bool, count=K)
-        has_area_B  = out_area_B > EPS
+        has_faces_B = np.fromiter(
+            (len(f) > 0 for f in out_faces_B), dtype=bool, count=K
+        )
+        has_area_B = out_area_B > EPS
         keepB = has_faces_B & has_area_B
     else:
         keepB = np.zeros(K, dtype=bool)
@@ -888,23 +1037,29 @@ def map_contact_sites(
     # compact per-seed structures
     out_faces_A = [out_faces_A[i] for i in orig_idx]
     out_faces_B = [out_faces_B[i] for i in orig_idx]
-    out_frac_A  = [out_frac_A[i]  for i in orig_idx]
-    out_frac_B  = [out_frac_B[i]  for i in orig_idx]
-    out_area_A  = out_area_A[orig_idx]
-    out_area_B  = out_area_B[orig_idx]
-    seeds_A     = seeds_A[orig_idx]
-    seeds_B     = seeds_B[orig_idx]
+    out_frac_A = [out_frac_A[i] for i in orig_idx]
+    out_frac_B = [out_frac_B[i] for i in orig_idx]
+    out_area_A = out_area_A[orig_idx]
+    out_area_B = out_area_B[orig_idx]
+    seeds_A = seeds_A[orig_idx]
+    seeds_B = seeds_B[orig_idx]
     if return_pairs:
         out_pairs = [out_pairs[i] for i in orig_idx]
 
     K = orig_idx.size
     if K == 0:
         meta = dict(
-            tol=tol, radius=radius, fractional=bool(fractional),
-            sample_scheme=sample_scheme, normal_opposition_dot=normal_opposition_dot,
-            cluster_eps=cluster_eps, cluster_halo=float(cluster_halo),
+            tol=tol,
+            radius=radius,
+            fractional=bool(fractional),
+            sample_scheme=sample_scheme,
+            normal_opposition_dot=normal_opposition_dot,
+            cluster_eps=cluster_eps,
+            cluster_halo=float(cluster_halo),
             engine="seed-cluster → local-submesh PQ → union-by-face",
-            sides=("A" if (doA and not doB) else ("B" if (doB and not doA) else "both")),
+            sides=(
+                "A" if (doA and not doB) else ("B" if (doB and not doA) else "both")
+            ),
             unit=unit,
             K_seeds_in=int(K0),
             K_seeds_kept=0,
@@ -913,10 +1068,13 @@ def map_contact_sites(
             seed_to_patch=(-np.ones(K0, dtype=np.int64)),
         )
         return ContactSitesResult(
-            faces_A=[], faces_B=[],
-            area_A=np.zeros(0, float), area_B=np.zeros(0, float),
+            faces_A=[],
+            faces_B=[],
+            area_A=np.zeros(0, float),
+            area_B=np.zeros(0, float),
             area_mean=np.zeros(0, float),
-            seeds_A=np.empty((0,3), float), seeds_B=np.empty((0,3), float),
+            seeds_A=np.empty((0, 3), float),
+            seeds_B=np.empty((0, 3), float),
             pairs_AB=([] if return_pairs else None),
             meta=meta,
         )
@@ -948,19 +1106,25 @@ def map_contact_sites(
         if total == 0:
             return
         face_all = np.concatenate([f for f in faces_list if len(f)])
-        seed_all = np.concatenate([np.full(len(f), i, dtype=np.int64) for i, f in enumerate(faces_list) if len(f)])
+        seed_all = np.concatenate(
+            [
+                np.full(len(f), i, dtype=np.int64)
+                for i, f in enumerate(faces_list)
+                if len(f)
+            ]
+        )
         order = np.argsort(face_all)
         face_sorted = face_all[order]
         seed_sorted = seed_all[order]
         if len(face_sorted) == 0:
             return
         starts = np.r_[0, 1 + np.flatnonzero(face_sorted[1:] != face_sorted[:-1])]
-        ends   = np.r_[starts[1:], len(face_sorted)]
+        ends = np.r_[starts[1:], len(face_sorted)]
         for s0, s1 in zip(starts, ends):
             if s1 - s0 <= 1:
                 continue
             base = seed_sorted[s0]
-            for u in seed_sorted[s0+1:s1]:
+            for u in seed_sorted[s0 + 1 : s1]:
                 union(base, u)
 
     if doA:
@@ -970,14 +1134,16 @@ def map_contact_sites(
 
     roots = np.fromiter((find(i) for i in range(K)), dtype=np.int64, count=K)
     uniq_roots, inv = np.unique(roots, return_inverse=True)
-    groups = [np.flatnonzero(inv == gi) for gi in range(len(uniq_roots))]  # list of compacted-seed index arrays
+    groups = [
+        np.flatnonzero(inv == gi) for gi in range(len(uniq_roots))
+    ]  # list of compacted-seed index arrays
 
     # Build merged outputs
     new_faces_A: list[np.ndarray] = []
     new_faces_B: list[np.ndarray] = []
-    new_area_A_list: list[float]  = []
-    new_area_B_list: list[float]  = []
-    new_pairs: list[np.ndarray] | None = ([] if return_pairs else None)
+    new_area_A_list: list[float] = []
+    new_area_B_list: list[float] = []
+    new_pairs: list[np.ndarray] | None = [] if return_pairs else None
     new_seeds_A: list[np.ndarray] = []
     new_seeds_B: list[np.ndarray] = []
 
@@ -985,14 +1151,18 @@ def map_contact_sites(
         # ---- A side merge (guarded)
         if doA:
             fa_seqs = [out_faces_A[i] for i in members if len(out_faces_A[i])]
-            fr_seqs = [out_frac_A[i]  for i in members if len(out_frac_A[i])]
+            fr_seqs = [out_frac_A[i] for i in members if len(out_frac_A[i])]
             if fa_seqs:
                 fa_cat = np.concatenate(fa_seqs)
                 fr_cat = np.concatenate(fr_seqs)
                 uA, invA = np.unique(fa_cat, return_inverse=True)
                 frac_sum = np.bincount(invA, weights=fr_cat, minlength=uA.size)
                 frac_sum = np.minimum(1.0, frac_sum)
-                areaA_val = float(np.dot(frac_sum, areaA[uA])) if fractional else float(areaA[uA].sum())
+                areaA_val = (
+                    float(np.dot(frac_sum, areaA[uA]))
+                    if fractional
+                    else float(areaA[uA].sum())
+                )
                 facesA_m = uA
             else:
                 facesA_m = np.empty(0, np.int64)
@@ -1004,14 +1174,18 @@ def map_contact_sites(
         # ---- B side merge (guarded)
         if doB:
             fb_seqs = [out_faces_B[i] for i in members if len(out_faces_B[i])]
-            frb_seqs= [out_frac_B[i]  for i in members if len(out_frac_B[i])]
+            frb_seqs = [out_frac_B[i] for i in members if len(out_frac_B[i])]
             if fb_seqs:
                 fb_cat = np.concatenate(fb_seqs)
-                frb_cat= np.concatenate(frb_seqs)
+                frb_cat = np.concatenate(frb_seqs)
                 uB, invB = np.unique(fb_cat, return_inverse=True)
                 frac_sumB = np.bincount(invB, weights=frb_cat, minlength=uB.size)
                 frac_sumB = np.minimum(1.0, frac_sumB)
-                areaB_val = float(np.dot(frac_sumB, areaB[uB])) if fractional else float(areaB[uB].sum())
+                areaB_val = (
+                    float(np.dot(frac_sumB, areaB[uB]))
+                    if fractional
+                    else float(areaB[uB].sum())
+                )
                 facesB_m = uB
             else:
                 facesB_m = np.empty(0, np.int64)
@@ -1034,7 +1208,11 @@ def map_contact_sites(
 
         # pairs merge (sum duplicate weights)
         if return_pairs:
-            pcats = [out_pairs[i] for i in members if out_pairs[i] is not None and out_pairs[i].size]
+            pcats = [
+                out_pairs[i]
+                for i in members
+                if out_pairs[i] is not None and out_pairs[i].size
+            ]
             if pcats:
                 cat = np.vstack(pcats)
                 keys = cat[:, :2].astype(np.int64)
@@ -1043,7 +1221,7 @@ def map_contact_sites(
                 wsum = np.bincount(invk, weights=w, minlength=uniq_keys.shape[0])
                 merged_pairs = np.column_stack([uniq_keys, wsum]).astype(np.float64)
             else:
-                merged_pairs = np.empty((0,3), np.float64)
+                merged_pairs = np.empty((0, 3), np.float64)
             new_pairs.append(merged_pairs)
 
         new_faces_A.append(facesA_m)
@@ -1054,11 +1232,11 @@ def map_contact_sites(
     # Convert lists to arrays
     out_faces_A = new_faces_A
     out_faces_B = new_faces_B
-    out_area_A  = np.asarray(new_area_A_list, float)
-    out_area_B  = np.asarray(new_area_B_list, float)
-    seeds_A     = np.vstack(new_seeds_A) if new_seeds_A else np.empty((0,3), float)
-    seeds_B     = np.vstack(new_seeds_B) if new_seeds_B else np.empty((0,3), float)
-    K_groups    = len(out_faces_A)  # == len(groups)
+    out_area_A = np.asarray(new_area_A_list, float)
+    out_area_B = np.asarray(new_area_B_list, float)
+    seeds_A = np.vstack(new_seeds_A) if new_seeds_A else np.empty((0, 3), float)
+    seeds_B = np.vstack(new_seeds_B) if new_seeds_B else np.empty((0, 3), float)
+    K_groups = len(out_faces_A)  # == len(groups)
 
     # Map from original seed index -> patch index (after group pruning below)
     # Start with compacted-seed -> group index:
@@ -1067,24 +1245,34 @@ def map_contact_sites(
 
     # -------- ALWAYS prune empty groups -----------------------------------
     eps = 1e-12
-    hasA = (np.array([len(fa) > 0 for fa in out_faces_A], dtype=bool) & (out_area_A > eps)) if doA else np.zeros(K_groups, bool)
-    hasB = (np.array([len(fb) > 0 for fb in out_faces_B], dtype=bool) & (out_area_B > eps)) if doB else np.zeros(K_groups, bool)
+    hasA = (
+        (np.array([len(fa) > 0 for fa in out_faces_A], dtype=bool) & (out_area_A > eps))
+        if doA
+        else np.zeros(K_groups, bool)
+    )
+    hasB = (
+        (np.array([len(fb) > 0 for fb in out_faces_B], dtype=bool) & (out_area_B > eps))
+        if doB
+        else np.zeros(K_groups, bool)
+    )
     keep_mask_groups = hasA | hasB
     keep_idx = np.flatnonzero(keep_mask_groups)
 
     if keep_idx.size != K_groups:
         out_faces_A = [out_faces_A[i] for i in keep_idx]
         out_faces_B = [out_faces_B[i] for i in keep_idx]
-        out_area_A  = out_area_A[keep_idx]
-        out_area_B  = out_area_B[keep_idx]
-        seeds_A     = seeds_A[keep_idx]
-        seeds_B     = seeds_B[keep_idx]
+        out_area_A = out_area_A[keep_idx]
+        out_area_B = out_area_B[keep_idx]
+        seeds_A = seeds_A[keep_idx]
+        seeds_B = seeds_B[keep_idx]
         if return_pairs:
             new_pairs = [new_pairs[i] for i in keep_idx]
         # remap compacted-seed -> new group indices, else -1
         new_index_of_group = -np.ones(K_groups, dtype=np.int64)
         new_index_of_group[keep_idx] = np.arange(len(keep_idx), dtype=np.int64)
-        seed_to_group = np.where(keep_mask_groups[seed_to_group], new_index_of_group[seed_to_group], -1)
+        seed_to_group = np.where(
+            keep_mask_groups[seed_to_group], new_index_of_group[seed_to_group], -1
+        )
 
     # area_mean after pruning
     if doA and doB:
@@ -1099,10 +1287,13 @@ def map_contact_sites(
     seed_to_patch[orig_idx] = seed_to_group  # compacted seeds correspond to orig_idx
 
     meta = dict(
-        tol=tol, radius=radius, fractional=bool(fractional),
+        tol=tol,
+        radius=radius,
+        fractional=bool(fractional),
         sample_scheme=sample_scheme,
         normal_opposition_dot=normal_opposition_dot,
-        cluster_eps=cluster_eps, cluster_halo=float(cluster_halo),
+        cluster_eps=cluster_eps,
+        cluster_halo=float(cluster_halo),
         engine="seed-cluster → local-submesh PQ → union-by-face",
         sides=("A" if (doA and not doB) else ("B" if (doB and not doA) else "both")),
         unit=unit,
@@ -1124,3 +1315,43 @@ def map_contact_sites(
         pairs_AB=(new_pairs if return_pairs else None),
         meta=meta,
     )
+
+
+# visualize contact sites
+
+
+def _vtk_faces_actor(
+    mesh: trimesh.Trimesh,
+    faces_idx: np.ndarray,
+    color=(1.0, 0.0, 0.0),
+    opacity: float = 1.0,
+    scale: float = 1.0,
+):
+    """
+    Build a VTK actor from a subset of faces of 'mesh'. Uses polygon offset to avoid
+    z-fighting with the full mesh actor.
+    """
+    import vtk
+
+    faces_idx = np.asarray(faces_idx, np.int64)
+    if faces_idx.size == 0:
+        return None
+
+    # Make a compact submesh with local vertex indexing
+    sub = mesh.submesh([faces_idx], append=True, repair=False)
+
+    # Reuse your existing mesh-to-actor path
+    actor = _vtk_mesh_actor(sub, color=color, opacity=opacity, scale=scale)
+
+    # Enable polygon offset to render cleanly on top of the base mesh
+    try:
+        vtk.vtkMapper.SetResolveCoincidentTopologyToPolygonOffset()
+        vtk.vtkMapper.SetResolveCoincidentTopologyPolygonOffsetParameters(1.0, 1.0)
+    except Exception:
+        pass  # older/newer VTK naming differences are harmless to skip
+
+    # Optional: show a thin outline to make patches pop
+    actor.GetProperty().SetEdgeVisibility(True)
+    actor.GetProperty().SetEdgeColor(0.0, 0.0, 0.0)
+    actor.GetProperty().SetLineWidth(1.0)
+    return actor
