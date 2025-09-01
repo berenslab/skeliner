@@ -1,4 +1,6 @@
-from __future__ import annotations
+# Portions derived from vis3d module in `seung-lab/microviewer``
+# (c) 2025 William Silversmith <william.silversmith@gmail.com> originally under LGPL-2.1.
+# This copy is distributed under the terms of the GNU GPL v3 (per LGPL-2.1 §3).
 
 from dataclasses import dataclass
 from typing import List, Sequence, Tuple
@@ -572,40 +574,62 @@ def _bbox_union(a: BBox | None, b: BBox | None) -> BBox | None:
     return BBox(lo, hi)
 
 
+def _add_mesh_toggles(interactor, renderer, actor_A, actor_B):
+    import vtk
+
+    # On-screen hint (optional)
+    hud = vtk.vtkTextActor()
+    hud.SetInput("[a] toggle A   [b] toggle B")
+    hudprop = hud.GetTextProperty()
+    hudprop.SetFontSize(20)
+    hudprop.SetColor(1.0, 1.0, 1.0)
+    hud.SetDisplayPosition(10, 10)
+    renderer.AddActor2D(hud)
+
+    def on_keypress(obj, evt):
+        key = obj.GetKeySym()
+        if key == "a":
+            actor_A.SetVisibility(0 if actor_A.GetVisibility() else 1)
+            renderer.GetRenderWindow().Render()
+        elif key == "b":
+            actor_B.SetVisibility(0 if actor_B.GetVisibility() else 1)
+            renderer.GetRenderWindow().Render()
+
+    interactor.AddObserver("KeyPressEvent", on_keypress)
+
+
 def _vtk_faces_actor(
     mesh: trimesh.Trimesh,
     faces_idx: np.ndarray,
     color=(1.0, 0.0, 0.0),
     opacity: float = 1.0,
     scale: float = 1.0,
+    patch_lift: float = 0.0,  # << new: in display units
+    show_edges: bool = False,
 ):
-    """
-    Build a VTK actor from a subset of faces of 'mesh'. Uses polygon offset to avoid
-    z-fighting with the full mesh actor.
-    """
-    import vtk
-
     faces_idx = np.asarray(faces_idx, np.int64)
     if faces_idx.size == 0:
         return None
 
-    # Make a compact submesh with local vertex indexing
     sub = mesh.submesh([faces_idx], append=True, repair=False)
 
-    # Reuse your existing mesh-to-actor path
+    # Micro-lift along normals (convert display -> model units)
+    if patch_lift > 0.0 and sub.vertices.size:
+        lift_model = float(patch_lift) / float(scale)
+        # trimesh computes normals lazily; ensure availability
+        n = sub.vertex_normals
+        sub = trimesh.Trimesh(
+            vertices=sub.vertices + lift_model * n, faces=sub.faces, process=False
+        )
+
     actor = _vtk_mesh_actor(sub, color=color, opacity=opacity, scale=scale)
 
-    # Enable polygon offset to render cleanly on top of the base mesh
-    try:
-        vtk.vtkMapper.SetResolveCoincidentTopologyToPolygonOffset()
-        vtk.vtkMapper.SetResolveCoincidentTopologyPolygonOffsetParameters(1.0, 1.0)
-    except Exception:
-        pass  # older/newer VTK naming differences are harmless to skip
+    # Optional edge overlay; if on, also offset lines to avoid z-fight
+    actor.GetProperty().SetEdgeVisibility(bool(show_edges))
+    if show_edges:
+        actor.GetProperty().SetEdgeColor(0.0, 0.0, 0.0)
+        actor.GetProperty().SetLineWidth(1.0)
 
-    # Optional: show a thin outline to make patches pop
-    actor.GetProperty().SetEdgeVisibility(True)
-    actor.GetProperty().SetEdgeColor(0.0, 0.0, 0.0)
-    actor.GetProperty().SetLineWidth(1.0)
     return actor
 
 
@@ -669,15 +693,26 @@ def view_contacts(
         if doA and i < len(contacts.faces_A):
             fa = contacts.faces_A[i]
             act = _vtk_faces_actor(
-                A, fa, color=site_color, opacity=site_opacity, scale=scale
+                A,
+                fa,
+                color=site_color,
+                opacity=site_opacity,
+                scale=scale,
+                patch_lift=0.05,
             )
+
             if act is not None:
                 renderer.AddActor(act)
 
         if doB and i < len(contacts.faces_B):
             fb = contacts.faces_B[i]
             act = _vtk_faces_actor(
-                B, fb, color=site_color, opacity=site_opacity, scale=scale
+                B,
+                fb,
+                color=site_color,
+                opacity=site_opacity,
+                scale=scale,
+                patch_lift=0.05,
             )
             if act is not None:
                 renderer.AddActor(act)
@@ -748,6 +783,8 @@ def view_contacts(
     picker = vtk.vtkCellPicker()
     _add_recenter_controls(picker, iren, renderer)
     iren.AddObserver("ExitEvent", lambda *_: iren.TerminateApp())
+
+    _add_mesh_toggles(iren, renderer, actor_A, actor_B)
 
     win.Render()
     iren.Start()
