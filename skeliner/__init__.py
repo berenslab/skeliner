@@ -1,10 +1,10 @@
 from importlib.metadata import PackageNotFoundError, version
 
-from . import dx, io, post
+from . import dx, io, pair, plot, post
 from .core import Skeleton, skeletonize
-from .plot import projection as plot2d
-from .plot import threeviews as plot3v
-from .plot import view3d
+from .plot.vis2d import projection as plot2d
+from .plot.vis2d import threeviews as plot3v
+from .plot.vis3d import view3d
 
 try:
     __version__ = version(__name__)       
@@ -20,4 +20,6 @@ __all__ = [
     "io",
     "dx",
     "post",
+    "pair",
+    "plot",
 ]
