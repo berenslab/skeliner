@@ -1,5 +1,5 @@
-"""skeliner.dx – graph‑theoretic diagnostics for a single Skeleton
-"""
+"""skeliner.dx – graph‑theoretic diagnostics for a single Skeleton"""
+
 from typing import Any, Dict, List, Sequence, Set, Tuple
 
 import igraph as ig
@@ -9,7 +9,7 @@ __skeleton__ = [
     "connectivity",
     "acyclicity",
     "degree",
-    "neighbors", 
+    "neighbors",
     "nodes_of_degree",
     "branches_of_length",
     "twigs_of_length",
@@ -17,6 +17,7 @@ __skeleton__ = [
     "node_summary",
     "extract_neurites",
     "neurites_out_of_bounds",
+    "volume",
 ]
 
 # -----------------------------------------------------------------------------
@@ -27,6 +28,7 @@ __skeleton__ = [
 def _graph(skel) -> ig.Graph:
     """Return the undirected *igraph* view of the skeleton."""
     return skel._igraph()
+
 
 # -----------------------------------------------------------------------------
 # 1. connectivity & cycles
@@ -65,9 +67,11 @@ def acyclicity(skel, *, return_cycles: bool = False):
     cyc = g.cycle_basis()[0]  # list of vertex ids
     return [(cyc[i], cyc[(i + 1) % len(cyc)]) for i in range(len(cyc))]
 
+
 # -----------------------------------------------------------------------------
 # 2. degree-related helpers
 # -----------------------------------------------------------------------------
+
 
 def degree(skel, node_id: int | Sequence[int]):
     """Return the degree(s) of one node *or* a sequence of nodes."""
@@ -114,17 +118,20 @@ def node_summary(
         "neighbors": [],
     }
     for nb in neighbors(skel, node_id):
-        out["neighbors"].append({
-            "id": int(nb),
-            "degree": degree(skel, nb),
-            "radius": float(skel.radii[radius_metric][nb]),
-        })
+        out["neighbors"].append(
+            {
+                "id": int(nb),
+                "degree": degree(skel, nb),
+                "radius": float(skel.radii[radius_metric][nb]),
+            }
+        )
     return out
 
 
 # -----------------------------------------------------------------------------
 # 3. degree distribution with optional detailed map
 # -----------------------------------------------------------------------------
+
 
 def degree_distribution(
     skel,
@@ -158,7 +165,8 @@ def degree_distribution(
         high_dict[int(idx)] = int(deg[idx])
         if detailed:
             high_dict[int(idx)] = node_summary(
-                skel, int(idx), radius_metric=radius_metric)
+                skel, int(idx), radius_metric=radius_metric
+            )
 
     return {
         "degree": np.arange(hist.size)[1:],
@@ -166,6 +174,7 @@ def degree_distribution(
         "threshold": float(thresh),
         "high_degree_nodes": high_dict,
     }
+
 
 def nodes_of_degree(skel, k: int):
     """Return *all* node IDs whose degree == *k* (soma excluded).
@@ -183,6 +192,7 @@ def nodes_of_degree(skel, k: int):
     if k == deg[0]:  # avoid returning the soma
         idx = idx[idx != 0]
     return idx.astype(int)
+
 
 def branches_of_length(
     skel,
@@ -238,7 +248,9 @@ def branches_of_length(
             prev, curr = ep, nb
             while True:
                 path.append(curr)
-                visited_edges.add((min(int(prev), int(curr)), max(int(prev), int(curr))))
+                visited_edges.add(
+                    (min(int(prev), int(curr)), max(int(prev), int(curr)))
+                )
                 if curr in endpoints:
                     break
                 # internal vertex (deg==2) → continue straight
@@ -283,10 +295,10 @@ def twigs_of_length(
     -------
     list[list[int]]
         Each sub-list is ordered **proximal ➜ leaf**.
-        * Length == k              when include_branching_node=False  
+        * Length == k              when include_branching_node=False
         * Length == k + 1          when include_branching_node=True
     """
-    g  = _graph(skel)
+    g = _graph(skel)
     deg = np.asarray(g.degree())
 
     twigs: List[List[int]] = []
@@ -301,7 +313,7 @@ def twigs_of_length(
         while True:
             par = parent[curr]
             if par == -1:
-                break                     # should not happen – disconnected
+                break  # should not happen – disconnected
             if deg[par] == 2 and par != 0:
                 chain.append(par)
                 curr = par
@@ -310,7 +322,7 @@ def twigs_of_length(
             if len(chain) == k:
                 if include_branching_node:
                     chain.append(par)
-                twigs.append(chain[::-1])   # proximal➜distal order
+                twigs.append(chain[::-1])  # proximal➜distal order
             break
 
     return twigs
@@ -330,6 +342,7 @@ def leaf_depths(skel) -> np.ndarray:
         return np.empty(0, dtype=int)
     depths = np.asarray(g.shortest_paths(source=0))[0]
     return depths[leaves].astype(int)
+
 
 def suspicious_tips(
     skel,
@@ -385,8 +398,7 @@ def suspicious_tips(
     # Build an igraph view with edge‑length weights (Euclidean)
     g: ig.Graph = skel._igraph()
     g.es["weight"] = [
-        float(np.linalg.norm(skel.nodes[a] - skel.nodes[b]))
-        for a, b in skel.edges
+        float(np.linalg.norm(skel.nodes[a] - skel.nodes[b])) for a, b in skel.edges
     ]
 
     # Tip detection – degree = 1, excluding the soma (node 0)
@@ -414,7 +426,9 @@ def suspicious_tips(
 
     if not return_stats:
         # sort by descending ratio (most egregious first)
-        return sorted(map(int, suspicious), key=lambda nid: -ratio[np.where(tips == nid)[0][0]])
+        return sorted(
+            map(int, suspicious), key=lambda nid: -ratio[np.where(tips == nid)[0][0]]
+        )
 
     stats: Dict[int, Dict[str, float]] = {
         int(nid): {
@@ -430,6 +444,7 @@ def suspicious_tips(
     suspicious_sorted = sorted(suspicious, key=lambda nid: -stats[int(nid)]["ratio"])
     return suspicious_sorted, stats
 
+
 def extract_neurites(
     skel,
     root: int,
@@ -438,35 +453,35 @@ def extract_neurites(
 ) -> List[int]:
     """Return the full *neurite subtree* emerging distally from ``root``.
 
-The routine uses *graph distance* to the soma (node 0) to orient edges:
-for every edge ``(u, v)`` the direction is from the **closer** vertex to
-soma → **further** vertex.  All vertices whose shortest path to soma passes
-through ``root`` (including any downstream bifurcations) are returned.
+    The routine uses *graph distance* to the soma (node 0) to orient edges:
+    for every edge ``(u, v)`` the direction is from the **closer** vertex to
+    soma → **further** vertex.  All vertices whose shortest path to soma passes
+    through ``root`` (including any downstream bifurcations) are returned.
 
-    The skeleton is assumed to be a tree (acyclic).  *Distal* means all
-    descendants of ``root`` when the soma (vertex 0) is treated as the
-    root.
+        The skeleton is assumed to be a tree (acyclic).  *Distal* means all
+        descendants of ``root`` when the soma (vertex 0) is treated as the
+        root.
 
-    Examples
-    --------
-    >>> skel.dx.extract_neurite(skel, 2)
-    [2, 3, 4, 5, ...]   # entire subtree starting at 2
-    >>> skel.dx.extract_neurite(skel, 0, include_root=False)
-    list(range(1, len(skel.nodes)))  # every non‑soma node
+        Examples
+        --------
+        >>> skel.dx.extract_neurite(skel, 2)
+        [2, 3, 4, 5, ...]   # entire subtree starting at 2
+        >>> skel.dx.extract_neurite(skel, 0, include_root=False)
+        list(range(1, len(skel.nodes)))  # every non‑soma node
 
-    Parameters
-    ----------
-    skel
-        A :class:`skeliner.Skeleton` instance.
-    root
-        Index of the *proximal* node that defines the neurite base.
-    include_root : bool, default ``True``
-        Whether ``root`` itself should be included in the returned list.
+        Parameters
+        ----------
+        skel
+            A :class:`skeliner.Skeleton` instance.
+        root
+            Index of the *proximal* node that defines the neurite base.
+        include_root : bool, default ``True``
+            Whether ``root`` itself should be included in the returned list.
 
-    Returns
-    -------
-    list[int]
-        Sorted vertex IDs belonging to the neurite.
+        Returns
+        -------
+        list[int]
+            Sorted vertex IDs belonging to the neurite.
     """
     N = len(skel.nodes)
     if root < 0 or root >= N:
@@ -497,6 +512,7 @@ through ``root`` (including any downstream bifurcations) are returned.
 
     return sorted(out)
 
+
 def neurites_out_of_bounds(
     skel,
     bounds: tuple[np.ndarray, np.ndarray] | tuple[Sequence[float], Sequence[float]],
@@ -525,7 +541,7 @@ def neurites_out_of_bounds(
     if lo.shape != (3,) or hi.shape != (3,):
         raise ValueError("bounds must be two length-3 vectors")
 
-    coords  = skel.nodes
+    coords = skel.nodes
     outside = np.any((coords < lo) | (coords > hi), axis=1)
     if not outside.any():
         return []
@@ -533,8 +549,8 @@ def neurites_out_of_bounds(
     # ------------------------------------------------------------------
     # one igraph shortest-path pass from soma (vertex 0)
     # ------------------------------------------------------------------
-    g      = skel._igraph()
-    dists  = np.asarray(g.shortest_paths(source=[0])[0], dtype=int)
+    g = skel._igraph()
+    dists = np.asarray(g.shortest_paths(source=[0])[0], dtype=int)
 
     # For every edge (u,v) orient from proximal→distal
     children: list[list[int]] = [[] for _ in range(len(coords))]
@@ -550,9 +566,265 @@ def neurites_out_of_bounds(
         # ensure nid is indeed the *first* outside node on its path
         par = g.bfs(0, mode="ALL")[2][nid]
         if par != -1 and outside[par]:
-            continue                        # ancestor already outside – skip
-        targets.update(
-            extract_neurites(skel, int(nid), include_root=include_root)
-        )
+            continue  # ancestor already outside – skip
+        targets.update(extract_neurites(skel, int(nid), include_root=include_root))
 
     return sorted(targets)
+
+
+# -----------------------------------------------------------------------------
+# volume helpers
+# -----------------------------------------------------------------------------
+
+
+def _parse_bbox(bbox) -> tuple[np.ndarray, np.ndarray] | None:
+    """Accepts [xmin, xmax, ymin, ymax, zmin, zmax] or ((xlo,ylo,zlo),(xhi,yhi,zhi))."""
+    if bbox is None:
+        return None
+    if isinstance(bbox, (list, tuple)) and len(bbox) == 6:
+        lo = np.array([bbox[0], bbox[2], bbox[4]], dtype=np.float64)
+        hi = np.array([bbox[1], bbox[3], bbox[5]], dtype=np.float64)
+        if not np.all(lo <= hi):
+            raise ValueError("bbox must satisfy lo <= hi in each axis")
+        return lo, hi
+    if isinstance(bbox, (list, tuple)) and len(bbox) == 2:
+        lo = np.asarray(bbox[0], dtype=np.float64).reshape(3)
+        hi = np.asarray(bbox[1], dtype=np.float64).reshape(3)
+        if not np.all(lo <= hi):
+            raise ValueError("bbox must satisfy lo <= hi in each axis")
+        return lo, hi
+    raise ValueError("bbox must be [xmin,xmax,ymin,ymax,zmin,zmax] or (lo, hi)")
+
+
+def _ellipsoid_aabb(soma) -> tuple[np.ndarray, np.ndarray]:
+    """Axis-aligned bounding box of a rotated ellipsoid."""
+    # For x = c + R diag(a) u, u ∈ unit sphere, the extreme along axis i is:
+    #   c_i ± sum_j |R_{ij}| * a_j
+    R = soma.R
+    a = soma.axes
+    extents = np.abs(R) @ a
+    lo = soma.center - extents
+    hi = soma.center + extents
+    return lo, hi
+
+
+def _choose_voxel_size(
+    radii: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    *,
+    target_voxels: float = 1e8,
+    user_voxel: float | None = None,
+    min_voxels_across_diam: int = 24,
+) -> tuple[float, tuple[int, int, int]]:
+    if user_voxel is not None and user_voxel <= 0:
+        raise ValueError("voxel_size must be positive")
+
+    if user_voxel is not None:
+        base = float(user_voxel)
+    else:
+        pos = radii[radii > 0]
+        if pos.size:
+            base = float(np.percentile(pos, 25)) / 3.0
+            base = max(base, 1e-6)
+            r_ref = float(np.percentile(pos, 10))
+            if r_ref > 0:
+                base = min(base, (2.0 * r_ref) / float(min_voxels_across_diam))
+        else:
+            span = float(np.max(hi - lo))
+            base = max(span / 256.0, 1e-6)
+
+    span = hi - lo
+    n_est = np.ceil(span / base).astype(int)
+    est_total = float(n_est[0] * n_est[1] * n_est[2])
+
+    if est_total > target_voxels:
+        scale = (est_total / target_voxels) ** (1.0 / 3.0)
+        base *= scale
+        n_est = np.ceil(span / base).astype(int)
+
+    n_est = np.maximum(n_est, 1)
+    return float(base), (int(n_est[0]), int(n_est[1]), int(n_est[2]))
+
+
+def _volume_voxel_union(
+    skel,
+    radii: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    *,
+    voxel_size: float | None,
+    include_soma: bool,
+    return_details: bool,
+):
+    """
+    Voxelize union of all edge frusta and the soma ellipsoid inside [lo,hi].
+    """
+    h, (nx, ny, nz) = _choose_voxel_size(radii, lo, hi, user_voxel=voxel_size)
+    xs = lo[0] + (np.arange(nx) + 0.5) * h
+    ys = lo[1] + (np.arange(ny) + 0.5) * h
+    zs = lo[2] + (np.arange(nz) + 0.5) * h
+
+    occ = np.zeros((nx, ny, nz), dtype=bool)
+    nodes = skel.nodes.astype(np.float64)
+    edges = skel.edges.astype(int)
+
+    # --- rasterize soma (within its AABB ∩ bbox) --------------------------
+    if include_soma and skel.soma is not None:
+        slo, shi = _ellipsoid_aabb(skel.soma)
+        slo = np.maximum(slo, lo)
+        shi = np.minimum(shi, hi)
+        # indices covering soma AABB
+        i0 = int(max(0, np.floor((slo[0] - lo[0]) / h)))
+        i1 = int(min(nx - 1, np.floor((shi[0] - lo[0]) / h)))
+        j0 = int(max(0, np.floor((slo[1] - lo[1]) / h)))
+        j1 = int(min(ny - 1, np.floor((shi[1] - lo[1]) / h)))
+        k0 = int(max(0, np.floor((slo[2] - lo[2]) / h)))
+        k1 = int(min(nz - 1, np.floor((shi[2] - lo[2]) / h)))
+        if i1 >= i0 and j1 >= j0 and k1 >= k0:
+            X, Y, Z = np.meshgrid(
+                xs[i0 : i1 + 1], ys[j0 : j1 + 1], zs[k0 : k1 + 1], indexing="ij"
+            )
+            P = np.stack((X.ravel(), Y.ravel(), Z.ravel()), axis=1)
+            inside = skel.soma.contains(P)
+            mask = inside.reshape(X.shape)
+            occ[i0 : i1 + 1, j0 : j1 + 1, k0 : k1 + 1] |= mask
+
+    # --- rasterize each edge frustum within its padded AABB ----------------
+    for i, j in edges:
+        a, b = nodes[i], nodes[j]
+        r0, r1 = float(radii[i]), float(radii[j])
+        rmax = max(r0, r1)
+        if not np.isfinite(rmax) or rmax < 0.0:
+            continue
+
+        # edge AABB in world coords, padded by rmax
+        lo_e = np.minimum(a, b) - rmax
+        hi_e = np.maximum(a, b) + rmax
+        lo_e = np.maximum(lo_e, lo)
+        hi_e = np.minimum(hi_e, hi)
+        if np.any(lo_e > hi_e):
+            continue
+
+        ii0 = int(max(0, np.floor((lo_e[0] - lo[0]) / h)))
+        ii1 = int(min(nx - 1, np.floor((hi_e[0] - lo[0]) / h)))
+        jj0 = int(max(0, np.floor((lo_e[1] - lo[1]) / h)))
+        jj1 = int(min(ny - 1, np.floor((hi_e[1] - lo[1]) / h)))
+        kk0 = int(max(0, np.floor((lo_e[2] - lo[2]) / h)))
+        kk1 = int(min(nz - 1, np.floor((hi_e[2] - lo[2]) / h)))
+        if ii1 < ii0 or jj1 < jj0 or kk1 < kk0:
+            continue
+
+        X, Y, Z = np.meshgrid(
+            xs[ii0 : ii1 + 1], ys[jj0 : jj1 + 1], zs[kk0 : kk1 + 1], indexing="ij"
+        )
+        P = np.stack((X.ravel(), Y.ravel(), Z.ravel()), axis=1)
+
+        v = b - a
+        L2 = float(v @ v)
+        if L2 <= 1e-24:
+            # treat as a ball at 'a' with radius rmax
+            d2 = np.sum((P - a) ** 2, axis=1)
+            mask = (d2 <= rmax * rmax).reshape(X.shape)
+            occ[ii0 : ii1 + 1, jj0 : jj1 + 1, kk0 : kk1 + 1] |= mask
+            continue
+
+        # projection parameter clamped to [0,1]
+        s = np.clip(((P - a) @ v) / L2, 0.0, 1.0)
+        F = a + s[:, None] * v
+        d2 = np.sum((P - F) ** 2, axis=1)
+        r = (1.0 - s) * r0 + s * r1
+        mask = (d2 <= r * r).reshape(X.shape)
+        occ[ii0 : ii1 + 1, jj0 : jj1 + 1, kk0 : kk1 + 1] |= mask
+
+    count = int(occ.sum())
+    V = float(count) * (h**3)
+    if not return_details:
+        return V
+    return V, {
+        "voxel_size": h,
+        "grid_shape": (nx, ny, nz),
+        "bbox_lo": lo,
+        "bbox_hi": hi,
+        "filled_voxels": count,
+    }
+
+
+def volume(
+    skel,
+    bbox: list[float] | tuple[Sequence[float], Sequence[float]] | None = None,
+    *,
+    radius_metric: str | None = None,
+    voxel_size: float | None = None,
+    include_soma: bool = True,
+    return_details: bool = False,
+):
+    """
+    Estimate the morphology volume, optionally restricted to an axis-aligned bbox.
+
+    Robust union via voxelization inside the bbox: fills voxels that lie
+    inside any edge frustum or the soma ellipsoid. Correctly handles
+    branch overlaps and bbox clipping. Accuracy controlled by `voxel_size`
+    (defaults to ~1/3 of a thin-branch radius, auto-scaled to keep the grid
+    under ~60M voxels unless you pass voxel_size explicitly).
+
+    Parameters
+    ----------
+    bbox
+        None (whole neuron) or [xmin, xmax, ymin, ymax, zmin, zmax] or (lo, hi).
+    radius_metric
+        Which `skel.radii[metric]` column to use; defaults to the
+        choice from `skel.recommend_radius()`.
+    voxel_size
+        Edge length of voxels. If None, a size is chosen
+        from radii and capped so the grid stays reasonably small.
+    include_soma
+        Whether to include the soma ellipsoid in the volume.
+    return_details
+        If True, returns (V, details_dict) with diagnostic info for debugging.
+
+    Returns
+    -------
+    float or (float, dict)
+        Estimated volume (in the cube of your skeleton units). If
+        `return_details=True`, also returns a small diagnostics dict.
+
+    Notes
+    -----
+    * 'frustum' is blazing-fast and good for whole-cell summaries. It trims
+      soma overlap on edges but **does not** de-overlap at branch junctions.
+    * 'voxel' is the accurate union (no double counting) and is recommended
+      whenever `bbox` is used or precise union is important.
+    """
+    if radius_metric is None:
+        radius_metric = skel.recommend_radius()[0]
+    radii = np.asarray(skel.radii[radius_metric], dtype=np.float64).reshape(-1)
+    if radii.shape[0] != skel.nodes.shape[0]:
+        raise ValueError("radius_metric array length must match number of nodes")
+
+    # dispatch
+    lo_hi = _parse_bbox(bbox)
+
+    if lo_hi is None:
+        # Auto bbox that tightly encloses neuron + radii + soma extents
+        lo_nodes = (skel.nodes - radii[:, None]).min(axis=0)
+        hi_nodes = (skel.nodes + radii[:, None]).max(axis=0)
+        if include_soma and skel.soma is not None:
+            slo, shi = _ellipsoid_aabb(skel.soma)
+            lo = np.minimum(lo_nodes, slo)
+            hi = np.maximum(hi_nodes, shi)
+        else:
+            lo, hi = lo_nodes, hi_nodes
+    else:
+        lo, hi = lo_hi
+
+    V = _volume_voxel_union(
+        skel,
+        radii,
+        lo,
+        hi,
+        voxel_size=voxel_size,
+        include_soma=include_soma,
+        return_details=return_details,
+    )
+    return V
