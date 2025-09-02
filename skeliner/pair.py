@@ -627,11 +627,57 @@ def _cluster_points(P: np.ndarray, eps: float) -> list[np.ndarray]:
     return clusters
 
 
+def _aabbs_for_patches(
+    mesh: trimesh.Trimesh, patch_faces: list[np.ndarray]
+) -> np.ndarray:
+    """
+    Compute per-patch AABBs from lists of face indices.
+    Returns (M,2,3) array; rows with no faces are filled with NaNs.
+    """
+    M = len(patch_faces)
+    out = np.full((M, 2, 3), np.nan, dtype=float)
+    if M == 0:
+        return out
+    tri = np.asarray(mesh.triangles)  # (F,3,3)
+    for i, faces in enumerate(patch_faces):
+        if len(faces):
+            pts = tri[np.asarray(faces, np.int64)].reshape(-1, 3)
+            out[i, 0] = pts.min(axis=0)
+            out[i, 1] = pts.max(axis=0)
+    return out
+
+
+def _union_aabbs(bA: np.ndarray, bB: np.ndarray) -> np.ndarray:
+    """
+    Union two (M,2,3) AABB arrays (NaN-safe).
+    If only one side is present (finite), union == that side.
+    If both missing, union is NaN.
+    """
+    out = np.full_like(bA, np.nan)
+    hasA = np.all(np.isfinite(bA), axis=(1, 2))
+    hasB = np.all(np.isfinite(bB), axis=(1, 2))
+    both = hasA & hasB
+
+    # both sides present
+    out[both, 0] = np.minimum(bA[both, 0], bB[both, 0])
+    out[both, 1] = np.maximum(bA[both, 1], bB[both, 1])
+
+    # only A
+    onlyA = hasA & (~hasB)
+    out[onlyA] = bA[onlyA]
+
+    # only B
+    onlyB = hasB & (~hasA)
+    out[onlyB] = bB[onlyB]
+
+    return out
+
+
 # ------------------------ result struct ---------------------------------
 
 
 @dataclass(slots=True)
-class ContactSitesResult:
+class ContactSites:
     faces_A: list[np.ndarray]  # per-contact face indices on A
     faces_B: list[np.ndarray]  # per-contact face indices on B
     area_A: np.ndarray  # per-contact area on A
@@ -640,6 +686,9 @@ class ContactSitesResult:
     seeds_A: np.ndarray  # projected seed on A
     seeds_B: np.ndarray  # projected seed on B
     pairs_AB: list[np.ndarray] | None
+    bbox_A: np.ndarray  # (M,2,3) [min,max] AABBs on A in mesh units
+    bbox_B: np.ndarray  # (M,2,3) [min,max] AABBs on B in mesh units
+    bbox: np.ndarray  # (M,2,3) union(A,B) in mesh units
     meta: dict[str, object]
 
     def to_npz(self, path: str | Path, *, compress: bool = True) -> None:
@@ -668,7 +717,7 @@ def map_contact_sites(
     workers: int = 16,
     sides: str = "both",
     unit: str = "nm^2",
-) -> ContactSitesResult:
+) -> ContactSites:
     """
     Extract touching-face patches near seeds, then MERGE overlapping per-seed patches
     into consolidated contact patches (no seed→patch 1:1). Empty patches are pruned.
@@ -1074,7 +1123,8 @@ def map_contact_sites(
             K_patches=0,
             seed_to_patch=(-np.ones(K0, dtype=np.int64)),
         )
-        return ContactSitesResult(
+        empty_bbox = np.empty((0, 2, 3), float)
+        return ContactSites(
             faces_A=[],
             faces_B=[],
             area_A=np.zeros(0, float),
@@ -1083,6 +1133,9 @@ def map_contact_sites(
             seeds_A=np.empty((0, 3), float),
             seeds_B=np.empty((0, 3), float),
             pairs_AB=([] if return_pairs else None),
+            bbox_A=empty_bbox,
+            bbox_B=empty_bbox,
+            bbox=empty_bbox,
             meta=meta,
         )
 
@@ -1243,6 +1296,18 @@ def map_contact_sites(
     out_area_B = np.asarray(new_area_B_list, float)
     seeds_A = np.vstack(new_seeds_A) if new_seeds_A else np.empty((0, 3), float)
     seeds_B = np.vstack(new_seeds_B) if new_seeds_B else np.empty((0, 3), float)
+    bbox_A = (
+        _aabbs_for_patches(A, out_faces_A)
+        if doA
+        else np.full((len(out_faces_A), 2, 3), np.nan)
+    )
+    bbox_B = (
+        _aabbs_for_patches(B, out_faces_B)
+        if doB
+        else np.full((len(out_faces_B), 2, 3), np.nan)
+    )
+    bbox_union = _union_aabbs(bbox_A, bbox_B)
+
     K_groups = len(out_faces_A)  # == len(groups)
 
     # Map from original seed index -> patch index (after group pruning below)
@@ -1311,7 +1376,7 @@ def map_contact_sites(
         seed_to_patch=seed_to_patch,
     )
 
-    return ContactSitesResult(
+    return ContactSites(
         faces_A=out_faces_A,
         faces_B=out_faces_B,
         area_A=out_area_A,
@@ -1320,5 +1385,8 @@ def map_contact_sites(
         seeds_A=seeds_A,
         seeds_B=seeds_B,
         pairs_AB=(new_pairs if return_pairs else None),
+        bbox_A=bbox_A,
+        bbox_B=bbox_B,
+        bbox=bbox_union,
         meta=meta,
     )
