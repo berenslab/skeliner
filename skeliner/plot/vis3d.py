@@ -644,7 +644,7 @@ def view_contacts(
     color_A: tuple[float, float, float] = (0.82, 0.86, 1.00),  # light bluish
     color_B: tuple[float, float, float] = (1.00, 0.85, 0.85),  # light reddish
     site_opacity: float = 1.0,
-    sides: str = "both",  # 'A', 'B', or 'both'
+    sides: str = "A",  # 'A', 'B', or 'both'
     window_size: tuple[int, int] = (2000, 1500),
     background: tuple[float, float, float] = (0.0, 0.062745, 0.129412),
     # --- NEW: AABB controls ---

@@ -1,6 +1,3 @@
-# test_volume.py
-from __future__ import annotations
-
 import math
 from copy import deepcopy
 
