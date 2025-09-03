@@ -644,40 +644,19 @@ def subsample(
     radius_key: str = "median",
     rtol: float = 0.05,
     atol: float = 0.0,
-    aggregate: str = "median",  # {"median", "mean"} for radii aggregation
+    aggregate: str = "median",  # {"median","mean"} for radii aggregation
+    merge_endpoints: bool = True,
+    slide_branchpoints: bool = True,
+    max_anchor_shift: float | None = None,  # (units of coords)
     verbose: bool = True,
 ):
     """
     Radii-aware subsampling that preserves topology.
 
-    Strategy
-    --------
-    • Keep all *anchors* (soma, endpoints, branch points: degree != 2).
-    • For every degree‑2 run between anchors, segment it into groups where
-      radius (from `radius_key`) changes slowly:
-        |r_i − r_ref| ≤ atol + rtol * max(r_i, r_ref).
-    • Replace each group with a single node:
-        - position  : length‑weighted centroid of the group's polyline
-        - radii     : median (or mean) over the group for *all* radius keys
-        - ntype     : integer mode over the group
-        - node2verts: concatenation (unique) of members' sets
-      Edges are rewired in run order so the tree structure is preserved.
-
-    Parameters
-    ----------
-    radius_key
-        Column in `skel.radii` used to *decide* grouping.
-    rtol, atol
-        Relative / absolute tolerance for radius closeness.
-    aggregate
-        Aggregator for radii values of the merged node: "median" (robust) or "mean".
-    verbose
-        Print a short summary.
-
-    Returns
-    -------
-    Skeleton
-        A **new** skeleton with fewer nodes, same topology.
+    By default: only degree-2 runs are merged (anchors kept).
+    Optional: absorb leaf endpoints and/or slide branchpoints into adjacent
+    runs when |Δr| ≤ atol + rtol * max(r_anchor, r_group). Merging node 0 is
+    never allowed.
     """
     from .core import Skeleton, _build_mst
 
@@ -686,12 +665,10 @@ def subsample(
             f"radius_key '{radius_key}' not found in skel.radii "
             f"(available keys: {tuple(skel.radii)})"
         )
-
     N = int(len(skel.nodes))
     if N <= 1:
         return skel
 
-    # Input views
     nodes = skel.nodes
     radiiD = skel.radii
     r_dec = radiiD[radius_key]
@@ -702,26 +679,22 @@ def subsample(
 
     node2verts0: list[np.ndarray] | None = None
     vert2node0: dict[int, int] | None = None
-
     if has_node2verts:
-        # Ensure indexability up to N with empty arrays
         node2verts0 = list(skel.node2verts)
         if len(node2verts0) < N:
-            node2verts0 = node2verts0 + [
+            node2verts0 += [
                 np.empty(0, dtype=np.int64) for _ in range(N - len(node2verts0))
             ]
     if has_vert2node:
         vert2node0 = dict(skel.vert2node)
 
-    # Graph structure
     g = skel._igraph()
     deg = np.asarray(g.degree(), dtype=np.int64)
     anchors: set[int] = {i for i, d in enumerate(deg) if d != 2}
-    anchors.add(0)  # always keep soma (already covered unless deg==2 by accident)
+    anchors.add(0)
 
     adj = _adjacency_from_edges(N, skel.edges)
 
-    # Accumulators for the new skeleton
     new_nodes: list[np.ndarray] = []
     new_radii: dict[str, list[float]] = {k: [] for k in radiiD.keys()}
     new_ntype: list[int] = []
@@ -730,7 +703,6 @@ def subsample(
     old2new: dict[int, int] = {}
 
     def _add_anchor(old_id: int) -> int:
-        """Create (or fetch) a preserved anchor node."""
         oid = int(old_id)
         if oid in old2new:
             return old2new[oid]
@@ -750,14 +722,11 @@ def subsample(
         return nid
 
     def _add_group(group_ids: list[int]) -> int:
-        """Create a new merged node from a contiguous group of degree-2 nodes."""
         gids = list(map(int, group_ids))
         nid = len(new_nodes)
-
-        # Position: length-weighted centroid along the polyline
         pos = _len_weighted_centroid(nodes[gids])
+        new_nodes.append(pos.astype(np.float64))
 
-        # Radii aggregation for every available key
         for k in new_radii:
             vals = radiiD[k][gids]
             val = (
@@ -767,10 +736,8 @@ def subsample(
             )
             new_radii[k].append(val)
 
-        # ntype: majority vote in the group
         new_ntype.append(_mode_int(ntype0[gids], default=3))
 
-        # node2verts: union/concat (unique)
         if new_node2verts is not None:
             if node2verts0 is None:
                 new_node2verts.append(np.empty(0, dtype=np.int64))
@@ -780,20 +747,21 @@ def subsample(
                     for j in gids
                     if j < len(node2verts0)
                 ]
-                if parts:
-                    merged = np.unique(np.concatenate(parts))
-                else:
-                    merged = np.empty(0, dtype=np.int64)
+                merged = (
+                    np.unique(np.concatenate(parts))
+                    if parts
+                    else np.empty(0, dtype=np.int64)
+                )
                 new_node2verts.append(merged)
 
-        new_nodes.append(pos.astype(np.float64))
-
-        # Map all old group members to this newly created node
         for j in gids:
             old2new[j] = nid
         return nid
 
-    # Walk every run between anchors exactly once
+    def _within_tol(ra: float, rb: float) -> bool:
+        tol = float(atol) + float(rtol) * max(abs(ra), abs(rb))
+        return abs(ra - rb) <= tol
+
     visited: set[tuple[int, int]] = set()
 
     for a in sorted(anchors):
@@ -801,7 +769,8 @@ def subsample(
             e0 = _norm_edge(a, b)
             if e0 in visited:
                 continue
-            # begin a→…→z walk
+
+            # Walk a → ... → z along the corridor
             path = [a]
             prev, cur = a, b
             visited.add(e0)
@@ -809,36 +778,136 @@ def subsample(
                 path.append(cur)
                 nxts = [x for x in adj[cur] if x != prev]
                 if len(nxts) != 1:
-                    # Non-tree oddity (cycle or broken adj); stop the run safely
                     break
                 nxt = nxts[0]
                 visited.add(_norm_edge(cur, nxt))
                 prev, cur = cur, nxt
             if cur != path[-1]:
-                path.append(cur)  # z (anchor)
+                path.append(cur)
 
-            # Partition the internal corridor by radius closeness
             a_id, z_id = path[0], path[-1]
             internal = path[1:-1]
 
             left = _add_anchor(a_id)
-
-            if internal:
-                groups = _partition_by_radius(internal, r_dec, rtol=rtol, atol=atol)
-                for grp in groups:
-                    g_id = _add_group(grp)
-                    new_edges.append(_norm_edge(left, g_id))
-                    left = g_id
-
             right = _add_anchor(z_id)
-            new_edges.append(_norm_edge(left, right))
 
-    # Corner case: isolated anchors with no edges (deg==0)
+            groups = _partition_by_radius(internal, r_dec, rtol=rtol, atol=atol)
+
+            # --- Optional: absorb leftmost group into left anchor -----------
+            if (
+                groups
+                and a_id != 0
+                and (
+                    (merge_endpoints and deg[a_id] == 1)
+                    or (slide_branchpoints and deg[a_id] >= 3)
+                )
+            ):
+                g0 = groups[0]
+                ra = float(r_dec[a_id])
+                rg = (
+                    float(np.median(r_dec[g0]))
+                    if aggregate == "median"
+                    else float(np.mean(r_dec[g0]))
+                )
+                if _within_tol(ra, rg):
+                    new_pos = _len_weighted_centroid(nodes[[a_id] + g0])
+                    if (
+                        max_anchor_shift is None
+                        or np.linalg.norm(new_pos - new_nodes[left]) <= max_anchor_shift
+                    ):
+                        # mutate anchor accumulators
+                        new_nodes[left] = new_pos
+                        for k in new_radii:
+                            vals = np.concatenate(([radiiD[k][a_id]], radiiD[k][g0]))
+                            new_radii[k][left] = float(
+                                np.median(vals)
+                                if aggregate == "median"
+                                else np.mean(vals)
+                            )
+                        if new_node2verts is not None and node2verts0 is not None:
+                            parts = [node2verts0[a_id]] + [node2verts0[j] for j in g0]
+                            merged = (
+                                np.unique(
+                                    np.concatenate(
+                                        [
+                                            p
+                                            for p in parts
+                                            if p is not None and p.size > 0
+                                        ]
+                                    )
+                                )
+                                if any((p is not None and p.size > 0) for p in parts)
+                                else np.empty(0, dtype=np.int64)
+                            )
+                            new_node2verts[left] = merged
+                        for j in g0:
+                            old2new[j] = left
+                        groups = groups[1:]
+
+            # --- Optional: absorb rightmost group into right anchor ----------
+            if (
+                groups
+                and z_id != 0
+                and (
+                    (merge_endpoints and deg[z_id] == 1)
+                    or (slide_branchpoints and deg[z_id] >= 3)
+                )
+            ):
+                gL = groups[-1]
+                rz = float(r_dec[z_id])
+                rg = (
+                    float(np.median(r_dec[gL]))
+                    if aggregate == "median"
+                    else float(np.mean(r_dec[gL]))
+                )
+                if _within_tol(rz, rg):
+                    new_pos = _len_weighted_centroid(nodes[gL + [z_id]])
+                    if (
+                        max_anchor_shift is None
+                        or np.linalg.norm(new_pos - new_nodes[right])
+                        <= max_anchor_shift
+                    ):
+                        new_nodes[right] = new_pos
+                        for k in new_radii:
+                            vals = np.concatenate((radiiD[k][gL], [radiiD[k][z_id]]))
+                            new_radii[k][right] = float(
+                                np.median(vals)
+                                if aggregate == "median"
+                                else np.mean(vals)
+                            )
+                        if new_node2verts is not None and node2verts0 is not None:
+                            parts = [node2verts0[j] for j in gL] + [node2verts0[z_id]]
+                            merged = (
+                                np.unique(
+                                    np.concatenate(
+                                        [
+                                            p
+                                            for p in parts
+                                            if p is not None and p.size > 0
+                                        ]
+                                    )
+                                )
+                                if any((p is not None and p.size > 0) for p in parts)
+                                else np.empty(0, dtype=np.int64)
+                            )
+                            new_node2verts[right] = merged
+                        for j in gL:
+                            old2new[j] = right
+                        groups = groups[:-1]
+
+            # Wire: left → groups → right
+            L = left
+            for grp in groups:
+                g_id = _add_group(grp)
+                new_edges.append(_norm_edge(L, g_id))
+                L = g_id
+            new_edges.append(_norm_edge(L, right))
+
+    # Handle isolated anchors (deg == 0)
     for a in sorted(anchors):
         if deg[a] == 0:
             _add_anchor(a)
 
-    # Finalize arrays
     nodes_new = np.asarray(new_nodes, dtype=np.float64)
     radii_new = {k: np.asarray(v, dtype=np.float64) for k, v in new_radii.items()}
     ntype_new = np.asarray(new_ntype, dtype=np.int8)
@@ -848,7 +917,7 @@ def subsample(
         np.unique(np.sort(edges_arr, axis=1), axis=0) if edges_arr.size else edges_arr
     )
 
-    # vert2node remap
+    # vert2node
     if has_vert2node and vert2node0 is not None:
         vert2node_new = {
             int(v): int(old2new.get(int(n), old2new.get(0, 0)))
@@ -856,7 +925,6 @@ def subsample(
             if int(n) in old2new
         }
     elif new_node2verts is not None:
-        # Rebuild from node2verts if available
         vert2node_new = {
             int(v): int(i)
             for i, vs in enumerate(new_node2verts)
@@ -865,7 +933,7 @@ def subsample(
     else:
         vert2node_new = None
 
-    # Ensure soma (old id 0) stays at index 0
+    # Keep soma at index 0
     new_root = int(old2new.get(0, 0))
     if new_root != 0 and len(nodes_new):
         swap = new_root
@@ -889,12 +957,8 @@ def subsample(
         edges_arr[a1] = 0
         edges_arr = np.unique(np.sort(edges_arr, axis=1), axis=0)
 
-    # Build the output Skeleton. Re-run MST to be extra safe / canonical.
-    from .core import Soma  # type: ignore
-
-    soma_out = skel.soma if isinstance(skel.soma, Soma) else skel.soma  # unchanged soma
     new_skel = Skeleton(
-        soma=soma_out,
+        soma=skel.soma,
         nodes=nodes_new,
         radii=radii_new,
         edges=_build_mst(nodes_new, edges_arr),
@@ -908,7 +972,8 @@ def subsample(
     if verbose:
         print(
             f"[skeliner] subsample – nodes: {N} → {len(nodes_new)}; "
-            f"rtol={rtol:g}, atol={atol:g}, key='{radius_key}', agg='{aggregate}'"
+            f"rtol={rtol:g}, atol={atol:g}, key='{radius_key}', agg='{aggregate}', "
+            f"merge_endpoints={merge_endpoints}, slide_branchpoints={slide_branchpoints}"
         )
 
     return new_skel
