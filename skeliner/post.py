@@ -1,5 +1,5 @@
-"""skeliner.post – post-processing functions for skeletons.
-"""
+"""skeliner.post – post-processing functions for skeletons."""
+
 from typing import Iterable, Set, cast
 
 import igraph as ig
@@ -13,6 +13,7 @@ __skeleton__ = [
     "graft",
     "clip",
     "prune",
+    "subsample",
     # editing ntype
     "set_ntype",
 ]
@@ -20,6 +21,7 @@ __skeleton__ = [
 # -----------------------------------------------------------------------------
 # helpers
 # -----------------------------------------------------------------------------
+
 
 def _norm_edge(u: int, v: int) -> tuple[int, int]:
     """Return *sorted* vertex pair as tuple."""
@@ -30,11 +32,17 @@ def _norm_edge(u: int, v: int) -> tuple[int, int]:
 
 def _refresh_igraph(skel) -> ig.Graph:  # type: ignore[valid-type]
     """Build an igraph view from current edge list."""
-    return ig.Graph(n=len(skel.nodes), edges=[tuple(map(int, e)) for e in skel.edges], directed=False)
+    return ig.Graph(
+        n=len(skel.nodes),
+        edges=[tuple(map(int, e)) for e in skel.edges],
+        directed=False,
+    )
+
 
 # -----------------------------------------------------------------------------
 # editing edges: graft / clip
 # -----------------------------------------------------------------------------
+
 
 def graft(skel, u: int, v: int, *, allow_cycle: bool = True) -> None:
     """Insert an undirected edge *(u,v)*.
@@ -56,7 +64,9 @@ def graft(skel, u: int, v: int, *, allow_cycle: bool = True) -> None:
     if not allow_cycle:
         g = _refresh_igraph(skel)
         if g.are_connected(u, v):
-            raise ValueError("graft would introduce a cycle; set allow_cycle=True to override")
+            raise ValueError(
+                "graft would introduce a cycle; set allow_cycle=True to override"
+            )
 
     skel.edges = np.sort(
         np.vstack([skel.edges, np.asarray(new_edge, dtype=np.int64)]), axis=1
@@ -90,10 +100,11 @@ def clip(skel, u: int, v: int, *, drop_orphans: bool = False) -> None:
 
         _rebuild_keep_subset(skel, reachable)
 
+
 def prune(
     skel,
     *,
-    kind: str= "twigs",
+    kind: str = "twigs",
     num_nodes: int | None = None,
     nodes: Iterable[int] | None = None,
 ) -> None:
@@ -121,6 +132,7 @@ def prune(
     else:
         raise ValueError(f"Unknown kind '{kind}'")
 
+
 def _collect_twig_nodes(skel, num_nodes: int) -> Set[int]:
     """
     Vertices to drop when pruning *twigs* ≤ num_nodes.
@@ -132,7 +144,7 @@ def _collect_twig_nodes(skel, num_nodes: int) -> Set[int]:
     for k in range(1, num_nodes + 1):
         for twig in dx.twigs_of_length(skel, k, include_branching_node=True):
             # twig[0] is the branching node when include_branching_node=True
-            nodes.update(twig[1:])          # drop only the true twig
+            nodes.update(twig[1:])  # drop only the true twig
     return nodes
 
 
@@ -141,6 +153,7 @@ def _prune_twigs(skel, *, num_nodes: int):
     if not drop:
         return  # nothing to do
     _rebuild_drop_set(skel, drop)
+
 
 def _prune_nodes(
     skel,
@@ -161,9 +174,11 @@ def _prune_nodes(
 
     _rebuild_drop_set(skel, drop)
 
+
 # -----------------------------------------------------------------------------
 #  array rebuild utilities
 # -----------------------------------------------------------------------------
+
 
 def _rebuild_drop_set(skel, drop: Iterable[int]):
     """Compact skeleton arrays after dropping a set of vertices."""
@@ -179,12 +194,18 @@ def _rebuild_drop_set(skel, drop: Iterable[int]):
     remap[keep_mask] = np.arange(keep_mask.sum(), dtype=np.int64)
 
     skel.nodes = skel.nodes[keep_mask]
-    skel.node2verts = [skel.node2verts[i] for i in np.where(keep_mask)[0]] if skel.node2verts is not None and len(skel.node2verts) > 0 else None
+    skel.node2verts = (
+        [skel.node2verts[i] for i in np.where(keep_mask)[0]]
+        if skel.node2verts is not None and len(skel.node2verts) > 0
+        else None
+    )
     skel.radii = {k: v[keep_mask] for k, v in skel.radii.items()}
 
     # update vert2node mapping
     if skel.vert2node is not None and len(skel.vert2node) > 0:
-        skel.vert2node = {int(v): int(remap[n]) for v, n in skel.vert2node.items() if keep_mask[n]}
+        skel.vert2node = {
+            int(v): int(remap[n]) for v, n in skel.vert2node.items() if keep_mask[n]
+        }
 
     # rebuild edges
     new_edges = []
@@ -200,9 +221,11 @@ def _rebuild_keep_subset(skel, keep_set: Set[int]):
     keep_mask[list(keep_set)] = True
     _rebuild_drop_set(skel, np.where(~keep_mask)[0])
 
+
 # -----------------------------------------------------------------------------
 #  ntype editing
 # -----------------------------------------------------------------------------
+
 
 def set_ntype(
     skel,
@@ -233,7 +256,7 @@ def set_ntype(
         Control how the neurite expansion behaves (ignored when
         ``node_ids`` is given).
     """
-   # ----------------------------------------------------------- #
+    # ----------------------------------------------------------- #
     # argument sanity                                             #
     # ----------------------------------------------------------- #
     if (root is None) == (node_ids is None):
@@ -245,9 +268,7 @@ def set_ntype(
     if node_ids is not None:
         target = set(map(int, node_ids))
     else:
-        bases_arr = np.atleast_1d(
-            cast(ArrayLike, root)
-        ).astype(int)
+        bases_arr = np.atleast_1d(cast(ArrayLike, root)).astype(int)
 
         bases: set[int] = set(bases_arr)
         target: set[int] = set()
@@ -259,15 +280,17 @@ def set_ntype(
         else:
             target.update(bases)
 
-    target.discard(0)          # never overwrite soma
+    target.discard(0)  # never overwrite soma
     if not target:
         return
 
     skel.ntype[np.fromiter(target, dtype=int)] = int(code)
 
+
 # -----------------------------------------------------------------------------
 # Re-detect Soma
 # -----------------------------------------------------------------------------
+
 
 def _find_soma(
     nodes: np.ndarray,
@@ -301,7 +324,7 @@ def _find_soma(
 
     # 2. anchor = single largest node
     idx_max = int(np.argmax(radii))
-    R_max   = float(radii[idx_max])
+    R_max = float(radii[idx_max])
 
     # 3. keep candidates that cluster around the anchor
     d = np.linalg.norm(nodes[cand_idx] - nodes[idx_max], axis=1)
@@ -316,7 +339,7 @@ def _find_soma(
     return soma_est, soma_idx, has_soma
 
 
-def detect_soma(          
+def detect_soma(
     skel,
     *,
     radius_key: str = "median",
@@ -355,22 +378,23 @@ def detect_soma(
         skeleton whose node 0 is the freshly detected soma centroid.
     """
     from .core import Skeleton, Soma, _build_mst
+
     if radius_key not in skel.radii:
         raise KeyError(
             f"radius_key '{radius_key}' not found in skel.radii "
             f"(available keys: {tuple(skel.radii)})"
         )
     if len(skel.nodes) <= 1:
-        return skel                 # trivial graph → nothing to do
-
+        return skel  # trivial graph → nothing to do
 
     has_node2verts = skel.node2verts is not None and len(skel.node2verts) > 0
     has_vert2node = skel.vert2node is not None and len(skel.vert2node) > 0
-    # ------------------------------------------------------------------ 
+    # ------------------------------------------------------------------
     # A. re-detect the soma cluster
     # ------------------------------------------------------------------
     soma_est, soma_idx, has_soma = _find_soma(
-        skel.nodes, skel.radii[radius_key],
+        skel.nodes,
+        skel.radii[radius_key],
         pct_large=soma_radius_percentile_threshold,
         dist_factor=soma_radius_distance_factor,
         min_keep=soma_min_nodes,
@@ -383,22 +407,20 @@ def detect_soma(
         return skel
 
     # Which node will be the *new* root?
-    new_root_old = int(
-        soma_idx[np.argmax(skel.radii[radius_key][soma_idx])]
-    )
+    new_root_old = int(soma_idx[np.argmax(skel.radii[radius_key][soma_idx])])
     drop_nodes = {int(i) for i in soma_idx if i != new_root_old}
 
-    # ------------------------------------------------------------------ 
+    # ------------------------------------------------------------------
     # B. clone arrays so we do not mutate the caller’s object
     # ------------------------------------------------------------------
-    nodes       = skel.nodes.copy()
-    radii       = {k: v.copy() for k, v in skel.radii.items()}
-    edges       = skel.edges.copy()
-    node2verts  = [vs.copy() for vs in skel.node2verts] if has_node2verts else None
-    vert2node   = dict(skel.vert2node)         if has_vert2node else None
-    ntype       = skel.ntype.copy()            if skel.ntype is not None else None
+    nodes = skel.nodes.copy()
+    radii = {k: v.copy() for k, v in skel.radii.items()}
+    edges = skel.edges.copy()
+    node2verts = [vs.copy() for vs in skel.node2verts] if has_node2verts else None
+    vert2node = dict(skel.vert2node) if has_vert2node else None
+    ntype = skel.ntype.copy() if skel.ntype is not None else None
 
-    # ------------------------------------------------------------------ 
+    # ------------------------------------------------------------------
     # C. **collapse** of multiple soma nodes
     # ------------------------------------------------------------------
     if drop_nodes:
@@ -415,11 +437,17 @@ def detect_soma(
                 # auto-extend the mapping list if it is shorter than needed
                 if idx >= len(node2verts):
                     node2verts.extend(
-                        [np.empty(0, dtype=np.int64) for _ in range(idx + 1 - len(node2verts))]
+                        [
+                            np.empty(0, dtype=np.int64)
+                            for _ in range(idx + 1 - len(node2verts))
+                        ]
                     )
                 if new_root_old >= len(node2verts):
                     node2verts.extend(
-                        [np.empty(0, dtype=np.int64) for _ in range(new_root_old + 1 - len(node2verts))]
+                        [
+                            np.empty(0, dtype=np.int64)
+                            for _ in range(new_root_old + 1 - len(node2verts))
+                        ]
                     )
                 node2verts[new_root_old] = np.concatenate(
                     (node2verts[new_root_old], node2verts[idx])
@@ -445,7 +473,7 @@ def detect_soma(
             # row-wise sort then deduplicate
             edges = np.unique(np.sort(edges, axis=1), axis=0)
 
-    # ------------------------------------------------------------------ 
+    # ------------------------------------------------------------------
     # D. build keep-mask & remap after the (optional) merge
     # ------------------------------------------------------------------
     keep_mask = np.ones(len(nodes), bool)
@@ -460,8 +488,9 @@ def detect_soma(
     if has_node2verts:
         node2verts = [node2verts[i] for i in np.where(keep_mask)[0]]
     if has_vert2node:
-        vert2node = {int(v): remap[int(n)]
-                     for v, n in vert2node.items() if keep_mask[n]}
+        vert2node = {
+            int(v): remap[int(n)] for v, n in vert2node.items() if keep_mask[n]
+        }
 
     # edges – remap & de-duplicate
     edges = np.asarray(
@@ -473,7 +502,7 @@ def detect_soma(
 
     new_root = remap[new_root_old]
 
-    # ------------------------------------------------------------------ 
+    # ------------------------------------------------------------------
     # E. enforce: soma → vertex 0
     # ------------------------------------------------------------------
     if new_root != 0:
@@ -498,15 +527,18 @@ def detect_soma(
         edges[a1] = 0
         edges = np.unique(np.sort(edges, axis=1), axis=0)
 
-    # ------------------------------------------------------------------ 
+    # ------------------------------------------------------------------
     # F. rebuild the Soma object (sphere model – no mesh available)
     # ------------------------------------------------------------------
     r0 = float(radii[radius_key][0])
-    soma_new = Soma.from_sphere(nodes[0], r0,
-                                verts=node2verts[0] if node2verts is not None and len(node2verts) > 0 else None)
+    soma_new = Soma.from_sphere(
+        nodes[0],
+        r0,
+        verts=node2verts[0] if node2verts is not None and len(node2verts) > 0 else None,
+    )
 
     if ntype is not None:
-        ntype[0] = 1                       # SWC code for soma
+        ntype[0] = 1  # SWC code for soma
 
     if verbose:
         centre_txt = ", ".join(f"{c:7.1f}" for c in nodes[0])
@@ -514,7 +546,7 @@ def detect_soma(
         what = f"merged {merged} node{'s' if merged != 1 else ''}"
         print(f"[skeliner] detect_soma – {what} → soma @ [{centre_txt}], r ≈ {r0:.1f}")
 
-    # ------------------------------------------------------------------ 
+    # ------------------------------------------------------------------
     # G. return the **new** skeleton object
     # ------------------------------------------------------------------
     new_skel = Skeleton(
@@ -525,10 +557,358 @@ def detect_soma(
         ntype=ntype,
         node2verts=node2verts,
         vert2node=vert2node,
-        meta={**skel.meta},       # shallow copies are fine
+        meta={**skel.meta},  # shallow copies are fine
         extra={**skel.extra},
     )
 
     new_skel.prune(num_nodes=1)  # remove any remaining twigs
     return new_skel
 
+
+# -----------------------------------------------------------------------------
+# Radii-aware subsampling
+# -----------------------------------------------------------------------------
+
+
+def _mode_int(vals: np.ndarray, default: int = 3) -> int:
+    """Fast integer mode with a sane default when empty."""
+    vals = np.asarray(vals, dtype=np.int64)
+    if vals.size == 0:
+        return int(default)
+    mx = int(vals.max(initial=0))
+    if mx < 0:
+        return int(default)
+    return int(np.bincount(np.clip(vals, 0, mx)).argmax())
+
+
+def _adjacency_from_edges(n: int, edges: np.ndarray) -> list[list[int]]:
+    """Build simple adjacency lists."""
+    adj = [set() for _ in range(n)]
+    for a, b in edges:
+        a = int(a)
+        b = int(b)
+        if a == b:
+            continue
+        adj[a].add(b)
+        adj[b].add(a)
+    return [list(s) for s in adj]
+
+
+def _len_weighted_centroid(xs: np.ndarray) -> np.ndarray:
+    """
+    Length-weighted centroid of a polyline defined by node coordinates.
+    Uses segment midpoints weighted by segment length.
+    For a single point, returns that point.
+    """
+    xs = np.asarray(xs, dtype=np.float64)
+    if len(xs) <= 1:
+        return xs.reshape(-1, 3)[0]
+    seg = xs[1:] - xs[:-1]
+    L = np.linalg.norm(seg, axis=1)
+    if not np.isfinite(L).all() or np.all(L == 0):
+        return xs.mean(axis=0)
+    mids = 0.5 * (xs[1:] + xs[:-1])
+    return (mids * L[:, None]).sum(axis=0) / L.sum()
+
+
+def _partition_by_radius(
+    ids: list[int], r: np.ndarray, *, rtol: float, atol: float
+) -> list[list[int]]:
+    """
+    Greedy 1D segmentation along a path based on a running radius reference.
+    Starts a new group when the next radius deviates beyond tolerance.
+    """
+    if not ids:
+        return []
+    groups: list[list[int]] = []
+    cur: list[int] = [ids[0]]
+    r_ref = float(r[ids[0]])
+    for nid in ids[1:]:
+        ri = float(r[nid])
+        tol = float(atol) + float(rtol) * max(abs(r_ref), abs(ri))
+        if abs(ri - r_ref) <= tol:
+            cur.append(nid)
+            # running mean keeps the reference centered without exploding variance
+            r_ref += (ri - r_ref) / len(cur)
+        else:
+            groups.append(cur)
+            cur = [nid]
+            r_ref = ri
+    groups.append(cur)
+    return groups
+
+
+def subsample(
+    skel,
+    *,
+    radius_key: str = "median",
+    rtol: float = 0.05,
+    atol: float = 0.0,
+    aggregate: str = "median",  # {"median", "mean"} for radii aggregation
+    verbose: bool = True,
+):
+    """
+    Radii-aware subsampling that preserves topology.
+
+    Strategy
+    --------
+    • Keep all *anchors* (soma, endpoints, branch points: degree != 2).
+    • For every degree‑2 run between anchors, segment it into groups where
+      radius (from `radius_key`) changes slowly:
+        |r_i − r_ref| ≤ atol + rtol * max(r_i, r_ref).
+    • Replace each group with a single node:
+        - position  : length‑weighted centroid of the group's polyline
+        - radii     : median (or mean) over the group for *all* radius keys
+        - ntype     : integer mode over the group
+        - node2verts: concatenation (unique) of members' sets
+      Edges are rewired in run order so the tree structure is preserved.
+
+    Parameters
+    ----------
+    radius_key
+        Column in `skel.radii` used to *decide* grouping.
+    rtol, atol
+        Relative / absolute tolerance for radius closeness.
+    aggregate
+        Aggregator for radii values of the merged node: "median" (robust) or "mean".
+    verbose
+        Print a short summary.
+
+    Returns
+    -------
+    Skeleton
+        A **new** skeleton with fewer nodes, same topology.
+    """
+    from .core import Skeleton, _build_mst
+
+    if radius_key not in skel.radii:
+        raise KeyError(
+            f"radius_key '{radius_key}' not found in skel.radii "
+            f"(available keys: {tuple(skel.radii)})"
+        )
+
+    N = int(len(skel.nodes))
+    if N <= 1:
+        return skel
+
+    # Input views
+    nodes = skel.nodes
+    radiiD = skel.radii
+    r_dec = radiiD[radius_key]
+    ntype0 = skel.ntype if skel.ntype is not None else np.full(N, 3, dtype=np.int8)
+
+    has_node2verts = skel.node2verts is not None and len(skel.node2verts) > 0
+    has_vert2node = skel.vert2node is not None and len(skel.vert2node) > 0
+
+    node2verts0: list[np.ndarray] | None = None
+    vert2node0: dict[int, int] | None = None
+
+    if has_node2verts:
+        # Ensure indexability up to N with empty arrays
+        node2verts0 = list(skel.node2verts)
+        if len(node2verts0) < N:
+            node2verts0 = node2verts0 + [
+                np.empty(0, dtype=np.int64) for _ in range(N - len(node2verts0))
+            ]
+    if has_vert2node:
+        vert2node0 = dict(skel.vert2node)
+
+    # Graph structure
+    g = skel._igraph()
+    deg = np.asarray(g.degree(), dtype=np.int64)
+    anchors: set[int] = {i for i, d in enumerate(deg) if d != 2}
+    anchors.add(0)  # always keep soma (already covered unless deg==2 by accident)
+
+    adj = _adjacency_from_edges(N, skel.edges)
+
+    # Accumulators for the new skeleton
+    new_nodes: list[np.ndarray] = []
+    new_radii: dict[str, list[float]] = {k: [] for k in radiiD.keys()}
+    new_ntype: list[int] = []
+    new_node2verts: list[np.ndarray] | None = [] if has_node2verts else None
+    new_edges: list[tuple[int, int]] = []
+    old2new: dict[int, int] = {}
+
+    def _add_anchor(old_id: int) -> int:
+        """Create (or fetch) a preserved anchor node."""
+        oid = int(old_id)
+        if oid in old2new:
+            return old2new[oid]
+        nid = len(new_nodes)
+        new_nodes.append(nodes[oid].astype(np.float64))
+        for k in new_radii:
+            new_radii[k].append(float(radiiD[k][oid]))
+        new_ntype.append(int(ntype0[oid]))
+        if new_node2verts is not None:
+            arr = (
+                node2verts0[oid]
+                if node2verts0 is not None
+                else np.empty(0, dtype=np.int64)
+            )
+            new_node2verts.append(np.asarray(arr, dtype=np.int64))
+        old2new[oid] = nid
+        return nid
+
+    def _add_group(group_ids: list[int]) -> int:
+        """Create a new merged node from a contiguous group of degree-2 nodes."""
+        gids = list(map(int, group_ids))
+        nid = len(new_nodes)
+
+        # Position: length-weighted centroid along the polyline
+        pos = _len_weighted_centroid(nodes[gids])
+
+        # Radii aggregation for every available key
+        for k in new_radii:
+            vals = radiiD[k][gids]
+            val = (
+                float(np.median(vals))
+                if aggregate == "median"
+                else float(np.mean(vals))
+            )
+            new_radii[k].append(val)
+
+        # ntype: majority vote in the group
+        new_ntype.append(_mode_int(ntype0[gids], default=3))
+
+        # node2verts: union/concat (unique)
+        if new_node2verts is not None:
+            if node2verts0 is None:
+                new_node2verts.append(np.empty(0, dtype=np.int64))
+            else:
+                parts = [
+                    np.asarray(node2verts0[j], dtype=np.int64)
+                    for j in gids
+                    if j < len(node2verts0)
+                ]
+                if parts:
+                    merged = np.unique(np.concatenate(parts))
+                else:
+                    merged = np.empty(0, dtype=np.int64)
+                new_node2verts.append(merged)
+
+        new_nodes.append(pos.astype(np.float64))
+
+        # Map all old group members to this newly created node
+        for j in gids:
+            old2new[j] = nid
+        return nid
+
+    # Walk every run between anchors exactly once
+    visited: set[tuple[int, int]] = set()
+
+    for a in sorted(anchors):
+        for b in adj[a]:
+            e0 = _norm_edge(a, b)
+            if e0 in visited:
+                continue
+            # begin a→…→z walk
+            path = [a]
+            prev, cur = a, b
+            visited.add(e0)
+            while deg[cur] == 2:
+                path.append(cur)
+                nxts = [x for x in adj[cur] if x != prev]
+                if len(nxts) != 1:
+                    # Non-tree oddity (cycle or broken adj); stop the run safely
+                    break
+                nxt = nxts[0]
+                visited.add(_norm_edge(cur, nxt))
+                prev, cur = cur, nxt
+            if cur != path[-1]:
+                path.append(cur)  # z (anchor)
+
+            # Partition the internal corridor by radius closeness
+            a_id, z_id = path[0], path[-1]
+            internal = path[1:-1]
+
+            left = _add_anchor(a_id)
+
+            if internal:
+                groups = _partition_by_radius(internal, r_dec, rtol=rtol, atol=atol)
+                for grp in groups:
+                    g_id = _add_group(grp)
+                    new_edges.append(_norm_edge(left, g_id))
+                    left = g_id
+
+            right = _add_anchor(z_id)
+            new_edges.append(_norm_edge(left, right))
+
+    # Corner case: isolated anchors with no edges (deg==0)
+    for a in sorted(anchors):
+        if deg[a] == 0:
+            _add_anchor(a)
+
+    # Finalize arrays
+    nodes_new = np.asarray(new_nodes, dtype=np.float64)
+    radii_new = {k: np.asarray(v, dtype=np.float64) for k, v in new_radii.items()}
+    ntype_new = np.asarray(new_ntype, dtype=np.int8)
+
+    edges_arr = np.asarray(new_edges, dtype=np.int64)
+    edges_arr = (
+        np.unique(np.sort(edges_arr, axis=1), axis=0) if edges_arr.size else edges_arr
+    )
+
+    # vert2node remap
+    if has_vert2node and vert2node0 is not None:
+        vert2node_new = {
+            int(v): int(old2new.get(int(n), old2new.get(0, 0)))
+            for v, n in vert2node0.items()
+            if int(n) in old2new
+        }
+    elif new_node2verts is not None:
+        # Rebuild from node2verts if available
+        vert2node_new = {
+            int(v): int(i)
+            for i, vs in enumerate(new_node2verts)
+            for v in np.asarray(vs, dtype=np.int64)
+        }
+    else:
+        vert2node_new = None
+
+    # Ensure soma (old id 0) stays at index 0
+    new_root = int(old2new.get(0, 0))
+    if new_root != 0 and len(nodes_new):
+        swap = new_root
+        nodes_new[[0, swap]] = nodes_new[[swap, 0]]
+        for k in radii_new:
+            radii_new[k][[0, swap]] = radii_new[k][[swap, 0]]
+        ntype_new[[0, swap]] = ntype_new[[swap, 0]]
+        if new_node2verts is not None:
+            new_node2verts[0], new_node2verts[swap] = (
+                new_node2verts[swap],
+                new_node2verts[0],
+            )
+        if vert2node_new is not None:
+            for v, n in list(vert2node_new.items()):
+                if n == 0:
+                    vert2node_new[v] = swap
+                elif n == swap:
+                    vert2node_new[v] = 0
+        a0, a1 = edges_arr == 0, edges_arr == swap
+        edges_arr[a0] = swap
+        edges_arr[a1] = 0
+        edges_arr = np.unique(np.sort(edges_arr, axis=1), axis=0)
+
+    # Build the output Skeleton. Re-run MST to be extra safe / canonical.
+    from .core import Soma  # type: ignore
+
+    soma_out = skel.soma if isinstance(skel.soma, Soma) else skel.soma  # unchanged soma
+    new_skel = Skeleton(
+        soma=soma_out,
+        nodes=nodes_new,
+        radii=radii_new,
+        edges=_build_mst(nodes_new, edges_arr),
+        ntype=ntype_new,
+        node2verts=new_node2verts,
+        vert2node=vert2node_new,
+        meta={**skel.meta},
+        extra={**skel.extra},
+    )
+
+    if verbose:
+        print(
+            f"[skeliner] subsample – nodes: {N} → {len(nodes_new)}; "
+            f"rtol={rtol:g}, atol={atol:g}, key='{radius_key}', agg='{aggregate}'"
+        )
+
+    return new_skel
