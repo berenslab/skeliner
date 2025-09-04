@@ -644,7 +644,7 @@ def subsample(
     radius_key: str = "median",
     rtol: float = 0.05,
     atol: float = 0.0,
-    aggregate: str = "median",  # {"median","mean"} for radii aggregation
+    aggregate: str = "area",  # {"median","mean", "area"} for radii aggregation
     merge_endpoints: bool = True,
     slide_branchpoints: bool = True,
     max_anchor_shift: float | None = None,  # (units of coords)
@@ -721,6 +721,18 @@ def subsample(
         old2new[oid] = nid
         return nid
 
+    def _compute_aggregate(vals, aggregate):
+        if aggregate == "median":
+            val = float(np.median(vals))
+        elif aggregate == "mean":
+            val = float(np.mean(vals))
+        elif aggregate == "area":  # new: preserve mean cross‑section
+            val = float(np.sqrt(np.mean(vals * vals)))
+        else:
+            raise ValueError("aggregate must be 'median', 'mean', or 'area'")
+
+        return val
+
     def _add_group(group_ids: list[int]) -> int:
         gids = list(map(int, group_ids))
         nid = len(new_nodes)
@@ -729,11 +741,7 @@ def subsample(
 
         for k in new_radii:
             vals = radiiD[k][gids]
-            val = (
-                float(np.median(vals))
-                if aggregate == "median"
-                else float(np.mean(vals))
-            )
+            val = _compute_aggregate(vals, aggregate)
             new_radii[k].append(val)
 
         new_ntype.append(_mode_int(ntype0[gids], default=3))
@@ -804,11 +812,7 @@ def subsample(
             ):
                 g0 = groups[0]
                 ra = float(r_dec[a_id])
-                rg = (
-                    float(np.median(r_dec[g0]))
-                    if aggregate == "median"
-                    else float(np.mean(r_dec[g0]))
-                )
+                rg = _compute_aggregate(r_dec[g0], aggregate)
                 if _within_tol(ra, rg):
                     new_pos = _len_weighted_centroid(nodes[[a_id] + g0])
                     if (
@@ -819,11 +823,8 @@ def subsample(
                         new_nodes[left] = new_pos
                         for k in new_radii:
                             vals = np.concatenate(([radiiD[k][a_id]], radiiD[k][g0]))
-                            new_radii[k][left] = float(
-                                np.median(vals)
-                                if aggregate == "median"
-                                else np.mean(vals)
-                            )
+                            new_radii[k][left] = _compute_aggregate(vals, aggregate)
+
                         if new_node2verts is not None and node2verts0 is not None:
                             parts = [node2verts0[a_id]] + [node2verts0[j] for j in g0]
                             merged = (
@@ -855,11 +856,7 @@ def subsample(
             ):
                 gL = groups[-1]
                 rz = float(r_dec[z_id])
-                rg = (
-                    float(np.median(r_dec[gL]))
-                    if aggregate == "median"
-                    else float(np.mean(r_dec[gL]))
-                )
+                rg = _compute_aggregate(r_dec[gL], aggregate)
                 if _within_tol(rz, rg):
                     new_pos = _len_weighted_centroid(nodes[gL + [z_id]])
                     if (
@@ -870,11 +867,7 @@ def subsample(
                         new_nodes[right] = new_pos
                         for k in new_radii:
                             vals = np.concatenate((radiiD[k][gL], [radiiD[k][z_id]]))
-                            new_radii[k][right] = float(
-                                np.median(vals)
-                                if aggregate == "median"
-                                else np.mean(vals)
-                            )
+                            new_radii[k][right] = _compute_aggregate(vals, aggregate)
                         if new_node2verts is not None and node2verts0 is not None:
                             parts = [node2verts0[j] for j in gL] + [node2verts0[z_id]]
                             merged = (
