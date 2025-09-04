@@ -13,7 +13,7 @@ __skeleton__ = [
     "graft",
     "clip",
     "prune",
-    "subsample",
+    "downsample",
     # editing ntype
     "set_ntype",
 ]
@@ -638,7 +638,7 @@ def _partition_by_radius(
     return groups
 
 
-def subsample(
+def downsample(
     skel,
     *,
     radius_key: str = "median",
@@ -651,7 +651,7 @@ def subsample(
     verbose: bool = True,
 ):
     """
-    Radii-aware subsampling that preserves topology.
+    Radii-aware downsampling that preserves topology.
 
     By default: only degree-2 runs are merged (anchors kept).
     Optional: absorb leaf endpoints and/or slide branchpoints into adjacent
@@ -978,7 +978,7 @@ def subsample(
 
     if verbose:
         print(
-            f"[skeliner] subsample – nodes: {N} → {len(nodes_new)}; "
+            f"[skeliner] downsample – nodes: {N} → {len(nodes_new)}; "
             f"rtol={rtol:g}, atol={atol:g}, key='{radius_key}', agg='{aggregate}', "
             f"merge_endpoints={merge_endpoints}, slide_branchpoints={slide_branchpoints}"
         )
