@@ -952,10 +952,24 @@ def subsample(
                     vert2node_new[v] = swap
                 elif n == swap:
                     vert2node_new[v] = 0
-        a0, a1 = edges_arr == 0, edges_arr == swap
-        edges_arr[a0] = swap
-        edges_arr[a1] = 0
-        edges_arr = np.unique(np.sort(edges_arr, axis=1), axis=0)
+        # a0, a1 = edges_arr == 0, edges_arr == swap
+        # edges_arr[a0] = swap
+        # edges_arr[a1] = 0
+        # edges_arr = np.unique(np.sort(edges_arr, axis=1), axis=0)
+        perm = np.arange(len(nodes_new), dtype=np.int64)
+        perm[[0, swap]] = perm[[swap, 0]]
+        edges_arr = perm[edges_arr]  # apply to both columns at once
+
+        edges_arr = np.sort(edges_arr, axis=1)
+        edges_arr = edges_arr[edges_arr[:, 0] != edges_arr[:, 1]]  # drop self-loops
+        edges_arr = np.unique(edges_arr, axis=0)
+
+    g_check = ig.Graph(
+        n=len(nodes_new), edges=[tuple(map(int, e)) for e in edges_arr], directed=False
+    )
+    if g_check.ecount() != g_check.vcount() - len(g_check.components()):
+        # make it a spanning forest over your candidate edges (acyclic by construction)
+        edges_arr = _build_mst(nodes_new, edges_arr)  # same helper you already import
 
     new_skel = Skeleton(
         soma=skel.soma,
