@@ -735,6 +735,8 @@ def map_contact_sites(
     if P.ndim != 2 or P.shape[1] != 3:
         raise ValueError("contact_pos must be (K,3)")
     K = len(P)
+    if K == 0:
+        raise ValueError("contact_pos must not be empty")
     K0 = K  # original seed count
 
     s = sides.lower()
