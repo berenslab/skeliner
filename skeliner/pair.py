@@ -735,8 +735,6 @@ def map_contact_sites(
     if P.ndim != 2 or P.shape[1] != 3:
         raise ValueError("contact_pos must be (K,3)")
     K = len(P)
-    if K == 0:
-        raise ValueError("contact_pos must not be empty")
     K0 = K  # original seed count
 
     s = sides.lower()
@@ -759,6 +757,42 @@ def map_contact_sites(
     tol = float(tol)
     radius = float(radius)
     cluster_eps = float(cluster_eps)
+
+    if K0 == 0:
+        empty_bbox = np.empty((0, 2, 3), float)
+        meta = dict(
+            tol=tol,
+            radius=radius,
+            fractional=bool(fractional),
+            sample_scheme=sample_scheme,
+            normal_opposition_dot=normal_opposition_dot,
+            cluster_eps=cluster_eps,
+            cluster_halo=float(cluster_halo),
+            engine="seed-cluster → local-submesh PQ → union-by-face",
+            sides=(
+                "A" if (doA and not doB) else ("B" if (doB and not doA) else "both")
+            ),
+            unit=unit,
+            K_seeds_in=0,
+            K_seeds_kept=0,
+            K_groups_before_prune=0,
+            K_patches=0,
+            seed_to_patch=(-np.ones(0, dtype=np.int64)),
+        )
+        return ContactSites(
+            faces_A=[],
+            faces_B=[],
+            area_A=np.zeros(0, float),
+            area_B=np.zeros(0, float),
+            area_mean=np.zeros(0, float),
+            seeds_A=np.empty((0, 3), float),
+            seeds_B=np.empty((0, 3), float),
+            pairs_AB=([] if return_pairs else None),
+            bbox_A=empty_bbox,
+            bbox_B=empty_bbox,
+            bbox=empty_bbox,
+            meta=meta,
+        )
 
     # Per-mesh caches
     kdtA, _, nA, areaA = _build_face_kdt(A)
