@@ -18,6 +18,7 @@ __skeleton__ = [
     "extract_neurites",
     "neurites_out_of_bounds",
     "volume",
+    "total_path_length",
 ]
 
 # -----------------------------------------------------------------------------
