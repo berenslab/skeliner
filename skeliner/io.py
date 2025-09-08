@@ -457,6 +457,9 @@ def save_contact_sites_npz(res, path: str | Path, *, compress: bool = True) -> N
         area_mean=np.asarray(res.area_mean, np.float64),
         seeds_A=np.asarray(res.seeds_A, np.float64),
         seeds_B=np.asarray(res.seeds_B, np.float64),
+        bbox_A=np.asarray(res.bbox_A, np.float64),
+        bbox_B=np.asarray(res.bbox_B, np.float64),
+        bbox=np.asarray(res.bbox, np.float64),
         meta_json=_json_encode_meta(res.meta),
         _schema=np.array("ContactSitesResult@1", dtype="U"),
     )
@@ -471,7 +474,7 @@ def load_contact_sites_npz(path: str | Path):
     Read a ContactSitesResult written by save_contact_sites_npz.
     Returns a ContactSitesResult instance.
     """
-    from .pair import ContactSitesResult  # local import avoids cycles
+    from .pair import ContactSites  # local import avoids cycles
 
     path = Path(path)
     with np.load(path, allow_pickle=False) as z:
@@ -482,7 +485,7 @@ def load_contact_sites_npz(path: str | Path):
         else:
             pairs_AB = None
 
-        return ContactSitesResult(
+        return ContactSites(
             faces_A=faces_A,
             faces_B=faces_B,
             area_A=z["area_A"].astype(np.float64, copy=False),
@@ -491,5 +494,14 @@ def load_contact_sites_npz(path: str | Path):
             seeds_A=z["seeds_A"].astype(np.float64, copy=False),
             seeds_B=z["seeds_B"].astype(np.float64, copy=False),
             pairs_AB=pairs_AB,
+            bbox_A=z["bbox_A"].astype(np.float64, copy=False)
+            if "bbox_A" in z  # backward compatibility
+            else np.array([]),
+            bbox_B=z["bbox_B"].astype(np.float64, copy=False)
+            if "bbox_B" in z
+            else np.array([]),
+            bbox=z["bbox"].astype(np.float64, copy=False)
+            if "bbox" in z
+            else np.array([]),
             meta=_json_decode_meta(z["meta_json"]),
         )

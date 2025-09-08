@@ -828,3 +828,128 @@ def volume(
         return_details=return_details,
     )
     return V
+
+
+# -----------------------------------------------------------------------------
+# path length (sum of edge lengths) with optional bbox clipping
+# -----------------------------------------------------------------------------
+
+
+def _segment_aabb_clip_length(
+    a: np.ndarray, b: np.ndarray, lo: np.ndarray, hi: np.ndarray
+) -> float:
+    """
+    Return the length of the line segment [a,b] that lies inside the
+    axis-aligned box [lo, hi].  Zero if there is no intersection.
+    """
+    v = b - a
+    L = float(np.linalg.norm(v))
+    if L <= 0.0:
+        # Degenerate edge → contributes nothing (even if "inside").
+        return 0.0
+
+    # Liang–Barsky style parametric clipping in 3D.
+    t0, t1 = 0.0, 1.0
+    for d in range(3):
+        vd = float(v[d])
+        ad = float(a[d])
+        eps = 1e-12 * max(1.0, abs(v[0]), abs(v[1]), abs(v[2]))
+        if abs(vd) < eps:
+            # Segment is parallel to this slab; reject if outside.
+            if ad < lo[d] or ad > hi[d]:
+                return 0.0
+            continue
+
+        t_enter = (lo[d] - ad) / vd
+        t_exit = (hi[d] - ad) / vd
+        if t_enter > t_exit:
+            t_enter, t_exit = t_exit, t_enter
+
+        t0 = max(t0, t_enter)
+        t1 = min(t1, t_exit)
+        if t0 > t1:
+            return 0.0
+
+    return L * max(0.0, t1 - t0)
+
+
+def total_path_length(
+    skel,
+    bbox: list[float] | tuple[Sequence[float], Sequence[float]] | None = None,
+    *,
+    return_details: bool = False,
+):
+    """
+    Sum of Euclidean edge lengths, optionally **clipped** to an axis-aligned bbox.
+
+    Parameters
+    ----------
+    bbox
+        None → full skeleton length (no clipping); or
+        [xmin, xmax, ymin, ymax, zmin, zmax]; or ((xlo,ylo,zlo), (xhi,yhi,zhi)).
+    return_details
+        When True, also returns a small diagnostics dict.
+
+    Returns
+    -------
+    float or (float, dict)
+        Total path length in the same units as your coordinates.
+
+    Notes
+    -----
+    * This is purely geometric path length over the graph edges. It does **not**
+      subtract portions running inside the soma ellipsoid.
+    * Complexity O(|E|). Numerically robust to nearly-parallel edges.
+    """
+    nodes = skel.nodes.astype(np.float64)
+    edges = np.asarray(skel.edges, dtype=int)
+
+    if bbox is None:
+        # Fast vectorized sum with no clipping.
+        if edges.size == 0:
+            return (
+                (
+                    0.0,
+                    {
+                        "bbox_lo": None,
+                        "bbox_hi": None,
+                        "edges_total": 0,
+                        "edges_intersected": 0,
+                        "clipped": False,
+                    },
+                )
+                if return_details
+                else 0.0
+            )
+        seg = nodes[edges[:, 1]] - nodes[edges[:, 0]]
+        L = float(np.linalg.norm(seg, axis=1).sum())
+        if not return_details:
+            return L
+        return L, {
+            "bbox_lo": None,
+            "bbox_hi": None,
+            "edges_total": int(edges.shape[0]),
+            "edges_intersected": int(edges.shape[0]),
+            "clipped": False,
+        }
+
+    lo, hi = _parse_bbox(bbox)
+
+    total = 0.0
+    n_hit = 0
+    for u, v in edges:
+        ell = _segment_aabb_clip_length(nodes[u], nodes[v], lo, hi)
+        if ell > 0.0:
+            total += ell
+            n_hit += 1
+
+    if not return_details:
+        return float(total)
+
+    return float(total), {
+        "bbox_lo": lo,
+        "bbox_hi": hi,
+        "edges_total": int(edges.shape[0]),
+        "edges_intersected": n_hit,
+        "clipped": True,
+    }
