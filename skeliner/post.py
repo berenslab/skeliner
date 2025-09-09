@@ -16,6 +16,9 @@ __skeleton__ = [
     "downsample",
     # editing ntype
     "set_ntype",
+    # reroot / redetect soma
+    "reroot",
+    "detect_soma",
 ]
 
 # -----------------------------------------------------------------------------
@@ -285,6 +288,161 @@ def set_ntype(
         return
 
     skel.ntype[np.fromiter(target, dtype=int)] = int(code)
+
+
+# -----------------------------------------------------------------------------
+# Reroot skeleton (re-assign a new soma node)
+# -----------------------------------------------------------------------------
+
+
+def _axis_index(axis: str) -> int:
+    try:
+        return {"x": 0, "y": 1, "z": 2}[axis.lower()]
+    except KeyError:
+        raise ValueError("axis must be one of {'x','y','z'}")
+
+
+def _degrees_from_edges(n: int, edges: np.ndarray) -> np.ndarray:
+    deg = np.zeros(n, dtype=np.int64)
+    if edges.size:
+        for a, b in edges:
+            deg[int(a)] += 1
+            deg[int(b)] += 1
+    return deg
+
+
+def _extreme_node(
+    skel,
+    *,
+    axis: str = "z",
+    mode: str = "min",  # {"min","max"}
+    prefer_leaves: bool = True,
+) -> int:
+    """
+    Pick a node index at an *extreme* along `axis`, based on skeleton coords only.
+
+    If `prefer_leaves=True`, restrict to degree-1 nodes when any exist; otherwise
+    search all nodes. Returns an index in [0..N-1].
+    """
+    ax = _axis_index(axis)
+    xs = np.asarray(skel.nodes, dtype=np.float64)[:, ax]
+    n = xs.shape[0]
+    if n == 0:
+        raise ValueError("empty skeleton")
+
+    deg = _degrees_from_edges(n, np.asarray(skel.edges, dtype=np.int64))
+    cand = np.where(deg == 1)[0] if prefer_leaves and np.any(deg == 1) else np.arange(n)
+    if cand.size == 0:
+        cand = np.arange(n)
+
+    vals = xs[cand]
+    idx = int(cand[np.argmin(vals) if mode == "min" else np.argmax(vals)])
+    return idx
+
+
+def reroot(
+    skel,
+    node_id: int | None = None,
+    *,
+    axis: str = "z",
+    mode: str = "min",
+    prefer_leaves: bool = True,
+    rebuild_mst: bool = False,
+    verbose: bool = True,
+):
+    """
+    Re-root so that node 0 becomes `node_id` (or an axis-extreme among leaves).
+
+    Pure reindexing: swaps indices 0 ↔ target and remaps edges and mappings.
+    Geometry and radii are unchanged. Ideal prep for `detect_soma()`.
+    """
+    import numpy as np
+
+    from .core import Skeleton, Soma, _build_mst
+
+    N = int(len(skel.nodes))
+    if N <= 1:
+        return skel
+
+    tgt = (
+        int(node_id)
+        if node_id is not None
+        else int(_extreme_node(skel, axis=axis, mode=mode, prefer_leaves=prefer_leaves))
+    )
+    if tgt < 0 or tgt >= N:
+        raise ValueError(f"reroot: node_id {tgt} out of bounds [0,{N - 1}]")
+    if tgt == 0:
+        if verbose:
+            print("[skeliner] reroot – already rooted at 0.")
+        return skel
+
+    # Clone arrays
+    nodes = skel.nodes.copy()
+    radii = {k: v.copy() for k, v in skel.radii.items()}
+    edges = skel.edges.copy()
+    ntype = skel.ntype.copy() if skel.ntype is not None else None
+
+    has_node2verts = skel.node2verts is not None and len(skel.node2verts) > 0
+    has_vert2node = skel.vert2node is not None and len(skel.vert2node) > 0
+    node2verts = [vs.copy() for vs in skel.node2verts] if has_node2verts else None
+    vert2node = dict(skel.vert2node) if has_vert2node else None
+
+    # Swap 0 ↔ tgt
+    swap = tgt
+    nodes[[0, swap]] = nodes[[swap, 0]]
+    for k in radii:
+        radii[k][[0, swap]] = radii[k][[swap, 0]]
+    if ntype is not None:
+        ntype[[0, swap]] = ntype[[swap, 0]]
+    if node2verts is not None:
+        node2verts[0], node2verts[swap] = node2verts[swap], node2verts[0]
+    if vert2node is not None:
+        for v, n in list(vert2node.items()):
+            if n == 0:
+                vert2node[v] = swap
+            elif n == swap:
+                vert2node[v] = 0
+
+    # Remap edges with a permutation
+    perm = np.arange(N, dtype=np.int64)
+    perm[[0, swap]] = perm[[swap, 0]]
+    edges = perm[edges]
+    edges = np.sort(edges, axis=1)
+    edges = edges[edges[:, 0] != edges[:, 1]]
+    edges = np.unique(edges, axis=0)
+
+    if rebuild_mst:
+        edges = _build_mst(nodes, edges)
+
+    new_soma = Soma.from_sphere(
+        center=nodes[0],
+        radius=float(radii["median"][0]),
+        verts=node2verts[0]
+        if node2verts is not None and node2verts[0].size > 0
+        else None,
+    )
+
+    new_skel = Skeleton(
+        soma=new_soma,
+        nodes=nodes,
+        radii=radii,
+        edges=edges,
+        ntype=ntype,
+        node2verts=node2verts,
+        vert2node=vert2node,
+        meta={**skel.meta},
+        extra={**skel.extra},
+    )
+
+    if verbose:
+        src = (
+            f"node_id={node_id}"
+            if node_id is not None
+            else f"extreme({axis.lower()},{mode}, prefer_leaves={prefer_leaves})"
+        )
+        print(f"[skeliner] reroot – 0 ↔ {swap} ({src}); rebuild_mst={rebuild_mst}")
+
+    return new_skel
 
 
 # -----------------------------------------------------------------------------
