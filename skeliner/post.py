@@ -347,6 +347,8 @@ def reroot(
     axis: str = "z",
     mode: str = "min",
     prefer_leaves: bool = True,
+    radius_key: str = "median",
+    set_soma_ntype: bool = True,
     rebuild_mst: bool = False,
     verbose: bool = True,
 ):
@@ -414,13 +416,22 @@ def reroot(
     if rebuild_mst:
         edges = _build_mst(nodes, edges)
 
+    if radius_key not in radii:
+        raise KeyError(
+            f"radius_key '{radius_key}' not found in skel.radii "
+            f"(available keys: {tuple(radii)})"
+        )
+    r0 = float(radii[radius_key][0])
     new_soma = Soma.from_sphere(
         center=nodes[0],
-        radius=float(radii["median"][0]),
+        radius=r0,
         verts=node2verts[0]
         if node2verts is not None and node2verts[0].size > 0
         else None,
     )
+
+    if set_soma_ntype and ntype is not None:
+        ntype[0] = 1
 
     new_skel = Skeleton(
         soma=new_soma,
