@@ -658,8 +658,8 @@ def _voxelize_union(
     include_soma: bool,
 ):
     """
-    Build a boolean occupancy grid for the union of all edge frusta and (optionally)
-    the soma ellipsoid inside [lo, hi]. Returns (occ, h, (nx,ny,nz)).
+    Boolean occupancy grid for the union of edge frusta and (optionally) soma,
+    inside [lo, hi].  Returns (occ, h, (nx,ny,nz), lo, hi).
     """
     h, (nx, ny, nz) = _choose_voxel_size(radii, lo, hi, user_voxel=voxel_size)
     xs = lo[0] + (np.arange(nx) + 0.5) * h
@@ -667,72 +667,133 @@ def _voxelize_union(
     zs = lo[2] + (np.arange(nz) + 0.5) * h
 
     occ = np.zeros((nx, ny, nz), dtype=bool)
-    nodes = skel.nodes.astype(np.float64)
-    edges = skel.edges.astype(int)
+    nodes = skel.nodes.astype(np.float64, copy=False)
+    edges = skel.edges.astype(np.int64, copy=False)
 
-    # --- rasterize soma (within its AABB ∩ bbox) --------------------------
-    if include_soma and getattr(skel, "soma", None) is not None:
+    # ---------------- helpers ----------------
+    def _idx_range(lo_e, hi_e):
+        """Index range [i0,i1] (clipped) for an axis."""
+        i0 = int(max(0, np.floor((lo_e - lo) / h)))
+        i1 = int(min([nx - 1, ny - 1, nz - 1]))  # overwritten per-axis
+        return i0, i1
+
+    def _range_x(x0, x1):
+        i0 = int(max(0, np.floor((x0 - lo[0]) / h)))
+        i1 = int(min(nx - 1, np.floor((x1 - lo[0]) / h)))
+        return i0, i1
+
+    def _range_y(y0, y1):
+        j0 = int(max(0, np.floor((y0 - lo[1]) / h)))
+        j1 = int(min(ny - 1, np.floor((y1 - lo[1]) / h)))
+        return j0, j1
+
+    def _range_z(z0, z1):
+        k0 = int(max(0, np.floor((z0 - lo[2]) / h)))
+        k1 = int(min(nz - 1, np.floor((z1 - lo[2]) / h)))
+        return k0, k1
+
+    # --------- precompute soma mask once (if there is a soma) ------------
+    soma_slice = None
+    soma_mask = None
+    if getattr(skel, "soma", None) is not None:
         slo, shi = _ellipsoid_aabb(skel.soma)
+        # clip to global bbox
         slo = np.maximum(slo, lo)
         shi = np.minimum(shi, hi)
-        i0 = int(max(0, np.floor((slo[0] - lo[0]) / h)))
-        i1 = int(min(nx - 1, np.floor((shi[0] - lo[0]) / h)))
-        j0 = int(max(0, np.floor((slo[1] - lo[1]) / h)))
-        j1 = int(min(ny - 1, np.floor((shi[1] - lo[1]) / h)))
-        k0 = int(max(0, np.floor((slo[2] - lo[2]) / h)))
-        k1 = int(min(nz - 1, np.floor((shi[2] - lo[2]) / h)))
-        if i1 >= i0 and j1 >= j0 and k1 >= k0:
-            X, Y, Z = np.meshgrid(
-                xs[i0 : i1 + 1], ys[j0 : j1 + 1], zs[k0 : k1 + 1], indexing="ij"
-            )
-            P = np.stack((X.ravel(), Y.ravel(), Z.ravel()), axis=1)
-            inside = skel.soma.contains(P).reshape(X.shape)
-            occ[i0 : i1 + 1, j0 : j1 + 1, k0 : k1 + 1] |= inside
+        i0, i1 = _range_x(slo[0], shi[0])
+        j0, j1 = _range_y(slo[1], shi[1])
+        k0, k1 = _range_z(slo[2], shi[2])
 
-    # --- rasterize each edge frustum within its padded AABB ----------------
+        if (i1 >= i0) and (j1 >= j0) and (k1 >= k0):
+            # broadcasted coordinate slabs (no big meshgrid; uses ogrid)
+            xi = xs[i0 : i1 + 1][:, None, None]
+            yj = ys[j0 : j1 + 1][None, :, None]
+            zk = zs[k0 : k1 + 1][None, None, :]
+
+            cx, cy, cz = skel.soma.center
+            Rt = skel.soma.R.T  # 3x3
+            ax, ay, az = skel.soma.axes
+            ax2, ay2, az2 = ax * ax, ay * ay, az * az
+
+            dx = xi - cx
+            dy = yj - cy
+            dz = zk - cz
+
+            # rotate into soma body-frame: u = R^T (x - c)
+            ux = Rt[0, 0] * dx + Rt[0, 1] * dy + Rt[0, 2] * dz
+            uy = Rt[1, 0] * dx + Rt[1, 1] * dy + Rt[1, 2] * dz
+            uz = Rt[2, 0] * dx + Rt[2, 1] * dy + Rt[2, 2] * dz
+
+            soma_mask = (ux * ux) / ax2 + (uy * uy) / ay2 + (uz * uz) / az2 <= 1.0
+            soma_slice = (slice(i0, i1 + 1), slice(j0, j1 + 1), slice(k0, k1 + 1))
+
+    # If soma is to be included, OR it now.
+    if include_soma and soma_mask is not None:
+        occ[soma_slice] |= soma_mask
+
+    # ---------------- rasterize every edge (broadcasted) -----------------
     for i, j in edges:
-        a, b = nodes[i], nodes[j]
-        r0, r1 = float(radii[i]), float(radii[j])
+        a = nodes[i]
+        b = nodes[j]
+        r0 = float(radii[i])
+        r1 = float(radii[j])
+
         rmax = max(r0, r1)
         if not np.isfinite(rmax) or rmax < 0.0:
             continue
 
-        # edge AABB in world coords, padded by rmax, clipped to [lo, hi]
+        # edge AABB padded by rmax, clipped to [lo,hi]
         lo_e = np.maximum(np.minimum(a, b) - rmax, lo)
         hi_e = np.minimum(np.maximum(a, b) + rmax, hi)
         if np.any(lo_e > hi_e):
             continue
 
-        ii0 = int(max(0, np.floor((lo_e[0] - lo[0]) / h)))
-        ii1 = int(min(nx - 1, np.floor((hi_e[0] - lo[0]) / h)))
-        jj0 = int(max(0, np.floor((lo_e[1] - lo[1]) / h)))
-        jj1 = int(min(ny - 1, np.floor((hi_e[1] - lo[1]) / h)))
-        kk0 = int(max(0, np.floor((lo_e[2] - lo[2]) / h)))
-        kk1 = int(min(nz - 1, np.floor((hi_e[2] - lo[2]) / h)))
-        if ii1 < ii0 or jj1 < jj0 or kk1 < kk0:
+        ii0, ii1 = _range_x(lo_e[0], hi_e[0])
+        jj0, jj1 = _range_y(lo_e[1], hi_e[1])
+        kk0, kk1 = _range_z(lo_e[2], hi_e[2])
+        if (ii1 < ii0) or (jj1 < jj0) or (kk1 < kk0):
             continue
 
-        X, Y, Z = np.meshgrid(
-            xs[ii0 : ii1 + 1], ys[jj0 : jj1 + 1], zs[kk0 : kk1 + 1], indexing="ij"
-        )
-        P = np.stack((X.ravel(), Y.ravel(), Z.ravel()), axis=1)
+        xi = xs[ii0 : ii1 + 1][:, None, None]
+        yj = ys[jj0 : jj1 + 1][None, :, None]
+        zk = zs[kk0 : kk1 + 1][None, None, :]
 
         v = b - a
         L2 = float(v @ v)
         if L2 <= 1e-24:
-            # treat as a ball at 'a' with radius rmax
-            d2 = np.sum((P - a) ** 2, axis=1)
-            mask = (d2 <= rmax * rmax).reshape(X.shape)
+            # degenerate: paint a ball of radius rmax at 'a'
+            dx = xi - a[0]
+            dy = yj - a[1]
+            dz = zk - a[2]
+            d2 = dx * dx + dy * dy + dz * dz
+            mask = d2 <= (rmax * rmax)
             occ[ii0 : ii1 + 1, jj0 : jj1 + 1, kk0 : kk1 + 1] |= mask
             continue
 
-        # projection parameter clamped to [0,1]
-        s = np.clip(((P - a) @ v) / L2, 0.0, 1.0)
-        F = a + s[:, None] * v
-        d2 = np.sum((P - F) ** 2, axis=1)
-        r = (1.0 - s) * r0 + s * r1
-        mask = (d2 <= r * r).reshape(X.shape)
+        vx, vy, vz = v
+        # projection parameter s (broadcasted), then clamp to [0,1]
+        dx = xi - a[0]
+        dy = yj - a[1]
+        dz = zk - a[2]
+        s = (dx * vx + dy * vy + dz * vz) / L2
+        # clip in-place to save a temporary
+        np.clip(s, 0.0, 1.0, out=s)
+
+        # distance from voxel center to closest point on segment
+        rx = dx - s * vx
+        ry = dy - s * vy
+        rz = dz - s * vz
+        d2 = rx * rx + ry * ry + rz * rz
+
+        # linear radius along the frustum
+        r = r0 + s * (r1 - r0)
+        mask = d2 <= (r * r)
+
         occ[ii0 : ii1 + 1, jj0 : jj1 + 1, kk0 : kk1 + 1] |= mask
+
+    # If soma is to be excluded, carve it out once (reuses precomputed mask).
+    if (not include_soma) and (soma_mask is not None):
+        occ[soma_slice] &= ~soma_mask
 
     return occ, float(h), (int(nx), int(ny), int(nz)), lo, hi
 
