@@ -648,7 +648,7 @@ def _choose_voxel_size(
     return float(base), (int(n_est[0]), int(n_est[1]), int(n_est[2]))
 
 
-def _volume_voxel_union(
+def _voxelize_union(
     skel,
     radii: np.ndarray,
     lo: np.ndarray,
@@ -656,10 +656,10 @@ def _volume_voxel_union(
     *,
     voxel_size: float | None,
     include_soma: bool,
-    return_details: bool,
 ):
     """
-    Voxelize union of all edge frusta and the soma ellipsoid inside [lo,hi].
+    Build a boolean occupancy grid for the union of all edge frusta and (optionally)
+    the soma ellipsoid inside [lo, hi]. Returns (occ, h, (nx,ny,nz)).
     """
     h, (nx, ny, nz) = _choose_voxel_size(radii, lo, hi, user_voxel=voxel_size)
     xs = lo[0] + (np.arange(nx) + 0.5) * h
@@ -671,11 +671,10 @@ def _volume_voxel_union(
     edges = skel.edges.astype(int)
 
     # --- rasterize soma (within its AABB ∩ bbox) --------------------------
-    if include_soma and skel.soma is not None:
+    if include_soma and getattr(skel, "soma", None) is not None:
         slo, shi = _ellipsoid_aabb(skel.soma)
         slo = np.maximum(slo, lo)
         shi = np.minimum(shi, hi)
-        # indices covering soma AABB
         i0 = int(max(0, np.floor((slo[0] - lo[0]) / h)))
         i1 = int(min(nx - 1, np.floor((shi[0] - lo[0]) / h)))
         j0 = int(max(0, np.floor((slo[1] - lo[1]) / h)))
@@ -687,9 +686,8 @@ def _volume_voxel_union(
                 xs[i0 : i1 + 1], ys[j0 : j1 + 1], zs[k0 : k1 + 1], indexing="ij"
             )
             P = np.stack((X.ravel(), Y.ravel(), Z.ravel()), axis=1)
-            inside = skel.soma.contains(P)
-            mask = inside.reshape(X.shape)
-            occ[i0 : i1 + 1, j0 : j1 + 1, k0 : k1 + 1] |= mask
+            inside = skel.soma.contains(P).reshape(X.shape)
+            occ[i0 : i1 + 1, j0 : j1 + 1, k0 : k1 + 1] |= inside
 
     # --- rasterize each edge frustum within its padded AABB ----------------
     for i, j in edges:
@@ -699,11 +697,9 @@ def _volume_voxel_union(
         if not np.isfinite(rmax) or rmax < 0.0:
             continue
 
-        # edge AABB in world coords, padded by rmax
-        lo_e = np.minimum(a, b) - rmax
-        hi_e = np.maximum(a, b) + rmax
-        lo_e = np.maximum(lo_e, lo)
-        hi_e = np.minimum(hi_e, hi)
+        # edge AABB in world coords, padded by rmax, clipped to [lo, hi]
+        lo_e = np.maximum(np.minimum(a, b) - rmax, lo)
+        hi_e = np.minimum(np.maximum(a, b) + rmax, hi)
         if np.any(lo_e > hi_e):
             continue
 
@@ -738,17 +734,7 @@ def _volume_voxel_union(
         mask = (d2 <= r * r).reshape(X.shape)
         occ[ii0 : ii1 + 1, jj0 : jj1 + 1, kk0 : kk1 + 1] |= mask
 
-    count = int(occ.sum())
-    V = float(count) * (h**3)
-    if not return_details:
-        return V
-    return V, {
-        "voxel_size": h,
-        "grid_shape": (nx, ny, nz),
-        "bbox_lo": lo,
-        "bbox_hi": hi,
-        "filled_voxels": count,
-    }
+    return occ, float(h), (int(nx), int(ny), int(nz)), lo, hi
 
 
 def volume(
@@ -819,16 +805,20 @@ def volume(
     else:
         lo, hi = lo_hi
 
-    V = _volume_voxel_union(
-        skel,
-        radii,
-        lo,
-        hi,
-        voxel_size=voxel_size,
-        include_soma=include_soma,
-        return_details=return_details,
+    occ, h, (nx, ny, nz), lo, hi = _voxelize_union(
+        skel, radii, lo, hi, voxel_size=voxel_size, include_soma=include_soma
     )
-    return V
+    count = int(occ.sum())
+    V = float(count) * (h**3)
+    if not return_details:
+        return V
+    return V, {
+        "voxel_size": h,
+        "grid_shape": (nx, ny, nz),
+        "bbox_lo": lo,
+        "bbox_hi": hi,
+        "filled_voxels": count,
+    }
 
 
 # -----------------------------------------------------------------------------
