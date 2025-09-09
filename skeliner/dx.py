@@ -648,7 +648,7 @@ def _choose_voxel_size(
     return float(base), (int(n_est[0]), int(n_est[1]), int(n_est[2]))
 
 
-def _volume_voxel_union(
+def _voxelize_union(
     skel,
     radii: np.ndarray,
     lo: np.ndarray,
@@ -656,10 +656,10 @@ def _volume_voxel_union(
     *,
     voxel_size: float | None,
     include_soma: bool,
-    return_details: bool,
 ):
     """
-    Voxelize union of all edge frusta and the soma ellipsoid inside [lo,hi].
+    Build a boolean occupancy grid for the union of all edge frusta and (optionally)
+    the soma ellipsoid inside [lo, hi]. Returns (occ, h, (nx,ny,nz)).
     """
     h, (nx, ny, nz) = _choose_voxel_size(radii, lo, hi, user_voxel=voxel_size)
     xs = lo[0] + (np.arange(nx) + 0.5) * h
@@ -671,11 +671,10 @@ def _volume_voxel_union(
     edges = skel.edges.astype(int)
 
     # --- rasterize soma (within its AABB ∩ bbox) --------------------------
-    if include_soma and skel.soma is not None:
+    if include_soma and getattr(skel, "soma", None) is not None:
         slo, shi = _ellipsoid_aabb(skel.soma)
         slo = np.maximum(slo, lo)
         shi = np.minimum(shi, hi)
-        # indices covering soma AABB
         i0 = int(max(0, np.floor((slo[0] - lo[0]) / h)))
         i1 = int(min(nx - 1, np.floor((shi[0] - lo[0]) / h)))
         j0 = int(max(0, np.floor((slo[1] - lo[1]) / h)))
@@ -687,9 +686,8 @@ def _volume_voxel_union(
                 xs[i0 : i1 + 1], ys[j0 : j1 + 1], zs[k0 : k1 + 1], indexing="ij"
             )
             P = np.stack((X.ravel(), Y.ravel(), Z.ravel()), axis=1)
-            inside = skel.soma.contains(P)
-            mask = inside.reshape(X.shape)
-            occ[i0 : i1 + 1, j0 : j1 + 1, k0 : k1 + 1] |= mask
+            inside = skel.soma.contains(P).reshape(X.shape)
+            occ[i0 : i1 + 1, j0 : j1 + 1, k0 : k1 + 1] |= inside
 
     # --- rasterize each edge frustum within its padded AABB ----------------
     for i, j in edges:
@@ -699,11 +697,9 @@ def _volume_voxel_union(
         if not np.isfinite(rmax) or rmax < 0.0:
             continue
 
-        # edge AABB in world coords, padded by rmax
-        lo_e = np.minimum(a, b) - rmax
-        hi_e = np.maximum(a, b) + rmax
-        lo_e = np.maximum(lo_e, lo)
-        hi_e = np.minimum(hi_e, hi)
+        # edge AABB in world coords, padded by rmax, clipped to [lo, hi]
+        lo_e = np.maximum(np.minimum(a, b) - rmax, lo)
+        hi_e = np.minimum(np.maximum(a, b) + rmax, hi)
         if np.any(lo_e > hi_e):
             continue
 
@@ -738,17 +734,7 @@ def _volume_voxel_union(
         mask = (d2 <= r * r).reshape(X.shape)
         occ[ii0 : ii1 + 1, jj0 : jj1 + 1, kk0 : kk1 + 1] |= mask
 
-    count = int(occ.sum())
-    V = float(count) * (h**3)
-    if not return_details:
-        return V
-    return V, {
-        "voxel_size": h,
-        "grid_shape": (nx, ny, nz),
-        "bbox_lo": lo,
-        "bbox_hi": hi,
-        "filled_voxels": count,
-    }
+    return occ, float(h), (int(nx), int(ny), int(nz)), lo, hi
 
 
 def volume(
@@ -819,16 +805,135 @@ def volume(
     else:
         lo, hi = lo_hi
 
-    V = _volume_voxel_union(
+    occ, h, (nx, ny, nz), lo, hi = _voxelize_union(
+        skel, radii, lo, hi, voxel_size=voxel_size, include_soma=include_soma
+    )
+    count = int(occ.sum())
+    V = float(count) * (h**3)
+    if not return_details:
+        return V
+    return V, {
+        "voxel_size": h,
+        "grid_shape": (nx, ny, nz),
+        "bbox_lo": lo,
+        "bbox_hi": hi,
+        "filled_voxels": count,
+    }
+
+
+# -----------------------------------------------------------------------------
+# surface area via voxel union
+# -----------------------------------------------------------------------------
+
+
+def area(
+    skel,
+    bbox: list[float] | tuple[Sequence[float], Sequence[float]] | None = None,
+    *,
+    radius_metric: str | None = None,
+    voxel_size: float | None = None,
+    include_soma: bool = True,
+    include_cut_faces: bool = False,
+    return_details: bool = False,
+):
+    """
+    Estimate the **surface area** of the morphology (union of frusta + optional soma),
+    optionally restricted to an axis-aligned bbox.
+
+    Method
+    ------
+    Voxelize the union inside the bbox and count exposed voxel faces (6-neighbour).
+    This correctly de-overlaps at branch junctions and across soma/neurites.
+
+    Parameters
+    ----------
+    bbox
+        None (whole neuron) or [xmin, xmax, ymin, ymax, zmin, zmax] or (lo, hi).
+    radius_metric
+        Which `skel.radii[metric]` column to use; defaults to
+        `skel.recommend_radius()[0]`.
+    voxel_size
+        Edge length of voxels. If None, a size is chosen from radii and capped
+        so the grid doesn't explode.
+    include_soma
+        Whether to include the soma ellipsoid in the surface area.
+    include_cut_faces
+        When a bbox is provided, include the planar faces created by clipping
+        at the bbox boundary (i.e., area of the *intersection's boundary*).
+        Default False → count only true morphology surface that lies inside the bbox.
+        Ignored when `bbox is None` (cut faces must be counted then).
+    return_details
+        If True, returns (A, details_dict) with diagnostic info.
+
+    Returns
+    -------
+    float or (float, dict)
+        Estimated area (in the square of your coordinate units). If
+        `return_details=True`, also returns a small diagnostics dict.
+
+    Notes
+    -----
+    * Accuracy improves as `voxel_size` decreases (bias is downward for coarse grids).
+    * For very large neurons, consider tuning `voxel_size` explicitly.
+    """
+    if radius_metric is None:
+        radius_metric = skel.recommend_radius()[0]
+    radii = np.asarray(skel.radii[radius_metric], dtype=np.float64).reshape(-1)
+    if radii.shape[0] != skel.nodes.shape[0]:
+        raise ValueError("radius_metric array length must match number of nodes")
+
+    # choose bbox (mirror dx.volume behaviour)
+    lo_hi = _parse_bbox(bbox)
+    if lo_hi is None:
+        # tight auto-bbox: neuron ± radii, union with soma AABB
+        lo_nodes = (skel.nodes - radii[:, None]).min(axis=0)
+        hi_nodes = (skel.nodes + radii[:, None]).max(axis=0)
+        if include_soma and getattr(skel, "soma", None) is not None:
+            slo, shi = _ellipsoid_aabb(skel.soma)
+            lo, hi = np.minimum(lo_nodes, slo), np.maximum(hi_nodes, shi)
+        else:
+            lo, hi = lo_nodes, hi_nodes
+    else:
+        lo, hi = lo_hi
+
+    occ, h, shape, lo, hi = _voxelize_union(
         skel,
         radii,
         lo,
         hi,
         voxel_size=voxel_size,
         include_soma=include_soma,
-        return_details=return_details,
     )
-    return V
+
+    # count exposed faces between occupied and empty voxels (interior faces)
+    faces = 0
+    faces += int(np.count_nonzero(np.logical_xor(occ[:-1, :, :], occ[1:, :, :])))
+    faces += int(np.count_nonzero(np.logical_xor(occ[:, :-1, :], occ[:, 1:, :])))
+    faces += int(np.count_nonzero(np.logical_xor(occ[:, :, :-1], occ[:, :, 1:])))
+
+    # boundary-of-domain faces:
+    # include them iff bbox is None (auto-tight domain) OR user asked to include cuts
+    count_boundary = (lo_hi is None) or bool(include_cut_faces)
+    if count_boundary:
+        faces += int(np.count_nonzero(occ[0, :, :]))
+        faces += int(np.count_nonzero(occ[-1, :, :]))
+        faces += int(np.count_nonzero(occ[:, 0, :]))
+        faces += int(np.count_nonzero(occ[:, -1, :]))
+        faces += int(np.count_nonzero(occ[:, :, 0]))
+        faces += int(np.count_nonzero(occ[:, :, -1]))
+
+    A = float(faces) * (h * h)
+    if not return_details:
+        return A
+
+    return A, {
+        "voxel_size": h,
+        "grid_shape": shape,
+        "bbox_lo": lo,
+        "bbox_hi": hi,
+        "surface_faces": int(faces),
+        "included_cut_faces": bool(count_boundary and lo_hi is not None),
+    }
 
 
 # -----------------------------------------------------------------------------
