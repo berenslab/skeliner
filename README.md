@@ -84,11 +84,11 @@ print("mean areas (mesh units^2):", sites.area_mean)
 # sk.plot.view_contacts(meshA, meshB, sites, sides="A")
 ```
 
-<div style="display:flex; gap:12px; flex-wrap:wrap">
-  <img src=".github/media/contacts-meshes-with-patches.png" style="max-width:30%; height:auto;">
-  <img src=".github/media/contacts-one-mesh-with-patches.png" style="max-width:30%; height:auto;">
-  <img src=".github/media/contacts-no-meshes-patches-only.png" style="max-width:30%; height:auto;">
-</div>
+<p align="center">
+  <img src=".github/media/contacts-meshes-with-patches.png" width="30%">
+  <img src=".github/media/contacts-one-mesh-with-patches.png" width="30%">
+  <img src=".github/media/contacts-no-meshes-patches-only.png" width="30%">
+</p>
 
 ---
 
