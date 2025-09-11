@@ -1526,9 +1526,38 @@ def compute_contact_stats(
     | ContactSites
 ):
     """
-    Compute per-patch shape/orientation stats and optionally attach them to the
-    ContactSites object as .stats_A/.stats_B/.stats_pair.
-    Returns (stats_A, stats_B, stats_pair), each a dict of np.ndarrays.
+    Compute per-patch shape and orientation descriptors and optionally attach
+    them onto the ContactSites as .stats_A/.stats_B/.stats_pair.
+
+    Stats computed
+    - Per-side (stats_A, stats_B), for each patch:
+      - extent_long, extent_short (float): 2D in‑plane extents after projecting
+        the patch’s face centroids to a best‑fit plane. Units are mesh units
+        (e.g. nm if your mesh is in nm).
+      - aspect (float): extent_long / max(extent_short, eps). Higher ⇒ more
+        elongated; ~1 ⇒ round.
+      - roundness (float): 4π·Area2D / Perimeter2D² of the 2D convex hull of
+        projected face centroids. In [0,1] for convex shapes; 1 ⇒ perfect disk.
+      - faces_count (float): number of faces in the patch on that side.
+      - normal_dispersion (float): 1 − ||Σ(area·n)/Σ(area)||. 0 ⇒ uniform
+        normals (planar/smooth); higher ⇒ more curvature/fragmentation.
+
+    - Pair-wise (stats_pair), for each patch:
+      - area_mean (float): from contacts.area_mean (units from contacts.meta['unit']).
+      - seed_count (float): number of original seeds mapped to this patch.
+      - normal_opposition_dot (float): dot( n̄_A, n̄_B ), where n̄_* are
+        area‑weighted mean normals per side. Range [-1,1]; ≈−1 indicates
+        strongly opposed surfaces, ≈+1 same direction, ≈0 orthogonal.
+
+    Parameters
+    - A, B: trimesh meshes corresponding to sides A/B.
+    - contacts: ContactSites to annotate.
+    - attach: If True (default), store stats on the object and return the same
+      ContactSites. If False, return a tuple (stats_A, stats_B, stats_pair).
+
+    Returns
+    - ContactSites with stats attached if attach=True; otherwise
+      (stats_A, stats_B, stats_pair) as dict[str, np.ndarray].
     """
     M = len(contacts.faces_A)
     # Side stats
@@ -1683,9 +1712,42 @@ def filter_contact_sites(
     return_sites: bool = True,
 ) -> ContactSites | np.ndarray:
     """
-    Use precomputed stats in 'contacts' to produce a boolean keep mask, or
-    return a filtered ContactSites if return_sites=True.
-    Requires contacts.stats_A, contacts.stats_B, contacts.stats_pair to be present.
+    Filter contact patches using stats computed by compute_contact_stats.
+
+    All criteria are optional and combined as follows:
+    - Shape criteria (faces_min, aspect_max, roundness_min, normal_dispersion_max)
+      are evaluated per side (A and B) and combined with OR across sides, i.e.
+      a patch is kept if at least one side satisfies all provided shape criteria.
+    - Orientation criterion (normal_opposition_max) is applied to the pairwise
+      dot(n̄_A, n̄_B); a patch is kept only if dot ≤ normal_opposition_max.
+      If None, orientation is ignored.
+    - Area bounds (area_min/area_max) are applied to contacts.area_mean.
+
+    Stats used (names map to contacts.stats_* keys):
+    - faces_min → stats_*['faces_count'] (integer ≥ 0)
+    - aspect_max → stats_*['aspect'] (≥ 1, dimensionless)
+    - roundness_min → stats_*['roundness'] (0..1, 1 ≈ disk)
+    - normal_dispersion_max → stats_*['normal_dispersion'] (0..1, 0 = uniform)
+    - normal_opposition_max → stats_pair['normal_opposition_dot'] (−1..1; use a
+      negative threshold, e.g. −0.6, to require opposed surfaces)
+    - area_min/area_max → stats_pair['area_mean'] (units per contacts.meta['unit'])
+
+    Missing stats default to “pass” for that criterion, so they won’t filter out
+    patches unintentionally. Compute stats first via compute_contact_stats.
+
+    Parameters
+    - contacts: ContactSites with stats_* populated.
+    - area_min/area_max: Keep only patches with area_mean within bounds.
+    - aspect_max: Keep if aspect ≤ aspect_max (on at least one side).
+    - roundness_min: Keep if roundness ≥ roundness_min (on at least one side).
+    - normal_opposition_max: Keep if opposition dot ≤ this value (pairwise).
+    - faces_min: Keep if faces_count ≥ faces_min (on at least one side).
+    - normal_dispersion_max: Keep if normal_dispersion ≤ value (on ≥ one side).
+    - return_sites: If True (default) return a new filtered ContactSites; if
+      False return a boolean keep mask.
+
+    Returns
+    - ContactSites (default) or np.ndarray[bool] mask when return_sites=False.
     """
     if (
         contacts.stats_A is None
