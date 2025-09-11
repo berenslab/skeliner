@@ -420,6 +420,30 @@ def _unpack_ragged_2d_fixed(stacked: np.ndarray, ptr: np.ndarray) -> list[np.nda
 # --- public API for ContactSitesResult ---------------------------------
 
 
+def _save_stats_to_payload(stats: dict | None, prefix: str, payload: dict) -> None:
+    """Pack dict of 1D arrays into NPZ payload using '<prefix>_keys' + '<prefix>__{key}'."""
+    if not stats:
+        return
+    keys = list(stats.keys())
+    payload[f"{prefix}_keys"] = np.array(keys, dtype="U")
+    for k in keys:
+        payload[f"{prefix}__{k}"] = np.asarray(stats[k], np.float64)
+
+
+def _load_stats_from_npz(z, prefix: str) -> dict | None:
+    """Inverse of _save_stats_to_payload; returns dict or None if not found."""
+    keys_name = f"{prefix}_keys"
+    if keys_name not in z:
+        return None
+    keys = list(z[keys_name].astype("U"))
+    out = {}
+    for k in keys:
+        arr_name = f"{prefix}__{k}"
+        if arr_name in z:
+            out[k] = z[arr_name].astype(np.float64, copy=False)
+    return out if out else None
+
+
 def save_contact_sites_npz(res, path: str | Path, *, compress: bool = True) -> None:
     """
     Serialize ContactSitesResult to a pickle-free NPZ:
@@ -461,8 +485,12 @@ def save_contact_sites_npz(res, path: str | Path, *, compress: bool = True) -> N
         bbox_B=np.asarray(res.bbox_B, np.float64),
         bbox=np.asarray(res.bbox, np.float64),
         meta_json=_json_encode_meta(res.meta),
-        _schema=np.array("ContactSitesResult@1", dtype="U"),
+        _schema=np.array("ContactSitesResult@2", dtype="U"),
     )
+    # Optional stats: flattened into many arrays with explicit key list per group
+    _save_stats_to_payload(getattr(res, "stats_A", None), "stats_A", payload)
+    _save_stats_to_payload(getattr(res, "stats_B", None), "stats_B", payload)
+    _save_stats_to_payload(getattr(res, "stats_pair", None), "stats_pair", payload)
     if compress:
         np.savez_compressed(path, **payload)
     else:
@@ -485,6 +513,22 @@ def load_contact_sites_npz(path: str | Path):
         else:
             pairs_AB = None
 
+        meta = _json_decode_meta(z["meta_json"]) if "meta_json" in z else {}
+
+        # Load optional stats (v2); else try meta['stats_*']
+        stats_A = _load_stats_from_npz(z, "stats_A")
+        stats_B = _load_stats_from_npz(z, "stats_B")
+        stats_pair = _load_stats_from_npz(z, "stats_pair")
+
+        if stats_A is None and isinstance(meta.get("stats_A"), dict):
+            stats_A = {k: np.asarray(v, np.float64) for k, v in meta["stats_A"].items()}
+        if stats_B is None and isinstance(meta.get("stats_B"), dict):
+            stats_B = {k: np.asarray(v, np.float64) for k, v in meta["stats_B"].items()}
+        if stats_pair is None and isinstance(meta.get("stats_pair"), dict):
+            stats_pair = {
+                k: np.asarray(v, np.float64) for k, v in meta["stats_pair"].items()
+            }
+
         return ContactSites(
             faces_A=faces_A,
             faces_B=faces_B,
@@ -503,5 +547,8 @@ def load_contact_sites_npz(path: str | Path):
             bbox=z["bbox"].astype(np.float64, copy=False)
             if "bbox" in z
             else np.array([]),
-            meta=_json_decode_meta(z["meta_json"]),
+            meta=meta,
+            stats_A=stats_A,
+            stats_B=stats_B,
+            stats_pair=stats_pair,
         )

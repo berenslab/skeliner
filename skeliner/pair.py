@@ -6,7 +6,7 @@ from typing import Iterable
 
 import numpy as np
 import trimesh
-from scipy.spatial import KDTree
+from scipy.spatial import ConvexHull, KDTree
 
 from .core import Skeleton
 
@@ -685,11 +685,15 @@ class ContactSites:
     area_mean: np.ndarray  # (A+B)/2
     seeds_A: np.ndarray  # projected seed on A
     seeds_B: np.ndarray  # projected seed on B
-    pairs_AB: list[np.ndarray] | None
     bbox_A: np.ndarray  # (M,2,3) [min,max] AABBs on A in mesh units
     bbox_B: np.ndarray  # (M,2,3) [min,max] AABBs on B in mesh units
     bbox: np.ndarray  # (M,2,3) union(A,B) in mesh units
     meta: dict[str, object]
+    # Optional, computed post-hoc
+    pairs_AB: list[np.ndarray] | None
+    stats_A: dict[str, np.ndarray] | None = None
+    stats_B: dict[str, np.ndarray] | None = None
+    stats_pair: dict[str, np.ndarray] | None = None
 
     def to_npz(self, path: str | Path, *, compress: bool = True) -> None:
         # Lazy import to avoid module-level circular imports
@@ -1426,3 +1430,330 @@ def map_contact_sites(
         bbox=bbox_union,
         meta=meta,
     )
+
+
+# ------------------------ stats & filters -------------------------------
+
+
+def _plane_project(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Best-fit plane through points via PCA; returns (center, u, v) where u,v span the plane.
+    """
+    pts = np.asarray(points, float)
+    if pts.size == 0:
+        return np.zeros(3), np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])
+    C = pts.mean(axis=0)
+    X = pts - C
+    # Covariance eigen-decomp (ascending eigenvalues)
+    cov = (X.T @ X) / max(len(X), 1)
+    w, V = np.linalg.eigh(cov)
+    # Normal is smallest-eigenvector; plane spanned by the other two
+    u = V[:, 2]
+    v = V[:, 1]
+    return C, u, v
+
+
+def _shape_stats_for_faces(
+    mesh: trimesh.Trimesh, faces: np.ndarray
+) -> dict[str, float]:
+    """
+    Compute simple 2D shape stats of a patch on a mesh side:
+    - extent_long, extent_short, aspect
+    - roundness (2D convex hull)
+    - faces_count
+    - normal_dispersion (1 - ||mean normal||)
+    """
+    faces = np.asarray(faces, np.int64)
+    if faces.size == 0:
+        return dict(
+            extent_long=0.0,
+            extent_short=0.0,
+            aspect=np.nan,
+            roundness=np.nan,
+            faces_count=0.0,
+            normal_dispersion=np.nan,
+        )
+
+    centers = mesh.triangles_center[faces]
+    areas = mesh.area_faces[faces].astype(float)
+    normals = mesh.face_normals[faces].astype(float)
+
+    # Area-weighted mean normal and dispersion
+    w = areas / (areas.sum() + 1e-12)
+    n_mean = (normals * w[:, None]).sum(axis=0)
+    n_norm = float(np.linalg.norm(n_mean))
+    normal_dispersion = float(1.0 - min(n_norm, 1.0))
+
+    # Project to best-fit plane and measure 2D extents
+    C, u, v = _plane_project(centers)
+    Y = np.column_stack(((centers - C) @ u, (centers - C) @ v))
+
+    ext_u = float(np.ptp(Y[:, 0]))
+    ext_v = float(np.ptp(Y[:, 1]))
+    length, width = (ext_u, ext_v) if ext_u >= ext_v else (ext_v, ext_u)
+    aspect = float(length / max(width, 1e-12))
+
+    # Roundness via 2D convex hull
+    roundness = np.nan
+    if len(Y) >= 3:
+        try:
+            hull = ConvexHull(Y)
+            A2d = float(hull.volume)  # area in 2D
+            P2d = float(hull.area)  # perimeter in 2D
+            if P2d > 0:
+                roundness = float(4.0 * np.pi * A2d / (P2d * P2d))
+        except Exception:
+            pass
+
+    return dict(
+        extent_long=length,
+        extent_short=width,
+        aspect=aspect,
+        roundness=roundness,
+        faces_count=float(len(faces)),
+        normal_dispersion=normal_dispersion,
+    )
+
+
+def compute_contact_stats(
+    A: trimesh.Trimesh,
+    B: trimesh.Trimesh,
+    contacts: ContactSites,
+    *,
+    attach: bool = True,
+) -> (
+    tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray]]
+    | ContactSites
+):
+    """
+    Compute per-patch shape/orientation stats and optionally attach them to the
+    ContactSites object as .stats_A/.stats_B/.stats_pair.
+    Returns (stats_A, stats_B, stats_pair), each a dict of np.ndarrays.
+    """
+    M = len(contacts.faces_A)
+    # Side stats
+    statsA_list = [
+        _shape_stats_for_faces(A, np.asarray(contacts.faces_A[i], np.int64))
+        for i in range(M)
+    ]
+    statsB_list = [
+        _shape_stats_for_faces(B, np.asarray(contacts.faces_B[i], np.int64))
+        for i in range(M)
+    ]
+
+    def pack(stats_list: list[dict[str, float]]) -> dict[str, np.ndarray]:
+        keys = list(stats_list[0].keys()) if stats_list else []
+        out: dict[str, np.ndarray] = {}
+        for k in keys:
+            out[k] = np.asarray([d[k] for d in stats_list], dtype=float)
+        return out
+
+    stats_A = pack(statsA_list)
+    stats_B = pack(statsB_list)
+
+    # Per-patch mean normals for opposition
+    nA_means = []
+    nB_means = []
+    for i in range(M):
+        fa = np.asarray(contacts.faces_A[i], np.int64)
+        fb = np.asarray(contacts.faces_B[i], np.int64)
+        if fa.size:
+            wA = A.area_faces[fa]
+            NA = (A.face_normals[fa] * (wA / (wA.sum() + 1e-12))[:, None]).sum(axis=0)
+            NA /= np.linalg.norm(NA) + 1e-12
+        else:
+            NA = np.array([np.nan, np.nan, np.nan])
+        if fb.size:
+            wB = B.area_faces[fb]
+            NB = (B.face_normals[fb] * (wB / (wB.sum() + 1e-12))[:, None]).sum(axis=0)
+            NB /= np.linalg.norm(NB) + 1e-12
+        else:
+            NB = np.array([np.nan, np.nan, np.nan])
+        nA_means.append(NA)
+        nB_means.append(NB)
+    nA_means = np.vstack(nA_means) if nA_means else np.empty((0, 3), float)
+    nB_means = np.vstack(nB_means) if nB_means else np.empty((0, 3), float)
+    normal_opposition_dot = np.einsum("ij,ij->i", nA_means, nB_means)
+
+    # Seed support count per patch from meta['seed_to_patch']
+    Mpatch = M
+    seed_to_patch = np.asarray(contacts.meta.get("seed_to_patch", []), dtype=np.int64)
+    seed_count = np.zeros(Mpatch, np.int64)
+    if seed_to_patch.size:
+        sel = seed_to_patch[seed_to_patch >= 0]
+        if sel.size:
+            seed_count = np.bincount(sel, minlength=Mpatch).astype(np.int64)
+
+    stats_pair = dict(
+        area_mean=np.asarray(contacts.area_mean, float),
+        seed_count=seed_count.astype(
+            float
+        ),  # store as float for JSON/meta friendliness
+        normal_opposition_dot=normal_opposition_dot.astype(float),
+    )
+
+    if attach:
+        contacts.stats_A = stats_A
+        contacts.stats_B = stats_B
+        contacts.stats_pair = stats_pair
+        return contacts
+
+    return stats_A, stats_B, stats_pair
+
+
+def _subset_contact_sites(
+    contacts: ContactSites, keep_mask: np.ndarray
+) -> ContactSites:
+    """
+    Create a new ContactSites object keeping only patches where keep_mask is True.
+    Preserves meta and updates seed_to_patch if present.
+    """
+    keep_mask = np.asarray(keep_mask, bool)
+    M = len(contacts.faces_A)
+    if keep_mask.shape[0] != M:
+        raise ValueError("keep_mask length must equal number of patches")
+    idx = np.flatnonzero(keep_mask)
+
+    faces_A = [contacts.faces_A[i] for i in idx]
+    faces_B = [contacts.faces_B[i] for i in idx]
+    area_A = np.asarray(contacts.area_A, float)[idx]
+    area_B = np.asarray(contacts.area_B, float)[idx]
+    area_mean = np.asarray(contacts.area_mean, float)[idx]
+    seeds_A = np.asarray(contacts.seeds_A, float)[idx]
+    seeds_B = np.asarray(contacts.seeds_B, float)[idx]
+    pairs_AB = None
+    if contacts.pairs_AB is not None:
+        pairs_AB = [contacts.pairs_AB[i] for i in idx]
+    bbox_A = np.asarray(contacts.bbox_A, float)[idx]
+    bbox_B = np.asarray(contacts.bbox_B, float)[idx]
+    bbox = np.asarray(contacts.bbox, float)[idx]
+
+    # Stats filtering if present
+    stats_A = None
+    stats_B = None
+    stats_pair = None
+    if contacts.stats_A is not None:
+        stats_A = {k: np.asarray(v)[idx] for k, v in contacts.stats_A.items()}
+    if contacts.stats_B is not None:
+        stats_B = {k: np.asarray(v)[idx] for k, v in contacts.stats_B.items()}
+    if contacts.stats_pair is not None:
+        stats_pair = {k: np.asarray(v)[idx] for k, v in contacts.stats_pair.items()}
+
+    # Meta: shallow copy, add filter info and remap seed_to_patch if present
+    meta = dict(contacts.meta)
+    meta.setdefault("filter", {})
+    meta["filter"] = dict(meta["filter"], kept=int(idx.size), total=int(M))
+
+    stp = np.asarray(meta.get("seed_to_patch", []), dtype=np.int64)
+    if stp.size:
+        # map old patch indices -> new ones
+        mapping = -np.ones(M, dtype=np.int64)
+        mapping[idx] = np.arange(idx.size, dtype=np.int64)
+        meta["seed_to_patch"] = np.where(stp >= 0, mapping[stp], -1)
+
+    return ContactSites(
+        faces_A=faces_A,
+        faces_B=faces_B,
+        area_A=area_A,
+        area_B=area_B,
+        area_mean=area_mean,
+        seeds_A=seeds_A,
+        seeds_B=seeds_B,
+        pairs_AB=pairs_AB,
+        bbox_A=bbox_A,
+        bbox_B=bbox_B,
+        bbox=bbox,
+        meta=meta,
+        stats_A=stats_A,
+        stats_B=stats_B,
+        stats_pair=stats_pair,
+    )
+
+
+def filter_contact_sites(
+    contacts: ContactSites,
+    *,
+    area_min: float | None = None,
+    area_max: float | None = None,
+    aspect_max: float | None = None,
+    roundness_min: float | None = None,
+    normal_opposition_max: float | None = None,
+    faces_min: int | None = None,
+    normal_dispersion_max: float | None = None,
+    return_sites: bool = True,
+) -> ContactSites | np.ndarray:
+    """
+    Use precomputed stats in 'contacts' to produce a boolean keep mask, or
+    return a filtered ContactSites if return_sites=True.
+    Requires contacts.stats_A, contacts.stats_B, contacts.stats_pair to be present.
+    """
+    if (
+        contacts.stats_A is None
+        or contacts.stats_B is None
+        or contacts.stats_pair is None
+    ):
+        raise ValueError(
+            "ContactSites.stats_* missing. Run compute_contact_stats(A,B,contacts) first."
+        )
+
+    # Basic side-wise shape checks (each criterion optional)
+    def side_ok(S: dict[str, np.ndarray]) -> np.ndarray:
+        # Determine M
+        M = len(contacts.area_mean)
+        ok = np.ones(M, dtype=bool)
+        if faces_min is not None:
+            arr = np.asarray(S.get("faces_count", np.full(M, np.inf)), float)
+            ok &= arr >= float(faces_min)
+        if aspect_max is not None:
+            arr = np.asarray(S.get("aspect", np.full(M, -np.inf)), float)
+            ok &= arr <= float(aspect_max)
+        if roundness_min is not None:
+            arr = np.asarray(S.get("roundness", np.full(M, np.inf)), float)
+            ok &= arr >= float(roundness_min)
+        if normal_dispersion_max is not None:
+            arr = np.asarray(S.get("normal_dispersion", np.full(M, -np.inf)), float)
+            ok &= arr <= float(normal_dispersion_max)
+        return ok
+
+    Aok = side_ok(contacts.stats_A)
+    Bok = side_ok(contacts.stats_B)
+    shape_ok = Aok | Bok  # accept if at least one side looks synapse-like
+
+    # Orientation: prefer strong opposition (dot closer to -1)
+    if normal_opposition_max is not None:
+        dot = np.asarray(
+            contacts.stats_pair.get("normal_opposition_dot", np.nan), float
+        )
+        orient_ok = np.isfinite(dot) & (dot <= float(normal_opposition_max))
+    else:
+        orient_ok = np.ones_like(contacts.area_mean, dtype=bool)
+
+    # Area bounds
+    area = np.asarray(contacts.stats_pair.get("area_mean", contacts.area_mean), float)
+    area_ok = np.isfinite(area)
+    if area_min is not None:
+        area_ok &= area >= float(area_min)
+    if area_max is not None:
+        area_ok &= area <= float(area_max)
+
+    keep = shape_ok & orient_ok & area_ok
+    if not return_sites:
+        return keep
+
+    # annotate thresholds; subset object
+    filtered = _subset_contact_sites(contacts, keep)
+    filtered.meta = dict(filtered.meta)
+    filtered.meta.setdefault("filter", {})
+    filtered.meta["filter"].update(
+        dict(
+            mask=keep,
+            area_min=area_min,
+            area_max=area_max,
+            aspect_max=aspect_max,
+            roundness_min=roundness_min,
+            normal_opposition_max=normal_opposition_max,
+            faces_min=int(faces_min),
+            normal_dispersion_max=normal_dispersion_max,
+        )
+    )
+    return filtered
