@@ -1,5 +1,7 @@
 # skeliner 
 
+[![PyPI version](https://badge.fury.io/py/skeliner.svg)](https://badge.fury.io/py/skeliner)
+
 A lightweight skeletonizer that converts neuron meshes into biophysical‑modelling‑ready morphologies. It extracts an acyclic center‑line skeleton, estimates per‑node radii, detects the soma, and bridges small gaps. It also provides robust contact‑site mapping between pairs of cells using both skeletons and meshes.
 
 ![](.github/banner.png)
