@@ -149,7 +149,7 @@ def nearest_skeletons(
     radius_metric: str | None = None,
     mode: str = "surface",
     return_all: bool = False,
-    structured: bool = False,
+    structured: bool = True,
     id_field: str = "id",
 ) -> (
     Tuple[np.ndarray, np.ndarray]
@@ -173,8 +173,9 @@ def nearest_skeletons(
     return_all
         When *True* also return the full distance matrix.
     structured
-        When *True* return a human-friendly summary that lists the nearest
+        When *True* (default) return a human-friendly summary that lists the nearest
         skeletons per point together with their meta IDs instead of the raw arrays.
+        Pass ``False`` to preserve the legacy tuple return style.
     id_field
         Key looked up on :attr:`Skeleton.meta` when building the structured
         summary. Only consulted when ``structured`` is *True*.
