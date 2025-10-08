@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterable, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 
 from . import dx
+
 if TYPE_CHECKING:
     from .core import Skeleton
 
 __all__ = ["distance_matrix", "nearest_skeletons"]
+
+StructuredMatches = Dict[str, Any] | List[Dict[str, Any]]
 
 
 def _ensure_points(points: Sequence[float] | np.ndarray) -> Tuple[np.ndarray, bool]:
@@ -26,7 +29,9 @@ def _ensure_points(points: Sequence[float] | np.ndarray) -> Tuple[np.ndarray, bo
     raise ValueError("points must be a 3-vector or an array of shape (M, 3)")
 
 
-def _ensure_skeletons(skeletons: Iterable["Skeleton"]) -> Tuple[Tuple["Skeleton", ...], int]:
+def _ensure_skeletons(
+    skeletons: Iterable["Skeleton"],
+) -> Tuple[Tuple["Skeleton", ...], int]:
     """Freeze iterable of skeletons and validate that each has nodes."""
     skels = tuple(skeletons)
     if not skels:
@@ -35,6 +40,47 @@ def _ensure_skeletons(skeletons: Iterable["Skeleton"]) -> Tuple[Tuple["Skeleton"
         if skel.nodes.size == 0:
             raise ValueError(f"Skeleton at index {idx} has no nodes")
     return skels, len(skels)
+
+
+def _build_structured_matches(
+    *,
+    points: np.ndarray,
+    distances: np.ndarray,
+    indices: np.ndarray,
+    skeletons: Sequence["Skeleton"],
+    single_point: bool,
+    id_field: str,
+    all_distances: np.ndarray | None = None,
+) -> StructuredMatches:
+    """Create a user friendly summary of nearest skeleton matches."""
+
+    dist_rows = np.atleast_2d(distances)
+    idx_rows = np.atleast_2d(indices)
+    all_rows = np.atleast_2d(all_distances) if all_distances is not None else None
+
+    point_matches: List[Dict[str, Any]] = []
+    for i, point in enumerate(points):
+        matches: List[Dict[str, Any]] = []
+        for dist, idx in zip(dist_rows[i], idx_rows[i], strict=False):
+            skel = skeletons[int(idx)]
+            meta = getattr(skel, "meta", {}) or {}
+            matches.append(
+                {
+                    "skeleton_index": int(idx),
+                    "skeleton_id": meta.get(id_field),
+                    "distance": float(dist),
+                }
+            )
+        entry: Dict[str, Any] = {
+            "point_index": i,
+            "point": point.tolist(),
+            "matches": matches,
+        }
+        if all_rows is not None:
+            entry["all_distances"] = all_rows[i].tolist()
+        point_matches.append(entry)
+
+    return point_matches[0] if single_point else point_matches
 
 
 def distance_matrix(
@@ -103,7 +149,13 @@ def nearest_skeletons(
     radius_metric: str | None = None,
     mode: str = "surface",
     return_all: bool = False,
-) -> Tuple[np.ndarray, np.ndarray] | Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    structured: bool = False,
+    id_field: str = "id",
+) -> (
+    Tuple[np.ndarray, np.ndarray]
+    | Tuple[np.ndarray, np.ndarray, np.ndarray]
+    | StructuredMatches
+):
     """
     Query the *k* closest skeletons for each point.
 
@@ -120,23 +172,36 @@ def nearest_skeletons(
         Forwarded to :func:`distance_matrix`.
     return_all
         When *True* also return the full distance matrix.
+    structured
+        When *True* return a human-friendly summary that lists the nearest
+        skeletons per point together with their meta IDs instead of the raw arrays.
+    id_field
+        Key looked up on :attr:`Skeleton.meta` when building the structured
+        summary. Only consulted when ``structured`` is *True*.
 
     Returns
     -------
     distances, indices [, all_distances]
-        Distances and skeleton indices of shape ``(k,)`` for a single point
-        or ``(M, k)`` for multiple points. ``indices`` refer to the order of
-        ``skeletons``. When ``return_all`` is *True* the full distance matrix
-        (``(S,)`` or ``(M, S)``) is appended to the return tuple.
+        When ``structured`` is *False* distances and skeleton indices of shape
+        ``(k,)`` for a single point or ``(M, k)`` for multiple points. ``indices``
+        refer to the order of ``skeletons``. When ``return_all`` is *True* the full
+        distance matrix (``(S,)`` or ``(M, S)``) is appended to the return tuple.
+    structured
+        When ``structured`` is *True* the function returns a dictionary (single point)
+        or a list of dictionaries (multiple points) describing the closest skeletons.
+        Each dictionary includes the matched skeleton IDs, indices, and distances. When
+        ``return_all`` is *True* each entry also contains an ``"all_distances"`` list
+        covering the distances to every skeleton in the input.
     """
     if k <= 0:
         raise ValueError("k must be positive")
 
+    pts, single_input = _ensure_points(points)
     skels, n_skels = _ensure_skeletons(skeletons)
 
     dist = distance_matrix(
         skels,
-        points,
+        pts[0] if single_input else pts,
         point_unit=point_unit,
         k_nearest=k_nearest,
         radius_metric=radius_metric,
@@ -147,7 +212,6 @@ def nearest_skeletons(
 
     single = dist.ndim == 1
     if single:
-        # 1D case: distances per skeleton
         if k == n_skels:
             idx = np.arange(n_skels, dtype=np.int64)
             dists = np.asarray(dist, dtype=np.float64)
@@ -157,21 +221,32 @@ def nearest_skeletons(
             order = np.argsort(dists)
             idx = part[order]
             dists = dists[order]
-
-        return (dists, idx) + ((dist,) if return_all else ())
-
-    # M>1 points – work row-wise
-    if k == n_skels:
-        order = np.argsort(dist, axis=1)
-        idx = np.tile(np.arange(n_skels, dtype=np.int64), (dist.shape[0], 1))
-        idx = np.take_along_axis(idx, order, axis=1)
-        dists = np.take_along_axis(dist, order, axis=1)
     else:
-        part_idx = np.argpartition(dist, k - 1, axis=1)[:, :k]
-        part_dist = np.take_along_axis(dist, part_idx, axis=1)
-        order = np.argsort(part_dist, axis=1)
-        idx = np.take_along_axis(part_idx, order, axis=1)
-        dists = np.take_along_axis(part_dist, order, axis=1)
-        return (dists, idx) + ((dist,) if return_all else ())
+        if k == n_skels:
+            order = np.argsort(dist, axis=1)
+            idx = np.tile(np.arange(n_skels, dtype=np.int64), (dist.shape[0], 1))
+            idx = np.take_along_axis(idx, order, axis=1)
+            dists = np.take_along_axis(dist, order, axis=1)
+        else:
+            part_idx = np.argpartition(dist, k - 1, axis=1)[:, :k]
+            part_dist = np.take_along_axis(dist, part_idx, axis=1)
+            order = np.argsort(part_dist, axis=1)
+            idx = np.take_along_axis(part_idx, order, axis=1)
+            dists = np.take_along_axis(part_dist, order, axis=1)
 
-    return (dists, idx) + ((dist,) if return_all else ())
+    if structured:
+        structured_matches = _build_structured_matches(
+            points=pts,
+            distances=dists,
+            indices=idx,
+            skeletons=skels,
+            single_point=single,
+            id_field=id_field,
+            all_distances=dist if return_all else None,
+        )
+        return structured_matches
+
+    result: Tuple[np.ndarray, ...] = (dists, idx)
+    if return_all:
+        result = result + (dist,)
+    return result
