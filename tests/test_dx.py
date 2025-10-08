@@ -105,8 +105,11 @@ def test_distance_point_queries(skel):
     offset_nm = perp * 500.0  # 500 nm away from the edge
     point_nm = mid + offset_nm
 
-    def brute_distance(point_nm_space: np.ndarray) -> float:
-        """Reference distance without spatial acceleration."""
+    radius_key = skel.recommend_radius()[0]
+    radii = np.asarray(skel.radii[radius_key], dtype=float)
+
+    def brute_centerline(point_nm_space: np.ndarray) -> float:
+        """Distance to the centreline (no radii)."""
         d_nodes = np.linalg.norm(skel.nodes - point_nm_space, axis=1).min()
         d_edges = np.inf
         for a, b in skel.edges:
@@ -116,17 +119,51 @@ def test_distance_point_queries(skel):
             )
         return min(d_nodes, d_edges)
 
-    expected_nm = brute_distance(point_nm)
-    d_nm = dx.distance(skel, point_nm, point_unit="nm")
-    assert d_nm == pytest.approx(expected_nm, rel=1e-6)
+    def brute_surface(point_nm_space: np.ndarray) -> float:
+        """Distance to the capsule envelope (clamped to zero inside)."""
+        d_nodes = float(
+            np.min(np.linalg.norm(skel.nodes - point_nm_space, axis=1) - radii)
+        )
+        d_edges = np.inf
+        for a, b in skel.edges:
+            d_edges = min(
+                d_edges,
+                dx._point_segment_capsule_distance(
+                    point_nm_space,
+                    skel.nodes[a],
+                    skel.nodes[b],
+                    radii[a],
+                    radii[b],
+                ),
+            )
+        return max(min(d_nodes, d_edges), 0.0)
+
+    expected_center_nm = brute_centerline(point_nm)
+    expected_surface_nm = brute_surface(point_nm)
+
+    # --- centreline mode -------------------------------------------------
+    d_center_nm = dx.distance(skel, point_nm, point_unit="nm", mode="centerline")
+    assert d_center_nm == pytest.approx(expected_center_nm, rel=1e-6)
 
     point_um = point_nm * 1e-3
-    d_um = dx.distance(skel, point_um, point_unit="um")
-    assert d_um == pytest.approx(expected_nm * 1e-3, rel=1e-6)
+    d_center_um = dx.distance(skel, point_um, point_unit="um", mode="centerline")
+    assert d_center_um == pytest.approx(expected_center_nm * 1e-3, rel=1e-6)
 
-    # vectorised query
+    # --- surface mode ----------------------------------------------------
+    d_surface_nm = dx.distance(skel, point_nm, point_unit="nm", mode="surface")
+    assert d_surface_nm == pytest.approx(expected_surface_nm, rel=1e-6)
+
+    point_um_surface = dx.distance(skel, point_um, point_unit="um", mode="surface")
+    assert point_um_surface == pytest.approx(expected_surface_nm * 1e-3, rel=1e-6)
+
+    # vectorised query mixes modes
     arr_nm = np.vstack([point_nm, mid])
-    distances = dx.distance(skel, arr_nm, point_unit="nm")
-    assert distances.shape == (2,)
-    assert distances[0] == pytest.approx(expected_nm, rel=1e-6)
-    assert distances[1] == pytest.approx(0.0, abs=1e-9)
+    distances_surface = dx.distance(skel, arr_nm, point_unit="nm", mode="surface")
+    assert distances_surface.shape == (2,)
+    assert distances_surface[0] == pytest.approx(expected_surface_nm, rel=1e-6)
+    assert distances_surface[1] == pytest.approx(0.0, abs=1e-9)
+
+    distances_center = dx.distance(skel, arr_nm, point_unit="nm", mode="centerline")
+    assert distances_center.shape == (2,)
+    assert distances_center[0] == pytest.approx(expected_center_nm, rel=1e-6)
+    assert distances_center[1] == pytest.approx(0.0, abs=1e-9)
