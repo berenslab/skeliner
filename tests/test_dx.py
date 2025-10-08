@@ -78,3 +78,55 @@ def test_suspicious_tips_are_leaves(skel):
     g = _igraph(skel)
     deg = np.asarray(g.degree())
     assert all(deg[t] == 1 and t != 0 for t in tips)
+
+
+def test_distance_point_queries(skel):
+    unit = skel.meta.get("unit", "nm")
+    soma = skel.nodes[0]
+    # distance to a node should be zero irrespective of units
+    assert dx.distance(skel, soma, point_unit=unit) == pytest.approx(0.0, abs=1e-9)
+
+    # take edge midpoint and move it away along a perpendicular direction
+    u, v = map(int, skel.edges[0])
+    edge_vec = skel.nodes[v] - skel.nodes[u]
+    mid = 0.5 * (skel.nodes[u] + skel.nodes[v])
+
+    # robust perpendicular
+    perp = None
+    for axis in np.eye(3):
+        candidate = np.cross(edge_vec, axis)
+        norm = np.linalg.norm(candidate)
+        if norm > 1e-9:
+            perp = candidate / norm
+            break
+    if perp is None:  # degenerate edge, fall back to arbitrary axis
+        perp = np.array([1.0, 0.0, 0.0])
+
+    offset_nm = perp * 500.0  # 500 nm away from the edge
+    point_nm = mid + offset_nm
+
+    def brute_distance(point_nm_space: np.ndarray) -> float:
+        """Reference distance without spatial acceleration."""
+        d_nodes = np.linalg.norm(skel.nodes - point_nm_space, axis=1).min()
+        d_edges = np.inf
+        for a, b in skel.edges:
+            d_edges = min(
+                d_edges,
+                dx._point_segment_distance(point_nm_space, skel.nodes[a], skel.nodes[b]),
+            )
+        return min(d_nodes, d_edges)
+
+    expected_nm = brute_distance(point_nm)
+    d_nm = dx.distance(skel, point_nm, point_unit="nm")
+    assert d_nm == pytest.approx(expected_nm, rel=1e-6)
+
+    point_um = point_nm * 1e-3
+    d_um = dx.distance(skel, point_um, point_unit="um")
+    assert d_um == pytest.approx(expected_nm * 1e-3, rel=1e-6)
+
+    # vectorised query
+    arr_nm = np.vstack([point_nm, mid])
+    distances = dx.distance(skel, arr_nm, point_unit="nm")
+    assert distances.shape == (2,)
+    assert distances[0] == pytest.approx(expected_nm, rel=1e-6)
+    assert distances[1] == pytest.approx(0.0, abs=1e-9)

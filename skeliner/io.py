@@ -1,4 +1,5 @@
 import json
+import pickle
 import re
 from pathlib import Path
 from typing import Iterable, List
@@ -293,7 +294,19 @@ def load_npz(path: str | Path) -> Skeleton:
             # stored as length-1 object array; .item() unwraps the dict
             meta = z["meta"].item()
 
-    return Skeleton(
+        node_kdtree = None
+        if "kdtree_nodes" in z.files:
+            blob = z["kdtree_nodes"]
+            if blob.size:
+                node_kdtree = pickle.loads(blob.item())
+
+        node_neighbors = None
+        if "neighbors_idx" in z.files and "neighbors_off" in z.files:
+            idx = z["neighbors_idx"].astype(np.int64)
+            off = z["neighbors_off"].astype(np.int64)
+            node_neighbors = tuple(idx[off[i] : off[i + 1]] for i in range(len(off) - 1))
+
+    skel = Skeleton(
         nodes=nodes,
         radii=radii,
         edges=edges,
@@ -304,11 +317,31 @@ def load_npz(path: str | Path) -> Skeleton:
         extra=extra,
         meta=meta,
     )
+    if node_kdtree is not None:
+        skel._nodes_kdtree = node_kdtree
+    if node_neighbors is not None:
+        skel._node_neighbors = node_neighbors
+    return skel
 
 
-def to_npz(skeleton: Skeleton, path: str | Path, *, compress: bool = True) -> None:
+
+def to_npz(
+    skeleton: Skeleton,
+    path: str | Path,
+    *,
+    compress: bool = True,
+    cache_kdtree: bool = True,
+) -> None:
     """
     Write the skeleton to a compressed `.npz` archive.
+
+    Parameters
+    ----------
+    compress
+        When *True* use :func:`numpy.savez_compressed`.
+    cache_kdtree
+        When *True* (default) ensure the node KD-tree and adjacency caches are
+        built and embedded in the archive for fast reloads.
     """
     path = Path(path)
 
@@ -317,6 +350,10 @@ def to_npz(skeleton: Skeleton, path: str | Path, *, compress: bool = True) -> No
         path = path.with_suffix(".npz")
 
     c = {} if not compress else {"compress": True}
+
+    if cache_kdtree:
+        skeleton._ensure_nodes_kdtree()
+        skeleton._ensure_node_neighbors()
 
     # radii_<name>  : one array per estimator
     radii_flat = {f"r_{k}": v for k, v in skeleton.radii.items()}
@@ -334,6 +371,25 @@ def to_npz(skeleton: Skeleton, path: str | Path, *, compress: bool = True) -> No
     # ndarrays — this keeps the archive a single *.npz* with no sidecars.
     extra = {"extra": np.array(skeleton.extra, dtype=object)}
     meta = {"meta": np.array(skeleton.meta, dtype=object)} if skeleton.meta else {}
+    tree_payload = {}
+    if skeleton._nodes_kdtree is not None:
+        tree_payload["kdtree_nodes"] = np.array(
+            pickle.dumps(skeleton._nodes_kdtree), dtype=object
+        )
+    if skeleton._node_neighbors is not None:
+        lengths = np.fromiter(
+            (len(nbrs) for nbrs in skeleton._node_neighbors),
+            dtype=np.int64,
+            count=len(skeleton._node_neighbors),
+        )
+        offsets = np.concatenate(([0], np.cumsum(lengths)))
+        data = (
+            np.concatenate(skeleton._node_neighbors)
+            if offsets[-1]
+            else np.empty(0, dtype=np.int64)
+        )
+        tree_payload["neighbors_idx"] = data.astype(np.int64, copy=False)
+        tree_payload["neighbors_off"] = offsets.astype(np.int64, copy=False)
 
     np.savez(
         path,
@@ -353,6 +409,7 @@ def to_npz(skeleton: Skeleton, path: str | Path, *, compress: bool = True) -> No
         **radii_flat,
         **extra,
         **meta,
+        **tree_payload,
         **c,
     )
 

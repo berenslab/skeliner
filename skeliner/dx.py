@@ -14,6 +14,7 @@ __skeleton__ = [
     "branches_of_length",
     "twigs_of_length",
     "suspicious_tips",
+    "distance",
     "node_summary",
     "extract_neurites",
     "neurites_out_of_bounds",
@@ -86,6 +87,110 @@ def neighbors(skel, node_id: int) -> List[int]:
     """Neighbour vertex IDs of *node_id* (undirected)."""
     g = _graph(skel)
     return [int(v) for v in g.neighbors(node_id)]
+
+
+def _point_segment_distance(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
+    """Return Euclidean distance from *point* to the segment [start, end]."""
+    vec = end - start
+    seg_len2 = float(np.dot(vec, vec))
+    if seg_len2 <= 0.0:
+        return float(np.linalg.norm(point - start))
+    t = float(np.dot(point - start, vec) / seg_len2)
+    t = min(1.0, max(0.0, t))
+    closest = start + t * vec
+    return float(np.linalg.norm(point - closest))
+
+
+def distance(
+    skel,
+    point: Sequence[float] | np.ndarray,
+    *,
+    metric: str = "euclidean",
+    point_unit: str | None = None,
+    k_nearest: int = 4,
+) -> float | np.ndarray:
+    """
+    Distance from an arbitrary point (or collection of points) to the skeleton.
+
+    Parameters
+    ----------
+    skel
+        :class:`skeliner.Skeleton` instance.
+    point
+        3-vector or array of shape (M, 3) giving query locations.
+    metric
+        Currently only ``'euclidean'`` is supported.
+    point_unit
+        Unit of the input coordinates and the returned distance. If ``None`` or
+        identical to ``skel.meta['unit']``, no conversion is performed.
+    k_nearest
+        Number of nearest skeleton nodes considered when refining the distance
+        against neighbouring edges (≥ 1).
+
+    Returns
+    -------
+    float or ndarray
+        Minimum Euclidean distance(s) in the same unit as *point_unit*.
+    """
+    if metric != "euclidean":
+        raise ValueError(f"Unsupported metric '{metric}'. Only 'euclidean' is available.")
+    pts = np.asarray(point, dtype=np.float64)
+    if pts.ndim == 1:
+        if pts.shape[0] != 3:
+            raise ValueError("point must be a 3-vector or an array of shape (M, 3)")
+        pts = pts[None, :]
+        single_input = True
+    elif pts.ndim == 2 and pts.shape[1] == 3:
+        single_input = False
+    else:
+        raise ValueError("point must be a 3-vector or an array of shape (M, 3)")
+
+    if skel.nodes.size == 0:
+        raise ValueError("Skeleton has no nodes; cannot compute distances.")
+    if k_nearest < 1:
+        raise ValueError("k_nearest must be at least 1.")
+
+    tree = skel._ensure_nodes_kdtree()
+    neighbours = skel._ensure_node_neighbors()
+
+    skel_unit = skel.meta.get("unit")
+    if point_unit is None or skel_unit is None or point_unit == skel_unit:
+        scale_in = 1.0
+        scale_out = 1.0
+    else:
+        scale_in = skel._get_unit_conversion_factor(point_unit, skel_unit)
+        scale_out = skel._get_unit_conversion_factor(skel_unit, point_unit)
+
+    distances = np.empty(len(pts), dtype=np.float64)
+    max_k = min(int(k_nearest), len(skel.nodes))
+    nodes = skel.nodes
+
+    for i, p in enumerate(pts):
+        p_skel = p * scale_in
+
+        nn_dist, nn_idx = tree.query(p_skel, k=max_k)
+        nn_idx_arr = np.atleast_1d(nn_idx).astype(np.int64, copy=False)
+        nn_dist_arr = np.atleast_1d(nn_dist)
+        best = float(nn_dist_arr.min())
+
+        # Collect unique edges incident to the nearest nodes
+        candidates: set[tuple[int, int]] = set()
+        for nid in nn_idx_arr:
+            for nb in neighbours[nid]:
+                if nid < nb:
+                    candidates.add((nid, nb))
+                else:
+                    candidates.add((nb, nid))
+
+        if candidates:
+            for a_idx, b_idx in candidates:
+                d = _point_segment_distance(p_skel, nodes[a_idx], nodes[b_idx])
+                if d < best:
+                    best = d
+
+        distances[i] = best * scale_out
+
+    return float(distances[0]) if single_input else distances
 
 
 def node_summary(
