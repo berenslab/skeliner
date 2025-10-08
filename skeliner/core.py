@@ -265,6 +265,13 @@ class Skeleton:
     # ---- optional dictionary for meta data and future extra data--------------
     meta: dict[str, Any] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
+    # ---- cached spatial helpers ----------------------------------------------
+    _nodes_kdtree: KDTree | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _node_neighbors: tuple[np.ndarray, ...] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def __getattr__(self, name: str):
         for mod in (dx, post):
@@ -305,6 +312,37 @@ class Skeleton:
         if self.soma is not None:
             if self.soma.verts is not None and self.soma.verts.ndim != 1:
                 raise ValueError("soma_verts must be 1-D")
+
+    # ---------------------------------------------------------------------
+    # spatial helpers (KD-tree + adjacency cache)
+    # ---------------------------------------------------------------------
+    def _invalidate_spatial_index(self) -> None:
+        """Drop cached spatial structures (KD-tree, adjacency)."""
+        self._nodes_kdtree = None
+        self._node_neighbors = None
+
+    def _ensure_nodes_kdtree(self, *, rebuild: bool = False) -> KDTree:
+        """Return a cached KD-tree over node coordinates."""
+        if rebuild:
+            self._nodes_kdtree = None
+        if self._nodes_kdtree is None:
+            if self.nodes.size == 0:
+                raise ValueError("Cannot build KD-tree: skeleton has no nodes.")
+            self._nodes_kdtree = KDTree(self.nodes)
+        return self._nodes_kdtree
+
+    def _ensure_node_neighbors(self) -> tuple[np.ndarray, ...]:
+        """Return cached neighbour lists for every node."""
+        if self._node_neighbors is None:
+            neighbours = [[] for _ in range(len(self.nodes))]
+            for u, v in self.edges:
+                neighbours[u].append(v)
+                neighbours[v].append(u)
+            self._node_neighbors = tuple(
+                np.asarray(nbrs, dtype=np.int64) if nbrs else np.empty(0, np.int64)
+                for nbrs in neighbours
+            )
+        return self._node_neighbors
 
     # ---------------------------------------------------------------------
     # helpers
@@ -445,6 +483,7 @@ class Skeleton:
             self.soma.axes *= factor
 
         self.meta["unit"] = target_unit
+        self._invalidate_spatial_index()
 
     def _get_unit_conversion_factor(
         self, current_unit: str, target_unit: str

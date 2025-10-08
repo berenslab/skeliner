@@ -1,6 +1,6 @@
 from importlib.metadata import PackageNotFoundError, version
 
-from . import dx, io, pair, plot, post
+from . import batch, dx, io, pair, plot, post
 from .core import Skeleton, skeletonize
 from .plot.vis2d import projection as plot2d
 from .plot.vis2d import threeviews as plot3v
@@ -19,6 +19,7 @@ __all__ = [
     "view3d",
     "io",
     "dx",
+    "batch",
     "post",
     "pair",
     "plot",

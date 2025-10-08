@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from skeliner import skeletonize
+from skeliner import dx, skeletonize
 from skeliner.io import load_mesh, load_npz, load_swc
 
 SAMPLES_DIR = Path(__file__).parent / "data" 
@@ -29,6 +29,10 @@ def reference_mesh():
 def test_io_roundtrip(reference_mesh, tmp_path):
     skel = skeletonize(reference_mesh, verbose=False)
 
+    # warm up KD-tree cache (and verify it exists)
+    dx.distance(skel, skel.nodes[0], point_unit=skel.meta.get("unit", "nm"))
+    assert skel._nodes_kdtree is not None
+
     # --- write ---------------------------------------------------------
     swc_path = tmp_path / "60427_test.swc"
     npz_path = tmp_path / "60427_test.npz"
@@ -41,6 +45,8 @@ def test_io_roundtrip(reference_mesh, tmp_path):
     # --- read back -----------------------------------------------------
     skel_from_swc = load_swc(swc_path)
     skel_from_npz = load_npz(npz_path)
+    assert skel_from_npz._nodes_kdtree is not None
+    assert skel_from_npz._node_neighbors is not None
 
     # --- very coarse equivalence checks --------------------------------
     # (Exact float equality is not expected; topology & sizes should match.)
