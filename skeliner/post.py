@@ -1270,3 +1270,148 @@ def downsample(
         )
 
     return new_skel
+
+
+def calibrate_radii(
+    skel,
+    *,
+    points: ArrayLike | None = None,
+    radius_metric: str | None = None,
+    aggregate: str = "median",
+    mode: str = "centerline",
+    store_key: str = "calibrated",
+    copy_if_missing: bool = True,
+) -> None:
+    """
+    Refine per‑node radii by measuring distances from mesh vertices to the
+    skeleton centreline, aggregated within each node's vertex bin.
+
+    Parameters
+    ----------
+    skel
+        Skeleton whose radii dictionary will be updated in‑place.
+    points
+        Optional (V,3) array of mesh vertices. If omitted, will try
+        ``skel.extra['mesh_vertices']``. If neither is available, the function
+        falls back to copying the recommended radius into ``store_key`` when
+        ``copy_if_missing`` is True, and otherwise raises a ValueError.
+    radius_metric
+        Existing radius key to use as a fallback for nodes without vertex bins.
+        Defaults to the recommended estimator.
+    aggregate
+        How to aggregate per‑vertex distances within a node: 'median' (default)
+        or 'mean'.
+    mode
+        Distance mode passed to :func:`dx.distance`. Defaults to 'centerline'.
+        Use 'surface' to estimate “thickness” outside current radii, though the
+        typical use here is centreline distance.
+    store_key
+        Key under which the calibrated radii will be stored in ``skel.radii``.
+    copy_if_missing
+        When True (default) and no ``points`` are available or no node2verts
+        mapping is present, create ``skel.radii[store_key]`` by copying the
+        recommended radii to keep downstream code functional.
+
+    Notes
+    -----
+    - Requires either ``skel.node2verts`` + ``points`` (or points in
+      ``skel.extra['mesh_vertices']``) to compute refined radii.
+    - Node 0 (soma) is set to the soma's spherical radius when available.
+    - Modifies the skeleton in place; returns None.
+    """
+    if mode not in {"centerline", "surface"}:
+        raise ValueError("mode must be 'centerline' or 'surface'")
+
+    N = int(len(skel.nodes))
+    if N == 0:
+        raise ValueError("Skeleton has no nodes; cannot calibrate radii.")
+
+    # Locate point cloud to sample distances from
+    pts_arr: np.ndarray | None
+    if points is None:
+        pts_arr = skel.extra.get("mesh_vertices") if isinstance(skel.extra, dict) else None
+        if pts_arr is not None:
+            pts_arr = np.asarray(pts_arr, dtype=np.float64)
+    else:
+        pts_arr = np.asarray(points, dtype=np.float64)
+
+    # Ensure we have a fallback radius vector
+    if radius_metric is None:
+        radius_metric = skel.recommend_radius()[0]
+    if radius_metric not in skel.radii:
+        raise ValueError(
+            f"radius_metric '{radius_metric}' not found in skel.radii (available keys: {tuple(skel.radii)})"
+        )
+    r_fallback = np.asarray(skel.radii[radius_metric], dtype=np.float64)
+
+    node2verts = skel.node2verts
+    have_bins = node2verts is not None and len(node2verts) > 0
+    have_points = pts_arr is not None and pts_arr.ndim == 2 and pts_arr.shape[1] == 3
+
+    if not (have_bins and have_points):
+        if copy_if_missing:
+            # Safe no‑op style: expose a calibrated column equal to fallback
+            skel.radii[store_key] = np.array(r_fallback, dtype=np.float64, copy=True)
+            # annotate meta for traceability
+            skel.extra["calibration"] = {
+                "status": "copied",
+                "source": radius_metric,
+                "reason": "missing node2verts or points",
+            }
+            return
+        else:
+            raise ValueError(
+                "calibrate_radii requires node2verts and a (V,3) points array; "
+                "provide points=... or set copy_if_missing=True"
+            )
+
+    # Compute per‑vertex distances to the skeleton according to requested mode
+    # We evaluate all vertices in one call for efficiency.
+    dists = dx.distance(skel, pts_arr, mode=mode, radius_metric=radius_metric)
+    dists = np.asarray(dists, dtype=np.float64)
+
+    # Aggregate distances for each node
+    r_new = np.array(r_fallback, dtype=np.float64, copy=True)
+
+    def _agg(vals: np.ndarray) -> float:
+        if vals.size == 0:
+            return np.nan
+        if aggregate == "median":
+            return float(np.median(vals))
+        elif aggregate == "mean":
+            return float(np.mean(vals))
+        else:
+            raise ValueError("aggregate must be 'median' or 'mean'")
+
+    for i in range(N):
+        # Special handling for soma if soma surface verts are defined
+        if i == 0 and skel.soma is not None and skel.soma.verts is not None:
+            # Prefer soma's spherical/equivalent radius rather than distance‑based
+            try:
+                r0 = float(skel.soma.spherical_radius())
+            except Exception:
+                r0 = float(_agg(dists[np.asarray(node2verts[0], dtype=int)])) if len(node2verts[0]) else float(r_fallback[0])
+            r_new[0] = r0
+            continue
+
+        vids = np.asarray(node2verts[i], dtype=np.int64) if i < len(node2verts) else np.empty(0, dtype=np.int64)
+        if vids.size == 0:
+            r_new[i] = float(r_fallback[i])
+            continue
+        val = _agg(dists[vids])
+        if np.isnan(val) or not np.isfinite(val):
+            r_new[i] = float(r_fallback[i])
+        else:
+            r_new[i] = float(max(val, 0.0))
+
+    skel.radii[store_key] = r_new
+    # annotate meta
+    skel.extra["calibration"] = {
+        "status": "computed",
+        "mode": mode,
+        "aggregate": aggregate,
+        "source_points": "extra.mesh_vertices" if points is None else "argument.points",
+        "fallback_radius": radius_metric,
+        "store_key": store_key,
+    }
+    return None
