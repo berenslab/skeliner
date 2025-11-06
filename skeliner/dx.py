@@ -161,9 +161,38 @@ def distance(
     k_nearest: int = 4,
     radius_metric: str | None = None,
     mode: str = "surface",
+    allowed_nodes: Sequence[int] | None = None,
+    allowed_edges: Sequence[tuple[int, int]] | None = None,
 ) -> float | np.ndarray:
     """
     Distance from an arbitrary point (or collection of points) to the skeleton.
+
+    Parameters
+    ----------
+    skel
+        :class:`skeliner.Skeleton` instance.
+    point
+        3-vector or array of shape (M, 3) giving query locations.
+    point_unit
+        Unit of the input coordinates and the returned distance. If ``None`` or
+        identical to ``skel.meta['unit']``, no conversion is performed.
+    k_nearest
+        Number of nearest skeleton nodes considered when refining the distance
+        against neighbouring edges (≥ 1). Ignored when a whitelist is provided.
+    radius_metric
+        Which column of ``skel.radii`` to use. Defaults to the recommended estimator.
+        Only consulted when *mode* is ``'surface'``.
+    mode
+        ``'surface'`` (default) returns the distance to the radius-aware capsule
+        envelope (values inside clamp to ``0``). ``'centerline'`` measures distance
+        to the centreline alone.
+    allowed_nodes
+        Optional per-call whitelist of node IDs. When provided, distances are
+        restricted to these node centres and to edges incident to any of these nodes.
+    allowed_edges
+        Optional per-call whitelist of edges (u,v). When provided, distances are
+        refined only against these edges (u and v are also considered as centres).
+        Edges are treated as undirected; order is ignored.
 
     Parameters
     ----------
@@ -239,25 +268,75 @@ def distance(
     max_k = min(int(k_nearest), len(skel.nodes))
     nodes = skel.nodes
 
+    # Prepare whitelist sets if provided
+    use_whitelist = (allowed_nodes is not None) or (allowed_edges is not None)
+    allowed_nodes_set: Set[int] | None = None
+    allowed_edges_set: Set[tuple[int, int]] | None = None
+    if allowed_nodes is not None:
+        allowed_nodes_set = {int(n) for n in allowed_nodes if 0 <= int(n) < len(nodes)}
+    if allowed_edges is not None:
+        allowed_edges_set = set()
+        for (u, v) in allowed_edges:
+            u2 = int(u)
+            v2 = int(v)
+            if u2 == v2:
+                continue
+            if not (0 <= u2 < len(nodes) and 0 <= v2 < len(nodes)):
+                continue
+            a, b = (u2, v2) if u2 < v2 else (v2, u2)
+            allowed_edges_set.add((a, b))
+
     for i, p in enumerate(pts):
         p_skel = p * scale_in
 
-        nn_dist, nn_idx = tree.query(p_skel, k=max_k)
-        nn_idx_arr = np.atleast_1d(nn_idx).astype(np.int64, copy=False)
-        nn_dist_arr = np.atleast_1d(nn_dist)
-        if surface:
-            best = float(np.min(nn_dist_arr - radii[nn_idx_arr]))
-        else:
-            best = float(nn_dist_arr.min())
+        # Initialize best distance from node centres
+        if use_whitelist:
+            # Collect centres to consider: explicit allowed nodes and endpoints of allowed edges
+            centres: Set[int] = set()
+            if allowed_nodes_set is not None:
+                centres.update(allowed_nodes_set)
+            if allowed_edges_set is not None:
+                for a, b in allowed_edges_set:
+                    centres.add(a)
+                    centres.add(b)
 
-        # Collect unique edges incident to the nearest nodes
-        candidates: set[tuple[int, int]] = set()
-        for nid in nn_idx_arr:
-            for nb in neighbours[nid]:
-                if nid < nb:
-                    candidates.add((nid, nb))
+            if centres:
+                # compute min distance to allowed centres
+                centres_list = list(centres)
+                diffs = nodes[centres_list] - p_skel
+                nn_dist_arr = np.linalg.norm(diffs, axis=1)
+                if surface:
+                    rad = (np.asarray([radii[c] for c in centres_list], dtype=np.float64) if radii is not None else 0.0)
+                    best = float(np.min(nn_dist_arr - rad))
                 else:
-                    candidates.add((nb, nid))
+                    best = float(np.min(nn_dist_arr))
+            else:
+                best = float("inf")
+
+            # Candidate edges: explicit allowed_edges plus edges incident to allowed_nodes
+            candidates: Set[tuple[int, int]] = set()
+            if allowed_edges_set is not None:
+                candidates.update(allowed_edges_set)
+            if allowed_nodes_set is not None:
+                for nid in allowed_nodes_set:
+                    for nb in neighbours[nid]:
+                        a, b = (nid, nb) if nid < nb else (nb, nid)
+                        candidates.add((a, b))
+        else:
+            # default global behaviour via KD-tree + incident edges
+            nn_dist, nn_idx = tree.query(p_skel, k=max_k)
+            nn_idx_arr = np.atleast_1d(nn_idx).astype(np.int64, copy=False)
+            nn_dist_arr = np.atleast_1d(nn_dist)
+            if surface:
+                best = float(np.min(nn_dist_arr - radii[nn_idx_arr]))
+            else:
+                best = float(nn_dist_arr.min())
+
+            candidates: set[tuple[int, int]] = set()
+            for nid in nn_idx_arr:
+                for nb in neighbours[nid]:
+                    a, b = (nid, nb) if nid < nb else (nb, nid)
+                    candidates.add((a, b))
 
         if candidates:
             for a_idx, b_idx in candidates:
