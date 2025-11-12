@@ -295,7 +295,7 @@ def bridge_gaps(
 def merge_near_soma_nodes(
     skel,
     *,
-    mesh_vertices: np.ndarray,
+    mesh_vertices: np.ndarray | None = None,
     radius_key: str = "median",
     inside_tol: float = 0.0,
     near_factor: float = 1.2,
@@ -314,12 +314,20 @@ def merge_near_soma_nodes(
 
     Nodes satisfying either condition are merged into node 0 along with their
     contributing mesh vertices, after which the soma is re-fitted using the
-    expanded vertex set.
+    expanded vertex set when mesh coordinates are provided.  If
+    ``mesh_vertices`` is *None*, vertex bookkeeping is skipped and the soma
+    falls back to a spherical approximation with a warning.
     verbose
         When *True* print timing information and messages from the merge routine.
     """
-    if not skel.node2verts:
-        raise ValueError("merge_near_soma_nodes requires node2verts data.")
+    node2verts_arr = (
+        [np.asarray(v, dtype=np.int64).copy() for v in skel.node2verts]
+        if skel.node2verts is not None
+        else None
+    )
+    mesh_arr = (
+        None if mesh_vertices is None else np.asarray(mesh_vertices, dtype=np.float64)
+    )
 
     with _post_stage("merge redundant near-soma nodes", verbose=verbose) as log:
         (
@@ -334,10 +342,10 @@ def merge_near_soma_nodes(
             np.asarray(skel.nodes, dtype=np.float64),
             {k: v.copy() for k, v in skel.radii.items()},
             np.asarray(skel.edges, dtype=np.int64),
-            [np.asarray(v, dtype=np.int64).copy() for v in skel.node2verts],
+            node2verts_arr,
             soma=skel.soma,
             radius_key=radius_key,
-            mesh_vertices=np.asarray(mesh_vertices, dtype=np.float64),
+            mesh_vertices=mesh_arr,
             inside_tol=inside_tol,
             near_factor=near_factor,
             fat_factor=fat_factor,
@@ -352,7 +360,11 @@ def merge_near_soma_nodes(
         radii=radii_new,
         edges=edges_new,
         ntype=ntype_new,
-        node2verts=[np.asarray(v, dtype=np.int64) for v in node2verts_new],
+        node2verts=(
+            [np.asarray(v, dtype=np.int64) for v in node2verts_new]
+            if node2verts_new is not None
+            else None
+        ),
         vert2node=vert2node,
         meta={**skel.meta},
         extra={**skel.extra},

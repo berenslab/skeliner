@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import heapq
+import warnings
 from collections import deque
 from typing import Callable, List
 
@@ -131,11 +132,11 @@ def _merge_near_soma_nodes(
     nodes: np.ndarray,
     radii_dict: dict[str, np.ndarray],
     edges: np.ndarray,
-    node2verts: list[np.ndarray],
+    node2verts: list[np.ndarray] | None,
     *,
     soma: Soma,
     radius_key: str,
-    mesh_vertices: np.ndarray,
+    mesh_vertices: np.ndarray | None,
     inside_tol: float = 0.0,
     near_factor: float = 1.2,
     fat_factor: float = 0.20,
@@ -156,13 +157,16 @@ def _merge_near_soma_nodes(
     Parameters
     ----------
     nodes, radii_dict, node2verts, edges
-        Skeleton arrays from :func:`skeletonize`.
+        Skeleton arrays from :func:`skeletonize`.  ``node2verts`` may be *None*
+        when mesh data is unavailable.
     soma
         Current spherical/ellipsoidal soma model (node 0).
     radius_key
         Which entry of ``radii_dict`` to use when checking the “fat” criterion.
     mesh_vertices
         Original mesh coordinates; required to re-fit the soma after merging.
+        If *None*, vertex bookkeeping is skipped and the soma falls back to a
+        spherical approximation with a warning.
     inside_tol, near_factor, fat_factor
         Dimensionless thresholds controlling the tests described above.
     log
@@ -172,6 +176,8 @@ def _merge_near_soma_nodes(
     -------
     nodes_new, radii_new, node2verts_new, vert2node, edges_new, soma_new, old2new
         Updated arrays and a mapping from *old* node indices to the survivors.
+        ``node2verts_new`` and ``vert2node`` are *None* when mesh data is
+        unavailable.
     """
     r_soma = soma.spherical_radius
     r_primary = radii_dict[radius_key]
@@ -188,8 +194,10 @@ def _merge_near_soma_nodes(
     if log:
         log(f"{merged_idx.size} nodes merged into soma")
 
+    keep_idx = np.where(keep_mask)[0]
+
     remap_stage = -np.ones(len(nodes), np.int64)
-    remap_stage[np.where(keep_mask)[0]] = np.arange(keep_mask.sum())
+    remap_stage[keep_idx] = np.arange(keep_mask.sum())
 
     a, b = edges.T
     both_keep = keep_mask[a] & keep_mask[b]
@@ -207,42 +215,65 @@ def _merge_near_soma_nodes(
 
     nodes_keep = nodes[keep_mask].copy()
     radii_keep = {k: v[keep_mask].copy() for k, v in radii_dict.items()}
-    node2_keep = [node2verts[i] for i in np.where(keep_mask)[0]]
-    vert2node = {}
+    node2_keep = (
+        [node2verts[i] for i in keep_idx]
+        if node2verts is not None
+        else None
+    )
+    vert2node: dict[int, int] | None = {} if node2_keep is not None else None
 
     if merged_idx.size:
-        w = np.array(
-            [len(node2verts[0]), *[len(node2verts[i]) for i in merged_idx]],
-            dtype=np.float64,
-        )
+        if node2verts is not None:
+            w = np.array(
+                [len(node2verts[0]), *[len(node2verts[i]) for i in merged_idx]],
+                dtype=np.float64,
+            )
+        else:
+            w = np.ones(merged_idx.size + 1, dtype=np.float64)
         nodes_keep[0] = np.average(
             np.vstack([nodes[0], nodes[merged_idx]]), axis=0, weights=w
         )
-        for idx in merged_idx:
-            vidx = node2verts[idx]
-            d_local = soma.distance_to_surface(mesh_vertices[vidx])
-            close = d_local < near_factor * r_soma
-            if np.any(close):
-                soma.verts = (
-                    np.concatenate((soma.verts, vidx[close]))
-                    if soma.verts is not None
-                    else vidx[close]
-                )
-                node2_keep[0] = np.concatenate((node2_keep[0], vidx[close]))
+        if node2_keep is not None:
+            for idx in merged_idx:
+                vidx = node2verts[idx]
+                if mesh_vertices is not None:
+                    d_local = soma.distance_to_surface(mesh_vertices[vidx])
+                    close = d_local < near_factor * r_soma
+                    contrib = vidx[close]
+                else:
+                    contrib = vidx
+                if contrib.size:
+                    soma.verts = (
+                        np.concatenate((soma.verts, contrib))
+                        if soma.verts is not None
+                        else contrib
+                    )
+                    node2_keep[0] = np.concatenate((node2_keep[0], contrib))
 
-    for nid, verts in enumerate(node2_keep):
-        for v in verts:
-            vert2node[int(v)] = nid
+    if node2_keep is not None:
+        for nid, verts in enumerate(node2_keep):
+            for v in verts:
+                vert2node[int(v)] = nid
 
-    soma.verts = (
-        np.unique(soma.verts).astype(np.int64) if soma.verts is not None else None
-    )
-    try:
-        soma = Soma.fit(mesh_vertices[soma.verts], verts=soma.verts)
-    except ValueError:
+    if soma.verts is not None:
+        soma.verts = np.unique(soma.verts).astype(np.int64)
+
+    if mesh_vertices is None:
         if log:
-            log("Soma fitting failed, using spherical approximation instead.")
+            log(
+                "mesh_vertices not provided; cannot re-fit soma, "
+                "falling back to spherical approximation."
+            )
         soma = Soma.from_sphere(soma.center, soma.spherical_radius, verts=soma.verts)
+    elif soma.verts is not None and soma.verts.size:
+        try:
+            soma = Soma.fit(mesh_vertices[soma.verts], verts=soma.verts)
+        except ValueError:
+            if log:
+                log("Soma fitting failed, using spherical approximation instead.")
+            soma = Soma.from_sphere(
+                soma.center, soma.spherical_radius, verts=soma.verts
+            )
 
     nodes_keep[0] = soma.center
     r_soma = soma.spherical_radius
@@ -256,7 +287,7 @@ def _merge_near_soma_nodes(
         log(f"(r = {radii_txt})")
 
     old2new = -np.ones(len(nodes), dtype=np.int64)
-    old2new[np.where(keep_mask)[0]] = np.arange(len(nodes_keep))
+    old2new[keep_idx] = np.arange(len(nodes_keep))
 
     return (
         nodes_keep,
