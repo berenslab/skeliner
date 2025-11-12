@@ -803,7 +803,14 @@ def _detect_soma(
     for k in radii:
         radii[k][0] = r_sphere
 
-    if mesh_vertices is not None and soma_est.verts is not None and soma_est.verts.size:
+    if mesh_vertices is None:
+        if log:
+            log(
+                "mesh_vertices not provided; cannot re-fit soma, "
+                "falling back to spherical approximation."
+            )
+        soma_est = Soma.from_sphere(soma_est.center, r_sphere, verts=soma_est.verts)
+    elif soma_est.verts is not None and soma_est.verts.size:
         try:
             soma_est = Soma.fit(mesh_vertices[soma_est.verts], verts=soma_est.verts)
         except ValueError:
