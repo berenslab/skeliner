@@ -106,3 +106,18 @@ def test_manual_pipeline_matches_auto(mesh_60427):
     skel_auto = skeletonize(mesh_60427.copy(), verbose=False)
     skel_post = _manual_post_pipeline(mesh_60427.copy())
     _assert_skeleton_equal(skel_auto, skel_post)
+
+
+def test_prune_neurites_without_mesh_vertices_logs_warning(mesh_60427, capsys):
+    skel_auto = skeletonize(mesh_60427.copy(), verbose=False)
+    skel_repruned = post.prune_neurites(
+        skel_auto,
+        mesh_vertices=None,
+        tip_extent_factor=1.2,
+        stem_extent_factor=3.0,
+        drop_single_node_branches=True,
+        verbose=True,
+    )
+    captured = capsys.readouterr()
+    assert "mesh_vertices not provided" in captured.out
+    assert len(skel_repruned.nodes) > 0

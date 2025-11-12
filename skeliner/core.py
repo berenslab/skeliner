@@ -307,7 +307,7 @@ def _prune_neurites(
     edges: np.ndarray,
     *,
     soma: Soma,
-    mesh_vertices: np.ndarray,
+    mesh_vertices: np.ndarray | None,
     tip_extent_factor: float = 1.1,
     stem_extent_factor: float = 5.0,
     drop_single_node_branches: bool = True,
@@ -325,6 +325,12 @@ def _prune_neurites(
     Collapse obvious mesh-artefact branches into the soma (node 0) in
     two independent passes.
     """
+    if mesh_vertices is None and log:
+        log(
+            "warning: mesh_vertices not provided; skipping soma/radius refits "
+            "and reusing existing estimates."
+        )
+
     r_soma = soma.spherical_radius
     d2c = np.asarray(soma.distance(nodes, to="center"))
 
@@ -368,9 +374,10 @@ def _prune_neurites(
 
         node2verts[0] = np.unique(node2verts[0])  # dedup
 
-        d0 = np.linalg.norm(mesh_vertices[node2verts[0]] - nodes[0], axis=1)
-        for k in radii_dict:
-            radii_dict[k][0] = _estimate_radius(d0, method=k)
+        if mesh_vertices is not None and node2verts[0].size:
+            d0 = np.linalg.norm(mesh_vertices[node2verts[0]] - nodes[0], axis=1)
+            for k in radii_dict:
+                radii_dict[k][0] = _estimate_radius(d0, method=k)
 
         if log:
             log(f"Merged {len(merge2soma)} peri-soma nodes into soma ")
@@ -392,9 +399,28 @@ def _prune_neurites(
     )
     vert2node = {int(v): i for i, vs in enumerate(node2verts_new) for v in vs}
 
-    soma.verts = np.unique(node2verts_new[0]).astype(np.int64)
-    pts = mesh_vertices[soma.verts]
-    soma = soma.fit(pts, verts=soma.verts)
+    soma_verts = np.unique(node2verts_new[0]).astype(np.int64)
+    if mesh_vertices is not None and soma_verts.size:
+        pts = mesh_vertices[soma_verts]
+        try:
+            soma = soma.fit(pts, verts=soma_verts)
+        except ValueError:
+            if log:
+                log("Soma fitting failed, using previous parameters instead.")
+            soma = Soma(
+                center=soma.center.copy(),
+                axes=soma.axes.copy(),
+                R=soma.R.copy(),
+                verts=soma_verts if soma_verts.size else None,
+            )
+    else:
+        # keep the existing ellipsoid parameters; verts already updated above
+        soma = Soma(
+            center=soma.center.copy(),
+            axes=soma.axes.copy(),
+            R=soma.R.copy(),
+            verts=soma_verts if soma_verts.size else None,
+        )
 
     if log:
         centre_txt = ", ".join(f"{c:7.1f}" for c in soma.center)
@@ -636,7 +662,7 @@ def _merge_single_node_branches(
     node2verts: list[np.ndarray],
     edges: np.ndarray,
     *,
-    mesh_vertices: np.ndarray,
+    mesh_vertices: np.ndarray | None,
     min_parent_degree: int = 3,
     return_mapping: bool = False,
 ) -> tuple[
@@ -672,10 +698,11 @@ def _merge_single_node_branches(
         for leaf in singles:
             par = parent[leaf]
             node2verts[par] = np.concatenate((node2verts[par], node2verts[leaf]))
-            pts = mesh_vertices[node2verts[par]]
-            d = np.linalg.norm(pts - nodes[par], axis=1)
-            for k in radii_dict:
-                radii_dict[k][par] = _estimate_radius(d, method=k)
+            if mesh_vertices is not None and node2verts[par].size:
+                pts = mesh_vertices[node2verts[par]]
+                d = np.linalg.norm(pts - nodes[par], axis=1)
+                for k in radii_dict:
+                    radii_dict[k][par] = _estimate_radius(d, method=k)
             to_drop.add(leaf)
 
         keep = np.ones(len(nodes), bool)

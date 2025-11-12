@@ -374,7 +374,7 @@ def merge_near_soma_nodes(
 def prune_neurites(
     skel,
     *,
-    mesh_vertices: np.ndarray,
+    mesh_vertices: np.ndarray | None = None,
     tip_extent_factor: float = 1.2,
     stem_extent_factor: float = 3.0,
     drop_single_node_branches: bool = True,
@@ -389,11 +389,18 @@ def prune_neurites(
        thresholds (multiples of the soma radius) collapse into the soma.
     2. **Single-node pruning** – optionally collapse degree-1 twigs whose parent
        has degree ≥ 3.
+
+    The stage mirrors :func:`skeliner.skeletonize` even when ``mesh_vertices`` is
+    unavailable. In that case radius/soma refits are skipped and a warning is
+    emitted in the verbose log.
     verbose
         When *True* print timing information and messages from the pruning routine.
     """
     if not skel.node2verts:
         raise ValueError("prune_neurites requires node2verts data.")
+    mesh_arr = (
+        None if mesh_vertices is None else np.asarray(mesh_vertices, dtype=np.float64)
+    )
 
     with _post_stage("prune tiny neurites", verbose=verbose) as log:
         (
@@ -410,7 +417,7 @@ def prune_neurites(
             [np.asarray(v, dtype=np.int64).copy() for v in skel.node2verts],
             np.asarray(skel.edges, dtype=np.int64),
             soma=skel.soma,
-            mesh_vertices=np.asarray(mesh_vertices, dtype=np.float64),
+            mesh_vertices=mesh_arr,
             tip_extent_factor=tip_extent_factor,
             stem_extent_factor=stem_extent_factor,
             drop_single_node_branches=drop_single_node_branches,
