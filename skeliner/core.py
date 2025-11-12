@@ -37,16 +37,24 @@ def _find_soma(
     if nodes.shape[0] == 0:
         raise ValueError("empty skeleton")
 
+    # -------------------------------------------------------------
+    # 1. radius threshold → initial candidate set
+    # -------------------------------------------------------------
     large_thresh = np.percentile(radii, pct_large)
     cand_idx = np.where(radii >= large_thresh)[0]
     if cand_idx.size == 0:
         raise RuntimeError(
             f"no nodes above the {pct_large:g}-th percentile (try lowering pct_large)"
         )
-
+    # -------------------------------------------------------------
+    # 2. choose the global-maximum node as “soma anchor”
+    # -------------------------------------------------------------
     idx_max = int(np.argmax(radii))
     R_max = radii[idx_max]
 
+    # -------------------------------------------------------------
+    # 3. distance filter: stay close to anchor
+    # -------------------------------------------------------------
     dists = np.linalg.norm(nodes[cand_idx] - nodes[idx_max], axis=1)
     keep = dists <= dist_factor * R_max
     soma_idx = cand_idx[keep]
