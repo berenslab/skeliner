@@ -16,7 +16,7 @@ from .core import (
     _estimate_radius,
     _find_soma,
     _merge_near_soma_nodes,
-    _merge_single_node_branches,
+    _prune_neurites,
 )
 from .dataclass import Skeleton, Soma
 
@@ -317,175 +317,6 @@ def _edges_from_mesh(
     return edges.astype(np.int64)  # copy to new array
 
 
-def _prune_neurites(
-    nodes: np.ndarray,
-    radii_dict: dict[str, np.ndarray],
-    node2verts: list[np.ndarray],
-    edges: np.ndarray,
-    *,
-    soma: Soma,
-    mesh_vertices: np.ndarray,
-    tip_extent_factor: float = 1.1,
-    stem_extent_factor: float = 5.0,
-    drop_single_node_branches: bool = True,
-    log: Callable | None = None,
-):
-    """
-    Collapse obvious mesh-artefact branches into the soma (node 0) in
-    two independent passes.
-
-    Parameters
-    ----------
-    tip_extent_factor : float, default 1.2
-        Maximum allowed *tip* distance from the soma **surface**,
-        expressed in multiples of the fitted spherical soma radius
-        ``r_soma``.  For every branch grown from a soma-adjacent node
-        (“stem”), we compute
-
-            ``max(d_tip_to_surface)``
-
-        over all nodes in that branch.  If the value never exceeds
-        ``tip_extent_factor * r_soma`` we classify the whole branch as a
-        peri-soma artefact and merge it into the soma.
-
-    stem_extent_factor : float, default 3.0
-        Companion threshold applied *only* to the stem node itself.
-        This reproduces legacy behaviour where anything whose very first
-        segment hugs the soma is considered expendable, even if its
-        children wander further out.  Set to a smaller number to be more
-        permissive (keep short stems), or larger to remove more.
-
-    drop_single_node_branches : bool, default True
-        After extent-based pruning, merge every remaining leaf whose
-        branch consists of a **single node** (degree-1 child hanging off
-        a parent with degree ≥ 3).  Disable if one-node twigs are
-        meaningful for your downstream pipeline.
-
-    Returns
-    -------
-    nodes_new, radii_new, node2verts_new, vert2node, edges_new, soma
-        Skeleton arrays with the selected branches collapsed into
-        the soma; see original function for exact formats.
-
-    Notes
-    -----
-    * Both extent thresholds are relative to the soma *surface*,
-      **not** its center.
-    * Setting both extent factors ≤ 1 collapses any branch that never
-      leaves the soma sphere at all.
-    * The hard-coded ``min_parent_degree`` for one-node pruning is 3—
-      adjust inside :func:`_merge_single_node_branches` if needed.
-    """
-    # ------------------------------------------------------------------
-    # A. legacy extent-based pruning (unchanged)
-    # ------------------------------------------------------------------
-    r_soma = soma.spherical_radius
-    d2c = np.asarray(soma.distance(nodes, to="center"))
-
-    N = len(nodes)
-    parent = _bfs_parents(edges, N, root=0)
-
-    adj = [[] for _ in range(N)]
-    for a, b in edges:
-        adj[a].append(b)
-        adj[b].append(a)
-
-    merge2soma, visited = set(), np.zeros(N, bool)
-
-    for child in adj[0]:  # one neurite at a time
-        if visited[child]:
-            continue
-
-        comp = []
-        stack, prev = [child], 0
-        while stack:
-            v = stack.pop()
-            if visited[v]:
-                continue
-            visited[v] = True
-            comp.append(v)
-            for nb in adj[v]:
-                if nb != prev and (parent[nb] == v or parent[v] == nb):
-                    stack.append(nb)
-            prev = v
-
-        max_d = d2c[comp].max()
-        thr = (stem_extent_factor if parent[child] == 0 else tip_extent_factor) * r_soma
-        if max_d <= thr:
-            merge2soma.update(comp)
-    # ------------------------------------------------------------------
-    # B. merge the selected branches *into* soma (node 0)
-    # ------------------------------------------------------------------
-    if merge2soma:
-        # 1. move vertices
-        for nid in merge2soma:
-            node2verts[0] = np.concatenate((node2verts[0], node2verts[nid]))
-
-        node2verts[0] = np.unique(node2verts[0])  # dedup
-
-        # 2. recompute soma radii from the enlarged vertex set
-        d0 = np.linalg.norm(mesh_vertices[node2verts[0]] - nodes[0], axis=1)
-        for k in radii_dict:
-            radii_dict[k][0] = _estimate_radius(d0, method=k)
-
-        # (optional) keep the verbose trail intact
-        if log:
-            log(f"Merged {len(merge2soma)} peri-soma nodes into soma ")
-
-    # ------------------------------------------------------------------
-    # C. build the keep-mask (drop the now-empty helper nodes)
-    # ------------------------------------------------------------------
-
-    keep = np.ones(N, dtype=bool)
-    if merge2soma:
-        keep[list(merge2soma)] = False
-    keep[0] = True  # never drop soma
-
-    remap = {old: new for new, old in enumerate(np.where(keep)[0])}
-
-    nodes_new = nodes[keep]
-    node2verts_new = [node2verts[i] for i in np.where(keep)[0]]
-    radii_new = {k: v[keep].copy() for k, v in radii_dict.items()}
-    edges_new = np.asarray(
-        [(remap[a], remap[b]) for a, b in edges if keep[a] and keep[b]], dtype=np.int64
-    )
-    vert2node = {int(v): i for i, vs in enumerate(node2verts_new) for v in vs}
-
-    soma.verts = np.unique(node2verts_new[0]).astype(np.int64)
-    pts = mesh_vertices[soma.verts]
-    soma = soma.fit(pts, verts=soma.verts)
-
-    if log:
-        centre_txt = ", ".join(f"{c:7.1f}" for c in soma.center)
-        radii_txt = ",".join(f"{c:7.1f}" for c in soma.axes)
-        log(f"Moved soma to [{centre_txt}]")
-        log(f"(r = {radii_txt})")
-
-    # ------------------------------------------------------------------
-    # C. optional one-node branch merge (runs on the rebuilt skeleton)
-    # ------------------------------------------------------------------
-    if drop_single_node_branches:
-        before_n, before_e = len(nodes_new), edges_new.shape[0]
-
-        (nodes_new, radii_new, node2verts_new, vert2node, edges_new) = (
-            _merge_single_node_branches(
-                nodes_new,
-                radii_new,
-                node2verts_new,
-                edges_new,
-                mesh_vertices=mesh_vertices,
-                min_parent_degree=3,
-            )
-        )
-
-        merged_n = before_n - len(nodes_new)
-        merged_e = before_e - edges_new.shape[0]
-        if log and merged_n:
-            log(f"Merged {merged_n} single-node branches ({merged_e} edges).")
-
-    return nodes_new, radii_new, node2verts_new, vert2node, edges_new, soma
-
-
 def _extreme_vertex(mesh: trimesh.Trimesh, axis: str = "z", mode: str = "min") -> int:
     """
     Return the mesh-vertex index with either the minimal or maximal coordinate
@@ -784,6 +615,7 @@ def skeletonize(
     unit: str = "nm",
     id: str | int | None = None,
     verbose: bool = False,
+    postprocess: bool = True,
 ) -> Skeleton:
     """Compute a center-line skeleton with radii of a neuronal mesh .
 
@@ -819,6 +651,11 @@ def skeletonize(
         Merge centroids that sit well inside the soma or have very fat radii.
     verbose : bool, default ``False``
         Print progress messages.
+    postprocess : bool, default ``True``
+        When ``False`` the optional post-processing stages (soma detection,
+        near-soma merging, gap bridging, MST rebuild, neurite pruning) are
+        skipped so that you can rerun them later via the corresponding
+        :mod:`skeliner.post` helpers.
 
     Returns
     -------
@@ -836,6 +673,14 @@ def skeletonize(
         )
         soma_ms = 0.0  # soma detection time
         post_ms = 0.0  # post-processing time
+
+    run_mst = True
+    if not postprocess:
+        detect_soma = False
+        collapse_soma = False
+        bridge_gaps = False
+        prune_tiny_neurites = False
+        run_mst = False
 
     @contextmanager
     def _timed(label: str, *, verbose: bool = verbose):  # keep the signature you like
@@ -954,19 +799,25 @@ def skeletonize(
         _t0 = time.perf_counter()
 
         with _timed("↳  merge redundant near-soma nodes", verbose=verbose) as log:
-            (nodes_arr, radii_dict, node2verts, vert2node, edges_arr, soma) = (
-                _merge_near_soma_nodes(
-                    nodes_arr,
-                    radii_dict,
-                    edges_arr,
-                    node2verts,
-                    soma=soma,
-                    radius_key=radius_estimators[0],
-                    mesh_vertices=mesh_vertices,
-                    fat_factor=collapse_soma_radius_factor,
-                    near_factor=collapse_soma_dist_factor,
-                    log=log,
-                )
+            (
+                nodes_arr,
+                radii_dict,
+                node2verts,
+                vert2node,
+                edges_arr,
+                soma,
+                _,
+            ) = _merge_near_soma_nodes(
+                nodes_arr,
+                radii_dict,
+                edges_arr,
+                node2verts,
+                soma=soma,
+                radius_key=radius_estimators[0],
+                mesh_vertices=mesh_vertices,
+                fat_factor=collapse_soma_radius_factor,
+                near_factor=collapse_soma_dist_factor,
+                log=log,
             )
 
         if verbose:
@@ -986,28 +837,38 @@ def skeletonize(
             post_ms += time.perf_counter() - _t0
 
     # 7. global minimum-spanning tree ------------------------------------
-    with _timed("↳  build global minimum-spanning tree", verbose=verbose):
-        edges_mst = _build_mst(nodes_arr, edges_arr)
+    if run_mst:
+        _t0 = time.perf_counter()
+        with _timed("↳  build global minimum-spanning tree", verbose=verbose):
+            edges_mst = _build_mst(nodes_arr, edges_arr)
         if verbose:
             post_ms += time.perf_counter() - _t0
+    else:
+        edges_mst = edges_arr
 
     # 8. prune tiny sub-trees near the soma
     if has_soma and prune_tiny_neurites:
         _t0 = time.perf_counter()
         with _timed("↳  prune tiny neurites", verbose=verbose) as log:
-            (nodes_arr, radii_dict, node2verts, vert2node, edges_mst, soma) = (
-                _prune_neurites(
-                    nodes_arr,
-                    radii_dict,
-                    node2verts,
-                    edges_mst,
-                    soma=soma,
-                    mesh_vertices=mesh_vertices,
-                    tip_extent_factor=prune_tip_extent_factor,
-                    stem_extent_factor=prune_stem_extent_factor,
-                    drop_single_node_branches=prune_drop_single_node_branches,
-                    log=log,
-                )
+            (
+                nodes_arr,
+                radii_dict,
+                node2verts,
+                vert2node,
+                edges_mst,
+                soma,
+                _,
+            ) = _prune_neurites(
+                nodes_arr,
+                radii_dict,
+                node2verts,
+                edges_mst,
+                soma=soma,
+                mesh_vertices=mesh_vertices,
+                tip_extent_factor=prune_tip_extent_factor,
+                stem_extent_factor=prune_stem_extent_factor,
+                drop_single_node_branches=prune_drop_single_node_branches,
+                log=log,
             )
         if verbose:
             post_ms += time.perf_counter() - _t0

@@ -19,6 +19,7 @@ __all__ = [
     "_bridge_gaps",
     "_merge_near_soma_nodes",
     "_merge_single_node_branches",
+    "_prune_neurites",
     "_estimate_radius",
 ]
 
@@ -139,7 +140,38 @@ def _merge_near_soma_nodes(
     fat_factor: float = 0.20,
     log: Callable | None = None,
 ):
-    """Shared collapse of near-soma nodes (ported from skeletonize)."""
+    """
+    Collapse every skeleton node whose sphere overlaps the soma (stage 5).
+
+    The routine performs two geometric tests on each node:
+
+    • Inside test:     d_surface < −inside_tol
+    • Near-and-fat:    d_center < near_factor·r_soma  AND  radius ≥ fat_factor·r_soma
+
+    Nodes that satisfy either test are merged into node 0, bringing along their
+    contributing mesh vertices so the soma can be re-fitted afterwards.  Any
+    dangling leaves created by the merge are re-linked back to the soma.
+
+    Parameters
+    ----------
+    nodes, radii_dict, node2verts, edges
+        Skeleton arrays from :func:`skeletonize`.
+    soma
+        Current spherical/ellipsoidal soma model (node 0).
+    radius_key
+        Which entry of ``radii_dict`` to use when checking the “fat” criterion.
+    mesh_vertices
+        Original mesh coordinates; required to re-fit the soma after merging.
+    inside_tol, near_factor, fat_factor
+        Dimensionless thresholds controlling the tests described above.
+    log
+        Optional callback used for verbose progress output.
+
+    Returns
+    -------
+    nodes_new, radii_new, node2verts_new, vert2node, edges_new, soma_new, old2new
+        Updated arrays and a mapping from *old* node indices to the survivors.
+    """
     r_soma = soma.spherical_radius
     r_primary = radii_dict[radius_key]
     d2s = soma.distance(nodes, to="surface")
@@ -155,15 +187,15 @@ def _merge_near_soma_nodes(
     if log:
         log(f"{merged_idx.size} nodes merged into soma")
 
-    old2new = -np.ones(len(nodes), np.int64)
-    old2new[np.where(keep_mask)[0]] = np.arange(keep_mask.sum())
+    remap_stage = -np.ones(len(nodes), np.int64)
+    remap_stage[np.where(keep_mask)[0]] = np.arange(keep_mask.sum())
 
     a, b = edges.T
     both_keep = keep_mask[a] & keep_mask[b]
-    edges_out = np.unique(np.sort(old2new[edges[both_keep]], 1), axis=0)
+    edges_out = np.unique(np.sort(remap_stage[edges[both_keep]], 1), axis=0)
 
     leaves = {
-        int(old2new[u if keep_mask[u] else v])
+        int(remap_stage[u if keep_mask[u] else v])
         for u, v in edges
         if keep_mask[u] ^ keep_mask[v]
     }
@@ -222,7 +254,146 @@ def _merge_near_soma_nodes(
         log(f"Moved soma to [{centre_txt}]")
         log(f"(r = {radii_txt})")
 
-    return (nodes_keep, radii_keep, node2_keep, vert2node, edges_out, soma)
+    old2new = -np.ones(len(nodes), dtype=np.int64)
+    old2new[np.where(keep_mask)[0]] = np.arange(len(nodes_keep))
+
+    return (
+        nodes_keep,
+        radii_keep,
+        node2_keep,
+        vert2node,
+        edges_out,
+        soma,
+        old2new,
+    )
+
+
+def _prune_neurites(
+    nodes: np.ndarray,
+    radii_dict: dict[str, np.ndarray],
+    node2verts: list[np.ndarray],
+    edges: np.ndarray,
+    *,
+    soma: Soma,
+    mesh_vertices: np.ndarray,
+    tip_extent_factor: float = 1.1,
+    stem_extent_factor: float = 5.0,
+    drop_single_node_branches: bool = True,
+    log: Callable | None = None,
+) -> tuple[
+    np.ndarray,
+    dict[str, np.ndarray],
+    list[np.ndarray],
+    dict[int, int],
+    np.ndarray,
+    Soma,
+    np.ndarray,
+]:
+    """
+    Collapse obvious mesh-artefact branches into the soma (node 0) in
+    two independent passes.
+    """
+    r_soma = soma.spherical_radius
+    d2c = np.asarray(soma.distance(nodes, to="center"))
+
+    N = len(nodes)
+    parent = _bfs_parents(edges, N, root=0)
+
+    adj = [[] for _ in range(N)]
+    for a, b in edges:
+        adj[a].append(b)
+        adj[b].append(a)
+
+    merge2soma, visited = set(), np.zeros(N, bool)
+
+    for child in adj[0]:  # one neurite at a time
+        if visited[child]:
+            continue
+
+        comp = []
+        stack, prev = [child], 0
+        while stack:
+            v = stack.pop()
+            if visited[v]:
+                continue
+            visited[v] = True
+            comp.append(v)
+            for nb in adj[v]:
+                if nb != prev and (parent[nb] == v or parent[v] == nb):
+                    stack.append(nb)
+            prev = v
+
+        max_d = d2c[comp].max()
+        thr = (
+            stem_extent_factor if parent[child] == 0 else tip_extent_factor
+        ) * r_soma
+        if max_d <= thr:
+            merge2soma.update(comp)
+
+    if merge2soma:
+        for nid in merge2soma:
+            node2verts[0] = np.concatenate((node2verts[0], node2verts[nid]))
+
+        node2verts[0] = np.unique(node2verts[0])  # dedup
+
+        d0 = np.linalg.norm(mesh_vertices[node2verts[0]] - nodes[0], axis=1)
+        for k in radii_dict:
+            radii_dict[k][0] = _estimate_radius(d0, method=k)
+
+        if log:
+            log(f"Merged {len(merge2soma)} peri-soma nodes into soma ")
+
+    keep = np.ones(N, dtype=bool)
+    if merge2soma:
+        keep[list(merge2soma)] = False
+    keep[0] = True
+
+    orig_indices = np.arange(N, dtype=np.int64)[keep]
+
+    remap = {old: new for new, old in enumerate(np.where(keep)[0])}
+
+    nodes_new = nodes[keep]
+    node2verts_new = [node2verts[i] for i in np.where(keep)[0]]
+    radii_new = {k: v[keep].copy() for k, v in radii_dict.items()}
+    edges_new = np.asarray(
+        [(remap[a], remap[b]) for a, b in edges if keep[a] and keep[b]], dtype=np.int64
+    )
+    vert2node = {int(v): i for i, vs in enumerate(node2verts_new) for v in vs}
+
+    soma.verts = np.unique(node2verts_new[0]).astype(np.int64)
+    pts = mesh_vertices[soma.verts]
+    soma = soma.fit(pts, verts=soma.verts)
+
+    if log:
+        centre_txt = ", ".join(f"{c:7.1f}" for c in soma.center)
+        radii_txt = ",".join(f"{c:7.1f}" for c in soma.axes)
+        log(f"Moved soma to [{centre_txt}]")
+        log(f"(r = {radii_txt})")
+
+    if drop_single_node_branches:
+        (
+            nodes_new,
+            radii_new,
+            node2verts_new,
+            vert2node,
+            edges_new,
+            extra_indices,
+        ) = _merge_single_node_branches(
+            nodes_new,
+            radii_new,
+            node2verts_new,
+            edges_new,
+            mesh_vertices=mesh_vertices,
+            min_parent_degree=3,
+            return_mapping=True,
+        )
+        if extra_indices is not None:
+            orig_indices = orig_indices[extra_indices]
+
+    old2new = -np.ones(N, dtype=np.int64)
+    old2new[orig_indices] = np.arange(len(nodes_new))
+
+    return nodes_new, radii_new, node2verts_new, vert2node, edges_new, soma, old2new
 
 
 def _bridge_gaps(
@@ -435,13 +606,23 @@ def _merge_single_node_branches(
     *,
     mesh_vertices: np.ndarray,
     min_parent_degree: int = 3,
-    estimate_radius: Callable[..., float] | None = None,
+    return_mapping: bool = False,
 ) -> tuple[
-    np.ndarray, dict[str, np.ndarray], list[np.ndarray], dict[int, int], np.ndarray
+    np.ndarray,
+    dict[str, np.ndarray],
+    list[np.ndarray],
+    dict[int, int],
+    np.ndarray,
+    np.ndarray | None,
 ]:
-    """Shared helper to merge single-node branches (ported from skeletonize)."""
-    if estimate_radius is None:
-        estimate_radius = _estimate_radius
+    """
+    Iteratively merge every leaf whose *parent* has degree ≥ `min_parent_degree`.
+    Terminates when no such leaves are left.
+    """
+    orig_indices = (
+        np.arange(len(nodes), dtype=np.int64) if return_mapping else None
+    )
+
     while True:
         deg = np.zeros(len(nodes), dtype=int)
         for a, b in edges:
@@ -462,7 +643,7 @@ def _merge_single_node_branches(
             pts = mesh_vertices[node2verts[par]]
             d = np.linalg.norm(pts - nodes[par], axis=1)
             for k in radii_dict:
-                radii_dict[k][par] = estimate_radius(d, method=k)
+                radii_dict[k][par] = _estimate_radius(d, method=k)
             to_drop.add(leaf)
 
         keep = np.ones(len(nodes), bool)
@@ -476,6 +657,10 @@ def _merge_single_node_branches(
             [(remap[a], remap[b]) for a, b in edges if keep[a] and keep[b]],
             dtype=np.int64,
         )
+        if return_mapping and orig_indices is not None:
+            orig_indices = orig_indices[keep]
 
     vert2node = {int(v): i for i, vs in enumerate(node2verts) for v in vs}
-    return nodes, radii_dict, node2verts, vert2node, edges
+    if return_mapping:
+        return nodes, radii_dict, node2verts, vert2node, edges, orig_indices
+    return nodes, radii_dict, node2verts, vert2node, edges, None

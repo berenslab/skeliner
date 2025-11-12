@@ -7,7 +7,12 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 from . import dx
-from .core import _bridge_gaps, _build_mst
+from .core import (
+    _bridge_gaps,
+    _build_mst,
+    _merge_near_soma_nodes,
+    _prune_neurites,
+)
 
 __skeleton__ = [
     # editing edges
@@ -15,6 +20,9 @@ __skeleton__ = [
     "clip",
     "prune",
     "bridge_gaps",
+    "merge_near_soma_nodes",
+    "prune_neurites",
+    "rebuild_mst",
     "downsample",
     # editing ntype
     "set_ntype",
@@ -42,6 +50,20 @@ def _refresh_igraph(skel) -> ig.Graph:  # type: ignore[valid-type]
         edges=[tuple(map(int, e)) for e in skel.edges],
         directed=False,
     )
+
+
+def _remap_ntype(
+    ntype: np.ndarray | None, old2new: np.ndarray, new_len: int
+) -> np.ndarray | None:
+    if ntype is None:
+        return None
+    mapped = np.full(new_len, 3, dtype=ntype.dtype)
+    for old_idx, new_idx in enumerate(old2new):
+        if new_idx >= 0:
+            mapped[new_idx] = ntype[old_idx]
+    if new_len:
+        mapped[0] = 1
+    return mapped
 
 
 # -----------------------------------------------------------------------------
@@ -219,6 +241,129 @@ def bridge_gaps(
         edges = _build_mst(skel.nodes, edges)
     skel.edges = edges
     skel._invalidate_spatial_index()
+
+
+# -----------------------------------------------------------------------------
+#  soma-adjacent cleanups
+# -----------------------------------------------------------------------------
+
+
+def merge_near_soma_nodes(
+    skel,
+    *,
+    mesh_vertices: np.ndarray,
+    radius_key: str = "median",
+    inside_tol: float = 0.0,
+    near_factor: float = 1.2,
+    fat_factor: float = 0.20,
+):
+    """
+    Collapse nodes that overlap with the soma back into node 0.
+    """
+    if not skel.node2verts:
+        raise ValueError("merge_near_soma_nodes requires node2verts data.")
+
+    (
+        nodes_new,
+        radii_new,
+        node2verts_new,
+        vert2node,
+        edges_new,
+        soma_new,
+        old2new,
+    ) = _merge_near_soma_nodes(
+        np.asarray(skel.nodes, dtype=np.float64),
+        {k: v.copy() for k, v in skel.radii.items()},
+        np.asarray(skel.edges, dtype=np.int64),
+        [np.asarray(v, dtype=np.int64).copy() for v in skel.node2verts],
+        soma=skel.soma,
+        radius_key=radius_key,
+        mesh_vertices=np.asarray(mesh_vertices, dtype=np.float64),
+        inside_tol=inside_tol,
+        near_factor=near_factor,
+        fat_factor=fat_factor,
+    )
+
+    ntype_new = _remap_ntype(skel.ntype, old2new, len(nodes_new))
+
+    return Skeleton(
+        soma=soma_new,
+        nodes=nodes_new,
+        radii=radii_new,
+        edges=edges_new,
+        ntype=ntype_new,
+        node2verts=[np.asarray(v, dtype=np.int64) for v in node2verts_new],
+        vert2node=vert2node,
+        meta={**skel.meta},
+        extra={**skel.extra},
+    )
+
+
+def prune_neurites(
+    skel,
+    *,
+    mesh_vertices: np.ndarray,
+    tip_extent_factor: float = 1.2,
+    stem_extent_factor: float = 3.0,
+    drop_single_node_branches: bool = True,
+):
+    """
+    Remove tiny peri-soma neurites using the same heuristics as the pipeline.
+    """
+    if not skel.node2verts:
+        raise ValueError("prune_neurites requires node2verts data.")
+
+    (
+        nodes_new,
+        radii_new,
+        node2verts_new,
+        vert2node,
+        edges_new,
+        soma_new,
+        old2new,
+    ) = _prune_neurites(
+        np.asarray(skel.nodes, dtype=np.float64),
+        {k: v.copy() for k, v in skel.radii.items()},
+        [np.asarray(v, dtype=np.int64).copy() for v in skel.node2verts],
+        np.asarray(skel.edges, dtype=np.int64),
+        soma=skel.soma,
+        mesh_vertices=np.asarray(mesh_vertices, dtype=np.float64),
+        tip_extent_factor=tip_extent_factor,
+        stem_extent_factor=stem_extent_factor,
+        drop_single_node_branches=drop_single_node_branches,
+    )
+
+    ntype_new = _remap_ntype(skel.ntype, old2new, len(nodes_new))
+
+    return Skeleton(
+        soma=soma_new,
+        nodes=nodes_new,
+        radii=radii_new,
+        edges=edges_new,
+        ntype=ntype_new,
+        node2verts=[np.asarray(v, dtype=np.int64) for v in node2verts_new],
+        vert2node=vert2node,
+        meta={**skel.meta},
+        extra={**skel.extra},
+    )
+
+
+def rebuild_mst(skel):
+    """Recompute the global MST to remove microscopic cycles."""
+    edges_new = _build_mst(np.asarray(skel.nodes, dtype=np.float64), skel.edges)
+    return Skeleton(
+        soma=skel.soma,
+        nodes=skel.nodes.copy(),
+        radii={k: v.copy() for k, v in skel.radii.items()},
+        edges=edges_new,
+        ntype=None if skel.ntype is None else skel.ntype.copy(),
+        node2verts=None
+        if skel.node2verts is None
+        else [np.asarray(v, dtype=np.int64).copy() for v in skel.node2verts],
+        vert2node=None if skel.vert2node is None else dict(skel.vert2node),
+        meta={**skel.meta},
+        extra={**skel.extra},
+    )
 
 
 # -----------------------------------------------------------------------------
