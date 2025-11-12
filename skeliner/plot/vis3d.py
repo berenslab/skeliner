@@ -8,7 +8,7 @@ from typing import List, Sequence, Tuple
 import numpy as np
 import trimesh
 
-from skeliner.core import Skeleton
+from skeliner.dataclass import Skeleton
 
 # ---------------------------------------------------------------------
 # Minimal palettes (no matplotlib dependency)

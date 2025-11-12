@@ -144,6 +144,9 @@ def load_swc(
         if p != -1 and p in id_map
     ]
     edges_arr = np.asarray(edges, dtype=np.int64)
+    if edges_arr.size:
+        edges_arr = np.sort(edges_arr, axis=1)
+        edges_arr = np.unique(edges_arr, axis=0)
 
     # --- minimal spherical soma around node 0 --------------------------
     soma_centre = nodes_arr[0]

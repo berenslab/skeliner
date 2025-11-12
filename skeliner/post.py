@@ -7,12 +7,14 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 from . import dx
+from .core import _bridge_gaps, _build_mst
 
 __skeleton__ = [
     # editing edges
     "graft",
     "clip",
     "prune",
+    "bridge_gaps",
     "downsample",
     # editing ntype
     "set_ntype",
@@ -176,6 +178,47 @@ def _prune_nodes(
             drop.remove(n)
 
     _rebuild_drop_set(skel, drop)
+
+
+# -----------------------------------------------------------------------------
+#  gap bridging
+# -----------------------------------------------------------------------------
+
+
+def bridge_gaps(
+    skel,
+    *,
+    bridge_max_factor: float | None = None,
+    bridge_recalc_after: int | None = None,
+    rebuild_mst: bool = True,
+) -> None:
+    """
+    Connect disconnected skeleton components with synthetic edges, mirroring
+    the automatic gap bridging performed during :func:`skeletonize`.
+
+    Parameters
+    ----------
+    bridge_max_factor
+        Optional ceiling for acceptable bridge length expressed as a multiple of
+        the mean edge length. ``None`` (default) uses the adaptive heuristic from
+        the core pipeline.
+    bridge_recalc_after
+        How often to recompute component-to-island distances. ``None`` (default)
+        triggers the adaptive heuristic.
+    rebuild_mst
+        When *True* (default) rebuild the global minimum-spanning tree after
+        adding the bridges to remove any short cycles.
+    """
+    edges = _bridge_gaps(
+        skel.nodes,
+        skel.edges,
+        bridge_max_factor=bridge_max_factor,
+        bridge_recalc_after=bridge_recalc_after,
+    )
+    if rebuild_mst:
+        edges = _build_mst(skel.nodes, edges)
+    skel.edges = edges
+    skel._invalidate_spatial_index()
 
 
 # -----------------------------------------------------------------------------
@@ -360,7 +403,6 @@ def reroot(
     """
     import numpy as np
 
-    from .core import _build_mst
     from .dataclass import Skeleton, Soma
 
     N = int(len(skel.nodes))
@@ -547,7 +589,6 @@ def detect_soma(
         *Either* the original instance (no change was necessary) *or* a new
         skeleton whose node 0 is the freshly detected soma centroid.
     """
-    from .core import _build_mst
     from .dataclass import Skeleton, Soma
 
     if radius_key not in skel.radii:
@@ -829,7 +870,6 @@ def downsample(
     runs when |Δr| ≤ atol + rtol * max(r_anchor, r_group). Merging node 0 is
     never allowed.
     """
-    from .core import _build_mst
     from .dataclass import Skeleton
 
     if radius_key not in skel.radii:

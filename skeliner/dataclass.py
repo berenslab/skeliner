@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from functools import wraps
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Tuple
 
 import igraph as ig
 import numpy as np
 from scipy.spatial import KDTree
-
-from . import dx, io, post
 
 __all__ = [
     "Soma",
@@ -19,6 +16,7 @@ __all__ = [
     "ContactSeeds",
     "ProxySites",
     "ContactSites",
+    "register_skeleton_methods",
 ]
 
 
@@ -249,13 +247,6 @@ class Skeleton:
         default=None, init=False, repr=False, compare=False
     )
 
-    def __getattr__(self, name: str):
-        for mod in (dx, post):
-            f = getattr(mod, name, None)
-            if callable(f):
-                return lambda *a, _f=f, **kw: _f(self, *a, **kw)
-        raise AttributeError(name)
-
     # ---------------------------------------------------------------------
     # sanity checks
     # ---------------------------------------------------------------------
@@ -342,6 +333,8 @@ class Skeleton:
         axis_order: tuple[int, int, int] | str = (0, 1, 2),
     ) -> None:
         """Write the skeleton to SWC."""
+        from . import io
+
         io.to_swc(
             self,
             path,
@@ -353,6 +346,8 @@ class Skeleton:
 
     def to_npz(self, path: str | Path) -> None:
         """Write the skeleton to a compressed NumPy archive."""
+        from . import io
+
         io.to_npz(self, path)
 
     # ------------------------------------------------------------------
@@ -467,26 +462,6 @@ class Skeleton:
         return self.radii[choice]
 
 
-# attach every diagnostic callable in dx.__skeleton__ as a method to Skeleton
-for _name in dx.__skeleton__:
-    _f = getattr(dx, _name)
-
-    @wraps(_f)
-    def _m(self, *args, _f=_f, **kw):
-        return _f(self, *args, **kw)
-
-    setattr(Skeleton, _name, _m)
-
-for _name in post.__skeleton__:
-    _f = getattr(post, _name)
-
-    @wraps(_f)
-    def _m(self, *args, _f=_f, **kw):
-        return _f(self, *args, **kw)
-
-    setattr(Skeleton, _name, _m)
-
-
 # -----------------------------------------------------------------------------
 # Pairwise contact dataclasses
 # -----------------------------------------------------------------------------
@@ -547,3 +522,21 @@ class ContactSites:
         from .io import save_contact_sites_npz
 
         save_contact_sites_npz(self, path, compress=compress)
+
+
+def register_skeleton_methods(module: Any, names: Iterable[str] | None = None) -> None:
+    """Attach functions from *module* as bound methods on :class:`Skeleton`."""
+    if names is None and hasattr(module, "__skeleton__"):
+        names = module.__skeleton__
+    if names is None:
+        raise ValueError("names must be provided when module lacks '__skeleton__'")
+
+    for name in names:
+        func = getattr(module, name, None)
+        if not callable(func):
+            continue
+
+        def _method(self, *args, _f=func, **kwargs):
+            return _f(self, *args, **kwargs)
+
+        setattr(Skeleton, name, _method)
