@@ -224,7 +224,67 @@ def _bridge_gaps(
     bridge_max_factor: float | None = None,
     bridge_recalc_after: int | None = None,
 ) -> np.ndarray:
-    """Shared helper to bridge disconnected components."""
+    """
+    Bridge all disconnected surface components of a neuron mesh **back to the
+    soma component** by inserting synthetic edges.
+
+    The routine works in four logical stages:
+
+    1.  **Component analysis** – build an undirected graph of the mesh,
+        identify connected components, and mark the one that contains the
+        soma (vertex 0) as the *island*.
+    2.  **Gap prioritisation** – for every *foreign* component find the
+        geodesically closest vertex pair (component ↔ island) and push the
+        tuple ``(gap_distance, cid, idx_comp, idx_island)`` into a
+        min-heap.
+        If *bridge_max_factor* is *None* we estimate a conservative upper
+        bound from the initial gap distribution:
+
+        ``factor = clip( 55-th percentile(gaps) / ⟨edge⟩ , [6 ×, 12 ×] )``
+
+        This filters out pathologically long jumps right from the start.
+    3.  **Greedy growth** – repeatedly pop the nearest component from the
+        heap and connect it with **one** synthetic edge (the cached closest
+        pair).  After each merge the island KD-tree is rebuilt and the heap
+        entries are refreshed every *bridge_recalc_after* merges
+        (auto-chosen if *None*; ≈ 5 % of remaining gaps, capped at 32).
+        A stall counter and a gentle *relax_factor* (1.5) guarantee
+        termination even on meshes with extremely uneven gap sizes.
+    4.  **Finish** – return the original edges plus all new bridges,
+        sorted and de-duplicated.
+
+    Notes
+    -----
+    * Only **one** edge per foreign component is added; the global MST step
+      later will prune any redundant cycles that could arise.
+    * Complexity is dominated by KD-tree queries:
+      *O((|V_island| + Σ|V_comp|) log |V|)* in practice.
+    * The heuristic defaults trade a few hundred ms of runtime for a markedly
+      lower rate of “long-jump” bridges.  Power users can override
+      *bridge_max_factor* or *bridge_recalc_after* if desired.
+
+    Parameters
+    ----------
+    nodes
+        ``(N, 3)`` float64 array of mesh-vertex coordinates.
+    edges
+        ``(E, 2)`` int64 array of **undirected, sorted** mesh edges.
+    bridge_max_factor
+        Optional hard ceiling for acceptable bridge length expressed as a
+        multiple of the mean mesh-edge length.  If *None* an adaptive value
+        (see above) is chosen.
+    bridge_recalc_after
+        How many successful merges to perform before all component-to-island
+        distances are recomputed.  If *None* an adaptive value based on the
+        number of gaps is used.
+
+    Returns
+    -------
+    np.ndarray
+        ``(E′, 2)`` int64 undirected edge list containing the original mesh
+        edges **plus** one synthetic edge for every formerly disconnected
+        component.  The array is sorted row-wise and de-duplicated.
+    """
 
     def _auto_bridge_max(
         gaps: list[float],
@@ -234,18 +294,25 @@ def _bridge_gaps(
         lo: float = 6.0,
         hi: float = 12.0,
     ) -> float:
+        """
+        Choose a bridge_max_factor from the initial gap distribution. Default is the
+        55th percentile of the gap distribution, clipped to [6, 20] times the mean edge
+        """
         raw = np.percentile(gaps, pct) / edge_mean
         return float(np.clip(raw, lo, hi))
 
     def _auto_recalc_after(n_gaps: int) -> int:
-        if n_gaps <= 10:
+        """Return a suitable recalc period for the given number of gaps."""
+        if n_gaps <= 10:  # tiny: update often
             return 2
-        if n_gaps <= 50:
+        if n_gaps <= 50:  # small: every 3–4 merges
             return 4
-        if n_gaps <= 200:
+        if n_gaps <= 200:  # medium: every ~5 % of gaps
             return max(4, n_gaps // 20)
+        # giant meshes: cap to 32 so we never starve
         return 32
 
+    # -- 0. quick exit if already connected ---------------------------------
     g = ig.Graph(
         n=len(nodes), edges=[tuple(map(int, e)) for e in edges], directed=False
     )
@@ -257,45 +324,47 @@ def _bridge_gaps(
     if len(comps) == 1:
         return edges
 
+    # -- 1. build one KD-tree per component ---------------------------------
     edge_len_mean = np.linalg.norm(
         nodes[edges[:, 0]] - nodes[edges[:, 1]], axis=1
     ).mean()
 
+    # -- 2. grow the island using a distance-ordered priority queue ---------
     island = set(comps[soma_cid])
     island_idx = np.fromiter(island, dtype=np.int64)
     island_tree = KDTree(nodes[island_idx])
 
+    # helper to compute the *current* closest gap of a component
     def closest_pair(cid: int) -> tuple[float, int, int]:
         pts = nodes[comp_idx[cid]]
         dists, idx_is = island_tree.query(pts, k=1, workers=-1)
         best = int(np.argmin(dists))
-        return float(dists[best]), best, int(idx_is[best])
+        return float(dists[best]), best, np.asarray(idx_is, dtype=np.int64)[best]
 
-    gaps = []
+    # priority queue of (gap_distance, cid, best_comp_idx, best_island_idx)
     pq = []
+    gap_samples = []
     for cid in range(len(comps)):
         if cid == soma_cid:
             continue
-        gap, best_c, best_i = closest_pair(cid)
-        gaps.append(gap)
-        pq.append((gap, cid, best_c, best_i))
+        gap, b_comp, b_is = closest_pair(cid)
+        pq.append((gap, cid, b_comp, b_is))
+        gap_samples.append(gap)
+    heapq.heapify(pq)
 
-    if not gaps:
-        return edges
-
+    # -- heuristic hyperparameters if not given -------------------------------
     if bridge_max_factor is None:
-        bridge_max_factor = _auto_bridge_max(gaps, edge_len_mean)
-    else:
-        bridge_max_factor = float(bridge_max_factor)
+        bridge_max_factor = _auto_bridge_max(gap_samples, edge_len_mean)
 
     if bridge_recalc_after is None:
-        recalc_after = _auto_recalc_after(len(comps) - 1)
+        gaps = len(comps) - 1
+        recalc_after = _auto_recalc_after(gaps)
     else:
-        recalc_after = int(bridge_recalc_after)
+        recalc_after = bridge_recalc_after
 
-    heapq.heapify(pq)
     edges_new: list[tuple[int, int]] = []
     merges_since_recalc = 0
+
     stall = 0
     relax_factor = 1.5
     max_stall = 3 * len(pq)
@@ -303,15 +372,18 @@ def _bridge_gaps(
 
     while pq:
         _, cid, _, _ = heapq.heappop(pq)
+        # postpone if the component is still too far away
         gap, best_c, best_i = closest_pair(cid)
+
         if gap > current_max:
-            heapq.heappush(pq, (gap, cid, best_c, best_i))
+            heapq.heappush(pq, (gap, cid, best_c, best_i))  # still too far, re-queue
             stall += 1
             if stall >= 2 * max_stall:
+                # after too many futile tries, do a *forced* heap rebuild
                 pq = [
-                    (g2, cid2, bc, bi)
+                    (g, cid2, bc, bi)
                     for _, cid2, _, _ in pq
-                    for g2, bc, bi in (closest_pair(cid2),)
+                    for g, bc, bi in (closest_pair(cid2),)
                 ]
                 heapq.heapify(pq)
                 current_max *= relax_factor
@@ -324,12 +396,14 @@ def _bridge_gaps(
         v = int(island_idx[best_i])
         edges_new.append((u, v))
 
+        # merge component into island and rebuild KD-tree
         island |= comps[cid]
         island_idx = np.concatenate([island_idx, verts_idx])
         island_tree = KDTree(nodes[island_idx])
 
         merges_since_recalc += 1
         if merges_since_recalc >= recalc_after:
+            # distances of *every* remaining component may have changed
             pq = [
                 (gap, cid, b_comp, b_is)
                 for _, cid, _, _ in pq
@@ -344,7 +418,6 @@ def _bridge_gaps(
         edges_aug = edges
 
     return np.unique(edges_aug, axis=0)
-
 
 def _merge_single_node_branches(
     nodes: np.ndarray,
