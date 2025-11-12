@@ -1,5 +1,7 @@
 """skeliner.post – post-processing functions for skeletons."""
 
+import time
+from contextlib import contextmanager
 from typing import Iterable, Set, cast
 
 import igraph as ig
@@ -32,6 +34,31 @@ __skeleton__ = [
     "reroot",
     "detect_soma",
 ]
+
+
+@contextmanager
+def _post_stage(label: str, *, verbose: bool):
+    """Uniform verbose/timing helper matching ``skeletonize`` output."""
+    if not verbose:
+        yield lambda *_: None
+        return
+
+    PAD = 39  # keeps the ASCII arrow alignment consistent
+    prefix = "[skeliner.post]"
+    print(f"{prefix} {label:<{PAD}} …", end="", flush=True)
+    t0 = time.perf_counter()
+    _msgs: list[str] = []
+
+    def log(msg: str) -> None:
+        _msgs.append(str(msg))
+
+    try:
+        yield log
+    finally:
+        dt = time.perf_counter() - t0
+        print(f" {dt:.2f} s")
+        for msg in _msgs:
+            print(f"      └─ {msg}")
 
 # -----------------------------------------------------------------------------
 # helpers
@@ -215,6 +242,7 @@ def bridge_gaps(
     bridge_max_factor: float | None = None,
     bridge_recalc_after: int | None = None,
     rebuild_mst: bool = True,
+    verbose: bool = False,
 ) -> None:
     """
     Connect disconnected skeleton components with synthetic edges, mirroring
@@ -232,15 +260,29 @@ def bridge_gaps(
     rebuild_mst
         When *True* (default) rebuild the global minimum-spanning tree after
         adding the bridges to remove any short cycles.
+    verbose
+        When *True* print timing information and per-stage summaries.
     """
-    edges = _bridge_gaps(
-        skel.nodes,
-        skel.edges,
-        bridge_max_factor=bridge_max_factor,
-        bridge_recalc_after=bridge_recalc_after,
-    )
-    if rebuild_mst:
-        edges = _build_mst(skel.nodes, edges)
+    edges = skel.edges
+    with _post_stage("bridge skeleton gaps", verbose=verbose) as log:
+        prev_edges = int(edges.shape[0])
+        edges = _bridge_gaps(
+            skel.nodes,
+            edges,
+            bridge_max_factor=bridge_max_factor,
+            bridge_recalc_after=bridge_recalc_after,
+        )
+        added = int(edges.shape[0] - prev_edges)
+        if added > 0:
+            log(f"added {added} synthetic bridge{'s' if added != 1 else ''}")
+        else:
+            log("already connected; no bridges added")
+
+        if rebuild_mst:
+            before = int(edges.shape[0])
+            edges = _build_mst(skel.nodes, edges)
+            log(f"recomputed MST ({before} → {edges.shape[0]} edges)")
+
     skel.edges = edges
     skel._invalidate_spatial_index()
 
@@ -258,6 +300,7 @@ def merge_near_soma_nodes(
     inside_tol: float = 0.0,
     near_factor: float = 1.2,
     fat_factor: float = 0.20,
+    verbose: bool = False,
 ):
     """
     Collapse nodes whose spheres overlap the soma **exactly** like stage 5 of
@@ -272,30 +315,34 @@ def merge_near_soma_nodes(
     Nodes satisfying either condition are merged into node 0 along with their
     contributing mesh vertices, after which the soma is re-fitted using the
     expanded vertex set.
+    verbose
+        When *True* print timing information and messages from the merge routine.
     """
     if not skel.node2verts:
         raise ValueError("merge_near_soma_nodes requires node2verts data.")
 
-    (
-        nodes_new,
-        radii_new,
-        node2verts_new,
-        vert2node,
-        edges_new,
-        soma_new,
-        old2new,
-    ) = _merge_near_soma_nodes(
-        np.asarray(skel.nodes, dtype=np.float64),
-        {k: v.copy() for k, v in skel.radii.items()},
-        np.asarray(skel.edges, dtype=np.int64),
-        [np.asarray(v, dtype=np.int64).copy() for v in skel.node2verts],
-        soma=skel.soma,
-        radius_key=radius_key,
-        mesh_vertices=np.asarray(mesh_vertices, dtype=np.float64),
-        inside_tol=inside_tol,
-        near_factor=near_factor,
-        fat_factor=fat_factor,
-    )
+    with _post_stage("merge redundant near-soma nodes", verbose=verbose) as log:
+        (
+            nodes_new,
+            radii_new,
+            node2verts_new,
+            vert2node,
+            edges_new,
+            soma_new,
+            old2new,
+        ) = _merge_near_soma_nodes(
+            np.asarray(skel.nodes, dtype=np.float64),
+            {k: v.copy() for k, v in skel.radii.items()},
+            np.asarray(skel.edges, dtype=np.int64),
+            [np.asarray(v, dtype=np.int64).copy() for v in skel.node2verts],
+            soma=skel.soma,
+            radius_key=radius_key,
+            mesh_vertices=np.asarray(mesh_vertices, dtype=np.float64),
+            inside_tol=inside_tol,
+            near_factor=near_factor,
+            fat_factor=fat_factor,
+            log=log,
+        )
 
     ntype_new = _remap_ntype(skel.ntype, old2new, len(nodes_new))
 
@@ -319,6 +366,7 @@ def prune_neurites(
     tip_extent_factor: float = 1.2,
     stem_extent_factor: float = 3.0,
     drop_single_node_branches: bool = True,
+    verbose: bool = False,
 ):
     """
     Remove tiny peri-soma neurites (stage 8 of :func:`skeliner.skeletonize`).
@@ -329,29 +377,33 @@ def prune_neurites(
        thresholds (multiples of the soma radius) collapse into the soma.
     2. **Single-node pruning** – optionally collapse degree-1 twigs whose parent
        has degree ≥ 3.
+    verbose
+        When *True* print timing information and messages from the pruning routine.
     """
     if not skel.node2verts:
         raise ValueError("prune_neurites requires node2verts data.")
 
-    (
-        nodes_new,
-        radii_new,
-        node2verts_new,
-        vert2node,
-        edges_new,
-        soma_new,
-        old2new,
-    ) = _prune_neurites(
-        np.asarray(skel.nodes, dtype=np.float64),
-        {k: v.copy() for k, v in skel.radii.items()},
-        [np.asarray(v, dtype=np.int64).copy() for v in skel.node2verts],
-        np.asarray(skel.edges, dtype=np.int64),
-        soma=skel.soma,
-        mesh_vertices=np.asarray(mesh_vertices, dtype=np.float64),
-        tip_extent_factor=tip_extent_factor,
-        stem_extent_factor=stem_extent_factor,
-        drop_single_node_branches=drop_single_node_branches,
-    )
+    with _post_stage("prune tiny neurites", verbose=verbose) as log:
+        (
+            nodes_new,
+            radii_new,
+            node2verts_new,
+            vert2node,
+            edges_new,
+            soma_new,
+            old2new,
+        ) = _prune_neurites(
+            np.asarray(skel.nodes, dtype=np.float64),
+            {k: v.copy() for k, v in skel.radii.items()},
+            [np.asarray(v, dtype=np.int64).copy() for v in skel.node2verts],
+            np.asarray(skel.edges, dtype=np.int64),
+            soma=skel.soma,
+            mesh_vertices=np.asarray(mesh_vertices, dtype=np.float64),
+            tip_extent_factor=tip_extent_factor,
+            stem_extent_factor=stem_extent_factor,
+            drop_single_node_branches=drop_single_node_branches,
+            log=log,
+        )
 
     ntype_new = _remap_ntype(skel.ntype, old2new, len(nodes_new))
 
@@ -368,9 +420,12 @@ def prune_neurites(
     )
 
 
-def rebuild_mst(skel):
-    """Recompute the global MST to remove microscopic cycles."""
-    edges_new = _build_mst(np.asarray(skel.nodes, dtype=np.float64), skel.edges)
+def rebuild_mst(skel, *, verbose: bool = False):
+    """Recompute the global MST to remove microscopic cycles (optionally verbosely)."""
+    with _post_stage("build global minimum-spanning tree", verbose=verbose) as log:
+        before = int(skel.edges.shape[0])
+        edges_new = _build_mst(np.asarray(skel.nodes, dtype=np.float64), skel.edges)
+        log(f"edges contracted {before} → {edges_new.shape[0]}")
     return Skeleton(
         soma=skel.soma,
         nodes=skel.nodes.copy(),
@@ -697,7 +752,7 @@ def detect_soma(
         fattest soma node is promoted to root and the others stay, simply
         re-connected to it.
     verbose
-        Print a concise log of what happened.
+        When *True* emit timing and sub-messages using the unified post-processing logger.
 
     Returns
     -------
@@ -726,38 +781,38 @@ def detect_soma(
     )
     vert2node = dict(skel.vert2node) if has_vert2node else {}
 
-    log = (lambda msg: print(f"[skeliner] detect_soma – {msg}")) if verbose else None
+    with _post_stage(
+        " post-skeletonization soma detection", verbose=verbose
+    ) as log:
+        (
+            nodes,
+            radii,
+            node2verts,
+            vert2node,
+            soma_new,
+            has_soma,
+            old2new,
+        ) = _detect_soma(
+            nodes,
+            radii,
+            node2verts,
+            vert2node,
+            soma_radius_percentile_threshold=soma_radius_percentile_threshold,
+            soma_radius_distance_factor=soma_radius_distance_factor,
+            soma_min_nodes=soma_min_nodes,
+            detect_soma=True,
+            radius_key=radius_key,
+            mesh_vertices=(
+                np.asarray(mesh_vertices, dtype=np.float64)
+                if mesh_vertices is not None
+                else None
+            ),
+            log=log,
+        )
 
-    (
-        nodes,
-        radii,
-        node2verts,
-        vert2node,
-        soma_new,
-        has_soma,
-        old2new,
-    ) = _detect_soma(
-        nodes,
-        radii,
-        node2verts,
-        vert2node,
-        soma_radius_percentile_threshold=soma_radius_percentile_threshold,
-        soma_radius_distance_factor=soma_radius_distance_factor,
-        soma_min_nodes=soma_min_nodes,
-        detect_soma=True,
-        radius_key=radius_key,
-        mesh_vertices=(
-            np.asarray(mesh_vertices, dtype=np.float64)
-            if mesh_vertices is not None
-            else None
-        ),
-        log=log,
-    )
-
-    if not has_soma:
-        if verbose:
-            print("[skeliner] detect_soma – existing soma kept unchanged.")
-        return skel
+        if not has_soma:
+            log("existing soma kept unchanged.")
+            return skel
 
     mapped_edges = []
     for a, b in skel.edges:
