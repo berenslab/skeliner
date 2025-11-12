@@ -1,8 +1,8 @@
 from importlib.metadata import PackageNotFoundError, version
 
 from . import batch, dx, io, pair, plot, post
-from .core import skeletonize
 from .dataclass import Skeleton
+from .skeletonize import skeletonize
 from .plot.vis2d import projection as plot2d
 from .plot.vis2d import threeviews as plot3v
 from .plot.vis3d import view3d

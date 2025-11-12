@@ -11,9 +11,6 @@ import numpy as np
 from .dataclass import Skeleton, Soma
 
 __all__ = [
-    "Skeleton",
-    "Soma",
-    "skeletonize",
     "_find_soma",
     "_bfs_parents",
     "_build_mst",
@@ -87,7 +84,3 @@ def _build_mst(nodes: np.ndarray, edges: np.ndarray) -> np.ndarray:
     return np.asarray(
         sorted(tuple(sorted(e)) for e in mst.get_edgelist()), dtype=np.int64
     )
-
-
-# Import at the end to avoid circular imports while defining helpers above.
-from .skeletonize import skeletonize  # noqa: E402

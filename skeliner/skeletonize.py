@@ -16,7 +16,6 @@ _SKELINER_VERSION = _metadata.version("skeliner")
 
 
 __all__ = [
-    "Skeleton",
     "skeletonize",
 ]
 
