@@ -35,8 +35,10 @@ def _igraph(skel):
 # ---------------------------------------------------------------------
 # individual tests
 # ---------------------------------------------------------------------
-def test_connectivity_and_acyclicity(skel):
+def test_connectivity(skel):
     assert dx.connectivity(skel)
+
+def test_acyclicity(skel):
     assert dx.acyclicity(skel) is True
     # acyclicity(..., return_cycles=True) must return a boolean when acyclic
     assert dx.acyclicity(skel, return_cycles=True) is True
