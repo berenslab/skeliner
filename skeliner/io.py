@@ -7,7 +7,8 @@ from typing import Iterable, List
 import numpy as np
 import trimesh
 
-from .core import Skeleton, Soma, _bfs_parents
+from .core import _bfs_parents
+from .dataclass import Skeleton, Soma
 
 __all__ = [
     "load_mesh",

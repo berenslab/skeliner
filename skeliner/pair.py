@@ -1,45 +1,16 @@
 """skeliner.pair – pairwise contact detection between two skeletons and meshes."""
 
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import trimesh
 from scipy.spatial import ConvexHull, KDTree
 
-from .core import Skeleton
+from .dataclass import ContactSeeds, ContactSites, ProxySites, Skeleton
 
 ####################
 ## Skeleton-based ##
 ####################
-
-# --- contact seeds ---
-
-
-@dataclass(slots=True)
-class ContactSeeds:
-    """
-    Pairwise geometrical contacts between two Skeletons (node-to-node).
-    idx_a, idx_b : (K,) int64  Node indices in A and B.
-    pos_a, pos_b : (K,3) float64  Closest points on the node spheres along the line of centers.
-    pos         : (K,3) float64  Midpoint between pos_a and pos_b.
-    center_gap  : (K,) float64   ||xa-xb|| - (ra+rb).
-    meta        : dict           Aux info.
-    """
-
-    idx_a: np.ndarray
-    idx_b: np.ndarray
-    pos_a: np.ndarray
-    pos_b: np.ndarray
-    pos: np.ndarray
-    center_gap: np.ndarray | None
-    meta: dict[str, object]
-
-    @property
-    def n(self) -> int:
-        return int(len(self.idx_a))
-
 
 # --- helpers -----------------------------------------------------------
 
@@ -206,20 +177,6 @@ def find_contact_seeds(
             "exclude_soma": exclude_soma,
         },
     )
-
-
-# --- approximate contact sites purely based on skeleton
-
-
-@dataclass(slots=True)
-class ProxySites:
-    seed_groups: list[np.ndarray]
-    center: np.ndarray  # (M,3) mean of seed midpoints (µm)
-    area_A: np.ndarray  # (M,) in chosen unit
-    area_B: np.ndarray  # (M,) in chosen unit
-    area_mean: np.ndarray
-    seed_to_site: np.ndarray  # (K,)
-    meta: dict
 
 
 def _pairwise_dists(X: np.ndarray) -> np.ndarray:
@@ -671,35 +628,6 @@ def _union_aabbs(bA: np.ndarray, bB: np.ndarray) -> np.ndarray:
     out[onlyB] = bB[onlyB]
 
     return out
-
-
-# ------------------------ result struct ---------------------------------
-
-
-@dataclass(slots=True)
-class ContactSites:
-    faces_A: list[np.ndarray]  # per-contact face indices on A
-    faces_B: list[np.ndarray]  # per-contact face indices on B
-    area_A: np.ndarray  # per-contact area on A
-    area_B: np.ndarray  # per-contact area on B
-    area_mean: np.ndarray  # (A+B)/2
-    seeds_A: np.ndarray  # projected seed on A
-    seeds_B: np.ndarray  # projected seed on B
-    bbox_A: np.ndarray  # (M,2,3) [min,max] AABBs on A in mesh units
-    bbox_B: np.ndarray  # (M,2,3) [min,max] AABBs on B in mesh units
-    bbox: np.ndarray  # (M,2,3) union(A,B) in mesh units
-    meta: dict[str, object]
-    # Optional, computed post-hoc
-    pairs_AB: list[np.ndarray] | None
-    stats_A: dict[str, np.ndarray] | None = None
-    stats_B: dict[str, np.ndarray] | None = None
-    stats_pair: dict[str, np.ndarray] | None = None
-
-    def to_npz(self, path: str | Path, *, compress: bool = True) -> None:
-        # Lazy import to avoid module-level circular imports
-        from .io import save_contact_sites_npz
-
-        save_contact_sites_npz(self, path, compress=compress)
 
 
 # ------------------------ fast extractor --------------------------------

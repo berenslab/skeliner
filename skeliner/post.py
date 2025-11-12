@@ -360,7 +360,8 @@ def reroot(
     """
     import numpy as np
 
-    from .core import Skeleton, Soma, _build_mst
+    from .core import _build_mst
+    from .dataclass import Skeleton, Soma
 
     N = int(len(skel.nodes))
     if N <= 1:
@@ -479,7 +480,7 @@ def _find_soma(
     soma_idx    –  1-D int64 array of node IDs judged to belong to the soma
     has_soma    –  True when ≥ `min_keep` nodes qualified
     """
-    from .core import Soma
+    from .dataclass import Soma
 
     if nodes.shape[0] == 0:
         raise ValueError("empty skeleton")
@@ -546,7 +547,8 @@ def detect_soma(
         *Either* the original instance (no change was necessary) *or* a new
         skeleton whose node 0 is the freshly detected soma centroid.
     """
-    from .core import Skeleton, Soma, _build_mst
+    from .core import _build_mst
+    from .dataclass import Skeleton, Soma
 
     if radius_key not in skel.radii:
         raise KeyError(
@@ -827,7 +829,8 @@ def downsample(
     runs when |Δr| ≤ atol + rtol * max(r_anchor, r_group). Merging node 0 is
     never allowed.
     """
-    from .core import Skeleton, _build_mst
+    from .core import _build_mst
+    from .dataclass import Skeleton
 
     if radius_key not in skel.radii:
         raise KeyError(
