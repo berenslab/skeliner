@@ -20,6 +20,7 @@ __all__ = [
     "_merge_near_soma_nodes",
     "_merge_single_node_branches",
     "_prune_neurites",
+    "_detect_soma",
     "_estimate_radius",
 ]
 
@@ -664,3 +665,125 @@ def _merge_single_node_branches(
     if return_mapping:
         return nodes, radii_dict, node2verts, vert2node, edges, orig_indices
     return nodes, radii_dict, node2verts, vert2node, edges, None
+
+
+def _detect_soma(
+    nodes: np.ndarray,
+    radii: dict[str, np.ndarray],
+    node2verts: list[np.ndarray],
+    vert2node: dict[int, int],
+    *,
+    soma_radius_percentile_threshold: float,
+    soma_radius_distance_factor: float,
+    soma_min_nodes: int,
+    detect_soma: bool,
+    radius_key: str,
+    mesh_vertices: np.ndarray | None,
+    log: Callable[[str], None] | None = None,
+) -> tuple[
+    np.ndarray,
+    dict[str, np.ndarray],
+    list[np.ndarray],
+    dict[int, int],
+    Soma,
+    bool,
+    np.ndarray,
+]:
+    """
+    Detect the soma cluster and enforce node 0 as its centroid/root.
+
+    Returns
+    -------
+    nodes, radii, node2verts, vert2node, soma, has_soma, old2new
+        Updated arrays (same objects passed in) plus the permutation that maps
+        old node IDs → new node IDs (identity when unchanged).
+    """
+    n_nodes = len(nodes)
+    if not node2verts:
+        node2verts[:] = [np.empty(0, dtype=np.int64) for _ in range(n_nodes)]
+    vert2node = vert2node or {}
+
+    def _identity() -> np.ndarray:
+        return np.arange(n_nodes, dtype=np.int64)
+
+    def _soma_verts(idx: int) -> np.ndarray | None:
+        if idx < len(node2verts) and node2verts[idx].size:
+            return node2verts[idx]
+        return None
+
+    if not detect_soma:
+        verts0 = _soma_verts(0)
+        soma = Soma.from_sphere(
+            nodes[0],
+            radii[radius_key][0],
+            verts=verts0 if verts0 is not None and verts0.size else None,
+        )
+        return nodes, radii, node2verts, vert2node, soma, False, _identity()
+
+    soma_est, soma_nodes, has_soma = _find_soma(
+        nodes,
+        radii[radius_key],
+        pct_large=soma_radius_percentile_threshold,
+        dist_factor=soma_radius_distance_factor,
+        min_keep=soma_min_nodes,
+    )
+    if not has_soma:
+        if log:
+            log("no soma detected → keeping old root")
+        verts0 = _soma_verts(0)
+        soma = Soma.from_sphere(
+            nodes[0],
+            radii[radius_key][0],
+            verts=verts0 if verts0 is not None and verts0.size else None,
+        )
+        return nodes, radii, node2verts, vert2node, soma, False, _identity()
+
+    old2new = _identity()
+
+    if 0 not in soma_nodes:
+        new_root = int(soma_nodes[np.argmax(radii[radius_key][soma_nodes])])
+        nodes[[0, new_root]] = nodes[[new_root, 0]]
+        for k in radii:
+            radii[k][[0, new_root]] = radii[k][[new_root, 0]]
+        node2verts[0], node2verts[new_root] = node2verts[new_root], node2verts[0]
+        for vid, nid in list(vert2node.items()):
+            if nid == 0:
+                vert2node[vid] = new_root
+            elif nid == new_root:
+                vert2node[vid] = 0
+        old2new[0], old2new[new_root] = old2new[new_root], old2new[0]
+
+    all_close = (
+        soma_est.distance(nodes[soma_nodes], to="center")
+        < soma_est.spherical_radius * 2
+    )
+    close_lists = [
+        node2verts[int(i)] for i in soma_nodes[all_close] if node2verts[int(i)].size
+    ]
+    if close_lists:
+        soma_vert_ids = np.unique(np.concatenate(close_lists)).astype(np.int64)
+    else:
+        fallback = _soma_verts(int(soma_nodes[0]))
+        soma_vert_ids = fallback if fallback is not None else np.empty(0, np.int64)
+    soma_est.verts = soma_vert_ids if soma_vert_ids.size else None
+
+    nodes[0] = soma_est.center
+    r_sphere = soma_est.spherical_radius
+    for k in radii:
+        radii[k][0] = r_sphere
+
+    if mesh_vertices is not None and soma_est.verts is not None and soma_est.verts.size:
+        try:
+            soma_est = Soma.fit(mesh_vertices[soma_est.verts], verts=soma_est.verts)
+        except ValueError:
+            if log:
+                log("Soma fitting failed, using spherical approximation instead.")
+            soma_est = Soma.from_sphere(soma_est.center, r_sphere, verts=soma_est.verts)
+
+    if log:
+        centre_txt = ", ".join(f"{c:7.1f}" for c in soma_est.center)
+        radii_txt = ",".join(f"{c:7.1f}" for c in soma_est.axes)
+        log(f"Found soma at [{centre_txt}]")
+        log(f"(r = {radii_txt})")
+
+    return nodes, radii, node2verts, vert2node, soma_est, True, old2new

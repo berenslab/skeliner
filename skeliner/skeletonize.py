@@ -13,8 +13,8 @@ from .core import (
     _bfs_parents,
     _bridge_gaps,
     _build_mst,
+    _detect_soma,
     _estimate_radius,
-    _find_soma,
     _merge_near_soma_nodes,
     _prune_neurites,
 )
@@ -474,101 +474,6 @@ def _make_nodes(
     return nodes_arr, radii_dict, node2verts, vert2node
 
 
-# ------------------------------------------------------------------
-#  Step-3 helper – refine soma & root swap
-# ------------------------------------------------------------------
-def _detect_soma(
-    nodes,
-    radii,
-    node2verts,
-    vert2node,
-    soma_radius_percentile_threshold,
-    soma_radius_distance_factor,
-    soma_min_nodes,
-    *,
-    detect_soma,
-    radius_key,
-    mesh_vertices,
-    log=None,
-):
-    """
-    Now returns (nodes, radii, node2verts, vert2node, soma, has_soma)
-    where `soma` is a *Soma* instance.
-    """
-    # ------------------------------------------------------------------
-    # A. skip?
-    # ------------------------------------------------------------------
-    if not detect_soma:
-        soma = Soma.from_sphere(nodes[0], radii[radius_key][0], verts=node2verts[0])
-        return nodes, radii, node2verts, vert2node, soma, False
-
-    # ------------------------------------------------------------------
-    # B. geometry-based detection
-    # ------------------------------------------------------------------
-    soma, soma_nodes, has_soma = _find_soma(
-        nodes,
-        radii[radius_key],
-        pct_large=soma_radius_percentile_threshold,
-        dist_factor=soma_radius_distance_factor,
-        min_keep=soma_min_nodes,
-    )
-    if not has_soma:
-        if log:
-            log("no soma detected → keeping old root")
-        soma = Soma.from_sphere(nodes[0], radii[radius_key][0], verts=node2verts[0])
-        return nodes, radii, node2verts, vert2node, soma, False
-
-    # ------------------------------------------------------------------
-    # C. ensure fattest soma node is root (logic unchanged)
-    # ------------------------------------------------------------------
-    if 0 not in soma_nodes:
-        new_root = int(soma_nodes[np.argmax(radii[radius_key][soma_nodes])])
-        nodes[[0, new_root]] = nodes[[new_root, 0]]
-        for k in radii:
-            radii[k][[0, new_root]] = radii[k][[new_root, 0]]
-        node2verts[0], node2verts[new_root] = node2verts[new_root], node2verts[0]
-        for vid, nid in list(vert2node.items()):
-            vert2node[vid] = {0: new_root, new_root: 0}.get(nid, nid)
-
-    # ------------------------------------------------------------------
-    # D. collect surface vertices that belong to the soma envelope
-    # ------------------------------------------------------------------
-    # quick hack fix, might need a better solution within _find_soma()
-
-    all_close = (
-        soma.distance(nodes[soma_nodes], to="center") < soma.spherical_radius * 2
-    )
-    soma_vert_ids = np.unique(
-        np.concatenate([node2verts[i] for i in soma_nodes[all_close]])
-    ).astype(np.int64)
-    soma.verts = soma_vert_ids
-
-    # update centroid & spherical_radius written to node 0
-    nodes[0] = soma.center
-    r_sphere = soma.spherical_radius
-    for k in radii:
-        radii[k][0] = r_sphere
-
-    try:
-        soma = Soma.fit(
-            mesh_vertices[soma.verts],
-            verts=soma.verts,
-        )
-    except ValueError:
-        if log:
-            log("Soma fitting failed, using spherical approximation instead.")
-        # fallback to spherical approximation
-        soma = Soma.from_sphere(soma.center, r_sphere, verts=soma.verts)
-
-    if log:
-        centre_txt = ", ".join(f"{c:7.1f}" for c in soma.center)
-        radii_txt = ",".join(f"{c:7.1f}" for c in soma.axes)
-        log(f"Found soma at [{centre_txt}]")
-        log(f"(r = {radii_txt})")
-
-    return nodes, radii, node2verts, vert2node, soma, True
-
-
 # -----------------------------------------------------------------------------
 #  Skeletonization Public API
 # -----------------------------------------------------------------------------
@@ -771,7 +676,15 @@ def skeletonize(
     # 3. soma detection (optional) -----------------------------------
     _t0 = time.perf_counter()
     with _timed("↳  post-skeletonization soma detection") as log:
-        (nodes_arr, radii_dict, node2verts, vert2node, soma, has_soma) = _detect_soma(
+        (
+            nodes_arr,
+            radii_dict,
+            node2verts,
+            vert2node,
+            soma,
+            has_soma,
+            _,
+        ) = _detect_soma(
             nodes_arr,
             radii_dict,
             node2verts,
