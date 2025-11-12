@@ -674,6 +674,7 @@ def detect_soma(
     soma_radius_distance_factor: float = 4.0,
     soma_min_nodes: int = 3,
     verbose: bool = True,
+    mesh_vertices: np.ndarray | None = None,
 ):
     """
     Post-hoc soma detection **on an existing Skeleton**.
@@ -745,7 +746,11 @@ def detect_soma(
         soma_min_nodes=soma_min_nodes,
         detect_soma=True,
         radius_key=radius_key,
-        mesh_vertices=None,
+        mesh_vertices=(
+            np.asarray(mesh_vertices, dtype=np.float64)
+            if mesh_vertices is not None
+            else None
+        ),
         log=log,
     )
 
