@@ -13,6 +13,7 @@ from .core import (
     _merge_near_soma_nodes,
     _prune_neurites,
 )
+from .dataclass import Skeleton
 
 __skeleton__ = [
     # editing edges
@@ -258,7 +259,18 @@ def merge_near_soma_nodes(
     fat_factor: float = 0.20,
 ):
     """
-    Collapse nodes that overlap with the soma back into node 0.
+    Collapse nodes whose spheres overlap the soma **exactly** like stage 5 of
+    :func:`skeliner.skeletonize`.
+
+    Tests applied to every node (see :func:`_merge_near_soma_nodes` for details):
+
+    • Inside test:     ``distance_to_surface < −inside_tol``
+    • Near-and-fat:    ``distance_to_center < near_factor × r_soma`` and
+      ``radius ≥ fat_factor × r_soma``.
+
+    Nodes satisfying either condition are merged into node 0 along with their
+    contributing mesh vertices, after which the soma is re-fitted using the
+    expanded vertex set.
     """
     if not skel.node2verts:
         raise ValueError("merge_near_soma_nodes requires node2verts data.")
@@ -308,7 +320,14 @@ def prune_neurites(
     drop_single_node_branches: bool = True,
 ):
     """
-    Remove tiny peri-soma neurites using the same heuristics as the pipeline.
+    Remove tiny peri-soma neurites (stage 8 of :func:`skeliner.skeletonize`).
+
+    Behaviour matches the original two-pass routine:
+
+    1. **Extent pruning** – branches whose stem and tips never exceed the
+       thresholds (multiples of the soma radius) collapse into the soma.
+    2. **Single-node pruning** – optionally collapse degree-1 twigs whose parent
+       has degree ≥ 3.
     """
     if not skel.node2verts:
         raise ValueError("prune_neurites requires node2verts data.")

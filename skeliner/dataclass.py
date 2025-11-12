@@ -546,34 +546,8 @@ if TYPE_CHECKING:
     from . import dx as _dx_mod
     from . import post as _post_mod
 
-    # skeliner/dx
-    connectivity = _dx_mod.connectivity
-    acyclicity = _dx_mod.acyclicity
-    degree = _dx_mod.degree
-    neighbors = _dx_mod.neighbors
-    nodes_of_degree = _dx_mod.nodes_of_degree
-    branches_of_length = _dx_mod.branches_of_length
-    twigs_of_length = _dx_mod.twigs_of_length
-    suspicious_tips = _dx_mod.suspicious_tips
-    distance = _dx_mod.distance
-    node_summary = _dx_mod.node_summary
-    extract_neurites = _dx_mod.extract_neurites
-    neurites_out_of_bounds = _dx_mod.neurites_out_of_bounds
-    volume = _dx_mod.volume
-    total_path_length = _dx_mod.total_path_length
+    for _name in getattr(_dx_mod, "__skeleton__", ()):
+        setattr(Skeleton, _name, getattr(_dx_mod, _name))
 
-    # skeliner/post
-    graft = _post_mod.graft
-    clip = _post_mod.clip
-    prune = _post_mod.prune
-    bridge_gaps = _post_mod.bridge_gaps
-    downsample = _post_mod.downsample
-    set_ntype = _post_mod.set_ntype
-    reroot = _post_mod.reroot
-    detect_soma = _post_mod.detect_soma
-
-    # for _name in getattr(_dx_mod, "__skeleton__", ()):
-    #     setattr(Skeleton, _name, getattr(_dx_mod, _name))
-
-    # for _name in getattr(_post_mod, "__skeleton__", ()):
-    #     setattr(Skeleton, _name, getattr(_post_mod, _name))
+    for _name in getattr(_post_mod, "__skeleton__", ()):
+        setattr(Skeleton, _name, getattr(_post_mod, _name))
