@@ -10,6 +10,10 @@ import igraph as ig
 import numpy as np
 from scipy.spatial import KDTree
 
+if TYPE_CHECKING:
+    from . import dx as _dx_mod
+    from . import post as _post_mod
+
 __all__ = [
     "Soma",
     "Skeleton",
@@ -461,6 +465,39 @@ class Skeleton:
         choice = self.recommend_radius()[0]
         return self.radii[choice]
 
+    # ------------------------------------------------------------------
+    # Type Checking block to make pylance happy
+    # ------------------------------------------------------------------
+    if TYPE_CHECKING:
+        # diagnostics
+        connectivity = _dx_mod.connectivity
+        acyclicity = _dx_mod.acyclicity
+        degree = _dx_mod.degree
+        neighbors = _dx_mod.neighbors
+        nodes_of_degree = _dx_mod.nodes_of_degree
+        branches_of_length = _dx_mod.branches_of_length
+        twigs_of_length = _dx_mod.twigs_of_length
+        suspicious_tips = _dx_mod.suspicious_tips
+        distance = _dx_mod.distance
+        node_summary = _dx_mod.node_summary
+        extract_neurites = _dx_mod.extract_neurites
+        neurites_out_of_bounds = _dx_mod.neurites_out_of_bounds
+        volume = _dx_mod.volume
+        total_path_length = _dx_mod.total_path_length
+
+        # post-processing
+        graft = _post_mod.graft
+        clip = _post_mod.clip
+        prune = _post_mod.prune
+        bridge_gaps = _post_mod.bridge_gaps
+        merge_near_soma_nodes = _post_mod.merge_near_soma_nodes
+        prune_neurites = _post_mod.prune_neurites
+        rebuild_mst = _post_mod.rebuild_mst
+        downsample = _post_mod.downsample
+        set_ntype = _post_mod.set_ntype
+        reroot = _post_mod.reroot
+        detect_soma = _post_mod.detect_soma
+
 
 # -----------------------------------------------------------------------------
 # Pairwise contact dataclasses
@@ -535,19 +572,4 @@ def register_skeleton_methods(module: Any, names: Iterable[str] | None = None) -
         func = getattr(module, name, None)
         if not callable(func):
             continue
-
-        def _method(self, *args, _f=func, **kwargs):
-            return _f(self, *args, **kwargs)
-
-        setattr(Skeleton, name, _method)
-
-
-if TYPE_CHECKING:
-    from . import dx as _dx_mod
-    from . import post as _post_mod
-
-    for _name in getattr(_dx_mod, "__skeleton__", ()):
-        setattr(Skeleton, _name, getattr(_dx_mod, _name))
-
-    for _name in getattr(_post_mod, "__skeleton__", ()):
-        setattr(Skeleton, _name, getattr(_post_mod, _name))
+        setattr(Skeleton, name, func)
