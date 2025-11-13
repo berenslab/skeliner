@@ -67,6 +67,7 @@ def _post_stage(label: str, *, verbose: bool):
         for msg in _msgs:
             print(f"      └─ {msg}")
 
+
 # -----------------------------------------------------------------------------
 # helpers
 # -----------------------------------------------------------------------------
@@ -803,9 +804,7 @@ def detect_soma(
     node2verts = state.ensure_node2verts()
     vert2node = state.vert2node or {}
 
-    with _post_stage(
-        " post-skeletonization soma detection", verbose=verbose
-    ) as log:
+    with _post_stage(" post-skeletonization soma detection", verbose=verbose) as log:
         (
             nodes,
             radii,
@@ -853,6 +852,8 @@ def detect_soma(
         meta={**skel.meta},
         extra={**skel.extra},
     )
+
+
 # -----------------------------------------------------------------------------
 # Radii-aware subsampling
 # -----------------------------------------------------------------------------

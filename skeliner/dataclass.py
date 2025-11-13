@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MethodType
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Tuple
 
 import igraph as ig
@@ -22,6 +23,29 @@ __all__ = [
     "ContactSites",
     "register_skeleton_methods",
 ]
+
+
+class _SkeletonModuleView:
+    """Expose module functions as bound methods on a Skeleton instance."""
+
+    __slots__ = ("_skel", "_module")
+
+    def __init__(self, skel: "Skeleton", module: Any) -> None:
+        self._skel = skel
+        self._module = module
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._module, name)
+        if callable(attr):
+            return MethodType(attr, self._skel)
+        return attr
+
+    def __dir__(self) -> list[str]:
+        names = set(dir(self._module))
+        skeleton_names = getattr(self._module, "__skeleton__", None)
+        if skeleton_names is not None:
+            names.update(skeleton_names)
+        return sorted(names)
 
 
 # -----------------------------------------------------------------------------
@@ -464,6 +488,20 @@ class Skeleton:
         """Return radii based on the recommended estimator."""
         choice = self.recommend_radius()[0]
         return self.radii[choice]
+
+    @property
+    def dx(self) -> "_dx_mod":
+        """Bound view over :mod:`skeliner.dx`, e.g. ``skel.dx.connectivity()``."""
+        from . import dx as dx_mod
+
+        return _SkeletonModuleView(self, dx_mod)
+
+    @property
+    def post(self) -> "_post_mod":
+        """Bound view over :mod:`skeliner.post`, e.g. ``skel.post.clip(...)``."""
+        from . import post as post_mod
+
+        return _SkeletonModuleView(self, post_mod)
 
     # ------------------------------------------------------------------
     # Type Checking block to make pylance happy

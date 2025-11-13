@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import heapq
-import warnings
 from collections import deque
 from typing import Callable, List
 
@@ -218,9 +217,7 @@ def _merge_near_soma_nodes(
     if leaves:
         leaf_edges = np.array([[0, nid] for nid in sorted(leaves)], dtype=np.int64)
         edges_out = (
-            leaf_edges
-            if edges_out.size == 0
-            else np.vstack([edges_out, leaf_edges])
+            leaf_edges if edges_out.size == 0 else np.vstack([edges_out, leaf_edges])
         )
         edges_out = np.unique(np.sort(edges_out, axis=1), axis=0)
 
@@ -358,9 +355,7 @@ def _prune_neurites(
             prev = v
 
         max_d = d2c[comp].max()
-        thr = (
-            stem_extent_factor if parent[child] == 0 else tip_extent_factor
-        ) * r_soma
+        thr = (stem_extent_factor if parent[child] == 0 else tip_extent_factor) * r_soma
         if max_d <= thr:
             merge2soma.update(comp)
 
@@ -398,7 +393,9 @@ def _prune_neurites(
     node2verts_new = state.node2verts
     radii_new = state.radii
     edges_new = state.edges
-    vert2node = rebuild_vert2node(node2verts_new) if node2verts_new is not None else None
+    vert2node = (
+        rebuild_vert2node(node2verts_new) if node2verts_new is not None else None
+    )
 
     soma_verts = np.unique(node2verts_new[0]).astype(np.int64)
     if mesh_vertices is not None and soma_verts.size:
@@ -656,6 +653,7 @@ def _bridge_gaps(
         edges_aug = edges
 
     return np.unique(edges_aug, axis=0)
+
 
 def _merge_single_node_branches(
     nodes: np.ndarray,

@@ -110,7 +110,9 @@ def compact_state(
     nodes = state.nodes[keep_mask].copy()
     radii = {k: v[keep_mask].copy() for k, v in state.radii.items()}
     node2verts = (
-        [state.node2verts[i] for i in keep_idx] if state.node2verts is not None else None
+        [state.node2verts[i] for i in keep_idx]
+        if state.node2verts is not None
+        else None
     )
 
     edges = remap_edges(state.edges, old2new)

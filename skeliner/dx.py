@@ -89,7 +89,9 @@ def neighbors(skel, node_id: int) -> List[int]:
     return [int(v) for v in g.neighbors(node_id)]
 
 
-def _point_segment_distance(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
+def _point_segment_distance(
+    point: np.ndarray, start: np.ndarray, end: np.ndarray
+) -> float:
     """Return Euclidean distance from *point* to the segment [start, end]."""
     vec = end - start
     seg_len2 = float(np.dot(vec, vec))
@@ -399,7 +401,6 @@ def branches_of_length(
     """
     g = _graph(skel)
     deg = np.asarray(g.degree())
-    N = len(deg)
 
     # Mark endpoints = vertices with degree != 2 OR soma (0) even if deg==2
     endpoints: Set[int] = {i for i, d in enumerate(deg) if d != 2}

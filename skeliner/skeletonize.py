@@ -1,8 +1,7 @@
-import heapq
 import time
 from contextlib import contextmanager
 from importlib import metadata as _metadata
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Dict, List
 
 import igraph as ig
 import numpy as np
