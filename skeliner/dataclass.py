@@ -491,7 +491,7 @@ class Skeleton:
 
     @property
     def dx(self) -> "_dx_mod":
-        """Bound view over :mod:`skeliner.dx`, e.g. ``skel.dx.connectivity()``."""
+        """Bound view over :mod:`skeliner.dx`, e.g. ``skel.dx.check_connectivity()``."""
         from . import dx as dx_mod
 
         return _SkeletonModuleView(self, dx_mod)
@@ -508,7 +508,9 @@ class Skeleton:
     # ------------------------------------------------------------------
     if TYPE_CHECKING:
         # diagnostics
+        check_connectivity = _dx_mod.check_connectivity
         connectivity = _dx_mod.connectivity
+        check_acyclicity = _dx_mod.check_acyclicity
         acyclicity = _dx_mod.acyclicity
         degree = _dx_mod.degree
         neighbors = _dx_mod.neighbors
