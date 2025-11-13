@@ -707,9 +707,10 @@ def neurites_out_of_bounds(
     * Works on acyclic skeletons (trees).
     * Uses only igraph helpers; no custom BFS routine.
     """
-    lo, hi = np.asarray(bounds[0], float), np.asarray(bounds[1], float)
-    if lo.shape != (3,) or hi.shape != (3,):
-        raise ValueError("bounds must be two length-3 vectors")
+    lo_hi = _parse_bbox(bounds)
+    if lo_hi is None:
+        raise ValueError("bounds must be provided")
+    lo, hi = lo_hi
 
     coords = skel.nodes
     outside = np.any((coords < lo) | (coords > hi), axis=1)
