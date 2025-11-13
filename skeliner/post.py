@@ -9,13 +9,14 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 from . import dx
-from .core import (
+from ._core import (
     _bridge_gaps,
     _build_mst,
     _detect_soma,
     _merge_near_soma_nodes,
     _prune_neurites,
 )
+from ._state import SkeletonState, rebuild_vert2node, remap_edges, swap_nodes
 from .dataclass import Skeleton, Soma
 
 __skeleton__ = [
@@ -658,54 +659,44 @@ def reroot(
         return skel
 
     # Clone arrays
-    nodes = skel.nodes.copy()
-    radii = {k: v.copy() for k, v in skel.radii.items()}
-    edges = skel.edges.copy()
+    state = SkeletonState(
+        nodes=skel.nodes.copy(),
+        radii={k: v.copy() for k, v in skel.radii.items()},
+        edges=skel.edges.copy(),
+        node2verts=(
+            [np.asarray(v, dtype=np.int64).copy() for v in skel.node2verts]
+            if skel.node2verts is not None
+            else None
+        ),
+        vert2node=dict(skel.vert2node) if skel.vert2node is not None else None,
+    )
     ntype = skel.ntype.copy() if skel.ntype is not None else None
-
-    has_node2verts = skel.node2verts is not None and len(skel.node2verts) > 0
-    has_vert2node = skel.vert2node is not None and len(skel.vert2node) > 0
-    node2verts = [vs.copy() for vs in skel.node2verts] if has_node2verts else None
-    vert2node = dict(skel.vert2node) if has_vert2node else None
 
     # Swap 0 ↔ tgt
     swap = tgt
-    nodes[[0, swap]] = nodes[[swap, 0]]
-    for k in radii:
-        radii[k][[0, swap]] = radii[k][[swap, 0]]
+    swap_nodes(state, 0, swap)
     if ntype is not None:
         ntype[[0, swap]] = ntype[[swap, 0]]
-    if node2verts is not None:
-        node2verts[0], node2verts[swap] = node2verts[swap], node2verts[0]
-    if vert2node is not None:
-        for v, n in list(vert2node.items()):
-            if n == 0:
-                vert2node[v] = swap
-            elif n == swap:
-                vert2node[v] = 0
 
     # Remap edges with a permutation
     perm = np.arange(N, dtype=np.int64)
     perm[[0, swap]] = perm[[swap, 0]]
-    edges = perm[edges]
-    edges = np.sort(edges, axis=1)
-    edges = edges[edges[:, 0] != edges[:, 1]]
-    edges = np.unique(edges, axis=0)
+    edges = remap_edges(state.edges, perm)
 
     if rebuild_mst:
-        edges = _build_mst(nodes, edges)
+        edges = _build_mst(state.nodes, edges)
 
-    if radius_key not in radii:
+    if radius_key not in state.radii:
         raise KeyError(
             f"radius_key '{radius_key}' not found in skel.radii "
-            f"(available keys: {tuple(radii)})"
+            f"(available keys: {tuple(state.radii)})"
         )
-    r0 = float(radii[radius_key][0])
+    r0 = float(state.radii[radius_key][0])
     new_soma = Soma.from_sphere(
-        center=nodes[0],
+        center=state.nodes[0],
         radius=r0,
-        verts=node2verts[0]
-        if node2verts is not None and node2verts[0].size > 0
+        verts=state.node2verts[0]
+        if state.node2verts is not None and state.node2verts[0].size > 0
         else None,
     )
 
@@ -714,12 +705,12 @@ def reroot(
 
     new_skel = Skeleton(
         soma=new_soma,
-        nodes=nodes,
-        radii=radii,
+        nodes=state.nodes,
+        radii=state.radii,
         edges=edges,
         ntype=ntype,
-        node2verts=node2verts,
-        vert2node=vert2node,
+        node2verts=state.node2verts,
+        vert2node=state.vert2node,
         meta={**skel.meta},
         extra={**skel.extra},
     )
@@ -833,35 +824,10 @@ def detect_soma(
             log("existing soma kept unchanged.")
             return skel
 
-    mapped_edges = []
-    for a, b in skel.edges:
-        na = int(old2new[a])
-        nb = int(old2new[b])
-        if na == nb:
-            continue
-        if na > nb:
-            na, nb = nb, na
-        mapped_edges.append((na, nb))
-    edges = (
-        np.unique(np.asarray(mapped_edges, dtype=np.int64), axis=0)
-        if mapped_edges
-        else np.empty((0, 2), dtype=np.int64)
-    )
+    edges = remap_edges(skel.edges, old2new)
+    ntype_new = _remap_ntype(skel.ntype, old2new, len(nodes))
 
-    if skel.ntype is not None:
-        ntype_new = np.empty(len(nodes), dtype=skel.ntype.dtype)
-        for old_idx, new_idx in enumerate(old2new):
-            ntype_new[new_idx] = skel.ntype[old_idx]
-        if len(ntype_new):
-            ntype_new[0] = 1
-    else:
-        ntype_new = None
-
-    node2verts_ret = (
-        [np.asarray(v, dtype=np.int64) for v in node2verts]
-        if has_node2verts
-        else None
-    )
+    node2verts_ret = node2verts if has_node2verts else None
     vert2node_ret = vert2node if has_vert2node else None
 
     return Skeleton(
@@ -1227,39 +1193,28 @@ def downsample(
             if int(n) in old2new
         }
     elif new_node2verts is not None:
-        vert2node_new = {
-            int(v): int(i)
-            for i, vs in enumerate(new_node2verts)
-            for v in np.asarray(vs, dtype=np.int64)
-        }
+        vert2node_new = rebuild_vert2node(new_node2verts)
     else:
         vert2node_new = None
 
     # Keep soma at index 0
     new_root = int(old2new.get(0, 0))
     if new_root != 0 and len(nodes_new):
-        swap = new_root
-        nodes_new[[0, swap]] = nodes_new[[swap, 0]]
-        for k in radii_new:
-            radii_new[k][[0, swap]] = radii_new[k][[swap, 0]]
-        ntype_new[[0, swap]] = ntype_new[[swap, 0]]
-        if new_node2verts is not None:
-            new_node2verts[0], new_node2verts[swap] = (
-                new_node2verts[swap],
-                new_node2verts[0],
-            )
-        if vert2node_new is not None:
-            for v, n in list(vert2node_new.items()):
-                if n == 0:
-                    vert2node_new[v] = swap
-                elif n == swap:
-                    vert2node_new[v] = 0
-        # a0, a1 = edges_arr == 0, edges_arr == swap
-        # edges_arr[a0] = swap
-        # edges_arr[a1] = 0
-        # edges_arr = np.unique(np.sort(edges_arr, axis=1), axis=0)
+        state = SkeletonState(
+            nodes=nodes_new,
+            radii=radii_new,
+            edges=np.empty((0, 2), dtype=np.int64),
+            node2verts=new_node2verts,
+            vert2node=vert2node_new,
+        )
+        swap_nodes(state, 0, new_root)
+        nodes_new = state.nodes
+        radii_new = state.radii
+        new_node2verts = state.node2verts
+        vert2node_new = state.vert2node
+        ntype_new[[0, new_root]] = ntype_new[[new_root, 0]]
         perm = np.arange(len(nodes_new), dtype=np.int64)
-        perm[[0, swap]] = perm[[swap, 0]]
+        perm[[0, new_root]] = perm[[new_root, 0]]
         edges_arr = perm[edges_arr]  # apply to both columns at once
 
         edges_arr = np.sort(edges_arr, axis=1)

@@ -11,6 +11,7 @@ import igraph as ig
 import numpy as np
 from scipy.spatial import KDTree
 
+from ._state import SkeletonState, compact_state, rebuild_vert2node, swap_nodes
 from .dataclass import Soma
 
 __all__ = [
@@ -194,33 +195,34 @@ def _merge_near_soma_nodes(
     if log:
         log(f"{merged_idx.size} nodes merged into soma")
 
-    keep_idx = np.where(keep_mask)[0]
-
-    remap_stage = -np.ones(len(nodes), np.int64)
-    remap_stage[keep_idx] = np.arange(keep_mask.sum())
-
-    a, b = edges.T
-    both_keep = keep_mask[a] & keep_mask[b]
-    edges_out = np.unique(np.sort(remap_stage[edges[both_keep]], 1), axis=0)
-
-    leaves = {
-        int(remap_stage[u if keep_mask[u] else v])
-        for u, v in edges
-        if keep_mask[u] ^ keep_mask[v]
-    }
-    if leaves:
-        edges_out = np.vstack(
-            [edges_out, np.array([[0, i] for i in sorted(leaves)], dtype=np.int64)]
-        )
-
-    nodes_keep = nodes[keep_mask].copy()
-    radii_keep = {k: v[keep_mask].copy() for k, v in radii_dict.items()}
-    node2_keep = (
-        [node2verts[i] for i in keep_idx]
-        if node2verts is not None
-        else None
+    state_in = SkeletonState(
+        nodes=nodes,
+        radii=radii_dict,
+        edges=edges,
+        node2verts=node2verts,
+        vert2node=None,
     )
-    vert2node: dict[int, int] | None = {} if node2_keep is not None else None
+    state_out, old2new = compact_state(state_in, keep_mask, return_old2new=True)
+
+    nodes_keep = state_out.nodes
+    radii_keep = state_out.radii
+    node2_keep = state_out.node2verts
+    edges_out = state_out.edges
+
+    leaves: set[int] = set()
+    for u, v in edges:
+        if keep_mask[u] and not keep_mask[v]:
+            leaves.add(int(old2new[u]))
+        elif keep_mask[v] and not keep_mask[u]:
+            leaves.add(int(old2new[v]))
+    if leaves:
+        leaf_edges = np.array([[0, nid] for nid in sorted(leaves)], dtype=np.int64)
+        edges_out = (
+            leaf_edges
+            if edges_out.size == 0
+            else np.vstack([edges_out, leaf_edges])
+        )
+        edges_out = np.unique(np.sort(edges_out, axis=1), axis=0)
 
     if merged_idx.size:
         if node2verts is not None:
@@ -250,10 +252,7 @@ def _merge_near_soma_nodes(
                     )
                     node2_keep[0] = np.concatenate((node2_keep[0], contrib))
 
-    if node2_keep is not None:
-        for nid, verts in enumerate(node2_keep):
-            for v in verts:
-                vert2node[int(v)] = nid
+    vert2node = rebuild_vert2node(node2_keep) if node2_keep is not None else None
 
     if soma.verts is not None:
         soma.verts = np.unique(soma.verts).astype(np.int64)
@@ -285,9 +284,6 @@ def _merge_near_soma_nodes(
         radii_txt = ",".join(f"{c:7.1f}" for c in soma.axes)
         log(f"Moved soma to [{centre_txt}]")
         log(f"(r = {radii_txt})")
-
-    old2new = -np.ones(len(nodes), dtype=np.int64)
-    old2new[keep_idx] = np.arange(len(nodes_keep))
 
     return (
         nodes_keep,
@@ -387,17 +383,22 @@ def _prune_neurites(
         keep[list(merge2soma)] = False
     keep[0] = True
 
-    orig_indices = np.arange(N, dtype=np.int64)[keep]
+    orig_indices = np.where(keep)[0]
 
-    remap = {old: new for new, old in enumerate(np.where(keep)[0])}
-
-    nodes_new = nodes[keep]
-    node2verts_new = [node2verts[i] for i in np.where(keep)[0]]
-    radii_new = {k: v[keep].copy() for k, v in radii_dict.items()}
-    edges_new = np.asarray(
-        [(remap[a], remap[b]) for a, b in edges if keep[a] and keep[b]], dtype=np.int64
+    state = SkeletonState(
+        nodes=nodes,
+        radii=radii_dict,
+        edges=edges,
+        node2verts=node2verts,
+        vert2node=None,
     )
-    vert2node = {int(v): i for i, vs in enumerate(node2verts_new) for v in vs}
+    state, _ = compact_state(state, keep)
+
+    nodes_new = state.nodes
+    node2verts_new = state.node2verts
+    radii_new = state.radii
+    edges_new = state.edges
+    vert2node = rebuild_vert2node(node2verts_new) if node2verts_new is not None else None
 
     soma_verts = np.unique(node2verts_new[0]).astype(np.int64)
     if mesh_vertices is not None and soma_verts.size:
@@ -677,18 +678,25 @@ def _merge_single_node_branches(
     Iteratively merge every leaf whose *parent* has degree ≥ `min_parent_degree`.
     Terminates when no such leaves are left.
     """
+    state = SkeletonState(
+        nodes=nodes,
+        radii=radii_dict,
+        edges=edges,
+        node2verts=node2verts,
+        vert2node=None,
+    )
     orig_indices = (
-        np.arange(len(nodes), dtype=np.int64) if return_mapping else None
+        np.arange(len(state.nodes), dtype=np.int64) if return_mapping else None
     )
 
     while True:
-        deg = np.zeros(len(nodes), dtype=int)
-        for a, b in edges:
+        deg = np.zeros(len(state.nodes), dtype=int)
+        for a, b in state.edges:
             deg[a] += 1
             deg[b] += 1
 
         leaves = [i for i, d in enumerate(deg) if d == 1 and i != 0]
-        parent = _bfs_parents(edges, len(nodes), root=0)
+        parent = _bfs_parents(state.edges, len(state.nodes), root=0)
         singles = [leaf for leaf in leaves if deg[parent[leaf]] >= min_parent_degree]
 
         if not singles:
@@ -697,32 +705,33 @@ def _merge_single_node_branches(
         to_drop = set()
         for leaf in singles:
             par = parent[leaf]
-            node2verts[par] = np.concatenate((node2verts[par], node2verts[leaf]))
-            if mesh_vertices is not None and node2verts[par].size:
-                pts = mesh_vertices[node2verts[par]]
-                d = np.linalg.norm(pts - nodes[par], axis=1)
+            state.node2verts[par] = np.concatenate(
+                (state.node2verts[par], state.node2verts[leaf])
+            )
+            if mesh_vertices is not None and state.node2verts[par].size:
+                pts = mesh_vertices[state.node2verts[par]]
+                d = np.linalg.norm(pts - state.nodes[par], axis=1)
                 for k in radii_dict:
-                    radii_dict[k][par] = _estimate_radius(d, method=k)
+                    state.radii[k][par] = _estimate_radius(d, method=k)
             to_drop.add(leaf)
 
-        keep = np.ones(len(nodes), bool)
+        keep = np.ones(len(state.nodes), bool)
         keep[list(to_drop)] = False
-        remap = {old: new for new, old in enumerate(np.where(keep)[0])}
-
-        nodes = nodes[keep]
-        node2verts = [node2verts[i] for i in np.where(keep)[0]]
-        radii_dict = {k: v[keep].copy() for k, v in radii_dict.items()}
-        edges = np.asarray(
-            [(remap[a], remap[b]) for a, b in edges if keep[a] and keep[b]],
-            dtype=np.int64,
-        )
+        state, _ = compact_state(state, keep)
         if return_mapping and orig_indices is not None:
             orig_indices = orig_indices[keep]
 
-    vert2node = {int(v): i for i, vs in enumerate(node2verts) for v in vs}
+    vert2node = rebuild_vert2node(state.node2verts)
     if return_mapping:
-        return nodes, radii_dict, node2verts, vert2node, edges, orig_indices
-    return nodes, radii_dict, node2verts, vert2node, edges, None
+        return (
+            state.nodes,
+            state.radii,
+            state.node2verts,
+            vert2node,
+            state.edges,
+            orig_indices,
+        )
+    return state.nodes, state.radii, state.node2verts, vert2node, state.edges, None
 
 
 def _detect_soma(
@@ -760,6 +769,14 @@ def _detect_soma(
     if not node2verts:
         node2verts[:] = [np.empty(0, dtype=np.int64) for _ in range(n_nodes)]
     vert2node = vert2node or {}
+
+    state = SkeletonState(
+        nodes=nodes,
+        radii=radii,
+        edges=np.empty((0, 2), dtype=np.int64),
+        node2verts=node2verts,
+        vert2node=vert2node,
+    )
 
     def _identity() -> np.ndarray:
         return np.arange(n_nodes, dtype=np.int64)
@@ -800,15 +817,7 @@ def _detect_soma(
 
     if 0 not in soma_nodes:
         new_root = int(soma_nodes[np.argmax(radii[radius_key][soma_nodes])])
-        nodes[[0, new_root]] = nodes[[new_root, 0]]
-        for k in radii:
-            radii[k][[0, new_root]] = radii[k][[new_root, 0]]
-        node2verts[0], node2verts[new_root] = node2verts[new_root], node2verts[0]
-        for vid, nid in list(vert2node.items()):
-            if nid == 0:
-                vert2node[vid] = new_root
-            elif nid == new_root:
-                vert2node[vid] = 0
+        swap_nodes(state, 0, new_root)
         old2new[0], old2new[new_root] = old2new[new_root], old2new[0]
 
     all_close = (

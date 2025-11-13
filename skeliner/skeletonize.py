@@ -9,8 +9,7 @@ import numpy as np
 import trimesh
 from scipy.spatial import KDTree
 
-from .core import (
-    _bfs_parents,
+from ._core import (
     _bridge_gaps,
     _build_mst,
     _detect_soma,

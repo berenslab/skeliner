@@ -7,7 +7,7 @@ from typing import Iterable, List
 import numpy as np
 import trimesh
 
-from .core import _bfs_parents
+from ._core import _bfs_parents
 from .dataclass import Skeleton, Soma
 
 __all__ = [
