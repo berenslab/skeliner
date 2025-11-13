@@ -249,7 +249,7 @@ def bridge_gaps(
     bridge_max_factor: float | None = None,
     bridge_recalc_after: int | None = None,
     rebuild_mst: bool = True,
-    verbose: bool = False,
+    verbose: bool = True,
 ) -> None:
     """
     Connect disconnected skeleton components with synthetic edges, mirroring
@@ -307,7 +307,7 @@ def merge_near_soma_nodes(
     inside_tol: float = 0.0,
     near_factor: float = 1.2,
     fat_factor: float = 0.20,
-    verbose: bool = False,
+    verbose: bool = True,
 ):
     """
     Collapse nodes whose spheres overlap the soma **exactly** like stage 5 of
@@ -385,7 +385,7 @@ def prune_neurites(
     tip_extent_factor: float = 1.2,
     stem_extent_factor: float = 3.0,
     drop_single_node_branches: bool = True,
-    verbose: bool = False,
+    verbose: bool = True,
 ):
     """
     Remove tiny peri-soma neurites (stage 8 of :func:`skeliner.skeletonize`).
@@ -446,7 +446,7 @@ def prune_neurites(
     )
 
 
-def rebuild_mst(skel, *, verbose: bool = False):
+def rebuild_mst(skel, *, verbose: bool = True):
     """Recompute the global MST to remove microscopic cycles (optionally verbosely)."""
     with _post_stage("build global minimum-spanning tree", verbose=verbose) as log:
         before = int(skel.edges.shape[0])
