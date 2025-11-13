@@ -17,6 +17,7 @@ from ._core import (
     _merge_near_soma_nodes,
     _prune_neurites,
 )
+from ._state import rebuild_vert2node
 from .dataclass import Skeleton, Soma
 
 _SKELINER_VERSION = _metadata.version("skeliner")
@@ -463,12 +464,7 @@ def _make_nodes(
         for k in radii_dict:
             radii_dict[k] = np.asanyarray(radii_dict[k][keep_mask])
 
-        # rebuild vert2node using final indices
-        vert2node = {
-            int(v): int(new_id)
-            for new_id, verts in enumerate(node2verts)
-            for v in verts
-        }
+        vert2node = rebuild_vert2node(node2verts) or {}
 
     return nodes_arr, radii_dict, node2verts, vert2node
 

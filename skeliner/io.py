@@ -8,6 +8,7 @@ import numpy as np
 import trimesh
 
 from ._core import _bfs_parents
+from ._state import rebuild_vert2node
 from .dataclass import Skeleton, Soma
 
 __all__ = [
@@ -278,7 +279,7 @@ def load_npz(path: str | Path) -> Skeleton:
         off = z["node2verts_off"].astype(np.int64)
         node2verts = [idx[off[i] : off[i + 1]] for i in range(len(off) - 1)]
 
-        vert2node = {int(v): i for i, vs in enumerate(node2verts) for v in vs}
+        vert2node = rebuild_vert2node(node2verts) or {}
 
         soma = Soma(
             center=z["soma_centre"],
