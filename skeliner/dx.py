@@ -1,12 +1,15 @@
 """skeliner.dx – graph‑theoretic diagnostics for a single Skeleton"""
 
+import warnings
 from typing import Any, Dict, List, Sequence, Set, Tuple
 
 import igraph as ig
 import numpy as np
 
 __skeleton__ = [
+    "check_connectivity",
     "connectivity",
+    "check_acyclicity",
     "acyclicity",
     "degree",
     "neighbors",
@@ -37,7 +40,7 @@ def _graph(skel) -> ig.Graph:
 # -----------------------------------------------------------------------------
 
 
-def connectivity(skel, *, return_isolated: bool = False):
+def check_connectivity(skel, *, return_isolated: bool = False):
     """Verify that **every** node is reachable from the soma (vertex 0).
 
     Parameters
@@ -55,7 +58,17 @@ def connectivity(skel, *, return_isolated: bool = False):
     return len(reachable) == g.vcount()
 
 
-def acyclicity(skel, *, return_cycles: bool = False):
+def connectivity(skel, *, return_isolated: bool = False):
+    """Deprecated alias for :func:`check_connectivity`."""
+    warnings.warn(
+        "dx.connectivity() is deprecated; use dx.check_connectivity() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return check_connectivity(skel, return_isolated=return_isolated)
+
+
+def check_acyclicity(skel, *, return_cycles: bool = False):
     """Check that the skeleton is a *forest* (|E| = |V| − components).
 
     If a cycle exists and ``return_cycle`` is *True*, a representative list of
@@ -68,6 +81,16 @@ def acyclicity(skel, *, return_cycles: bool = False):
         return acyclic
     cyc = g.cycle_basis()[0]  # list of vertex ids
     return [(cyc[i], cyc[(i + 1) % len(cyc)]) for i in range(len(cyc))]
+
+
+def acyclicity(skel, *, return_cycles: bool = False):
+    """Deprecated alias for :func:`check_acyclicity`."""
+    warnings.warn(
+        "dx.acyclicity() is deprecated; use dx.check_acyclicity() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return check_acyclicity(skel, return_cycles=return_cycles)
 
 
 # -----------------------------------------------------------------------------
@@ -89,7 +112,9 @@ def neighbors(skel, node_id: int) -> List[int]:
     return [int(v) for v in g.neighbors(node_id)]
 
 
-def _point_segment_distance(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
+def _point_segment_distance(
+    point: np.ndarray, start: np.ndarray, end: np.ndarray
+) -> float:
     """Return Euclidean distance from *point* to the segment [start, end]."""
     vec = end - start
     seg_len2 = float(np.dot(vec, vec))
@@ -257,6 +282,36 @@ def distance(
     return float(distances[0]) if single_input else distances
 
 
+def _node_summary_from_cache(
+    skel,
+    node_id: int,
+    radius_metric: str | None,
+    g: ig.Graph,
+    deg: np.ndarray,
+) -> Dict[str, Any]:
+    """Internal helper that reuses a precomputed degree vector + graph."""
+    if radius_metric is None:
+        radius_metric = skel.recommend_radius()[0]
+
+    deg_root = int(deg[node_id])
+    r_root = float(skel.radii[radius_metric][node_id])
+
+    summary = {
+        "degree": deg_root,
+        "radius": r_root,
+        "neighbors": [],
+    }
+    for nb in g.neighbors(node_id):
+        summary["neighbors"].append(
+            {
+                "id": int(nb),
+                "degree": int(deg[nb]),
+                "radius": float(skel.radii[radius_metric][nb]),
+            }
+        )
+    return summary
+
+
 def node_summary(
     skel,
     node_id: int,
@@ -276,26 +331,9 @@ def node_summary(
             ]
         }
     """
-    if radius_metric is None:
-        radius_metric = skel.recommend_radius()[0]
-
-    deg_root = degree(skel, node_id)
-    r_root = float(skel.radii[radius_metric][node_id])
-
-    out = {
-        "degree": deg_root,
-        "radius": r_root,
-        "neighbors": [],
-    }
-    for nb in neighbors(skel, node_id):
-        out["neighbors"].append(
-            {
-                "id": int(nb),
-                "degree": degree(skel, nb),
-                "radius": float(skel.radii[radius_metric][nb]),
-            }
-        )
-    return out
+    g = _graph(skel)
+    deg = np.asarray(g.degree())
+    return _node_summary_from_cache(skel, node_id, radius_metric, g, deg)
 
 
 # -----------------------------------------------------------------------------
@@ -334,8 +372,8 @@ def degree_distribution(
     for idx in high:
         high_dict[int(idx)] = int(deg[idx])
         if detailed:
-            high_dict[int(idx)] = node_summary(
-                skel, int(idx), radius_metric=radius_metric
+            high_dict[int(idx)] = _node_summary_from_cache(
+                skel, int(idx), radius_metric, g, deg
             )
 
     return {
@@ -351,8 +389,8 @@ def nodes_of_degree(skel, k: int):
 
     Examples
     --------
-    >>> leaves = sk.dx.degree_eq(skel, 1)
-    >>> hubs   = sk.dx.degree_eq(skel, 4)
+    >>> leaves = dx.nodes_of_degree(skel, 1)
+    >>> hubs = dx.nodes_of_degree(skel, 4)
     """
     if k < 0:
         raise ValueError("k must be non‑negative")
@@ -399,7 +437,6 @@ def branches_of_length(
     """
     g = _graph(skel)
     deg = np.asarray(g.degree())
-    N = len(deg)
 
     # Mark endpoints = vertices with degree != 2 OR soma (0) even if deg==2
     endpoints: Set[int] = {i for i, d in enumerate(deg) if d != 2}
@@ -510,8 +547,11 @@ def leaf_depths(skel) -> np.ndarray:
     leaves = np.where((deg == 1) & (np.arange(len(deg)) != 0))[0]
     if leaves.size == 0:
         return np.empty(0, dtype=int)
-    depths = np.asarray(g.shortest_paths(source=0))[0]
-    return depths[leaves].astype(int)
+    # Only compute distances to the leaf subset to avoid full all-pairs output
+    dists = np.asarray(
+        g.shortest_paths_dijkstra(source=0, target=leaves.tolist(), weights=None)[0]
+    )
+    return dists.astype(int)
 
 
 def suspicious_tips(
@@ -707,9 +747,10 @@ def neurites_out_of_bounds(
     * Works on acyclic skeletons (trees).
     * Uses only igraph helpers; no custom BFS routine.
     """
-    lo, hi = np.asarray(bounds[0], float), np.asarray(bounds[1], float)
-    if lo.shape != (3,) or hi.shape != (3,):
-        raise ValueError("bounds must be two length-3 vectors")
+    lo_hi = _parse_bbox(bounds)
+    if lo_hi is None:
+        raise ValueError("bounds must be provided")
+    lo, hi = lo_hi
 
     coords = skel.nodes
     outside = np.any((coords < lo) | (coords > hi), axis=1)

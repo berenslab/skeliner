@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from skeliner import batch, dx
-from skeliner.core import Skeleton, Soma
+from skeliner.dataclass import Skeleton, Soma
 
 
 def make_line_skeleton(base: np.ndarray, *, skel_id: str | None = None) -> Skeleton:

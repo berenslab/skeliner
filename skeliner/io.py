@@ -7,7 +7,9 @@ from typing import Iterable, List
 import numpy as np
 import trimesh
 
-from .core import Skeleton, Soma, _bfs_parents
+from ._core import _bfs_parents
+from ._state import rebuild_vert2node
+from .dataclass import Skeleton, Soma
 
 __all__ = [
     "load_mesh",
@@ -143,6 +145,9 @@ def load_swc(
         if p != -1 and p in id_map
     ]
     edges_arr = np.asarray(edges, dtype=np.int64)
+    if edges_arr.size:
+        edges_arr = np.sort(edges_arr, axis=1)
+        edges_arr = np.unique(edges_arr, axis=0)
 
     # --- minimal spherical soma around node 0 --------------------------
     soma_centre = nodes_arr[0]
@@ -274,7 +279,7 @@ def load_npz(path: str | Path) -> Skeleton:
         off = z["node2verts_off"].astype(np.int64)
         node2verts = [idx[off[i] : off[i + 1]] for i in range(len(off) - 1)]
 
-        vert2node = {int(v): i for i, vs in enumerate(node2verts) for v in vs}
+        vert2node = rebuild_vert2node(node2verts) or {}
 
         soma = Soma(
             center=z["soma_centre"],

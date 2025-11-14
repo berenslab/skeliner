@@ -9,7 +9,7 @@ import numpy as np
 from . import dx
 
 if TYPE_CHECKING:
-    from .core import Skeleton
+    from .dataclass import Skeleton
 
 __all__ = ["distance_matrix", "nearest_skeletons"]
 

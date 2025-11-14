@@ -11,7 +11,7 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Circle, Ellipse
 from scipy.stats import binned_statistic_2d
 
-from ..core import Skeleton
+from ..dataclass import Skeleton
 
 __all__ = ["projection", "threeviews", "details", "node_details"]
 

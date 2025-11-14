@@ -5,10 +5,9 @@ No hard-coded biology – we just compare against ground-truth values
 computed on-the-fly with igraph so the test is independent of the mesh
 content.
 """
-import copy
+
 from pathlib import Path
 
-import igraph as ig
 import numpy as np
 import pytest
 
@@ -35,18 +34,33 @@ def _igraph(skel):
 # ---------------------------------------------------------------------
 # individual tests
 # ---------------------------------------------------------------------
-def test_connectivity_and_acyclicity(skel):
-    assert dx.connectivity(skel)
-    assert dx.acyclicity(skel) is True
-    # acyclicity(..., return_cycles=True) must return a boolean when acyclic
-    assert dx.acyclicity(skel, return_cycles=True) is True
+def test_check_connectivity(skel):
+    assert dx.check_connectivity(skel)
+
+
+def test_connectivity_deprecated_alias_warns(skel):
+    with pytest.warns(DeprecationWarning, match="check_connectivity"):
+        assert dx.connectivity(skel)
+
+
+def test_check_acyclicity(skel):
+    assert dx.check_acyclicity(skel) is True
+    # check_acyclicity(..., return_cycles=True) must return a boolean when acyclic
+    assert dx.check_acyclicity(skel, return_cycles=True) is True
+
+
+def test_acyclicity_deprecated_alias_warns(skel):
+    with pytest.warns(DeprecationWarning, match="check_acyclicity"):
+        assert dx.acyclicity(skel, return_cycles=True) is True
 
 
 def test_degree_and_neighbors_match_igraph(skel):
     g = _igraph(skel)
     degrees_ref = g.degree()
     # vector query
-    assert np.array_equal([dx.degree(skel, node_id=n) for n in range(len(skel.nodes))], degrees_ref)
+    assert np.array_equal(
+        [dx.degree(skel, node_id=n) for n in range(len(skel.nodes))], degrees_ref
+    )
     # scalar query + neighbors
     nid = 0  # arbitrary but deterministic
     assert dx.degree(skel, nid) == degrees_ref[nid]
@@ -56,7 +70,7 @@ def test_degree_and_neighbors_match_igraph(skel):
 def test_nodes_of_degree(skel):
     g = _igraph(skel)
     deg = np.asarray(g.degree())
-    for k in (0, 1, 2, 3):      # 0 included on purpose – should be empty
+    for k in (0, 1, 2, 3):  # 0 included on purpose – should be empty
         expected = {int(i) for i in np.where(deg == k)[0] if i != 0}
         got = set(dx.nodes_of_degree(skel, k))
         assert got == expected
@@ -115,7 +129,9 @@ def test_distance_point_queries(skel):
         for a, b in skel.edges:
             d_edges = min(
                 d_edges,
-                dx._point_segment_distance(point_nm_space, skel.nodes[a], skel.nodes[b]),
+                dx._point_segment_distance(
+                    point_nm_space, skel.nodes[a], skel.nodes[b]
+                ),
             )
         return min(d_nodes, d_edges)
 

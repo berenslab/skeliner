@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 import skeliner as sk
-from skeliner.core import Skeleton, Soma
+from skeliner.dataclass import Skeleton, Soma
 
 # ======================== analytic helpers ========================
 
