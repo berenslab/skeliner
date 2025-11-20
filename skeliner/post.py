@@ -6,9 +6,7 @@ from typing import Iterable, Set, cast
 
 import igraph as ig
 import numpy as np
-import trimesh
 from numpy.typing import ArrayLike
-from tqdm import tqdm
 
 from . import dx
 from ._core import (
