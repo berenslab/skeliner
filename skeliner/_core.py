@@ -107,8 +107,8 @@ def _estimate_radius(
     d: np.ndarray,
     *,
     method: str = "median",
-    trim_fraction: float = 0.05,
-    q: float = 0.90,
+    trim_fraction: float = 0.15,
+    q: float = 80.,
 ) -> float:
     """Return one scalar radius according to *method*."""
     if method == "median":
@@ -119,6 +119,8 @@ def _estimate_radius(
         return float(d.max())
     if method == "min":
         return float(d.min())
+    if method == "percentile":
+        return float(np.percentile(d, q=q))
     if method == "trim":
         lo, hi = np.quantile(d, [trim_fraction, 1.0 - trim_fraction])
         mask = (d >= lo) & (d <= hi)

@@ -6,7 +6,9 @@ from typing import Iterable, Set, cast
 
 import igraph as ig
 import numpy as np
+import trimesh
 from numpy.typing import ArrayLike
+from tqdm import tqdm
 
 from . import dx
 from ._core import (
@@ -1272,194 +1274,196 @@ def downsample(
     return new_skel
 
 
-def _reduce_to_outer(
-        vals: np.ndarray,
-        min_inner_frac: float = 0.10,
-        max_inner_frac: float = 0.30,
-        gap_threshold: float = 2.5,
-        min_cluster_size: float = 5,
-        kmeans_tol: float = 1e-6,
-        max_kmeans_iter: float = 20,
-        verbose: bool = False,
-) -> np.ndarray | None:
-    """Detect if there is a clear outer cluster in the 1D data.
-    If so, ignore internal structures.
-    """
-    v = np.sort(vals)
-    n = v.size
-
-    # Quick check: look for a gap in the lower portion of data
-    # Check if there's a notable jump between lower quantiles
-    # Stricter initial check: look for bimodality
-    q_low = float(np.quantile(v, q=0.15))
-    q_mid = float(np.quantile(v, q=0.50))
-    q_high = float(np.quantile(v, q=0.85))
-
-    # Reject if distribution looks too uniform/unimodal
-    iqr = q_high - q_low
-    if iqr < 0.2 * q_mid:  # Stricter: IQR should be at least 20% of median
-        if verbose:
-            print("[_reduce_to_outer] rejected: low IQR")
-        return None
-
-    # Look for actual separation in the data
-    if q_mid - q_low < 0.3 * iqr:  # Lower half should be compressed
-        if verbose:
-            print("[_reduce_to_outer] rejected: low lower-half spread")
-        return None
-
-    # Initialize centers: l ow quantile for inner, high quantile for outer
-    c = np.array([q_low, q_high], dtype=np.float64)
-
-    if np.abs(c[1] - c[0]) < kmeans_tol:
-        if verbose:
-            print("[_reduce_to_outer] rejected: initial centers too close")
-        return None
-
-    labels = None
-
-    # K-means with k=2
-    for iteration in range(max_kmeans_iter):
-        # Assign to nearest center
-        dist0 = np.abs(v - c[0])
-        dist1 = np.abs(v - c[1])
-        labels = (dist1 < dist0).astype(np.int8)
-
-        c0_vals = v[labels == 0]
-        c1_vals = v[labels == 1]
-
-        if c0_vals.size == 0 or c1_vals.size == 0:
-            if verbose:
-                print("[_reduce_to_outer] rejected: empty cluster")
-            return None
-
-        # Update centers
-        new_c = np.array([
-            np.median(c0_vals),
-            np.median(c1_vals)
-        ], dtype=np.float64)
-
-        if np.allclose(new_c, c, atol=kmeans_tol, rtol=1e-5):
-            break
-
-        c = new_c
-
-    if labels is None:
-        if verbose:
-            print("[_reduce_to_outer] rejected: no labels assigned")
-        return None
-
-    # Identify which cluster is "inner" (should be smaller and lower)
-    c0_vals = v[labels == 0]
-    c1_vals = v[labels == 1]
-
-    # Inner cluster should have lower center
-    if c[0] < c[1]:
-        inner_vals, outer_vals = c0_vals, c1_vals
-        inner_center, outer_center = c[0], c[1]
-    else:
-        inner_vals, outer_vals = c1_vals, c0_vals
-        inner_center, outer_center = c[1], c[0]
-
-    # Validate the pattern
-    inner_frac = len(inner_vals) / n
-
-    if inner_frac < min_inner_frac:
-        if verbose:
-            print("[_reduce_to_outer] rejected: inner cluster too small")
-        return None
-    if inner_frac > max_inner_frac:
-        if verbose:
-            print("[_reduce_to_outer] rejected: inner cluster too large")
-        return None
-
-    # Check: there should be a clear gap between clusters
-    inner_spread = np.std(inner_vals) if len(inner_vals) > 1 else 0.0
-    gap = outer_center - inner_center
-
-    if inner_spread > 0 and gap < gap_threshold * inner_spread:
-        if verbose:
-            print("[_reduce_to_outer] rejected: insufficient gap between clusters")
-        return None
-
-    # Check: outer cluster should have minimum size
-    if len(outer_vals) < min_cluster_size:
-        if verbose:
-            print("[_reduce_to_outer] rejected: outer cluster too small")
-        return None
-
-    return outer_vals
-
-
 def _estimate_radius(
-        d: np.ndarray,
-        *,
-        method: str = "median",
+    d: np.ndarray,
+    *,
+    method: str = "median",
+    trim_fraction: float = 0.05,
+    q: float = 55.,
 ) -> float:
-    """Return one scalar radius according to *method*.
-
-    Methods
-    -------
-    median          : 50‑th percentile (robust default)
-    mean            : arithmetic mean (biased by tails)
-    """
+    """Return one scalar radius according to *method*."""
     if method == "median":
         return float(np.median(d))
     if method == "mean":
         return float(d.mean())
+    if method == "max":
+        return float(d.max())
+    if method == "min":
+        return float(d.min())
+    if method == "percentile":
+        return float(np.percentile(d, q=q))
+    if method == "trim":
+        lo, hi = np.quantile(d, [trim_fraction, 1.0 - trim_fraction])
+        mask = (d >= lo) & (d <= hi)
+        if not np.any(mask):
+            return float(np.mean(d))
+        return float(d[mask].mean())
+    if method == "trimlow":
+        lo = np.quantile(d, trim_fraction)
+        mask = (d >= lo)
+        if not np.any(mask):
+            return float(np.mean(d))
+        return float(d[mask].mean())
+    if method == "trimhigh":
+        hi = np.quantile(d, 1.0 - trim_fraction)
+        mask = (d <= hi)
+        if not np.any(mask):
+            return float(np.mean(d))
+        return float(d[mask].mean())
     raise ValueError(f"Unknown radius estimator '{method}'.")
 
 
+def submesh_by_vertices(
+        mesh : trimesh.Trimesh,
+        vertex_indices : np.ndarray,
+) -> trimesh.Trimesh:
+    """
+    Reduce mesh to a subset of vertices and corresponding faces.
+    """
+    vertex_indices = np.asarray(vertex_indices, dtype=np.int64)
+    used = np.isin(mesh.faces, vertex_indices).all(axis=1)
+    faces = mesh.faces[used]
+
+    # build mapping from old → new vertex indices
+    old_to_new = -np.ones(len(mesh.vertices), dtype=np.int64)
+    old_to_new[vertex_indices] = np.arange(len(vertex_indices))
+
+    new_faces = old_to_new[faces]
+
+    new_vertices = mesh.vertices[vertex_indices]
+
+    return trimesh.Trimesh(vertices=new_vertices, faces=new_faces, process=False)
+
+
+def filter_inner_surfaces_raycast(mesh, num_rays=20, thresh=0.2, sample=True):
+    """
+    Return vertex indices belonging to outer faces only.
+    """
+    if not isinstance(mesh, trimesh.Trimesh):
+        raise TypeError(f"mesh must be of type 'trimesh.Trimesh' but is {type(mesh)}")
+
+    # ---- Ray directions ----
+    if sample:
+        phi = np.random.uniform(0, 2*np.pi, num_rays)
+        theta = np.arccos(np.random.uniform(-1, 1, num_rays))
+        directions = np.column_stack([
+            np.sin(theta) * np.cos(phi),
+            np.sin(theta) * np.sin(phi),
+            np.cos(theta)
+        ])
+    else:
+        golden_ratio = (1 + np.sqrt(5)) / 2
+        idx = np.arange(num_rays)
+        theta = 2 * np.pi * idx / golden_ratio
+        phi = np.arccos(1 - 2 * (idx + 0.5) / num_rays)
+        directions = np.column_stack([
+            np.sin(phi) * np.cos(theta),
+            np.sin(phi) * np.sin(theta),
+            np.cos(phi)
+        ])
+
+    # ---- Precompute centroids & normals ----
+    C = mesh.triangles_center
+    N = mesh.face_normals
+    F = len(C)
+
+    # ---- Expand origins to (F, R, 3) ----
+    origins = C[:, None, :] + 0.001 * N[:, None, :]
+    origins = np.broadcast_to(origins, (F, num_rays, 3))
+
+    # ---- Outward-facing ray mask (F, R) ----
+    mask = (directions @ N.T).T > 0
+    active_idx = np.nonzero(mask)
+
+    if len(active_idx[0]) == 0:
+        # All faces are considered "outer"
+        return np.unique(mesh.faces.reshape(-1))
+
+    # Flatten rays
+    origins_flat = origins[active_idx]
+    directions_flat = directions[active_idx[1]]
+
+    # ---- Fast intersector ----
+    try:
+        from trimesh.ray.ray_pyembree import RayMeshIntersector
+        intersector = RayMeshIntersector(mesh)
+    except ImportError:
+        intersector = mesh.ray
+
+    hits = intersector.intersects_first(origins_flat, directions_flat)
+    hit_mask = hits != -1
+
+    # Count hits for each face
+    hit_count = np.zeros(F, dtype=int)
+    np.add.at(hit_count, active_idx[0], hit_mask)
+
+    # Select outer faces
+    threshold = int(num_rays * thresh)
+    outer_faces = np.nonzero(hit_count < threshold)[0]
+
+    # ---- Return vertex indices from these faces ----
+    outer_vertices = mesh.faces[outer_faces].reshape(-1)
+    return np.unique(outer_vertices)
+
+
 def calibrate_radii(
-        skel,
+        skel : Skeleton,
+        mesh: trimesh.Trimesh,
         *,
-        mesh_vertices: np.ndarray,
         radius_metric: str | None = None,
         aggregate: str = "median",
+        min_n_outer : int = 20,
+        min_frac_outer : float = 0.33,
+        min_verts_q_outer : float = 80.,
+        rays_num_outer : int = 30,
+        rays_thresh_outer : float = 0.2,
+        rays_sample : bool = False,
         store_key: str = "calibrated",
-        min_samples_split: int = 15,
-        bimodal_kws: dict | None = None,
         verbose: bool = True,
 ) -> None:
     """
     Refine per‑node radii by measuring distances from mesh vertices to the
     skeleton centreline, aggregated within each node's vertex bin.
+    Tries to efficiently remove internal mesh structure like mitochondria using a combination of heuristics.
 
     Parameters
     ----------
     skel
         Skeleton whose radii dictionary will be updated in‑place.
-    mesh_vertices
-        Optional (V,3) array of mesh vertices. If omitted, will try
-        ``skel.extra['mesh_vertices']``. If neither is available, the function
-        falls back to copying the recommended radius into ``store_key`` when
-        ``copy_if_missing`` is True, and otherwise raises a ValueError.
+    mesh : trimesh.Trimesh
+        Mesh surface of the neuron. Must match the node2verts of the skeleton
     radius_metric
         Existing radius key to use as a fallback for nodes without vertex bins.
         Defaults to the recommended estimator.
     aggregate
         How to aggregate per‑vertex distances within a node: 'median' (default)
         or 'mean'.
+    min_n_outer
+        Minimum vertices of an outer shell as absolute number.
+    min_frac_outer
+        Minimum vertices of an outer shell as relative number.
+    min_verts_q_outer
+        Value between 0 and 100: Minimum vertices (as percentile over all nodes) to be tested for inner shell.
+        This assumes that nodes with internal structure have more vertices.
+        Set to zero to check all nodes.
+    rays_num_outer
+        Number of rays used to detect outer shell.
+    rays_thresh_outer
+        Value between 0 and 1: fraction of rays needed to hit a surface to be considered outer / inner shell.
+    rays_sample
+        If True, use randomly sampled cells instead of a grid.
     store_key
         Key under which the calibrated radii will be stored in ``skel.radii``.
-    min_samples_split
-        Minimum number of vertex samples in a node to attempt bimodal
-        separation. Nodes with fewer samples will always use the full set of
-        distances for radius estimation.
-    bimodal_kws
-        Parameters forwarded to :pyfunc:`_reduce_to_outer` for bimodal
-        detection within nodes that have enough samples.
     verbose
         When True (default), print a concise summary including how many nodes
         fell back to the prior radius and how many were clamped to it.
 
     Notes
     -----
-    - Requires either ``skel.node2verts``to compute refined radii.
+    - Requires ``skel.node2verts``to compute refined radii.
     - Modifies the skeleton in place; returns None.
     """
-    mesh_vertices = np.asarray(mesh_vertices, dtype=np.float64)
-    bimodal_kws = dict() if bimodal_kws is None else bimodal_kws
+    mesh_vertices = np.asarray(mesh.vertices, dtype=np.float64)
     n_total = int(len(skel.nodes))
     if n_total == 0:
         raise ValueError("Skeleton has no nodes; cannot calibrate radii.")
@@ -1476,7 +1480,12 @@ def calibrate_radii(
     r_new = np.array(skel.radii[radius_metric], dtype=np.float64, copy=True)
     r_kind = np.full(n_total, 'fallback', dtype='object')
 
-    for i in range(n_total):
+    n_verts = np.array([len(i) for i in skel.node2verts])
+    min_n_verts_bulb = int(np.percentile(n_verts, q=min_verts_q_outer))
+    if verbose:
+        print(f"[skeliner] calibrate_radii: {min_n_verts_bulb=}={np.mean(n_verts > min_n_verts_bulb):.0%}")
+
+    for i in tqdm(range(n_total), total=n_total):
         if i == 0 and skel.soma is not None:  # Ignore soma
             continue
 
@@ -1485,31 +1494,41 @@ def calibrate_radii(
         if vids.size == 0:
             continue
 
-        d_local = dx.distance(
-            skel,
-            mesh_vertices[vids],
-            mode='centerline',
-            radius_metric=radius_metric,
-            allowed_nodes=[int(i)],
-        )
+        outer_success = False
+        if n_verts[i] >= min_n_verts_bulb:
+            n_inner = len(vids)
+            mesh_i = submesh_by_vertices(mesh, vids)
+            assert len(mesh_i.vertices) == len(vids)
+            outer_vids = filter_inner_surfaces_raycast(
+                mesh_i, num_rays=rays_num_outer, thresh=rays_thresh_outer, sample=rays_sample)
+            n_outer = len(outer_vids)
 
-        if len(vids) < min_samples_split:
+            if (n_outer >= min_n_outer) and (n_outer >= min_frac_outer * n_inner) and (n_outer < n_inner):
+                d_local = dx.distance(
+                    skel,
+                    mesh_vertices[vids[outer_vids]],
+                    mode='centerline',
+                    radius_metric=radius_metric,
+                    allowed_nodes=[int(i)],
+                )
+                r_new[i] = _estimate_radius(d_local, method=aggregate)
+                r_kind[i] = 'outer_centerline'
+                outer_success = True
+
+        if not outer_success:
+            d_local = dx.distance(
+                skel,
+                mesh_vertices[vids],
+                mode='centerline',
+                radius_metric=radius_metric,
+                allowed_nodes=[int(i)],
+            )
             r_new_i = _estimate_radius(d_local, method=aggregate)
-            if r_new_i < r_new[i]:
+            if r_new_i < r_new[i]:  # Update only if smaller
                 r_new[i] = r_new_i
                 r_kind[i] = 'full_centerline'
-        else:
-            outer_vals = _reduce_to_outer(d_local, **bimodal_kws)
-            if (outer_vals is not None) and (len(outer_vals) >= min_samples_split):
-                r_new[i] = _estimate_radius(outer_vals, method=aggregate)
-                r_kind[i] = 'outer_centerline'
-            else:
-                r_new_i = _estimate_radius(d_local, method=aggregate)
-                if r_new_i < r_new[i]:
-                    r_new[i] = r_new_i
-                    r_kind[i] = 'full_centerline'
 
-    skel.radii[store_key] = r_new
+        skel.radii[store_key] = r_new
 
     n_fallback = int(np.sum(r_kind == 'fallback'))
     n_full_centerline = int(np.sum(r_kind == 'full_centerline'))
@@ -1527,6 +1546,7 @@ def calibrate_radii(
         "nodes_full_centerline": n_full_centerline,
         "nodes_outer_centerline": n_outer_centerline,
     }
+
     if verbose:
         print(
             f"[skeliner] calibrate_radii – N={n_total}, "
@@ -1534,5 +1554,5 @@ def calibrate_radii(
             f"n_full_centerline={n_full_centerline}={n_full_centerline / n_total:.0%}, "
             f"n_outer_centerline={n_outer_centerline}={n_outer_centerline / n_total:.0%}; "
             f"store='{store_key}', base='{radius_metric}'"
+
         )
-    return None
