@@ -101,6 +101,7 @@ def test_reroot_updates_soma_and_ntype():
         s.soma.axes[0], s.radii["median"][0]
     )  # radius equals selected column
     assert s.ntype[0] == 1
+    assert int(np.sum(s.ntype == 1)) == 1
 
 
 def test_reroot_node2verts_vert2node_consistency():
@@ -125,3 +126,30 @@ def test_reroot_node2verts_vert2node_consistency():
             assert s.vert2node[v] == i
     # Soma verts now come from the new node 0's membership
     assert set(s.soma.verts.tolist()) == set(s.node2verts[0].tolist())
+
+
+def test_detect_soma_remaps_ntype_once():
+    nodes = np.array([[0, 0, 0], [0, 0, 5], [0, 5, 0]], float)
+    edges = np.array([[0, 1], [1, 2]], np.int64)
+    radii = {"median": np.array([1.0, 4.0, 1.5])}
+    skel = Skeleton(
+        soma=Soma.from_sphere(nodes[0], radii["median"][0], verts=None),
+        nodes=nodes,
+        radii=radii,
+        edges=edges,
+        ntype=np.array([1, 3, 3], np.int8),
+    )
+
+    s = post.detect_soma(
+        skel,
+        radius_key="median",
+        soma_radius_percentile_threshold=90.0,
+        soma_radius_distance_factor=4.0,
+        soma_min_nodes=1,
+        verbose=False,
+        mesh_vertices=None,
+    )
+
+    assert np.allclose(s.nodes[0], nodes[1])  # new soma promoted
+    assert s.ntype[0] == 1
+    assert int(np.sum(s.ntype == 1)) == 1

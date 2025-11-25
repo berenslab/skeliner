@@ -100,6 +100,11 @@ def _remap_ntype(
             mapped[new_idx] = ntype[old_idx]
     if new_len:
         mapped[0] = 1
+        # keep soma label unique (some remaps move old node 0 away from index 0)
+        dupes = (mapped == 1)
+        dupes[0] = False
+        if np.any(dupes):
+            mapped[dupes] = 3
     return mapped
 
 
@@ -708,6 +713,10 @@ def reroot(
 
     if set_soma_ntype and ntype is not None:
         ntype[0] = 1
+        if len(ntype) > 1:
+            dupes = (ntype == 1)
+            dupes[0] = False
+            ntype[dupes] = 3
 
     new_skel = Skeleton(
         soma=new_soma,
