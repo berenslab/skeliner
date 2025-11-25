@@ -40,6 +40,7 @@ __skeleton__ = [
     # reroot / redetect soma
     "reroot",
     "detect_soma",
+    "calibrate_radii",
 ]
 
 
@@ -1405,19 +1406,19 @@ def filter_inner_surfaces_raycast(mesh, num_rays=20, thresh=0.2, sample=True):
 
 
 def calibrate_radii(
-        skel : Skeleton,
-        mesh: trimesh.Trimesh,
-        *,
-        radius_metric: str | None = None,
-        aggregate: str = "median",
-        min_n_outer : int = 20,
-        min_frac_outer : float = 0.33,
-        min_verts_q_outer : float = 80.,
-        rays_num_outer : int = 30,
-        rays_thresh_outer : float = 0.2,
-        rays_sample : bool = False,
-        store_key: str = "calibrated",
-        verbose: bool = True,
+    skel : Skeleton,
+    mesh: trimesh.Trimesh,
+    *,
+    radius_metric: str | None = None,
+    aggregate: str = "trim",
+    min_n_outer : int = 20,
+    min_frac_outer : float = 0.33,
+    min_verts_q_outer : float = 80.,
+    rays_num_outer : int = 30,
+    rays_thresh_outer : float = 0.2,
+    rays_sample : bool = False,
+    store_key: str = "calibrated",
+    verbose: bool = False,
 ) -> None:
     """
     Refine per‑node radii by measuring distances from mesh vertices to the
@@ -1480,11 +1481,19 @@ def calibrate_radii(
 
     n_verts = np.array([len(i) for i in skel.node2verts])
     min_n_verts_bulb = int(np.percentile(n_verts, q=min_verts_q_outer))
-    if verbose:
-        print(f"[skeliner] calibrate_radii: {min_n_verts_bulb=}={np.mean(n_verts > min_n_verts_bulb):.0%}")
 
-    for i in tqdm(range(n_total), total=n_total):
-        if i == 0 and skel.soma is not None:  # Ignore soma
+    log_steps = (np.array([0, 0.01, 0.05, 0.1, 0.25, 0.5, 1.]) * n_total).astype(int)
+    log_steps[-1] = n_total - 1
+
+    with _post_stage("calibrate_radii", verbose=verbose) as log:
+        log(f"Check for inner meshes in all nodes with min_n_verts_bulb>={min_n_verts_bulb};")
+        log(f"This is {np.mean(n_verts > min_n_verts_bulb):.0%} of all nodes")
+
+    for i in range(n_total):
+        if i in log_steps:
+            _post_stage(f"calibrate_radii - {i/n_total:.0%} calibrated", verbose=verbose)
+
+        if skel.ntype[i] == 1 and skel.soma is not None:  # Ignore soma
             continue
 
         vids = (np.asarray(skel.node2verts[i], dtype=np.int64)
@@ -1526,8 +1535,7 @@ def calibrate_radii(
                 r_new[i] = r_new_i
                 r_kind[i] = 'full_centerline'
 
-        skel.radii[store_key] = r_new
-
+    skel.radii[store_key] = r_new
     n_fallback = int(np.sum(r_kind == 'fallback'))
     n_full_centerline = int(np.sum(r_kind == 'full_centerline'))
     n_outer_centerline = int(np.sum(r_kind == 'outer_centerline'))
@@ -1545,12 +1553,9 @@ def calibrate_radii(
         "nodes_outer_centerline": n_outer_centerline,
     }
 
-    if verbose:
-        print(
-            f"[skeliner] calibrate_radii – N={n_total}, "
-            f"n_fallback={n_fallback}={n_fallback / n_total:.0%}, "
-            f"n_full_centerline={n_full_centerline}={n_full_centerline / n_total:.0%}, "
-            f"n_outer_centerline={n_outer_centerline}={n_outer_centerline / n_total:.0%}; "
-            f"store='{store_key}', base='{radius_metric}'"
-
-        )
+    with _post_stage("calibrate_radii summary", verbose=verbose) as log:
+        log(f"n_total={n_total}")
+        log(f"n_fallback={n_fallback}={n_fallback / n_total:.0%}, ")
+        log(f"n_full_centerline={n_full_centerline}={n_full_centerline / n_total:.0%}, ")
+        log(f"n_outer_centerline={n_outer_centerline}={n_outer_centerline / n_total:.0%}; ")
+        log(f"store='{store_key}', base='{radius_metric}'")

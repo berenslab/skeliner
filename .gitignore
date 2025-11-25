@@ -38,3 +38,5 @@ dev/
 *draft*
 
 .python-version
+
+*.obj
