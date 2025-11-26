@@ -834,6 +834,8 @@ def reroot(
             dupes = (ntype == 1) | (ntype == -1)
             dupes[0] = False
             ntype[dupes] = 0  # Default to unknown
+        ntype = _fill_ntype_gaps(ntype, edges)
+        ntype = _ensure_root_label(ntype, ntype[0])
 
     new_skel = Skeleton(
         soma=new_soma,
