@@ -798,11 +798,14 @@ def skeletonize(
                 f"({soma_ms:.2f} + {core_ms:.2f})"
             )
 
+    ntype = np.zeros(len(nodes_arr), np.int8)
+    ntype[0] = 1 if has_soma else -1
+
     return Skeleton(
         nodes=nodes_arr,
         radii=radii_dict,
         edges=edges_mst,
-        ntype=None,
+        ntype=ntype,
         soma=soma,
         node2verts=node2verts,
         vert2node=vert2node,
