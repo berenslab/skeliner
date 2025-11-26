@@ -253,7 +253,7 @@ def _palette_from_base(base_cmap_like) -> np.ndarray:
         else base(np.linspace(0, 1, 8))
     )
     swc = np.empty((8, 4), float)
-    for t in range(8):
+    for t in range(-1, 7):
         swc[t] = rows[_DEFAULT_IDX_BY_TYPE[t]]
     return swc
 
