@@ -4,6 +4,7 @@ Core pipeline smoke-test.
 Runs `skeletonize()` on the reference mesh and checks a handful of
 topological / numerical invariants so that regressions blow up early.
 """
+
 from pathlib import Path
 
 import numpy as np
@@ -30,7 +31,7 @@ def _assert_skeleton_valid(skel):
     assert skel.edges.shape[0] == skel.nodes.shape[0] - n_components
 
     # ----- soma is node 0 ----------------------------------------------
-    assert skel.ntype[0] == 1, "node 0 not marked as soma"
+    assert skel.ntype[0] == -1, "node 0 not marked as soma"
 
 
 @pytest.fixture(scope="session")

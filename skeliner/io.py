@@ -178,7 +178,7 @@ def to_swc(
 ) -> None:
     """Write the skeleton to SWC.
 
-    The first node (index 0) is written as type 1 (soma) and acts as the
+    The first node (index 0) is written as type -1 if ntype is None and acts as the
     root of the morphology tree. Parent IDs are therefore 1‑based to
     comply with the SWC format.
 
@@ -309,7 +309,9 @@ def load_npz(path: str | Path) -> Skeleton:
         if "neighbors_idx" in z.files and "neighbors_off" in z.files:
             idx = z["neighbors_idx"].astype(np.int64)
             off = z["neighbors_off"].astype(np.int64)
-            node_neighbors = tuple(idx[off[i] : off[i + 1]] for i in range(len(off) - 1))
+            node_neighbors = tuple(
+                idx[off[i] : off[i + 1]] for i in range(len(off) - 1)
+            )
 
     skel = Skeleton(
         nodes=nodes,
@@ -327,7 +329,6 @@ def load_npz(path: str | Path) -> Skeleton:
     if node_neighbors is not None:
         skel._node_neighbors = node_neighbors
     return skel
-
 
 
 def to_npz(

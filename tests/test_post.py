@@ -72,7 +72,7 @@ def test_set_ntype_on_subtree(template_skel):
     post.set_ntype(skel, root=base, code=4, subtree=False)
 
     assert skel.ntype[base] == 4
-    assert skel.ntype[0] == 1
+    assert skel.ntype[0] == -1
     changed = np.where(skel.ntype == 4)[0]
     assert set(changed) == {base}
 
