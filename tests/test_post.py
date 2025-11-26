@@ -77,6 +77,70 @@ def test_set_ntype_on_subtree(template_skel):
     assert set(changed) == {base}
 
 
+def test_remap_ntype_prefers_labels_over_unknown():
+    ntype = np.array([-1, 3, 0, 0], np.int8)
+    old2new = np.array([0, 1, 1, 1], np.int64)
+    mapped = post._remap_ntype(ntype, old2new, 2)
+    assert mapped.tolist() == [-1, 3]
+
+
+def test_remap_ntype_resolves_conflicts_with_priority():
+    ntype = np.array([-1, 4, 3, 3], np.int8)
+    old2new = np.array([0, 1, 1, 1], np.int64)
+    mapped = post._remap_ntype(ntype, old2new, 2)
+    assert mapped[0] == -1
+    assert mapped[1] == 3  # majority wins (4 vs two 3s)
+
+
+def test_downsample_preserves_branch_labels():
+    nodes = np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0]], float)
+    edges = np.array([[0, 1], [1, 2], [2, 3]], np.int64)
+    radii = {"median": np.array([1.0, 1.0, 1.0, 1.0])}
+    ntype = np.array([-1, 2, 0, 0], np.int8)
+    skel = Skeleton(
+        soma=Soma.from_sphere(nodes[0], 1.0, verts=None),
+        nodes=nodes,
+        radii=radii,
+        edges=edges,
+        ntype=ntype,
+    )
+    ds = post.downsample(
+        skel,
+        merge_endpoints=True,
+        slide_branchpoints=True,
+        verbose=False,
+    )
+    assert len(ds.nodes) < len(nodes)
+    assert ds.ntype[0] == -1
+    assert 2 in ds.ntype
+
+
+def test_detect_soma_demoted_root_keeps_neurite_label():
+    nodes = np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]], float)
+    edges = np.array([[0, 1], [1, 2]], np.int64)
+    # Make node 2 obviously the soma by radius
+    radii = {"median": np.array([1.0, 1.0, 5.0])}
+    ntype = np.array([-1, 4, 4], np.int8)
+    skel = Skeleton(
+        soma=Soma.from_sphere(nodes[0], 1.0, verts=None),
+        nodes=nodes,
+        radii=radii,
+        edges=edges,
+        ntype=ntype,
+    )
+    res = post.detect_soma(
+        skel,
+        radius_key="median",
+        soma_radius_percentile_threshold=50.0,
+        soma_radius_distance_factor=1.0,
+        soma_min_nodes=1,
+        verbose=False,
+    )
+    assert res.ntype[0] == 1  # new soma
+    # old root (now index 1) should keep its neurite label instead of 0
+    assert res.ntype[1] == 4
+
+
 def test_reroot_updates_soma_and_ntype():
     nodes = np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]], float)
     edges = np.array([[0, 1], [1, 2]], np.int64)
