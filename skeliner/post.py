@@ -94,17 +94,18 @@ def _remap_ntype(
 ) -> np.ndarray | None:
     if ntype is None:
         return None
-    mapped = np.full(new_len, 3, dtype=ntype.dtype)
+    mapped = np.full(new_len, 0, dtype=ntype.dtype)
     for old_idx, new_idx in enumerate(old2new):
         if new_idx >= 0:
             mapped[new_idx] = ntype[old_idx]
-    if new_len:
-        mapped[0] = 1
-        # keep soma label unique (some remaps move old node 0 away from index 0)
-        dupes = (mapped == 1)
+    if new_len > 0:
+        mapped[0] = -1 if not (ntype[0] in [-1, 1]) else ntype[0] # keep root/soma label
+
+        # unique (some remaps move old node 0 away from index 0)
+        dupes = (mapped == 1) | (mapped == -1)
         dupes[0] = False
         if np.any(dupes):
-            mapped[dupes] = 3
+            mapped[dupes] = 0
     return mapped
 
 
@@ -504,12 +505,14 @@ def _rebuild_drop_set(skel, drop: Iterable[int]):
         node2verts=skel.node2verts,
         vert2node=skel.vert2node,
     )
-    new_state, _ = compact_state(state, keep_mask)
+    # request remapping to keep auxiliary arrays (including ntype) consistent
+    new_state, old2new = compact_state(state, keep_mask, return_old2new=True)
     skel.nodes = new_state.nodes
     skel.radii = new_state.radii
     skel.edges = new_state.edges
     skel.node2verts = new_state.node2verts
     skel.vert2node = new_state.vert2node
+    skel.ntype = _remap_ntype(skel.ntype, old2new, len(new_state.nodes))
 
 
 def _rebuild_keep_subset(skel, keep_set: Set[int]):
@@ -642,7 +645,7 @@ def reroot(
     mode: str = "min",
     prefer_leaves: bool = True,
     radius_key: str = "median",
-    set_soma_ntype: bool = True,
+    set_soma_ntype: bool = False,
     rebuild_mst: bool = False,
     verbose: bool = True,
 ):
@@ -711,12 +714,12 @@ def reroot(
         else None,
     )
 
-    if set_soma_ntype and ntype is not None:
-        ntype[0] = 1
-        if len(ntype) > 1:
-            dupes = (ntype == 1)
+    if ntype is not None:
+        ntype[0] = 1 if set_soma_ntype else -1
+        if len(ntype) > 1:  # remove all other somas and roots
+            dupes = (ntype == 1) | (ntype == -1)
             dupes[0] = False
-            ntype[dupes] = 3
+            ntype[dupes] = 0  # Default to unknown
 
     new_skel = Skeleton(
         soma=new_soma,
@@ -846,6 +849,7 @@ def detect_soma(
 
     edges = remap_edges(state.edges, old2new)
     ntype_new = _remap_ntype(skel.ntype, old2new, len(nodes))
+    ntype_new[0] = 1  # set to "soma"
 
     node2verts_ret = node2verts if has_node2verts else None
     vert2node_ret = vert2node if has_vert2node else None
@@ -868,7 +872,7 @@ def detect_soma(
 # -----------------------------------------------------------------------------
 
 
-def _mode_int(vals: np.ndarray, default: int = 3) -> int:
+def _mode_int(vals: np.ndarray, default: int = 0) -> int:
     """Fast integer mode with a sane default when empty."""
     vals = np.asarray(vals, dtype=np.int64)
     if vals.size == 0:
@@ -969,7 +973,7 @@ def downsample(
     nodes = skel.nodes
     radiiD = skel.radii
     r_dec = radiiD[radius_key]
-    ntype0 = skel.ntype if skel.ntype is not None else np.full(N, 3, dtype=np.int8)
+    ntype0 = skel.ntype if skel.ntype is not None else np.full(N, 0, dtype=np.int8)
 
     has_node2verts = skel.node2verts is not None and len(skel.node2verts) > 0
     has_vert2node = skel.vert2node is not None and len(skel.vert2node) > 0
@@ -1041,7 +1045,7 @@ def downsample(
             val = _compute_aggregate(vals, aggregate)
             new_radii[k].append(val)
 
-        new_ntype.append(_mode_int(ntype0[gids], default=3))
+        new_ntype.append(_mode_int(ntype0[gids], default=0))
 
         if new_node2verts is not None:
             if node2verts0 is None:

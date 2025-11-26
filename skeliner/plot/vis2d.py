@@ -211,6 +211,7 @@ def _resample_n(cmap: mcolors.Colormap, n: int) -> mcolors.Colormap:
 
 
 _SWC_ALIASES = {
+    "root": -1,
     "undefined": 0,
     "undef": 0,
     "unknown": 0,
@@ -228,14 +229,14 @@ _SWC_ALIASES = {
 }
 
 # Keep stable aesthetic order (your previous mapping of SWC→index)
-_DEFAULT_IDX_BY_TYPE = {0: 6, 1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5}
+_DEFAULT_IDX_BY_TYPE = {-1: 7, 0: 6, 1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5}
 
 
 def _key_to_swc_typecode(key: int | str) -> int:
     if isinstance(key, int):
-        if 0 <= key <= 6:
+        if -1 <= key <= 6:
             return key
-        raise ValueError("SWC type code must be in 0..6")
+        raise ValueError("SWC type code must be in -1..6")
     k = key.strip().lower()
     if k not in _SWC_ALIASES:
         valid = ", ".join(sorted(set(_SWC_ALIASES)))
@@ -244,15 +245,15 @@ def _key_to_swc_typecode(key: int | str) -> int:
 
 
 def _palette_from_base(base_cmap_like) -> np.ndarray:
-    """Return (7,4) RGBA palette ordered by SWC 0..6 from a base colormap."""
-    base = _resample_n(_as_cmap(base_cmap_like), 7)
+    """Return (7,4) RGBA palette ordered by SWC -1..6 from a base colormap."""
+    base = _resample_n(_as_cmap(base_cmap_like), 8)
     rows = (
         np.asarray(base.colors)
         if hasattr(base, "colors")
-        else base(np.linspace(0, 1, 7))
+        else base(np.linspace(0, 1, 8))
     )
-    swc = np.empty((7, 4), float)
-    for t in range(7):
+    swc = np.empty((8, 4), float)
+    for t in range(8):
         swc[t] = rows[_DEFAULT_IDX_BY_TYPE[t]]
     return swc
 
@@ -260,9 +261,9 @@ def _palette_from_base(base_cmap_like) -> np.ndarray:
 def _resolve_swc_palette_from_skel_cmap(skel_cmap) -> np.ndarray:
     """
     Accepts:
-      - str / Colormap / sequence → derive 7-color palette
+      - str / Colormap / sequence → derive 8-color palette
       - dict {name|code: color, ...} with optional '__base__'
-    Returns (7,4) RGBA array indexed by SWC code 0..6.
+    Returns (8,4) RGBA array indexed by SWC code -1..6.
     """
     overrides: dict[int, str | tuple | list] = {}
     if isinstance(skel_cmap, Mapping):

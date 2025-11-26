@@ -292,16 +292,16 @@ class Skeleton:
 
         # ---- ntype ---------------------------------------------------
         if self.ntype is None:
-            # create default label vector: soma=1, rest=dendrite (3)
-            ntype = np.full(N, 3, dtype=np.int8)
+            # create default label vector: root=-1, rest=unknown (0)
+            ntype = np.full(N, 0, dtype=np.int8)
             if N:
-                ntype[0] = 1
+                ntype[0] = -1
                 self.ntype = ntype
         else:
             self.ntype = np.asanyarray(self.ntype, dtype=np.int8).reshape(-1)
             if len(self.ntype) != N:
                 raise ValueError("ntype length must match number of nodes")
-            self.ntype[0] = 1  # always enforce soma label
+            self.ntype[0] = -1 if not (self.ntype[0] in [-1, 1]) else self.ntype[0]  # root must be "root" or "soma"
 
         if self.soma is not None:
             if self.soma.verts is not None and self.soma.verts.ndim != 1:
