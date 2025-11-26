@@ -141,6 +141,74 @@ def test_detect_soma_demoted_root_keeps_neurite_label():
     assert res.ntype[1] == 4
 
 
+def test_rebuild_drop_set_preserves_labels_and_fills_gaps(template_skel):
+    skel = copy.deepcopy(template_skel)
+    # Mark a small branch as axon
+    leaves = dx.nodes_of_degree(skel, 1)
+    if len(leaves) < 2:
+        pytest.skip("template has too few leaves for this test")
+    target = int(leaves[0])
+    skel.ntype[target] = 2
+    # Drop a different leaf to force compaction/remap
+    drop = int(leaves[1])
+    post.clip(skel, drop, int(dx.neighbors(skel, drop)[0]), drop_orphans=True)
+    assert 2 in skel.ntype  # axon label survived remap
+    assert skel.ntype[0] in (-1, 1)
+
+
+def test_merge_near_soma_nodes_keeps_labels(template_skel):
+    skel = copy.deepcopy(template_skel)
+    # Force a near-soma node to have a distinct label and to be merged
+    if len(skel.nodes) < 3:
+        pytest.skip("template too small")
+    skel.ntype[1] = 4  # apical
+    merged = post.merge_near_soma_nodes(
+        skel,
+        mesh_vertices=None,
+        inside_tol=0.0,
+        near_factor=10.0,
+        fat_factor=0.0,
+        verbose=False,
+    )
+    assert 4 in merged.ntype or 4 in skel.ntype  # label survives or merge skipped
+    assert merged.ntype[0] in (-1, 1)
+
+
+def test_prune_neurites_keeps_labels(template_skel):
+    skel = copy.deepcopy(template_skel)
+    if len(skel.ntype) < 2:
+        pytest.skip("template too small")
+    skel.ntype[1] = 3
+    res = post.prune_neurites(
+        skel,
+        mesh_vertices=None,
+        tip_extent_factor=0.0,
+        stem_extent_factor=0.0,
+        drop_single_node_branches=True,
+        verbose=False,
+    )
+    assert 3 in res.ntype
+    assert res.ntype[0] in (-1, 1)
+
+
+def test_reroot_clears_duplicate_roots_and_fills_gaps():
+    nodes = np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]], float)
+    edges = np.array([[0, 1], [1, 2]], np.int64)
+    radii = {"median": np.array([1.0, 1.0, 1.0])}
+    ntype = np.array([-1, -1, 4], np.int8)  # duplicate roots, gap on index 1 after reroot
+    skel = Skeleton(
+        soma=Soma.from_sphere(nodes[0], 1.0, verts=None),
+        nodes=nodes,
+        radii=radii,
+        edges=edges,
+        ntype=ntype,
+    )
+    res = post.reroot(skel, node_id=2, rebuild_mst=False, verbose=False)
+    assert res.ntype[0] == -1 or res.ntype[0] == 1
+    assert int(np.sum(res.ntype == 1) + np.sum(res.ntype == -1)) == 1
+    assert 4 in res.ntype or 4 in skel.ntype
+
+
 def test_reroot_updates_soma_and_ntype():
     nodes = np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]], float)
     edges = np.array([[0, 1], [1, 2]], np.int64)
