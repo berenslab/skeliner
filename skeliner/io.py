@@ -178,7 +178,7 @@ def to_swc(
 ) -> None:
     """Write the skeleton to SWC.
 
-    The first node (index 0) is written as type 1 (soma) and acts as the
+    The first node (index 0) is written as type -1 if ntype is None and acts as the
     root of the morphology tree. Parent IDs are therefore 1‑based to
     comply with the SWC format.
 
@@ -225,9 +225,9 @@ def to_swc(
     if skeleton.ntype is not None:
         ntype = skeleton.ntype.astype(int, copy=False)
     else:
-        ntype = np.full(len(nodes), 3, dtype=int)
+        ntype = np.full(len(nodes), 0, dtype=int)  # default to "unknown"
         if len(ntype):
-            ntype[0] = 1
+            ntype[0] = -1  # default to "root"
 
     # --- write SWC file -----------------------------------------------
     with path.open("w", encoding="utf8") as fh:
@@ -242,7 +242,7 @@ def to_swc(
             zip(nodes[:, axis_order] * scale, radii * scale, parent, ntype), start=1
         ):
             fh.write(
-                f"{idx} {int(t if idx != 1 else 1)} "  # ensure soma has type 1
+                f"{idx} {int(-1 if ((idx == 1) and not (t in [-1, 1])) else t)} "  # ensure soma has type -1 or +1
                 f"{coord[0]} {coord[1]} {coord[2]} {r} "
                 f"{(pa + 1) if pa != -1 else -1}\n"
             )
@@ -270,9 +270,9 @@ def load_npz(path: str | Path) -> Skeleton:
         if "ntype" in z:
             ntype = z["ntype"].astype(np.int8)
         else:
-            ntype = np.full(len(nodes), 3, dtype=np.int8)
+            ntype = np.full(len(nodes), 0, dtype=np.int8)  # default to "unknown"
             if len(ntype):
-                ntype[0] = 1
+                ntype[0] = -1  # default to "root"
 
         # reconstruct ragged node2verts
         idx = z["node2verts_idx"].astype(np.int64)
@@ -309,7 +309,9 @@ def load_npz(path: str | Path) -> Skeleton:
         if "neighbors_idx" in z.files and "neighbors_off" in z.files:
             idx = z["neighbors_idx"].astype(np.int64)
             off = z["neighbors_off"].astype(np.int64)
-            node_neighbors = tuple(idx[off[i] : off[i + 1]] for i in range(len(off) - 1))
+            node_neighbors = tuple(
+                idx[off[i] : off[i + 1]] for i in range(len(off) - 1)
+            )
 
     skel = Skeleton(
         nodes=nodes,
@@ -327,7 +329,6 @@ def load_npz(path: str | Path) -> Skeleton:
     if node_neighbors is not None:
         skel._node_neighbors = node_neighbors
     return skel
-
 
 
 def to_npz(

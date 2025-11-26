@@ -91,22 +91,123 @@ def _refresh_igraph(skel) -> ig.Graph:  # type: ignore[valid-type]
     )
 
 
+_NTYPE_PRIORITY = (1, -1, 2, 3, 4, 5, 6, 0)
+
+
+def _build_adjacency(n: int, edges: np.ndarray) -> list[list[int]]:
+    adj = [[] for _ in range(n)]
+    if edges.size == 0:
+        return adj
+    for a, b in edges:
+        a = int(a)
+        b = int(b)
+        if a == b:
+            continue
+        adj[a].append(b)
+        adj[b].append(a)
+    return adj
+
+
+def _fill_ntype_gaps(ntype: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    """
+    Fill zero-labeled gaps by propagating neighboring non-zero (non-root/soma) labels.
+    Iterative majority voting; ties keep the gap.
+    """
+    if ntype is None or ntype.size == 0 or edges is None or edges.size == 0:
+        return ntype
+    filled = ntype.copy()
+    adj = _build_adjacency(len(filled), edges)
+    for _ in range(len(filled)):
+        changed = False
+        zeros = np.where(filled == 0)[0]
+        if not len(zeros):
+            break
+        for z in zeros:
+            nbr = adj[z]
+            if not nbr:
+                continue
+            lbls = filled[nbr]
+            nz = lbls[(lbls != 0) & (lbls != -1) & (lbls != 1)]
+            if nz.size == 0:
+                continue
+            candidate = _mode_int(nz, default=0)
+            if candidate != 0:
+                filled[z] = candidate
+                changed = True
+        if not changed:
+            break
+    return filled
+
+
+def _derive_root_label(ntype: np.ndarray) -> int:
+    val0 = int(ntype[0]) if len(ntype) else -1
+    if val0 == 1:
+        return 1
+    if val0 == -1:
+        return -1
+    return -1
+
+
+def _choose_label(labels: list[int]) -> int:
+    """
+    Aggregate labels for a merged node.
+
+    Non-zero labels are preferred over zeros. Ties are broken by `_NTYPE_PRIORITY`.
+    """
+    if not labels:
+        return 0
+    vals = np.asarray(labels, dtype=int)
+    nonzero = vals[vals != 0]
+    use = nonzero if nonzero.size else vals
+    uniq, counts = np.unique(use, return_counts=True)
+    max_count = counts.max()
+    candidates = {int(u) for u, c in zip(uniq, counts) if c == max_count}
+    for p in _NTYPE_PRIORITY:
+        if p in candidates:
+            return p
+    return int(next(iter(candidates)))
+
+
+def _ensure_root_label(arr: np.ndarray, root_label: int) -> np.ndarray:
+    if arr.size == 0:
+        return arr
+    lbl = 1 if root_label == 1 else -1
+    arr[0] = lbl
+    dupes = (arr == 1) | (arr == -1)
+    dupes[0] = False
+    if np.any(dupes):
+        arr[dupes] = 0
+    return arr
+
+
 def _remap_ntype(
-    ntype: np.ndarray | None, old2new: np.ndarray, new_len: int
+    ntype: np.ndarray | None,
+    old2new: np.ndarray,
+    new_len: int,
+    *,
+    root_hint: int | None = None,
+    edges: np.ndarray | None = None,
+    fill_gaps: bool = True,
 ) -> np.ndarray | None:
     if ntype is None:
         return None
-    mapped = np.full(new_len, 3, dtype=ntype.dtype)
+
+    buckets: list[list[int]] = [[] for _ in range(new_len)]
     for old_idx, new_idx in enumerate(old2new):
         if new_idx >= 0:
-            mapped[new_idx] = ntype[old_idx]
-    if new_len:
-        mapped[0] = 1
-        # keep soma label unique (some remaps move old node 0 away from index 0)
-        dupes = (mapped == 1)
-        dupes[0] = False
-        if np.any(dupes):
-            mapped[dupes] = 3
+            buckets[int(new_idx)].append(int(ntype[old_idx]))
+
+    mapped = np.empty(new_len, dtype=ntype.dtype)
+    for idx, vals in enumerate(buckets):
+        mapped[idx] = _choose_label(vals)
+
+    root_label = int(root_hint) if root_hint in (-1, 1) else _derive_root_label(ntype)
+    mapped = _ensure_root_label(mapped, root_label)
+    if fill_gaps:
+        mapped = _fill_ntype_gaps(
+            mapped, edges if edges is not None else np.empty((0, 2), dtype=np.int64)
+        )
+        mapped = _ensure_root_label(mapped, root_label)
     return mapped
 
 
@@ -367,7 +468,13 @@ def merge_near_soma_nodes(
             log=log,
         )
 
-    ntype_new = _remap_ntype(skel.ntype, old2new, len(nodes_new))
+    ntype_new = _remap_ntype(
+        skel.ntype,
+        old2new,
+        len(nodes_new),
+        edges=edges_new,
+        fill_gaps=True,
+    )
 
     return Skeleton(
         soma=soma_new,
@@ -439,7 +546,13 @@ def prune_neurites(
             log=log,
         )
 
-    ntype_new = _remap_ntype(skel.ntype, old2new, len(nodes_new))
+    ntype_new = _remap_ntype(
+        skel.ntype,
+        old2new,
+        len(nodes_new),
+        edges=edges_new,
+        fill_gaps=True,
+    )
 
     return Skeleton(
         soma=soma_new,
@@ -506,12 +619,16 @@ def _rebuild_drop_set(skel, drop: Iterable[int]):
         node2verts=skel.node2verts,
         vert2node=skel.vert2node,
     )
-    new_state, _ = compact_state(state, keep_mask)
+    # request remapping to keep auxiliary arrays (including ntype) consistent
+    new_state, old2new = compact_state(state, keep_mask, return_old2new=True)
     skel.nodes = new_state.nodes
     skel.radii = new_state.radii
     skel.edges = new_state.edges
     skel.node2verts = new_state.node2verts
     skel.vert2node = new_state.vert2node
+    skel.ntype = _remap_ntype(
+        skel.ntype, old2new, len(new_state.nodes), edges=new_state.edges, fill_gaps=True
+    )
 
 
 def _rebuild_keep_subset(skel, keep_set: Set[int]):
@@ -644,7 +761,7 @@ def reroot(
     mode: str = "min",
     prefer_leaves: bool = True,
     radius_key: str = "median",
-    set_soma_ntype: bool = True,
+    set_soma_ntype: bool = False,
     rebuild_mst: bool = False,
     verbose: bool = True,
 ):
@@ -713,12 +830,14 @@ def reroot(
         else None,
     )
 
-    if set_soma_ntype and ntype is not None:
-        ntype[0] = 1
-        if len(ntype) > 1:
-            dupes = (ntype == 1)
+    if ntype is not None:
+        ntype[0] = 1 if set_soma_ntype else -1
+        if len(ntype) > 1:  # remove all other somas and roots
+            dupes = (ntype == 1) | (ntype == -1)
             dupes[0] = False
-            ntype[dupes] = 3
+            ntype[dupes] = 0  # Default to unknown
+        ntype = _fill_ntype_gaps(ntype, edges)
+        ntype = _ensure_root_label(ntype, ntype[0])
 
     new_skel = Skeleton(
         soma=new_soma,
@@ -847,7 +966,14 @@ def detect_soma(
             return skel
 
     edges = remap_edges(state.edges, old2new)
-    ntype_new = _remap_ntype(skel.ntype, old2new, len(nodes))
+    ntype_new = _remap_ntype(
+        skel.ntype,
+        old2new,
+        len(nodes),
+        root_hint=1,
+        edges=edges,
+        fill_gaps=True,
+    )
 
     node2verts_ret = node2verts if has_node2verts else None
     vert2node_ret = vert2node if has_vert2node else None
@@ -870,7 +996,7 @@ def detect_soma(
 # -----------------------------------------------------------------------------
 
 
-def _mode_int(vals: np.ndarray, default: int = 3) -> int:
+def _mode_int(vals: np.ndarray, default: int = 0) -> int:
     """Fast integer mode with a sane default when empty."""
     vals = np.asarray(vals, dtype=np.int64)
     if vals.size == 0:
@@ -971,7 +1097,8 @@ def downsample(
     nodes = skel.nodes
     radiiD = skel.radii
     r_dec = radiiD[radius_key]
-    ntype0 = skel.ntype if skel.ntype is not None else np.full(N, 3, dtype=np.int8)
+    ntype0 = skel.ntype if skel.ntype is not None else np.full(N, 0, dtype=np.int8)
+    root_label = _derive_root_label(ntype0)
 
     has_node2verts = skel.node2verts is not None and len(skel.node2verts) > 0
     has_vert2node = skel.vert2node is not None and len(skel.vert2node) > 0
@@ -996,7 +1123,6 @@ def downsample(
 
     new_nodes: list[np.ndarray] = []
     new_radii: dict[str, list[float]] = {k: [] for k in radiiD.keys()}
-    new_ntype: list[int] = []
     new_node2verts: list[np.ndarray] | None = [] if has_node2verts else None
     new_edges: list[tuple[int, int]] = []
     old2new: dict[int, int] = {}
@@ -1009,7 +1135,6 @@ def downsample(
         new_nodes.append(nodes[oid].astype(np.float64))
         for k in new_radii:
             new_radii[k].append(float(radiiD[k][oid]))
-        new_ntype.append(int(ntype0[oid]))
         if new_node2verts is not None:
             arr = (
                 node2verts0[oid]
@@ -1042,8 +1167,6 @@ def downsample(
             vals = radiiD[k][gids]
             val = _compute_aggregate(vals, aggregate)
             new_radii[k].append(val)
-
-        new_ntype.append(_mode_int(ntype0[gids], default=3))
 
         if new_node2verts is not None:
             if node2verts0 is None:
@@ -1202,7 +1325,11 @@ def downsample(
 
     nodes_new = np.asarray(new_nodes, dtype=np.float64)
     radii_new = {k: np.asarray(v, dtype=np.float64) for k, v in new_radii.items()}
-    ntype_new = np.asarray(new_ntype, dtype=np.int8)
+
+    old2new_arr = -np.ones(N, dtype=np.int64)
+    for old_idx, new_idx in old2new.items():
+        old2new_arr[int(old_idx)] = int(new_idx)
+    ntype_new = _remap_ntype(ntype0, old2new_arr, len(nodes_new), root_hint=root_label)
 
     edges_arr = np.asarray(new_edges, dtype=np.int64)
     edges_arr = (
@@ -1236,7 +1363,8 @@ def downsample(
         radii_new = state.radii
         new_node2verts = state.node2verts
         vert2node_new = state.vert2node
-        ntype_new[[0, new_root]] = ntype_new[[new_root, 0]]
+        if ntype_new is not None:
+            ntype_new[[0, new_root]] = ntype_new[[new_root, 0]]
         perm = np.arange(len(nodes_new), dtype=np.int64)
         perm[[0, new_root]] = perm[[new_root, 0]]
         edges_arr = perm[edges_arr]  # apply to both columns at once
@@ -1244,6 +1372,8 @@ def downsample(
         edges_arr = np.sort(edges_arr, axis=1)
         edges_arr = edges_arr[edges_arr[:, 0] != edges_arr[:, 1]]  # drop self-loops
         edges_arr = np.unique(edges_arr, axis=0)
+    if ntype_new is not None:
+        ntype_new = _ensure_root_label(ntype_new, root_label)
 
     g_check = ig.Graph(
         n=len(nodes_new), edges=[tuple(map(int, e)) for e in edges_arr], directed=False
@@ -1251,6 +1381,10 @@ def downsample(
     if g_check.ecount() != g_check.vcount() - len(g_check.components()):
         # make it a spanning forest over your candidate edges (acyclic by construction)
         edges_arr = _build_mst(nodes_new, edges_arr)  # same helper you already import
+
+    if ntype_new is not None:
+        ntype_new = _fill_ntype_gaps(ntype_new, edges_arr)
+        ntype_new = _ensure_root_label(ntype_new, root_label)
 
     new_skel = Skeleton(
         soma=skel.soma,
