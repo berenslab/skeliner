@@ -1,7 +1,6 @@
 import numpy as np
 
-from skeliner import post
-from skeliner.core import Skeleton
+from skeliner import post, Skeleton
 
 
 def make_simple_skeleton(n_nodes=3):
