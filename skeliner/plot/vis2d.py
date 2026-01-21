@@ -291,8 +291,10 @@ def projection(
     xlim: tuple[float, float] | None = None,
     ylim: tuple[float, float] | None = None,
     draw_skel: bool = True,
+    draw_mesh: bool = True,
     draw_edges: bool = True,
     draw_cylinders: bool = False,
+    rasterized: bool = True,
     ax: Axes | None = None,
     mesh_cmap: str
     | mcolors.Colormap
@@ -311,6 +313,7 @@ def projection(
     unit: str | None = None,
     # soma --------------------------------------------------------------- #
     draw_soma_mask: bool = True,
+    soma_style: str = "dashed",  # "dashed" | "filled"
     # colors
     color_by: str = "fixed",  # "ntype" or "fixed"
 ) -> tuple[Figure, Axes]:
@@ -335,8 +338,14 @@ def projection(
     xlim, ylim : (min, max) or *None*
         Spatial extent **before** plotting.  If not given, limits are inferred
         from the histogram (when *mesh* is available) or the skeleton.
-    draw_skel, draw_edges, draw_cylinders : bool
+    draw_skel, draw_mesh, draw_edges, draw_cylinders: bool
         Toggles for skeleton glyphs.
+    soma_style : str
+        How to plot the soma, currently supported styles are:
+        - "dashed" : dashed ellipse outline (default)
+        - "filled" : filled circle with soma colour
+    rasterized : bool | int
+        Rasterize skeleton. If int and > 1, not only skeleton will be rasterized.
     ax : matplotlib.axes.Axes | None
         Existing *Axes* to draw into.  When *None*, a new figure is created.
     mesh_cmap, vmax_fraction : appearance of the histogram – see original docs.
@@ -385,7 +394,7 @@ def projection(
     xy_skel = _project(skel.nodes, ix, iy) * scl_skel
     rr = skel.radii[radius_metric] * scl_skel
 
-    if mesh is not None:
+    if mesh is not None and draw_mesh:
         xy_mesh = _project(mesh.vertices, ix, iy) * scl_mesh
     else:  # empty placeholder for unified code‑path
         xy_mesh = np.empty((0, 2), dtype=float)
@@ -412,12 +421,12 @@ def projection(
     else:
         col_nodes = "red"
 
-    if mesh is not None and xy_mesh.size:
+    if mesh is not None and xy_mesh.size and draw_mesh:
         keep_mesh = _crop_window(xy_mesh)
         xy_mesh = xy_mesh[keep_mesh]
 
     # ─────────────────────────────── histogram (mesh may be None) ──────────
-    if mesh is not None and xy_mesh.size:
+    if mesh is not None and xy_mesh.size and draw_mesh:
         # ensure bins argument correct
         if isinstance(bins, int):
             bins_arg: int | tuple[int, int] = bins
@@ -448,7 +457,7 @@ def projection(
         fig = ax.figure
 
     # background image – only when we do have a histogram
-    if hist is not None:
+    if hist is not None and draw_mesh:
         ax.imshow(
             hist,
             extent=(xedges[0], xedges[-1], yedges[0], yedges[-1]),
@@ -456,6 +465,7 @@ def projection(
             cmap=_as_cmap(mesh_cmap),
             vmax=hist.max() * vmax_fraction,
             alpha=1.0,
+            rasterized=rasterized > 1,
         )
 
     # ──────────────────────── draw skeleton circles (always) ───────────────
@@ -483,6 +493,7 @@ def projection(
             linewidths=1.0,
             alpha=circle_alpha,
             zorder=2,
+            rasterized=rasterized > 0,
         )
 
         # highlighted nodes – filled circles
@@ -499,39 +510,50 @@ def projection(
                     linewidths=0.9,
                     alpha=highlight_face_alpha,
                     zorder=3.5,
+                    rasterized=rasterized > 1,
                 )
 
     # ───────────────────────── soma shell & center (if possible) ───────────
     c_xy = _project(skel.nodes[[0]] * scl_skel, ix, iy).ravel()
-    centre_col = swc_colors[1] if color_by == "ntype" else "k"
-    ax.scatter(*c_xy, color="black", s=15, zorder=3)
+    col_soma = swc_colors[1] if color_by == "ntype" else "pink"
+
+    if soma_style == 'filled':
+        soma_fc = col_soma
+        soma_ec = 'k'
+        soma_ls = '-'
+        soma_mc = 'none'
+    else:
+        ax.scatter(*c_xy, color="black", s=15, zorder=3)
+        soma_fc = 'none'
+        soma_ec = 'k'
+        soma_ls = '--'
+        soma_mc = col_soma
 
     if (
-        draw_soma_mask
-        and mesh is not None
+        mesh is not None
         and skel.soma is not None
         and skel.soma.verts is not None
     ):
-        xy_soma = _project(mesh.vertices[np.asarray(skel.soma.verts, int)], ix, iy)
-        xy_soma = xy_soma * scl_mesh
-        xy_soma = xy_soma[_crop_window(xy_soma)]  # respect crop
+        if draw_soma_mask:
+            xy_soma = _project(mesh.vertices[np.asarray(skel.soma.verts, int)], ix, iy)
+            xy_soma = xy_soma * scl_mesh
+            xy_soma = xy_soma[_crop_window(xy_soma)]  # respect crop
 
-        col_soma = swc_colors[1] if color_by == "ntype" else "pink"
-
-        ax.scatter(
-            xy_soma[:, 0],
-            xy_soma[:, 1],
-            s=1,
-            c=[col_soma],
-            alpha=0.5,
-            linewidths=0,
-            label="soma surface",
-        )
+            ax.scatter(
+                xy_soma[:, 0],
+                xy_soma[:, 1],
+                s=1,
+                c=[soma_mc],
+                alpha=0.5,
+                linewidths=0,
+                label="soma surface",
+                rasterized=rasterized > 0,
+            )
         # dashed ellipse outline
         ell = _soma_ellipse2d(skel.soma, plane, scale=scl_skel)
-        ell.set_edgecolor("k")
-        ell.set_facecolor("none")
-        ell.set_linestyle("--")
+        ell.set_edgecolor(soma_ec)
+        ell.set_facecolor(soma_fc)
+        ell.set_linestyle(soma_ls)
         ell.set_linewidth(0.8)
         ell.set_alpha(0.9)
         ax.add_patch(ell)
@@ -539,10 +561,10 @@ def projection(
         soma_circle = Circle(
             c_xy,
             skel.soma.equiv_radius * scl_skel,
-            facecolor="none",
-            edgecolor=centre_col,
+            facecolor=soma_fc,
+            edgecolor=soma_ec,
             linewidth=0.8,
-            linestyle="--",
+            linestyle=soma_ls,
             alpha=0.9,
         )
         ax.add_patch(soma_circle)
@@ -567,6 +589,7 @@ def projection(
                     colors="black",
                     linewidths=edge_lw,
                     alpha=cylinder_alpha,
+                    rasterized=rasterized > 0,
                 )
                 ax.add_collection(lc)
 
@@ -603,19 +626,12 @@ def projection(
                         edgecolors="red",
                         alpha=cylinder_alpha,
                         zorder=10,
+                        rasterized=rasterized > 0,
                     )
                     ax.add_collection(pc)
 
     # ────────────────────────────── final cosmetics ────────────────────────
     # ax.set_aspect("equal")
-
-    if unit is None:
-        unit_str = "" if scl_skel == 1.0 else f"(×{scl_skel:g})"
-    else:
-        unit_str = f"({unit})"
-
-    ax.set_xlabel(f"{plane[0]} {unit_str}")
-    ax.set_ylabel(f"{plane[1]} {unit_str}")
 
     # guarantee limits if user requested specific window
     if xlim is not None:
@@ -962,12 +978,6 @@ def details(
 
     # ────────────── cosmetics & labels ────────────────────────────────────
     ax.set_aspect("equal")
-    if unit is None:
-        ax.set_xlabel(f"{plane[0]}")
-        ax.set_ylabel(f"{plane[1]}")
-    else:
-        ax.set_xlabel(f"{plane[0]} ({unit})")
-        ax.set_ylabel(f"{plane[1]} ({unit})")
 
     if xlim is not None:
         ax.set_xlim(xlim)
