@@ -1637,7 +1637,7 @@ def calibrate_radii(
             continue
 
         outer_success = False
-        if n_verts[i] >= min_n_verts_bulb:
+        if n_verts[i] >= min_n_verts_bulb and min_verts_q_outer < 100.0:
             n_inner = len(vids)
             mesh_i = submesh_by_vertices(mesh, vids)
             assert len(mesh_i.vertices) == len(vids)
