@@ -631,7 +631,16 @@ def projection(
                     ax.add_collection(pc)
 
     # ────────────────────────────── final cosmetics ────────────────────────
-    # ax.set_aspect("equal")
+    if plane in ['xy', 'yx']:
+        ax.set_aspect('equal', adjustable='box')
+
+    if unit is None:
+        unit_str = "" if scl_skel == 1.0 else f"(×{scl_skel:g})"
+    else:
+        unit_str = f"({unit})"
+
+    ax.set_xlabel(f"{plane[0]} {unit_str}")
+    ax.set_ylabel(f"{plane[1]} {unit_str}")
 
     # guarantee limits if user requested specific window
     if xlim is not None:
@@ -977,7 +986,16 @@ def details(
         ax.add_patch(ell)
 
     # ────────────── cosmetics & labels ────────────────────────────────────
-    ax.set_aspect("equal")
+    if plane in ['xy', 'yx']:
+        ax.set_aspect("equal", adjustable="box")
+
+    if unit is None:
+        ax.set_xlabel(f"{plane[0]}")
+        ax.set_ylabel(f"{plane[1]}")
+    else:
+        ax.set_xlabel(f"{plane[0]} ({unit})")
+        ax.set_ylabel(f"{plane[1]} ({unit})")
+
 
     if xlim is not None:
         ax.set_xlim(xlim)
