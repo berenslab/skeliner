@@ -6,6 +6,7 @@ from typing import Iterable, Set, cast
 
 import igraph as ig
 import numpy as np
+import trimesh
 from numpy.typing import ArrayLike
 
 from . import dx
@@ -40,6 +41,7 @@ __skeleton__ = [
     # reroot / redetect soma
     "reroot",
     "detect_soma",
+    "calibrate_radii",
 ]
 
 
@@ -1404,3 +1406,291 @@ def downsample(
         )
 
     return new_skel
+
+
+def _estimate_radius(
+    d: np.ndarray,
+    *,
+    method: str = "median",
+    trim_fraction: float = 0.05,
+    q: float = 55.,
+) -> float:
+    """Return one scalar radius according to *method*."""
+    if method == "median":
+        return float(np.median(d))
+    if method == "mean":
+        return float(d.mean())
+    if method == "max":
+        return float(d.max())
+    if method == "min":
+        return float(d.min())
+    if method == "percentile":
+        return float(np.percentile(d, q=q))
+    if method == "trim":
+        lo, hi = np.quantile(d, [trim_fraction, 1.0 - trim_fraction])
+        mask = (d >= lo) & (d <= hi)
+        if not np.any(mask):
+            return float(np.mean(d))
+        return float(d[mask].mean())
+    if method == "trimlow":
+        lo = np.quantile(d, trim_fraction)
+        mask = (d >= lo)
+        if not np.any(mask):
+            return float(np.mean(d))
+        return float(d[mask].mean())
+    if method == "trimhigh":
+        hi = np.quantile(d, 1.0 - trim_fraction)
+        mask = (d <= hi)
+        if not np.any(mask):
+            return float(np.mean(d))
+        return float(d[mask].mean())
+    raise ValueError(f"Unknown radius estimator '{method}'.")
+
+
+def submesh_by_vertices(
+        mesh : trimesh.Trimesh,
+        vertex_indices : np.ndarray,
+) -> trimesh.Trimesh:
+    """
+    Reduce mesh to a subset of vertices and corresponding faces.
+    """
+    vertex_indices = np.asarray(vertex_indices, dtype=np.int64)
+    used = np.isin(mesh.faces, vertex_indices).all(axis=1)
+    faces = mesh.faces[used]
+
+    # build mapping from old → new vertex indices
+    old_to_new = -np.ones(len(mesh.vertices), dtype=np.int64)
+    old_to_new[vertex_indices] = np.arange(len(vertex_indices))
+
+    new_faces = old_to_new[faces]
+
+    new_vertices = mesh.vertices[vertex_indices]
+
+    return trimesh.Trimesh(vertices=new_vertices, faces=new_faces, process=False)
+
+
+def filter_inner_surfaces_raycast(mesh, num_rays=20, thresh=0.2, sample=True):
+    """
+    Return vertex indices belonging to outer faces only.
+    """
+    if not isinstance(mesh, trimesh.Trimesh):
+        raise TypeError(f"mesh must be of type 'trimesh.Trimesh' but is {type(mesh)}")
+
+    # ---- Ray directions ----
+    if sample:
+        phi = np.random.uniform(0, 2*np.pi, num_rays)
+        theta = np.arccos(np.random.uniform(-1, 1, num_rays))
+        directions = np.column_stack([
+            np.sin(theta) * np.cos(phi),
+            np.sin(theta) * np.sin(phi),
+            np.cos(theta)
+        ])
+    else:
+        golden_ratio = (1 + np.sqrt(5)) / 2
+        idx = np.arange(num_rays)
+        theta = 2 * np.pi * idx / golden_ratio
+        phi = np.arccos(1 - 2 * (idx + 0.5) / num_rays)
+        directions = np.column_stack([
+            np.sin(phi) * np.cos(theta),
+            np.sin(phi) * np.sin(theta),
+            np.cos(phi)
+        ])
+
+    # ---- Precompute centroids & normals ----
+    C = mesh.triangles_center
+    N = mesh.face_normals
+    F = len(C)
+
+    # ---- Expand origins to (F, R, 3) ----
+    origins = C[:, None, :] + 0.001 * N[:, None, :]
+    origins = np.broadcast_to(origins, (F, num_rays, 3))
+
+    # ---- Outward-facing ray mask (F, R) ----
+    mask = (directions @ N.T).T > 0
+    active_idx = np.nonzero(mask)
+
+    if len(active_idx[0]) == 0:
+        # All faces are considered "outer"
+        return np.unique(mesh.faces.reshape(-1))
+
+    # Flatten rays
+    origins_flat = origins[active_idx]
+    directions_flat = directions[active_idx[1]]
+
+    # ---- Fast intersector ----
+    try:
+        from trimesh.ray.ray_pyembree import RayMeshIntersector
+        intersector = RayMeshIntersector(mesh)
+    except ImportError:
+        intersector = mesh.ray
+
+    hits = intersector.intersects_first(origins_flat, directions_flat)
+    hit_mask = hits != -1
+
+    # Count hits for each face
+    hit_count = np.zeros(F, dtype=int)
+    np.add.at(hit_count, active_idx[0], hit_mask)
+
+    # Select outer faces
+    threshold = int(num_rays * thresh)
+    outer_faces = np.nonzero(hit_count < threshold)[0]
+
+    # ---- Return vertex indices from these faces ----
+    outer_vertices = mesh.faces[outer_faces].reshape(-1)
+    return np.unique(outer_vertices)
+
+
+def calibrate_radii(
+    skel : Skeleton,
+    mesh: trimesh.Trimesh,
+    *,
+    radius_metric: str | None = None,
+    aggregate: str = "trim",
+    min_n_outer : int = 20,
+    min_frac_outer : float = 0.33,
+    min_verts_q_outer : float = 80.,
+    rays_num_outer : int = 30,
+    rays_thresh_outer : float = 0.2,
+    rays_sample : bool = False,
+    store_key: str = "calibrated",
+    verbose: bool = False,
+) -> None:
+    """
+    Refine per‑node radii by measuring distances from mesh vertices to the
+    skeleton centreline, aggregated within each node's vertex bin.
+    Tries to efficiently remove internal mesh structure like mitochondria using a combination of heuristics.
+
+    Parameters
+    ----------
+    skel
+        Skeleton whose radii dictionary will be updated in‑place.
+    mesh : trimesh.Trimesh
+        Mesh surface of the neuron. Must match the node2verts of the skeleton
+    radius_metric
+        Existing radius key to use as a fallback for nodes without vertex bins.
+        Defaults to the recommended estimator.
+    aggregate
+        How to aggregate per‑vertex distances within a node: 'median' (default)
+        or 'mean'.
+    min_n_outer
+        Minimum vertices of an outer shell as absolute number.
+    min_frac_outer
+        Minimum vertices of an outer shell as relative number.
+    min_verts_q_outer
+        Value between 0 and 100: Minimum vertices (as percentile over all nodes) to be tested for inner shell.
+        This assumes that nodes with internal structure have more vertices.
+        Set to zero to check all nodes.
+    rays_num_outer
+        Number of rays used to detect outer shell.
+    rays_thresh_outer
+        Value between 0 and 1: fraction of rays needed to hit a surface to be considered outer / inner shell.
+    rays_sample
+        If True, use randomly sampled cells instead of a grid.
+    store_key
+        Key under which the calibrated radii will be stored in ``skel.radii``.
+    verbose
+        When True (default), print a concise summary including how many nodes
+        fell back to the prior radius and how many were clamped to it.
+
+    Notes
+    -----
+    - Requires ``skel.node2verts``to compute refined radii.
+    - Modifies the skeleton in place; returns None.
+    """
+    mesh_vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    n_total = int(len(skel.nodes))
+    if n_total == 0:
+        raise ValueError("Skeleton has no nodes; cannot calibrate radii.")
+
+    # Ensure we have a fallback radius vector
+    if radius_metric is None:
+        radius_metric = skel.recommend_radius()[0]
+    if radius_metric not in skel.radii:
+        raise ValueError(
+            f"radius_metric '{radius_metric}' not found in skel.radii (available keys: {tuple(skel.radii)})"
+        )
+
+    # Aggregate distances for each node using per-call whitelist restriction
+    r_new = np.array(skel.radii[radius_metric], dtype=np.float64, copy=True)
+    r_kind = np.full(n_total, 'fallback', dtype='object')
+
+    n_verts = np.array([len(i) for i in skel.node2verts])
+    min_n_verts_bulb = int(np.percentile(n_verts, q=min_verts_q_outer))
+
+    log_steps = (np.array([0, 0.01, 0.05, 0.1, 0.25, 0.5, 1.]) * n_total).astype(int)
+    log_steps[-1] = n_total - 1
+
+    with _post_stage("calibrate_radii", verbose=verbose) as log:
+        log(f"Check for inner meshes in all nodes with min_n_verts_bulb>={min_n_verts_bulb};")
+        log(f"This is {np.mean(n_verts > min_n_verts_bulb):.0%} of all nodes")
+
+    for i in range(n_total):
+        if i in log_steps:
+            _post_stage(f"calibrate_radii - {i/n_total:.0%} calibrated", verbose=verbose)
+
+        if skel.ntype[i] == 1 and skel.soma is not None:  # Ignore soma
+            continue
+
+        vids = (np.asarray(skel.node2verts[i], dtype=np.int64)
+                if i < len(skel.node2verts) else np.empty(0, dtype=np.int64))
+        if vids.size == 0:
+            continue
+
+        outer_success = False
+        if n_verts[i] >= min_n_verts_bulb and min_verts_q_outer < 100.0:
+            n_inner = len(vids)
+            mesh_i = submesh_by_vertices(mesh, vids)
+            assert len(mesh_i.vertices) == len(vids)
+            outer_vids = filter_inner_surfaces_raycast(
+                mesh_i, num_rays=rays_num_outer, thresh=rays_thresh_outer, sample=rays_sample)
+            n_outer = len(outer_vids)
+
+            if (n_outer >= min_n_outer) and (n_outer >= min_frac_outer * n_inner) and (n_outer < n_inner):
+                d_local = dx.distance(
+                    skel,
+                    mesh_vertices[vids[outer_vids]],
+                    mode='centerline',
+                    radius_metric=radius_metric,
+                    allowed_nodes=[int(i)],
+                )
+                r_new[i] = _estimate_radius(d_local, method=aggregate)
+                r_kind[i] = 'outer_centerline'
+                outer_success = True
+
+        if not outer_success:
+            d_local = dx.distance(
+                skel,
+                mesh_vertices[vids],
+                mode='centerline',
+                radius_metric=radius_metric,
+                allowed_nodes=[int(i)],
+            )
+            r_new_i = _estimate_radius(d_local, method=aggregate)
+            if r_new_i < r_new[i]:  # Update only if smaller
+                r_new[i] = r_new_i
+                r_kind[i] = 'full_centerline'
+
+    skel.radii[store_key] = r_new
+    n_fallback = int(np.sum(r_kind == 'fallback'))
+    n_full_centerline = int(np.sum(r_kind == 'full_centerline'))
+    n_outer_centerline = int(np.sum(r_kind == 'outer_centerline'))
+
+    # annotate meta
+    skel.extra["calibration"] = {
+        "status": "computed",
+        "aggregate": aggregate,
+        "fallback_radius": radius_metric,
+        "store_key": store_key,
+        "radius_method": r_kind.tolist(),
+        "nodes_total": int(n_total),
+        "nodes_fallback": n_fallback,
+        "nodes_full_centerline": n_full_centerline,
+        "nodes_outer_centerline": n_outer_centerline,
+    }
+
+    with _post_stage("calibrate_radii summary", verbose=verbose) as log:
+        log(f"n_total={n_total}")
+        log(f"n_fallback={n_fallback}={n_fallback / n_total:.0%}, ")
+        log(f"n_full_centerline={n_full_centerline}={n_full_centerline / n_total:.0%}, ")
+        log(f"n_outer_centerline={n_outer_centerline}={n_outer_centerline / n_total:.0%}; ")
+        log(f"store='{store_key}', base='{radius_metric}'")
