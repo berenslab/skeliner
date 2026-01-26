@@ -355,8 +355,6 @@ def to_npz(
     if not path.suffix:
         path = path.with_suffix(".npz")
 
-    c = {} if not compress else {"compress": True}
-
     if cache_kdtree:
         skeleton._ensure_nodes_kdtree()
         skeleton._ensure_node_neighbors()
@@ -425,7 +423,9 @@ def to_npz(
         tree_payload["neighbors_idx"] = data.astype(np.int64, copy=False)
         tree_payload["neighbors_off"] = offsets.astype(np.int64, copy=False)
 
-    np.savez(
+    save_fun = np.savez_compressed if compress else np.savez
+
+    save_fun(
         path,
         nodes=skeleton.nodes,
         edges=skeleton.edges,
@@ -444,7 +444,6 @@ def to_npz(
         **extra,
         **meta,
         **tree_payload,
-        **c,
     )
 
 
