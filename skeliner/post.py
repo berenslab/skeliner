@@ -1667,100 +1667,25 @@ def calibrate_bins(
                 chains.append(chain)
         log(f"{len(chains)} chains")
 
-    with _post_stage("adaptive perpendicular re-binning", verbose=verbose) as log:
-        # ── Phase 2: re-bin along chains with adaptive width ─────────
-        # Each chain gets new bins with width ≈ 2 * local_radius,
-        # creating or merging nodes as needed.
-        #
-        # Result: new_bins = list of (verts, centroid) for all new nodes.
-        # Anchor nodes (branch points, tips, soma) are preserved as-is.
+    with _post_stage("perpendicular re-binning", verbose=verbose) as log:
+        # ── Phase 2: re-assign ALL vertices along chains ─────────────
+        # Project every vertex onto the piecewise skeleton path and
+        # assign to the nearest node using radius-weighted distance
+        # so that thick nodes claim proportionally more territory.
+        new_node2verts: list[list[int]] = [[] for _ in range(n_skel)]
+        centerline_dists: list[list[float]] = [[] for _ in range(n_skel)]
         assigned = np.zeros(n_mesh, dtype=bool)
 
-        # Keep anchor nodes, collect their data
-        # anchor_id -> index in new arrays
-        anchor_new_idx: dict[int, int] = {}
-        new_bins: list[list[int]] = []       # vertex lists
-        new_nodes_list: list[np.ndarray] = []  # positions
-        new_edges_list: list[tuple[int, int]] = []
-        centerline_dists: list[np.ndarray | None] = []  # per-bin centerline distances
-
-        # Reserve slots for non-dissolved anchors (tips, soma)
-        dissolved = set(branch_nodes)  # fully dissolved, no verts kept
-        # For dissolved nodes, track which chain endpoints meet there
-        # so we can connect them directly after chain binning
-        dissolved_chain_ends: dict[int, list[int]] = defaultdict(list)
-
-        for a in sorted(anchors):
-            if a in dissolved:
-                continue  # skip — will be removed entirely
-            idx = len(new_bins)
-            anchor_new_idx[a] = idx
-            av = [v for v in skel.node2verts[a] if not assigned[v]]
-            new_bins.append(av)
-            for v in av:
-                assigned[v] = True
-            new_nodes_list.append(skel.nodes[a].copy())
-            centerline_dists.append(None)  # no centerline info for anchors
-
-        def _connect_to_anchor(chain_bin_idx: int, anchor_id: int) -> None:
-            """Connect a chain's endpoint bin to an anchor, handling dissolved."""
-            if anchor_id in dissolved:
-                dissolved_chain_ends[anchor_id].append(chain_bin_idx)
-            else:
-                new_edges_list.append((chain_bin_idx, anchor_new_idx[anchor_id]))
-
         for chain in chains:
-            interior = [n for n in chain if n not in anchors]
-            if not interior:
-                # Direct anchor-to-anchor edge
-                start, end = chain[0], chain[-1]
-                if start in dissolved and end in dissolved:
-                    # Both dissolved — merge their endpoint lists so
-                    # the star connection links chains from both sides.
-                    # Use a sentinel to connect them after all chains.
-                    dissolved_chain_ends[start].append(("bridge", end))
-                    dissolved_chain_ends[end].append(("bridge", start))
-                elif start in dissolved:
-                    dissolved_chain_ends[start].append(anchor_new_idx[end])
-                elif end in dissolved:
-                    dissolved_chain_ends[end].append(anchor_new_idx[start])
-                else:
-                    a_idx = anchor_new_idx[start]
-                    b_idx = anchor_new_idx[end]
-                    if a_idx != b_idx:
-                        new_edges_list.append((a_idx, b_idx))
-                continue
-
-            # Collect vertices: original bins + dissolved extras
+            # Collect ALL vertices along the chain
             all_vids_set: set[int] = set()
-            for ni in interior:
-                all_vids_set.update(skel.node2verts[ni].tolist())
-                all_vids_set.update(extra_verts.get(ni, []))
-            first_interior = chain[1]
-            if first_interior in interior:
-                all_vids_set.update(extra_verts.get(first_interior, []))
-            # Remove already-assigned verts (e.g. from anchor reservation)
-            all_vids = [v for v in all_vids_set if not assigned[v]]
+            for ni in chain:
+                if ni not in soma_nodes:
+                    all_vids_set.update(skel.node2verts[ni].tolist())
+                    all_vids_set.update(extra_verts.get(ni, []))
 
-            if len(all_vids) < 3:
-                # Too few verts — assign to a single new node
-                if all_vids:
-                    idx = len(new_bins)
-                    new_bins.append(all_vids)
-                    pts = mesh_verts[np.asarray(all_vids, dtype=np.int64)]
-                    new_nodes_list.append(pts.mean(axis=0))
-                    centerline_dists.append(None)
-                    for v in all_vids:
-                        assigned[v] = True
-                    _connect_to_anchor(idx, chain[0])
-                    _connect_to_anchor(idx, chain[-1])
-                else:
-                    # No verts at all — still need connectivity
-                    start, end = chain[0], chain[-1]
-                    if start not in dissolved and end not in dissolved:
-                        new_edges_list.append(
-                            (anchor_new_idx[start], anchor_new_idx[end])
-                        )
+            all_vids = [v for v in all_vids_set if not assigned[v]]
+            if not all_vids:
                 continue
 
             all_vids_arr = np.asarray(all_vids, dtype=np.int64)
@@ -1787,152 +1712,74 @@ def calibrate_bins(
                 best_dist[closer] = d[closer]
                 best_t[closer] = arc_at[closer]
 
-            # Adaptive bin edges: walk along the arc-length, stepping
-            # by 2 * local_radius interpolated at the current position.
-            chain_arc = np.array([arc_len_path[chain.index(n)] for n in chain])
-            chain_r = np.array([r_ref[n] for n in chain])
-            t_min, t_max = best_t.min(), best_t.max()
+            # Radius-weighted assignment: each vertex goes to the node
+            # that minimizes |arc_dist| / node_radius.
+            # This way thick nodes claim more arc-length territory.
+            node_arcs = np.array([arc_len_path[i] for i in range(len(chain))])
+            node_radii = np.array([max(r_ref[chain[i]], 1.0) for i in range(len(chain))])
 
-            # March along the arc-length with variable step
-            bin_edges = [t_min]
-            pos = t_min
-            while pos < t_max:
-                # Interpolate local radius at current position
-                local_r = float(np.interp(pos, chain_arc, chain_r))
-                step = max(2.0 * local_r, 1.0)
-                pos += step
-                bin_edges.append(pos)
-            # Ensure last edge covers all vertices
-            if bin_edges[-1] < t_max + 0.01:
-                bin_edges[-1] = t_max + 0.01
-            bin_edges = np.array(bin_edges)
-            n_bins = len(bin_edges) - 1
-            bin_assign = np.digitize(best_t, bin_edges) - 1
-            bin_assign = np.clip(bin_assign, 0, n_bins - 1)
+            # Weighted distance: |t_vertex - t_node| / r_node
+            arc_diffs = np.abs(best_t[:, None] - node_arcs[None, :])  # (V, N)
+            weighted = arc_diffs / node_radii[None, :]  # (V, N)
+            nearest_chain_idx = np.argmin(weighted, axis=1)
 
-            # Create new nodes for each bin
-            chain_new_ids: list[int] = []
-            for bi in range(n_bins):
-                mask = bin_assign == bi
-                sub_vids = all_vids_arr[mask].tolist()
-                if not sub_vids:
-                    continue
-                idx = len(new_bins)
-                new_bins.append(sub_vids)
-                pts = mesh_verts[np.asarray(sub_vids, dtype=np.int64)]
-                new_nodes_list.append(pts.mean(axis=0))
-                # Store centerline distances for radius estimation
-                centerline_dists.append(best_dist[mask])
-                for v in sub_vids:
+            for vi, ci_idx in enumerate(nearest_chain_idx):
+                ni = chain[ci_idx]
+                if ni in soma_nodes:
+                    weighted_row = weighted[vi].copy()
+                    for oi in np.argsort(weighted_row):
+                        if chain[oi] not in soma_nodes:
+                            ni = chain[oi]
+                            break
+                new_node2verts[ni].append(all_vids[vi])
+                centerline_dists[ni].append(best_dist[vi])
+                assigned[all_vids[vi]] = True
+
+        # Assign remaining anchor verts
+        for a in sorted(anchors):
+            for v in skel.node2verts[a]:
+                if not assigned[v]:
+                    new_node2verts[a].append(v)
                     assigned[v] = True
-                chain_new_ids.append(idx)
-
-            # Chain edges: consecutive bins
-            for i in range(len(chain_new_ids) - 1):
-                new_edges_list.append((chain_new_ids[i], chain_new_ids[i + 1]))
-            # Connect to anchors
-            if chain_new_ids:
-                _connect_to_anchor(chain_new_ids[0], chain[0])
-                _connect_to_anchor(chain_new_ids[-1], chain[-1])
-
-        # Connect chain endpoints that meet at dissolved branch nodes
-        # First, resolve bridges: merge endpoint lists of bridged dissolved nodes
-        resolved: dict[int, list[int]] = {}
-        for bnode, endpoints in dissolved_chain_ends.items():
-            real_eps = []
-            for ep in endpoints:
-                if isinstance(ep, tuple) and ep[0] == "bridge":
-                    # Pull in the other dissolved node's real endpoints
-                    other = ep[1]
-                    for oep in dissolved_chain_ends.get(other, []):
-                        if not (isinstance(oep, tuple) and oep[0] == "bridge"):
-                            real_eps.append(oep)
-                else:
-                    real_eps.append(ep)
-            resolved[bnode] = real_eps
-
-        # Star topology: first endpoint is the hub, others connect to it
-        seen_dissolved: set[int] = set()
-        for bnode, endpoints in resolved.items():
-            if bnode in seen_dissolved:
-                continue
-            seen_dissolved.add(bnode)
-            # Also mark bridged partners as seen
-            for ep in dissolved_chain_ends.get(bnode, []):
-                if isinstance(ep, tuple) and ep[0] == "bridge":
-                    seen_dissolved.add(ep[1])
-            if len(endpoints) >= 2:
-                hub = endpoints[0]
-                for ep in endpoints[1:]:
-                    new_edges_list.append((hub, ep))
-
-        # Assign any remaining unassigned non-soma verts to nearest new node
-        unassigned_mask = ~assigned
-        for sn in soma_nodes:
-            for v in skel.node2verts[sn]:
-                unassigned_mask[v] = False
-        n_unassigned = int(unassigned_mask.sum())
 
         n_assigned = int(assigned.sum())
-        n_new = len(new_bins)
-        log(f"{n_assigned}/{n_mesh} verts assigned, "
-            f"{n_new} nodes ({n_skel} original), "
-            f"{n_unassigned} unassigned")
+        n_empty = sum(1 for i in range(n_skel) if len(new_node2verts[i]) == 0
+                      and i not in soma_nodes)
+        log(f"{n_assigned}/{n_mesh} verts assigned, {n_empty} empty non-soma nodes")
 
     with _post_stage("update skeleton", verbose=verbose) as log:
-        # ── Rebuild skeleton arrays ──────────────────────────────────
-        n_new = len(new_bins)
-        final_nodes = np.array(new_nodes_list, dtype=np.float64)
-        final_n2v = [np.asarray(bv, dtype=np.int64) for bv in new_bins]
-
-        # Deduplicate edges and sort pairs
-        edge_set: set[tuple[int, int]] = set()
-        for a, b in new_edges_list:
-            if a != b:
-                edge_set.add((min(a, b), max(a, b)))
-        final_edges = np.array(sorted(edge_set), dtype=np.int64) if edge_set else np.empty((0, 2), dtype=np.int64)
-
-        # Compute radii from new bins using centerline distance when available
-        final_radii: dict[str, np.ndarray] = {}
-        r_cal = np.zeros(n_new, dtype=np.float64)
-        for i in range(n_new):
-            bv = new_bins[i]
-            if len(bv) > 0:
-                if centerline_dists[i] is not None and len(centerline_dists[i]) > 0:
-                    # Use perpendicular distance to skeleton path (centerline)
-                    dists = centerline_dists[i]
-                else:
-                    # Fallback: distance to centroid (for anchors/tips)
-                    pts = mesh_verts[np.asarray(bv, dtype=np.int64)]
-                    dists = np.linalg.norm(pts - final_nodes[i], axis=1)
-                r_cal[i] = _estimate_radius(dists, method=aggregate)
-        final_radii["calibrated_bins"] = r_cal
-        # Also store as the standard keys
-        final_radii["trim"] = r_cal.copy()
-        final_radii["median"] = r_cal.copy()
-        final_radii["mean"] = r_cal.copy()
-
-        # ntype: soma nodes keep type 1, rest 0
-        final_ntype = np.zeros(n_new, dtype=np.int8)
-        for sn in soma_nodes:
-            if sn in anchor_new_idx:
-                final_ntype[anchor_new_idx[sn]] = 1
-
-        # Update skeleton in-place
-        skel.nodes = final_nodes
-        skel.edges = final_edges
-        skel.radii = final_radii
-        skel.ntype = final_ntype
-        skel.node2verts = final_n2v
+        # ── Update in-place: same nodes & edges, new vertex assignment ──
+        skel.node2verts = [np.asarray(bv, dtype=np.int64) for bv in new_node2verts]
         skel.vert2node = rebuild_vert2node(skel.node2verts)
 
-        # Rebuild cached spatial helpers (stale after node/edge changes)
+        # Recompute node positions (centroids) and radii
+        new_nodes = skel.nodes.copy()
+        r_cal = np.array(r_ref, dtype=np.float64, copy=True)
+        for i in range(n_skel):
+            bv = new_node2verts[i]
+            if len(bv) > 0:
+                pts = mesh_verts[np.asarray(bv, dtype=np.int64)]
+                new_nodes[i] = pts.mean(axis=0)
+                if centerline_dists[i]:
+                    dists = np.array(centerline_dists[i])
+                    r_cal[i] = _estimate_radius(dists, method=aggregate)
+                else:
+                    dists = np.linalg.norm(pts - new_nodes[i], axis=1)
+                    r_cal[i] = _estimate_radius(dists, method=aggregate)
+        skel.nodes = new_nodes
+        skel.radii["calibrated_bins"] = r_cal
+        # Update standard keys so downstream (SWC, viewer) uses calibrated radii
+        for key in ("trim", "median", "mean"):
+            if key in skel.radii:
+                skel.radii[key] = r_cal.copy()
+
+        # Rebuild cached spatial helpers
         skel._nodes_kdtree = None
         skel._ensure_nodes_kdtree()
         skel._node_neighbors = None
         skel._ensure_node_neighbors()
 
-        log(f"{n_new} nodes, {len(final_edges)} edges")
+        log(f"{n_skel} nodes, {len(skel.edges)} edges (unchanged)")
 
 
 def calibrate_radii(
