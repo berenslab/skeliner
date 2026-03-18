@@ -41,6 +41,7 @@ __skeleton__ = [
     # reroot / redetect soma
     "reroot",
     "detect_soma",
+    "calibrate_bins",
     "calibrate_radii",
 ]
 
@@ -1538,6 +1539,238 @@ def filter_inner_surfaces_raycast(mesh, num_rays=20, thresh=0.2, sample=True):
     # ---- Return vertex indices from these faces ----
     outer_vertices = mesh.faces[outer_faces].reshape(-1)
     return np.unique(outer_vertices)
+
+
+# ── Bin calibration ──────────────────────────────────────────────────
+
+
+def calibrate_bins(
+    skel: Skeleton,
+    mesh: trimesh.Trimesh,
+    *,
+    radius_metric: str | None = None,
+    aggregate: str = "trim",
+    verbose: bool = False,
+) -> None:
+    """Re-assign mesh vertices to skeleton nodes for isotropic bins.
+
+    Fixed-size geodesic binning produces thin rings on thick neurites and
+    long tubes on thin ones.  This function re-partitions vertices so that
+    each bin approximates a cross-sectional patch perpendicular to the
+    local neurite direction.
+
+    The algorithm has two phases:
+
+    1. **Dissolve branch points** – vertices of degree-3+ nodes are
+       projected onto each outgoing branch direction.  Vertices clearly
+       belonging to one branch are donated to that neighbor; ambiguous
+       vertices stay as a small junction bin.
+    2. **Perpendicular re-binning of chains** – for every degree-2 path
+       between anchors (branch points, tips, soma), all vertices are
+       projected onto the piecewise-linear skeleton path and assigned to
+       the nearest interior node by arc-length distance.
+
+    After re-assignment the function updates ``skel.nodes`` (centroids of
+    new bins), ``skel.node2verts``, ``skel.vert2node``, and writes a new
+    radius entry under *aggregate* into ``skel.radii``.
+
+    Parameters
+    ----------
+    skel
+        Skeleton modified **in-place**.
+    mesh
+        Mesh whose vertices correspond to ``skel.node2verts``.
+    radius_metric
+        Existing radius key used during the dissolve heuristic.  Defaults
+        to the recommended estimator.
+    aggregate
+        Radius estimator written for the calibrated bins (passed to
+        ``_estimate_radius``).
+    verbose
+        Print progress information.
+    """
+    from collections import defaultdict
+
+    mesh_verts = np.asarray(mesh.vertices, dtype=np.float64)
+    n_skel = len(skel.nodes)
+    n_mesh = len(mesh_verts)
+
+    if radius_metric is None:
+        radius_metric = skel.recommend_radius()[0]
+    r_ref = skel.radii[radius_metric]
+
+    # ── skeleton adjacency & degree ──────────────────────────────────
+    adj: dict[int, set[int]] = defaultdict(set)
+    degree = np.zeros(n_skel, dtype=int)
+    for a, b in skel.edges:
+        a, b = int(a), int(b)
+        adj[a].add(b); adj[b].add(a)
+        degree[a] += 1; degree[b] += 1
+
+    soma_nodes = set(np.where(skel.ntype == 1)[0]) if skel.ntype is not None else set()
+    branch_nodes = sorted(set(np.where(degree > 2)[0]) - soma_nodes)
+    anchors = set(np.where((degree > 2) | (degree == 1))[0]) | soma_nodes
+
+    with _post_stage("dissolve branch nodes", verbose=verbose) as log:
+        # ── Phase 1: dissolve branch-point bins ──────────────────────
+        extra_verts: dict[int, list[int]] = defaultdict(list)
+        junction_verts: dict[int, list[int]] = {}
+
+        for bnode in branch_nodes:
+            bv = skel.node2verts[bnode]
+            if len(bv) < 3:
+                continue
+            bpts = mesh_verts[bv]
+            bcenter = skel.nodes[bnode]
+            nbrs = sorted(adj[bnode])
+            if len(nbrs) < 2:
+                continue
+
+            dirs = np.empty((len(nbrs), 3), dtype=np.float64)
+            for ni, nbr in enumerate(nbrs):
+                d = skel.nodes[nbr] - bcenter
+                d_len = np.linalg.norm(d)
+                dirs[ni] = d / d_len if d_len > 1e-6 else 0.0
+
+            diff = bpts - bcenter
+            projections = diff @ dirs.T
+            sorted_proj = np.sort(projections, axis=1)[:, ::-1]
+            margin = sorted_proj[:, 0] - sorted_proj[:, 1]
+            dist_from_center = np.linalg.norm(diff, axis=1)
+            median_dist = np.median(dist_from_center) if len(dist_from_center) > 0 else 1.0
+            is_junction = (margin < 0.3 * dist_from_center) | (
+                dist_from_center < 0.2 * median_dist
+            )
+            best_dir = np.argmax(projections, axis=1)
+
+            junction_verts[bnode] = bv[is_junction].tolist()
+            for ni, nbr in enumerate(nbrs):
+                mask = (best_dir == ni) & ~is_junction
+                extra_verts[nbr].extend(bv[mask].tolist())
+
+        n_reassigned = sum(len(v) for v in extra_verts.values())
+        n_junction = sum(len(v) for v in junction_verts.values())
+        log(f"reassigned {n_reassigned} verts from {len(branch_nodes)} "
+            f"branch nodes, {n_junction} kept as junction")
+
+    with _post_stage("decompose chains", verbose=verbose) as log:
+        # ── Extract branch-to-branch chains ──────────────────────────
+        chains: list[list[int]] = []
+        visited_edges: set[tuple[int, int]] = set()
+        for anchor in sorted(anchors):
+            for nbr in adj[anchor]:
+                edge = (min(anchor, nbr), max(anchor, nbr))
+                if edge in visited_edges:
+                    continue
+                visited_edges.add(edge)
+                chain = [anchor, nbr]
+                cur, prev = nbr, anchor
+                while cur not in anchors:
+                    nexts = [n for n in adj[cur] if n != prev]
+                    if len(nexts) != 1:
+                        break
+                    prev, cur = cur, nexts[0]
+                    visited_edges.add((min(prev, cur), max(prev, cur)))
+                    chain.append(cur)
+                chains.append(chain)
+        log(f"{len(chains)} chains")
+
+    with _post_stage("perpendicular re-binning", verbose=verbose) as log:
+        # ── Phase 2: re-assign vertices along chains ─────────────────
+        new_node2verts: list[list[int]] = [[] for _ in range(n_skel)]
+        assigned = np.zeros(n_mesh, dtype=bool)
+
+        for chain in chains:
+            interior = [n for n in chain if n not in anchors]
+            if not interior:
+                continue
+
+            # Collect vertices: original bins + dissolved extras
+            all_vids_set: set[int] = set()
+            for ni in interior:
+                all_vids_set.update(skel.node2verts[ni].tolist())
+                all_vids_set.update(extra_verts.get(ni, []))
+            first_interior = chain[1]
+            if first_interior in interior:
+                all_vids_set.update(extra_verts.get(first_interior, []))
+            all_vids = list(all_vids_set)
+
+            if len(all_vids) < 3:
+                if all_vids and interior:
+                    new_node2verts[interior[0]].extend(all_vids)
+                    for v in all_vids:
+                        assigned[v] = True
+                continue
+
+            all_vids_arr = np.asarray(all_vids, dtype=np.int64)
+            all_pts = mesh_verts[all_vids_arr]
+
+            # Project onto piecewise-linear skeleton path
+            path_pts = np.array([skel.nodes[n] for n in chain])
+            seg_lens = np.linalg.norm(np.diff(path_pts, axis=0), axis=1)
+            arc_len = np.concatenate(([0.0], np.cumsum(seg_lens)))
+
+            best_dist = np.full(len(all_vids), np.inf)
+            best_t = np.zeros(len(all_vids))
+            for si in range(len(chain) - 1):
+                p0, p1 = path_pts[si], path_pts[si + 1]
+                s = seg_lens[si]
+                if s < 1e-10:
+                    continue
+                sd = (p1 - p0) / s
+                df = all_pts - p0
+                tp = np.clip(df @ sd, 0, s)
+                d = np.linalg.norm(all_pts - (p0 + np.outer(tp, sd)), axis=1)
+                arc_at = arc_len[si] + tp
+                closer = d < best_dist
+                best_dist[closer] = d[closer]
+                best_t[closer] = arc_at[closer]
+
+            # Assign each vertex to the nearest interior node by arc-length
+            interior_arc = np.array([arc_len[chain.index(ni)] for ni in interior])
+            nearest = np.argmin(
+                np.abs(best_t[:, None] - interior_arc[None, :]), axis=1
+            )
+
+            for vi, ni_idx in enumerate(nearest):
+                new_node2verts[interior[ni_idx]].append(all_vids[vi])
+                assigned[all_vids[vi]] = True
+
+        # Junction verts stay on branch nodes
+        for bnode, jvids in junction_verts.items():
+            for v in jvids:
+                if not assigned[v]:
+                    new_node2verts[bnode].append(v)
+                    assigned[v] = True
+
+        # Remaining anchor verts (tips, soma, undissolved branches)
+        for a in sorted(anchors):
+            for v in skel.node2verts[a]:
+                if not assigned[v]:
+                    new_node2verts[a].append(v)
+                    assigned[v] = True
+
+        n_assigned = int(assigned.sum())
+        log(f"{n_assigned}/{n_mesh} verts assigned")
+
+    with _post_stage("update skeleton", verbose=verbose) as log:
+        # ── Update skeleton in-place ─────────────────────────────────
+        skel.node2verts = [np.asarray(bv, dtype=np.int64) for bv in new_node2verts]
+        skel.vert2node = rebuild_vert2node(skel.node2verts)
+
+        # Recompute node positions (centroids) and radii
+        new_nodes = skel.nodes.copy()
+        r_new = np.array(r_ref, dtype=np.float64, copy=True)
+        for i in range(n_skel):
+            bv = new_node2verts[i]
+            if len(bv) > 0:
+                pts = mesh_verts[np.asarray(bv, dtype=np.int64)]
+                new_nodes[i] = pts.mean(axis=0)
+                dists = np.linalg.norm(pts - new_nodes[i], axis=1)
+                r_new[i] = _estimate_radius(dists, method=aggregate)
+        skel.nodes = new_nodes
+        skel.radii["calibrated_bins"] = r_new
+        log(f"updated {n_skel} nodes, stored radii as 'calibrated_bins'")
 
 
 def calibrate_radii(
