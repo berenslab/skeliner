@@ -1684,30 +1684,51 @@ def calibrate_bins(
         new_edges_list: list[tuple[int, int]] = []
         centerline_dists: list[np.ndarray | None] = []  # per-bin centerline distances
 
-        # Reserve slots for anchors first (preserves identity)
+        # Reserve slots for non-dissolved anchors (tips, soma)
         dissolved = set(branch_nodes)  # fully dissolved, no verts kept
+        # For dissolved nodes, track which chain endpoints meet there
+        # so we can connect them directly after chain binning
+        dissolved_chain_ends: dict[int, list[int]] = defaultdict(list)
+
         for a in sorted(anchors):
+            if a in dissolved:
+                continue  # skip — will be removed entirely
             idx = len(new_bins)
             anchor_new_idx[a] = idx
-            if a in dissolved:
-                # Dissolved branch node: empty bin, position only
-                new_bins.append([])
-            else:
-                av = [v for v in skel.node2verts[a] if not assigned[v]]
-                new_bins.append(av)
-                for v in av:
-                    assigned[v] = True
+            av = [v for v in skel.node2verts[a] if not assigned[v]]
+            new_bins.append(av)
+            for v in av:
+                assigned[v] = True
             new_nodes_list.append(skel.nodes[a].copy())
             centerline_dists.append(None)  # no centerline info for anchors
+
+        def _connect_to_anchor(chain_bin_idx: int, anchor_id: int) -> None:
+            """Connect a chain's endpoint bin to an anchor, handling dissolved."""
+            if anchor_id in dissolved:
+                dissolved_chain_ends[anchor_id].append(chain_bin_idx)
+            else:
+                new_edges_list.append((chain_bin_idx, anchor_new_idx[anchor_id]))
 
         for chain in chains:
             interior = [n for n in chain if n not in anchors]
             if not interior:
                 # Direct anchor-to-anchor edge
-                a_idx = anchor_new_idx[chain[0]]
-                b_idx = anchor_new_idx[chain[-1]]
-                if a_idx != b_idx:
-                    new_edges_list.append((a_idx, b_idx))
+                start, end = chain[0], chain[-1]
+                if start in dissolved and end in dissolved:
+                    # Both dissolved — merge their endpoint lists so
+                    # the star connection links chains from both sides.
+                    # Use a sentinel to connect them after all chains.
+                    dissolved_chain_ends[start].append(("bridge", end))
+                    dissolved_chain_ends[end].append(("bridge", start))
+                elif start in dissolved:
+                    dissolved_chain_ends[start].append(anchor_new_idx[end])
+                elif end in dissolved:
+                    dissolved_chain_ends[end].append(anchor_new_idx[start])
+                else:
+                    a_idx = anchor_new_idx[start]
+                    b_idx = anchor_new_idx[end]
+                    if a_idx != b_idx:
+                        new_edges_list.append((a_idx, b_idx))
                 continue
 
             # Collect vertices: original bins + dissolved extras
@@ -1731,13 +1752,15 @@ def calibrate_bins(
                     centerline_dists.append(None)
                     for v in all_vids:
                         assigned[v] = True
-                    # Connect to chain anchors
-                    new_edges_list.append((anchor_new_idx[chain[0]], idx))
-                    new_edges_list.append((idx, anchor_new_idx[chain[-1]]))
+                    _connect_to_anchor(idx, chain[0])
+                    _connect_to_anchor(idx, chain[-1])
                 else:
-                    new_edges_list.append(
-                        (anchor_new_idx[chain[0]], anchor_new_idx[chain[-1]])
-                    )
+                    # No verts at all — still need connectivity
+                    start, end = chain[0], chain[-1]
+                    if start not in dissolved and end not in dissolved:
+                        new_edges_list.append(
+                            (anchor_new_idx[start], anchor_new_idx[end])
+                        )
                 continue
 
             all_vids_arr = np.asarray(all_vids, dtype=np.int64)
@@ -1809,12 +1832,39 @@ def calibrate_bins(
                 new_edges_list.append((chain_new_ids[i], chain_new_ids[i + 1]))
             # Connect to anchors
             if chain_new_ids:
-                new_edges_list.append(
-                    (anchor_new_idx[chain[0]], chain_new_ids[0])
-                )
-                new_edges_list.append(
-                    (chain_new_ids[-1], anchor_new_idx[chain[-1]])
-                )
+                _connect_to_anchor(chain_new_ids[0], chain[0])
+                _connect_to_anchor(chain_new_ids[-1], chain[-1])
+
+        # Connect chain endpoints that meet at dissolved branch nodes
+        # First, resolve bridges: merge endpoint lists of bridged dissolved nodes
+        resolved: dict[int, list[int]] = {}
+        for bnode, endpoints in dissolved_chain_ends.items():
+            real_eps = []
+            for ep in endpoints:
+                if isinstance(ep, tuple) and ep[0] == "bridge":
+                    # Pull in the other dissolved node's real endpoints
+                    other = ep[1]
+                    for oep in dissolved_chain_ends.get(other, []):
+                        if not (isinstance(oep, tuple) and oep[0] == "bridge"):
+                            real_eps.append(oep)
+                else:
+                    real_eps.append(ep)
+            resolved[bnode] = real_eps
+
+        # Star topology: first endpoint is the hub, others connect to it
+        seen_dissolved: set[int] = set()
+        for bnode, endpoints in resolved.items():
+            if bnode in seen_dissolved:
+                continue
+            seen_dissolved.add(bnode)
+            # Also mark bridged partners as seen
+            for ep in dissolved_chain_ends.get(bnode, []):
+                if isinstance(ep, tuple) and ep[0] == "bridge":
+                    seen_dissolved.add(ep[1])
+            if len(endpoints) >= 2:
+                hub = endpoints[0]
+                for ep in endpoints[1:]:
+                    new_edges_list.append((hub, ep))
 
         # Assign any remaining unassigned non-soma verts to nearest new node
         unassigned_mask = ~assigned
@@ -1875,6 +1925,12 @@ def calibrate_bins(
         skel.ntype = final_ntype
         skel.node2verts = final_n2v
         skel.vert2node = rebuild_vert2node(skel.node2verts)
+
+        # Rebuild cached spatial helpers (stale after node/edge changes)
+        skel._nodes_kdtree = None
+        skel._ensure_nodes_kdtree()
+        skel._node_neighbors = None
+        skel._ensure_node_neighbors()
 
         log(f"{n_new} nodes, {len(final_edges)} edges")
 
