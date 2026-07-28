@@ -153,6 +153,119 @@ def _point_segment_capsule_distance(
     return dist - radius
 
 
+def _batched_point_segment_distance(
+    P: np.ndarray, A: np.ndarray, B: np.ndarray
+) -> np.ndarray:
+    """Vectorized centreline distance from *M* points to *E* segments.
+
+    P: (M, 3), A/B: (E, 3) segment endpoints. Returns (M, E).
+    """
+    vec = B - A
+    seg_len2 = np.einsum("ej,ej->e", vec, vec)
+    degenerate = seg_len2 <= 0.0
+    seg_len2_safe = np.where(degenerate, 1.0, seg_len2)
+
+    diff = P[:, None, :] - A[None, :, :]
+    t = np.einsum("mej,ej->me", diff, vec) / seg_len2_safe[None, :]
+    t = np.clip(t, 0.0, 1.0)
+    closest = A[None, :, :] + t[:, :, None] * vec[None, :, :]
+    dist = np.linalg.norm(P[:, None, :] - closest, axis=2)
+
+    if np.any(degenerate):
+        dist_to_a = np.linalg.norm(diff, axis=2)
+        dist = np.where(degenerate[None, :], dist_to_a, dist)
+    return dist
+
+
+def _batched_point_segment_capsule_distance(
+    P: np.ndarray, A: np.ndarray, B: np.ndarray, r_a: np.ndarray, r_b: np.ndarray
+) -> np.ndarray:
+    """Vectorized signed capsule distance (negative ⇒ inside).
+
+    P: (M, 3), A/B: (E, 3) segment endpoints, r_a/r_b: (E,) endpoint radii.
+    Returns (M, E).
+    """
+    vec = B - A
+    seg_len2 = np.einsum("ej,ej->e", vec, vec)
+    degenerate = seg_len2 <= 0.0
+    seg_len2_safe = np.where(degenerate, 1.0, seg_len2)
+
+    diff = P[:, None, :] - A[None, :, :]
+    t = np.einsum("mej,ej->me", diff, vec) / seg_len2_safe[None, :]
+    t = np.clip(t, 0.0, 1.0)
+    closest = A[None, :, :] + t[:, :, None] * vec[None, :, :]
+    dist = np.linalg.norm(P[:, None, :] - closest, axis=2)
+    radius = (1.0 - t) * r_a[None, :] + t * r_b[None, :]
+    d = dist - radius
+
+    if np.any(degenerate):
+        dist_to_a = np.linalg.norm(diff, axis=2)
+        radius_deg = np.maximum(r_a, r_b)
+        d = np.where(degenerate[None, :], dist_to_a - radius_deg[None, :], d)
+    return d
+
+
+def _whitelist_distances(
+    P: np.ndarray,
+    nodes: np.ndarray,
+    radii: np.ndarray | None,
+    surface: bool,
+    allowed_nodes_set: Set[int] | None,
+    allowed_edges_set: Set[tuple[int, int]] | None,
+    neighbours: tuple[np.ndarray, ...],
+) -> np.ndarray:
+    """Vectorized equivalent of the per-point whitelist branch in :func:`distance`.
+
+    Centres/candidates depend only on the whitelist (fixed for the whole call),
+    so they're computed once here instead of once per point.
+    """
+    M = P.shape[0]
+
+    centres: Set[int] = set()
+    if allowed_nodes_set is not None:
+        centres.update(allowed_nodes_set)
+    if allowed_edges_set is not None:
+        for a, b in allowed_edges_set:
+            centres.add(a)
+            centres.add(b)
+
+    if centres:
+        centres_idx = np.fromiter(centres, dtype=np.int64, count=len(centres))
+        diffs = P[:, None, :] - nodes[None, centres_idx, :]
+        nn_dist_arr = np.linalg.norm(diffs, axis=2)
+        if surface:
+            rad = radii[centres_idx]
+            best = np.min(nn_dist_arr - rad[None, :], axis=1)
+        else:
+            best = np.min(nn_dist_arr, axis=1)
+    else:
+        best = np.full(M, np.inf, dtype=np.float64)
+
+    candidates: Set[tuple[int, int]] = set()
+    if allowed_edges_set is not None:
+        candidates.update(allowed_edges_set)
+    if allowed_nodes_set is not None:
+        for nid in allowed_nodes_set:
+            for nb in neighbours[nid]:
+                nb = int(nb)
+                a, b = (nid, nb) if nid < nb else (nb, nid)
+                candidates.add((a, b))
+
+    if candidates:
+        edges_arr = np.array(list(candidates), dtype=np.int64)
+        A = nodes[edges_arr[:, 0]]
+        B = nodes[edges_arr[:, 1]]
+        if surface:
+            d = _batched_point_segment_capsule_distance(
+                P, A, B, radii[edges_arr[:, 0]], radii[edges_arr[:, 1]]
+            )
+        else:
+            d = _batched_point_segment_distance(P, A, B)
+        best = np.minimum(best, d.min(axis=1))
+
+    return best
+
+
 def distance(
     skel,
     point: Sequence[float] | np.ndarray,
@@ -286,43 +399,27 @@ def distance(
             a, b = (u2, v2) if u2 < v2 else (v2, u2)
             allowed_edges_set.add((a, b))
 
-    for i, p in enumerate(pts):
-        p_skel = p * scale_in
-
-        # Initialize best distance from node centres
-        if use_whitelist:
-            # Collect centres to consider: explicit allowed nodes and endpoints of allowed edges
-            centres: Set[int] = set()
-            if allowed_nodes_set is not None:
-                centres.update(allowed_nodes_set)
-            if allowed_edges_set is not None:
-                for a, b in allowed_edges_set:
-                    centres.add(a)
-                    centres.add(b)
-
-            if centres:
-                # compute min distance to allowed centres
-                centres_list = list(centres)
-                diffs = nodes[centres_list] - p_skel
-                nn_dist_arr = np.linalg.norm(diffs, axis=1)
-                if surface:
-                    rad = (np.asarray([radii[c] for c in centres_list], dtype=np.float64) if radii is not None else 0.0)
-                    best = float(np.min(nn_dist_arr - rad))
-                else:
-                    best = float(np.min(nn_dist_arr))
-            else:
-                best = float("inf")
-
-            # Candidate edges: explicit allowed_edges plus edges incident to allowed_nodes
-            candidates: Set[tuple[int, int]] = set()
-            if allowed_edges_set is not None:
-                candidates.update(allowed_edges_set)
-            if allowed_nodes_set is not None:
-                for nid in allowed_nodes_set:
-                    for nb in neighbours[nid]:
-                        a, b = (nid, nb) if nid < nb else (nb, nid)
-                        candidates.add((a, b))
+    if use_whitelist:
+        # Centres/candidates depend only on the whitelist, not on individual
+        # points, so the whole batch is resolved in one vectorized pass.
+        P_all = pts * scale_in
+        best = _whitelist_distances(
+            P_all,
+            nodes,
+            radii,
+            surface,
+            allowed_nodes_set,
+            allowed_edges_set,
+            neighbours,
+        )
+        if surface:
+            distances = np.maximum(best, 0.0) * scale_out
         else:
+            distances = best * scale_out
+    else:
+        for i, p in enumerate(pts):
+            p_skel = p * scale_in
+
             # default global behaviour via KD-tree + incident edges
             nn_dist, nn_idx = tree.query(p_skel, k=max_k)
             nn_idx_arr = np.atleast_1d(nn_idx).astype(np.int64, copy=False)
@@ -338,25 +435,25 @@ def distance(
                     a, b = (nid, nb) if nid < nb else (nb, nid)
                     candidates.add((a, b))
 
-        if candidates:
-            for a_idx, b_idx in candidates:
-                if surface:
-                    d = _point_segment_capsule_distance(
-                        p_skel,
-                        nodes[a_idx],
-                        nodes[b_idx],
-                        radii[a_idx],
-                        radii[b_idx],
-                    )
-                else:
-                    d = _point_segment_distance(p_skel, nodes[a_idx], nodes[b_idx])
-                if d < best:
-                    best = d
+            if candidates:
+                for a_idx, b_idx in candidates:
+                    if surface:
+                        d = _point_segment_capsule_distance(
+                            p_skel,
+                            nodes[a_idx],
+                            nodes[b_idx],
+                            radii[a_idx],
+                            radii[b_idx],
+                        )
+                    else:
+                        d = _point_segment_distance(p_skel, nodes[a_idx], nodes[b_idx])
+                    if d < best:
+                        best = d
 
-        if surface:
-            distances[i] = max(best, 0.0) * scale_out
-        else:
-            distances[i] = best * scale_out
+            if surface:
+                distances[i] = max(best, 0.0) * scale_out
+            else:
+                distances[i] = best * scale_out
 
     return float(distances[0]) if single_input else distances
 

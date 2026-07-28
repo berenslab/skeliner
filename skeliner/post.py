@@ -26,6 +26,11 @@ from ._state import (
 )
 from .dataclass import Skeleton, Soma
 
+try:
+    from trimesh.ray.ray_pyembree import RayMeshIntersector as _PyembreeIntersector
+except ImportError:
+    _PyembreeIntersector = None
+
 __skeleton__ = [
     # editing edges
     "graft",
@@ -1447,20 +1452,71 @@ def _estimate_radius(
     raise ValueError(f"Unknown radius estimator '{method}'.")
 
 
+def vertex_face_incidence(mesh: trimesh.Trimesh) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build a CSR-style vertex -> incident-face-ids map.
+
+    Deliberately built with plain numpy (argsort/searchsorted) over
+    ``mesh.vertices``/``mesh.faces`` rather than trimesh's cached
+    ``mesh.vertex_faces`` property: that property re-verifies the whole
+    mesh's cache validity (hashing its vertex/face data) on *every* access,
+    not just the first, which dominates cost when called once per node.
+
+    Returns
+    -------
+    (sorted_faces, starts) : the face ids incident to vertex ``v`` are
+        ``sorted_faces[starts[v]:starts[v + 1]]``.
+    """
+    faces = np.asarray(mesh.faces)
+    n_verts = len(mesh.vertices)
+    flat_vert = faces.ravel()
+    flat_face = np.repeat(np.arange(len(faces)), faces.shape[1])
+    order = np.argsort(flat_vert, kind="stable")
+    sorted_vert = flat_vert[order]
+    sorted_faces = flat_face[order]
+    starts = np.searchsorted(sorted_vert, np.arange(n_verts + 1))
+    return sorted_faces, starts
+
+
 def submesh_by_vertices(
         mesh : trimesh.Trimesh,
         vertex_indices : np.ndarray,
+        vertex_face_map: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> trimesh.Trimesh:
     """
     Reduce mesh to a subset of vertices and corresponding faces.
+
+    vertex_face_map
+        Optional precomputed :func:`vertex_face_incidence` result. Pass this
+        in when calling repeatedly (e.g. once per skeleton node) to avoid
+        rebuilding the vertex->face incidence structure on every call.
     """
     vertex_indices = np.asarray(vertex_indices, dtype=np.int64)
-    used = np.isin(mesh.faces, vertex_indices).all(axis=1)
-    faces = mesh.faces[used]
 
     # build mapping from old → new vertex indices
     old_to_new = -np.ones(len(mesh.vertices), dtype=np.int64)
     old_to_new[vertex_indices] = np.arange(len(vertex_indices))
+    in_set = old_to_new >= 0
+
+    # restrict the face scan to faces incident to vertex_indices instead of
+    # scanning every face in the mesh
+    sorted_faces, starts = (
+        vertex_face_map if vertex_face_map is not None else vertex_face_incidence(mesh)
+    )
+    if vertex_indices.size:
+        cand_face_idx = np.unique(
+            np.concatenate(
+                [sorted_faces[starts[v]:starts[v + 1]] for v in vertex_indices]
+            )
+        )
+    else:
+        cand_face_idx = np.empty(0, dtype=np.int64)
+
+    if cand_face_idx.size:
+        cand_faces = mesh.faces[cand_face_idx]
+        faces = cand_faces[in_set[cand_faces].all(axis=1)]
+    else:
+        faces = np.empty((0, mesh.faces.shape[1]), dtype=mesh.faces.dtype)
 
     new_faces = old_to_new[faces]
 
@@ -1518,11 +1574,9 @@ def filter_inner_surfaces_raycast(mesh, num_rays=20, thresh=0.2, sample=True):
     directions_flat = directions[active_idx[1]]
 
     # ---- Fast intersector ----
-    try:
-        from trimesh.ray.ray_pyembree import RayMeshIntersector
-        intersector = RayMeshIntersector(mesh)
-    except ImportError:
-        intersector = mesh.ray
+    intersector = (
+        _PyembreeIntersector(mesh) if _PyembreeIntersector is not None else mesh.ray
+    )
 
     hits = intersector.intersects_first(origins_flat, directions_flat)
     hit_mask = hits != -1
@@ -1617,6 +1671,9 @@ def calibrate_radii(
     n_verts = np.array([len(i) for i in skel.node2verts])
     min_n_verts_bulb = int(np.percentile(n_verts, q=min_verts_q_outer))
 
+    # built once and reused for every node's submesh_by_vertices call below
+    vertex_face_map = vertex_face_incidence(mesh)
+
     log_steps = (np.array([0, 0.01, 0.05, 0.1, 0.25, 0.5, 1.]) * n_total).astype(int)
     log_steps[-1] = n_total - 1
 
@@ -1639,7 +1696,7 @@ def calibrate_radii(
         outer_success = False
         if n_verts[i] >= min_n_verts_bulb and min_verts_q_outer < 100.0:
             n_inner = len(vids)
-            mesh_i = submesh_by_vertices(mesh, vids)
+            mesh_i = submesh_by_vertices(mesh, vids, vertex_face_map=vertex_face_map)
             assert len(mesh_i.vertices) == len(vids)
             outer_vids = filter_inner_surfaces_raycast(
                 mesh_i, num_rays=rays_num_outer, thresh=rays_thresh_outer, sample=rays_sample)

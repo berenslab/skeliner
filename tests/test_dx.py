@@ -183,3 +183,101 @@ def test_distance_point_queries(skel):
     assert distances_center.shape == (2,)
     assert distances_center[0] == pytest.approx(expected_center_nm, rel=1e-6)
     assert distances_center[1] == pytest.approx(0.0, abs=1e-9)
+
+
+# ---------------------------------------------------------------------
+# whitelist (allowed_nodes / allowed_edges) path — regression guard for the
+# vectorized rewrite in dx._whitelist_distances / dx.distance
+# ---------------------------------------------------------------------
+def _reference_whitelist_distance(
+    skel, pts, *, mode, allowed_nodes=None, allowed_edges=None
+):
+    """Literal port of dx.distance's pre-vectorization per-point whitelist loop."""
+    surface = mode == "surface"
+    nodes = skel.nodes
+    neighbours = skel._ensure_node_neighbors()
+    radii = (
+        np.asarray(skel.radii[skel.recommend_radius()[0]], dtype=np.float64)
+        if surface
+        else None
+    )
+
+    allowed_nodes_set = (
+        {int(n) for n in allowed_nodes} if allowed_nodes is not None else None
+    )
+    allowed_edges_set = None
+    if allowed_edges is not None:
+        allowed_edges_set = set()
+        for u, v in allowed_edges:
+            a, b = (int(u), int(v)) if u < v else (int(v), int(u))
+            allowed_edges_set.add((a, b))
+
+    out = np.empty(len(pts), dtype=np.float64)
+    for i, p in enumerate(pts):
+        centres = set()
+        if allowed_nodes_set is not None:
+            centres.update(allowed_nodes_set)
+        if allowed_edges_set is not None:
+            for a, b in allowed_edges_set:
+                centres.add(a)
+                centres.add(b)
+
+        if centres:
+            centres_list = list(centres)
+            diffs = nodes[centres_list] - p
+            nn_dist_arr = np.linalg.norm(diffs, axis=1)
+            if surface:
+                rad = np.asarray([radii[c] for c in centres_list], dtype=np.float64)
+                best = float(np.min(nn_dist_arr - rad))
+            else:
+                best = float(np.min(nn_dist_arr))
+        else:
+            best = float("inf")
+
+        candidates = set()
+        if allowed_edges_set is not None:
+            candidates.update(allowed_edges_set)
+        if allowed_nodes_set is not None:
+            for nid in allowed_nodes_set:
+                for nb in neighbours[nid]:
+                    a, b = (nid, int(nb)) if nid < nb else (int(nb), nid)
+                    candidates.add((a, b))
+
+        for a_idx, b_idx in candidates:
+            if surface:
+                d = dx._point_segment_capsule_distance(
+                    p, nodes[a_idx], nodes[b_idx], radii[a_idx], radii[b_idx]
+                )
+            else:
+                d = dx._point_segment_distance(p, nodes[a_idx], nodes[b_idx])
+            if d < best:
+                best = d
+
+        out[i] = max(best, 0.0) if surface else best
+    return out
+
+
+@pytest.mark.parametrize("mode", ["surface", "centerline"])
+@pytest.mark.parametrize(
+    "whitelist_kind", ["allowed_nodes", "allowed_edges", "both"]
+)
+def test_distance_whitelist_matches_reference_loop(skel, mode, whitelist_kind):
+    rng = np.random.default_rng(0)
+    bbox_lo = skel.nodes.min(axis=0)
+    bbox_hi = skel.nodes.max(axis=0)
+    pts = rng.uniform(bbox_lo, bbox_hi, size=(1000, 3))
+
+    nid = int(len(skel.nodes) // 2)
+    nbrs = dx.neighbors(skel, nid)
+    edge = (nid, nbrs[0]) if nbrs else (nid, nid)
+
+    kwargs = {}
+    if whitelist_kind in ("allowed_nodes", "both"):
+        kwargs["allowed_nodes"] = [nid]
+    if whitelist_kind in ("allowed_edges", "both"):
+        kwargs["allowed_edges"] = [edge]
+
+    got = dx.distance(skel, pts, mode=mode, **kwargs)
+    expected = _reference_whitelist_distance(skel, pts, mode=mode, **kwargs)
+
+    np.testing.assert_allclose(got, expected, rtol=1e-9, atol=1e-9)

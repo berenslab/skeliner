@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import trimesh
 
 from skeliner import dx, post, skeletonize
 from skeliner.dataclass import Skeleton, Soma
@@ -285,3 +286,162 @@ def test_detect_soma_remaps_ntype_once():
     assert np.allclose(s.nodes[0], nodes[1])  # new soma promoted
     assert s.ntype[0] == 1
     assert int(np.sum(s.ntype == 1)) == 1
+
+
+# ---------------------------------------------------------------------
+# submesh_by_vertices — regression guard for the vertex_faces-based rewrite
+# ---------------------------------------------------------------------
+def _reference_submesh_by_vertices(mesh, vertex_indices, vertex_face_map=None):
+    """Literal port of the pre-optimization full-mesh np.isin scan.
+
+    Accepts (and ignores) vertex_face_map so it can be swapped in for
+    post.submesh_by_vertices via monkeypatch in calibrate_radii, which now
+    always passes that kwarg.
+    """
+    vertex_indices = np.asarray(vertex_indices, dtype=np.int64)
+    used = np.isin(mesh.faces, vertex_indices).all(axis=1)
+    faces = mesh.faces[used]
+
+    old_to_new = -np.ones(len(mesh.vertices), dtype=np.int64)
+    old_to_new[vertex_indices] = np.arange(len(vertex_indices))
+    new_faces = old_to_new[faces]
+    new_vertices = mesh.vertices[vertex_indices]
+    return trimesh.Trimesh(vertices=new_vertices, faces=new_faces, process=False)
+
+
+def _assert_submesh_matches_reference(mesh, vertex_indices):
+    got = post.submesh_by_vertices(mesh, vertex_indices)
+    expected = _reference_submesh_by_vertices(mesh, vertex_indices)
+    assert np.array_equal(got.vertices, expected.vertices)
+    assert np.array_equal(got.faces, expected.faces)
+
+
+@pytest.fixture
+def toy_mesh_with_isolated_vertex():
+    # two triangles sharing an edge, plus one vertex referenced by no face
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],  # 0
+            [1.0, 0.0, 0.0],  # 1
+            [0.0, 1.0, 0.0],  # 2
+            [1.0, 1.0, 0.0],  # 3
+            [5.0, 5.0, 5.0],  # 4 - isolated, no incident face
+        ]
+    )
+    faces = np.array([[0, 1, 2], [1, 3, 2]], dtype=np.int64)
+    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+
+def test_submesh_by_vertices_matches_reference_on_real_bin(template_skel):
+    mesh = load_mesh(Path(__file__).parent / "data" / "60427.obj")
+    # pick the largest node2verts bin so the candidate-face restriction is exercised
+    sizes = [len(v) for v in template_skel.node2verts]
+    idx = int(np.argmax(sizes))
+    vids = template_skel.node2verts[idx]
+    assert len(vids) > 0
+    _assert_submesh_matches_reference(mesh, vids)
+
+
+def test_submesh_by_vertices_full_vertex_set(template_skel):
+    mesh = load_mesh(Path(__file__).parent / "data" / "60427.obj")
+    _assert_submesh_matches_reference(mesh, np.arange(len(mesh.vertices)))
+
+
+def test_submesh_by_vertices_isolated_vertex(toy_mesh_with_isolated_vertex):
+    mesh = toy_mesh_with_isolated_vertex
+    # isolated vertex included alongside one full face (0,1,2); face (1,3,2) missing vertex 3
+    _assert_submesh_matches_reference(mesh, [0, 1, 2, 4])
+
+
+def test_submesh_by_vertices_only_isolated_vertex(toy_mesh_with_isolated_vertex):
+    mesh = toy_mesh_with_isolated_vertex
+    got = post.submesh_by_vertices(mesh, [4])
+    assert len(got.vertices) == 1
+    assert len(got.faces) == 0
+    _assert_submesh_matches_reference(mesh, [4])
+
+
+def test_submesh_by_vertices_no_full_face(toy_mesh_with_isolated_vertex):
+    mesh = toy_mesh_with_isolated_vertex
+    # vertices 0,1 are both in face (0,1,2), but vertex 2 is excluded -> no full face
+    got = post.submesh_by_vertices(mesh, [0, 1, 4])
+    assert len(got.faces) == 0
+    _assert_submesh_matches_reference(mesh, [0, 1, 4])
+
+
+# ---------------------------------------------------------------------
+# calibrate_radii — end-to-end parity between the optimized implementation
+# and the pre-optimization reference (submesh_by_vertices + dx.distance)
+# ---------------------------------------------------------------------
+def _reference_dx_distance(
+    skel,
+    point,
+    *,
+    point_unit=None,
+    k_nearest=4,
+    radius_metric=None,
+    mode="surface",
+    allowed_nodes=None,
+    allowed_edges=None,
+):
+    """Literal port of dx.distance's pre-vectorization per-point whitelist loop,
+    restricted to calibrate_radii's exact calling convention: mode='centerline',
+    a single-node allowed_nodes whitelist, no allowed_edges, no unit conversion.
+    """
+    assert point_unit is None
+    assert mode == "centerline"
+    assert allowed_edges is None
+    assert allowed_nodes is not None and len(allowed_nodes) == 1
+
+    nodes = skel.nodes
+    neighbours = skel._ensure_node_neighbors()
+    node_id = int(allowed_nodes[0])
+    candidates = {
+        (node_id, int(nb)) if node_id < nb else (int(nb), node_id)
+        for nb in neighbours[node_id]
+    }
+
+    pts = np.asarray(point, dtype=np.float64)
+    out = np.empty(len(pts), dtype=np.float64)
+    for i, p in enumerate(pts):
+        best = float(np.linalg.norm(nodes[node_id] - p))
+        for a_idx, b_idx in candidates:
+            d = dx._point_segment_distance(p, nodes[a_idx], nodes[b_idx])
+            if d < best:
+                best = d
+        out[i] = best
+    return out
+
+
+def test_calibrate_radii_matches_reference_implementation(template_skel, monkeypatch):
+    mesh = load_mesh(Path(__file__).parent / "data" / "60427.obj")
+
+    skel_ref = copy.deepcopy(template_skel)
+    skel_new = copy.deepcopy(template_skel)
+
+    kwargs = dict(
+        aggregate="trim",
+        min_n_outer=5,
+        min_frac_outer=0.33,
+        min_verts_q_outer=0.0,  # exercise the outer-shell path on every eligible node
+        rays_num_outer=30,
+        rays_thresh_outer=0.2,
+        rays_sample=False,  # deterministic ray directions
+        store_key="calibrated",
+        verbose=False,
+    )
+
+    post.calibrate_radii(skel_new, mesh, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(post, "submesh_by_vertices", _reference_submesh_by_vertices)
+        m.setattr(dx, "distance", _reference_dx_distance)
+        post.calibrate_radii(skel_ref, mesh, **kwargs)
+
+    assert (
+        skel_ref.extra["calibration"]["radius_method"]
+        == skel_new.extra["calibration"]["radius_method"]
+    )
+    np.testing.assert_allclose(
+        skel_ref.radii["calibrated"], skel_new.radii["calibrated"], rtol=1e-9, atol=1e-9
+    )
