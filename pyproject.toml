@@ -13,30 +13,24 @@ dependencies = [
     "numpy>=2.0.2",
     "scipy>=1.13.1",
     "trimesh==4.7.4",
-    "matplotlib>=3.10.3",
     "rtree>=1.4.1",
-    "pandas>=2.3.3",
-    "jupyterlab>=4.4.10",
-    "notebook>=7.4.7",
-    "jupyter>=1.1.1",
-    "pytest>=8.3.5",
-    "python-multipart>=0.0.22",
     "shapely>=2.1.2",
-    "flake8>=7.3.0",
+    "matplotlib>=3.10.3",
     "starlette>=0.52.1",
-    "fastapi>=0.115.0",
     "uvicorn[standard]>=0.34.0",
+    "python-multipart>=0.0.22",
 ]
 license = "GPL-3.0-or-later"
 readme = {file = "README.md", content-type = "text/markdown"}
 
 [project.optional-dependencies]
 dev = [
+    "pytest>=8.3.5",
     "ruff",
-    "pytest",
+    "flake8>=7.3.0",
+    "httpx2>=2.0.0",
     "watermark>=2.5.0",
 ]
-
 
 [project.scripts]
 skeliner = "skeliner.__main__:main"
@@ -55,9 +49,3 @@ select = ["E4", "E7", "E9", "F", "ARG"]
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
-
-[tool.setuptools]
-packages = {find = {}}
-include-package-data = true
-
-
