@@ -1071,9 +1071,14 @@ def _create_app(
             return JSONResponse(
                 {"ok": False, "error": "Upload interrupted"}, status_code=499
             )
-        upload = form["file"]
-        tmp_path = port_dir / upload.filename
-        tmp_path.write_bytes(await upload.read())
+        # Starlette never closes a parsed form; its uploads are spooled temp
+        # files that would otherwise stay open until garbage collection.
+        try:
+            upload = form["file"]
+            tmp_path = port_dir / upload.filename
+            tmp_path.write_bytes(await upload.read())
+        finally:
+            await form.close()
         return await _apply_upload(tmp_path)
 
     async def upload_batch(request):
@@ -1097,19 +1102,20 @@ def _create_app(
                 {"ok": False, "error": "Upload interrupted"}, status_code=499
             )
 
-        uploads = form.getlist("files")
-        if not uploads:
-            return JSONResponse(
-                {"ok": False, "error": "No files in batch"}, status_code=400
-            )
-
         # Written before anything is applied because the tier of an .npz is
         # decided by sniffing its contents, which needs it on disk.
         paths: list[Path] = []
-        for upload in uploads:
-            tmp_path = port_dir / upload.filename
-            tmp_path.write_bytes(await upload.read())
-            paths.append(tmp_path)
+        try:
+            for upload in form.getlist("files"):
+                tmp_path = port_dir / upload.filename
+                tmp_path.write_bytes(await upload.read())
+                paths.append(tmp_path)
+        finally:
+            await form.close()
+        if not paths:
+            return JSONResponse(
+                {"ok": False, "error": "No files in batch"}, status_code=400
+            )
 
         meshes = [p for p in paths if _upload_tier(p) == _TIER_MESH]
         if len(meshes) > 1:
