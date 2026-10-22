@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Sequence, Set, Tuple
 import igraph as ig
 import numpy as np
 
+from . import _rs
+
 __skeleton__ = [
     "check_connectivity",
     "connectivity",
@@ -723,6 +725,29 @@ def distance(
                 continue
             a, b = (u2, v2) if u2 < v2 else (v2, u2)
             allowed_edges_set.add((a, b))
+
+    if (
+        use_whitelist
+        and not surface
+        and allowed_edges_set is None
+        and scale_in == 1.0
+        and scale_out == 1.0
+    ):
+        # the same minimum over the allowed centres and their edges, once
+        segments = sorted(
+            {
+                (min(nid, int(nb)), max(nid, int(nb)))
+                for nid in allowed_nodes_set
+                for nb in neighbours[nid]
+            }
+        )
+        distances = _rs.segment_distances(
+            pts,
+            np.asarray(nodes, dtype=np.float64),
+            sorted(allowed_nodes_set),
+            segments,
+        )
+        return float(distances[0]) if single_input else distances
 
     for i, p in enumerate(pts):
         p_skel = p * scale_in

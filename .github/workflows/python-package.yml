@@ -10,6 +10,29 @@ on:
         branches: ["main"]
 
 jobs:
+    rust:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.13"
+            - name: Set up Rust
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  components: clippy, rustfmt
+            - name: rustfmt
+              working-directory: rust
+              run: cargo fmt --all --check
+            - name: clippy
+              working-directory: rust
+              run: cargo clippy --workspace --all-targets -- -D warnings
+            - name: cargo test
+              working-directory: rust
+              # skeliner-py is the extension module; pytest covers it.
+              run: cargo test --workspace --exclude skeliner-py
+
     build:
         runs-on: ubuntu-latest
         strategy:
@@ -20,10 +43,14 @@ jobs:
         steps:
             - uses: actions/checkout@v4
             - name: Set up Python ${{ matrix.python-version }}
-              uses: actions/setup-python@v3
+              uses: actions/setup-python@v5
               with:
                   python-version: ${{ matrix.python-version }}
+                  allow-prereleases: true
+            - name: Set up Rust
+              uses: dtolnay/rust-toolchain@stable
             - name: Install dependencies
+              # Installing the package builds its Rust extension with maturin.
               run: |
                   python -m pip install --upgrade pip
                   python -m pip install flake8 pytest

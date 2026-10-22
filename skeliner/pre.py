@@ -6,11 +6,11 @@ import warnings
 from collections import Counter, defaultdict, deque
 from contextlib import contextmanager
 
-import igraph as ig
 import numpy as np
 import trimesh
 from scipy.spatial import KDTree
 
+from skeliner import _rs
 from skeliner.dataclass import (
     Discarded,
     MeshComponents,
@@ -105,67 +105,84 @@ def _edge_to_faces(mesh: trimesh.Trimesh) -> dict[tuple[int, int], list[int]]:
     return result
 
 
+def _edge_map(mesh: trimesh.Trimesh):
+    """Edge → faces of *mesh* as a :class:`skeliner._rs.Topology`.
+
+    It reads like the dict :func:`_edge_to_faces` builds — keys, face lists
+    and iteration order — so code written against the dict takes it.
+    """
+    return _rs.Topology(np.asarray(mesh.faces, dtype=np.int64), len(mesh.vertices))
+
+
+def _row_dot(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Dot product of each row of two ``(n, 3)`` arrays, summed left to right.
+
+    ``np.einsum("ij,ij->i", ...)`` follows no single per-row order, so its
+    last bit — and the sign of a dot near zero — is not reproducible; this
+    order is the Rust core's.
+    """
+    return (a[:, 0] * b[:, 0] + a[:, 1] * b[:, 1]) + a[:, 2] * b[:, 2]
+
+
+def _svd_rows(x: np.ndarray, full_matrices: bool) -> np.ndarray:
+    """``np.linalg.svd(x, full_matrices=...)[2]``.  The Rust core calls back
+    for every SVD: the platform's LAPACK rounds as no Rust solver does."""
+    return np.linalg.svd(x, full_matrices=full_matrices)[2]
+
+
+def _mouth_hull_area(pts: np.ndarray) -> float:
+    """Convex-hull area of *pts* projected onto their best-fit plane, 0 when
+    qhull cannot build the hull — :func:`find_pocket_mouths`' opening when
+    no rim loop closes."""
+    from scipy.spatial import ConvexHull
+
+    centered = pts - pts.mean(axis=0)
+    _, _, vh = np.linalg.svd(centered)
+    try:
+        return float(ConvexHull(centered @ vh[:2].T).volume)
+    except Exception:
+        return 0.0
+
+
+def _nearest(tree: KDTree, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Nearest point of *tree* to each of *points*: ``(distances, indices)``.
+
+    Exact ties go to the lowest index.  scipy's own pick among equally near
+    points depends on how its tree was built, and on these grid-snapped
+    meshes such ties are common — 2% of face-centroid queries on one cell.
+    """
+    points = np.atleast_2d(np.asarray(points, dtype=np.float64))
+    if tree.n < 2 or len(points) == 0:
+        return tree.query(points)
+    d2, i2 = tree.query(points, k=2)
+    d, i = d2[:, 0].copy(), i2[:, 0].copy()
+    tied = np.flatnonzero(d2[:, 1] <= d2[:, 0])
+    if len(tied):
+        reach = d[tied] * (1 + 1e-9) + 1e-12
+        data = tree.data
+        for row, cand in zip(tied, tree.query_ball_point(points[tied], reach)):
+            cand = np.asarray(cand)
+            sq = ((data[cand] - points[row]) ** 2).sum(axis=1)
+            i[row] = cand[sq == sq.min()].min()
+    return d, i
+
+
 def _face_edge_components(mesh: trimesh.Trimesh) -> tuple[np.ndarray, int]:
     """Connected components of faces using edge adjacency.
 
     Two faces are in the same component only if they share an edge
-    (not just a vertex).
+    (not just a vertex).  Faces with a repeated vertex are labelled -2 and
+    connect nothing; components are numbered by their lowest face.
 
     Returns
     -------
     labels : np.ndarray
         (nFaces,) int array — component id for each face.
     main : int
-        Component id of the largest component.
+        Component id of the largest component, ties to the lowest id.
     """
-    faces = mesh.faces
-    n = len(faces)
-
-    # Mark degenerate faces (duplicate vertices) so they are skipped
-    degen = ~_non_degenerate(faces)
-
-    edge_to_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
-    for fi in range(n):
-        if degen[fi]:
-            continue
-        face = faces[fi]
-        for i in range(3):
-            e = (
-                min(int(face[i]), int(face[(i + 1) % 3])),
-                max(int(face[i]), int(face[(i + 1) % 3])),
-            )
-            edge_to_faces[e].append(fi)
-
-    # -1 = unlabeled, -2 = degenerate (permanently skipped)
-    labels = np.full(n, -1, dtype=np.intp)
-    labels[degen] = -2
-    comp_id = 0
-    best_id, best_size = 0, 0
-
-    for seed in range(n):
-        if labels[seed] >= 0 or labels[seed] == -2:
-            continue
-        queue = [seed]
-        labels[seed] = comp_id
-        size = 0
-        while queue:
-            fi = queue.pop()
-            size += 1
-            face = mesh.faces[fi]
-            for i in range(3):
-                e = (
-                    min(int(face[i]), int(face[(i + 1) % 3])),
-                    max(int(face[i]), int(face[(i + 1) % 3])),
-                )
-                for nb in edge_to_faces[e]:
-                    if labels[nb] < 0:
-                        labels[nb] = comp_id
-                        queue.append(nb)
-        if size > best_size:
-            best_id, best_size = comp_id, size
-        comp_id += 1
-
-    return labels, best_id
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    return _rs.face_edge_components(faces, len(mesh.vertices))
 
 
 def find_holes(
@@ -936,17 +953,70 @@ def fill_holes(
 # ── Merge selected faces ────────────────────────────────────────────
 
 
+# The three vertex-column pairs that make a face's edges.
+_EDGE_COLS = ((0, 1), (1, 2), (0, 2))
+
+
+def _border_edges(
+    sel: set[int],
+    edge_to_faces: dict[tuple[int, int], list[int]],
+    faces: np.ndarray | None,
+) -> list[tuple[int, int]]:
+    """Edges shared by a face in *sel* and a face outside it, sorted.
+
+    Without *faces* the whole map is scanned.  With *faces* — the array
+    *edge_to_faces* was built from — only the selection's own edges are
+    examined, so the cost follows the selection rather than the mesh.
+    Both return the same list.
+    """
+    if faces is None:
+        return sorted(
+            e
+            for e, fis in edge_to_faces.items()
+            if any(fi in sel for fi in fis) and any(fi not in sel for fi in fis)
+        )
+    found: set[tuple[int, int]] = set()
+    seen: set[tuple[int, int]] = set()
+    for fi in sel:
+        f = faces[fi]
+        for a, b in _EDGE_COLS:
+            u, v = int(f[a]), int(f[b])
+            e = (u, v) if u < v else (v, u)
+            if e in seen:
+                continue
+            seen.add(e)
+            fis = edge_to_faces.get(e)
+            if fis and any(x in sel for x in fis) and any(x not in sel for x in fis):
+                found.add(e)
+    return sorted(found)
+
+
 def _trace_border_loops(
     sel: set[int],
     edge_to_faces: dict[tuple[int, int], list[int]],
+    faces: np.ndarray | None = None,
 ) -> list[list[int]]:
-    """Trace closed loops along the border between *sel* and kept faces."""
-    border_edges: list[tuple[int, int]] = []
-    for e, fis in edge_to_faces.items():
-        has_sel = any(fi in sel for fi in fis)
-        has_kept = any(fi not in sel for fi in fis)
-        if has_sel and has_kept:
-            border_edges.append(e)
+    """Trace closed loops along the border between *sel* and kept faces.
+
+    Each loop starts at its smallest vertex and, wherever the border offers
+    a choice, steps to the smallest unvisited neighbour, so the loops depend
+    only on which edges are on the border.  Given a
+    :class:`skeliner._rs.Topology` the Rust core traces them; given the dict,
+    pass *faces* to examine only the selection's edges (see
+    :func:`_border_edges`).
+    """
+    if isinstance(edge_to_faces, _rs.Topology):
+        return edge_to_faces.border_loops(sel)
+    return _trace_border_loops_py(sel, edge_to_faces, faces)
+
+
+def _trace_border_loops_py(
+    sel: set[int],
+    edge_to_faces: dict[tuple[int, int], list[int]],
+    faces: np.ndarray | None = None,
+) -> list[list[int]]:
+    """:func:`_trace_border_loops` on the dict :func:`_edge_to_faces` builds."""
+    border_edges = _border_edges(sel, edge_to_faces, faces)
 
     if len(border_edges) < 3:
         return []
@@ -976,7 +1046,7 @@ def _trace_border_loops(
                     break
             if closed:
                 break
-            nxt = next((n for n in nbs if n not in visited), None)
+            nxt = min((n for n in nbs if n not in visited), default=None)
             if nxt is None:
                 break
             visited.add(nxt)
@@ -996,10 +1066,13 @@ def _validate_loop_pair(
     """Return a reason string if the loop pair is unsuitable for stitching.
 
     Reject 3-vertex "loops" (degenerate triangle holes that no stitcher
-    can bridge to a larger rim manifoldly), and reject pairs whose size
+    can bridge to a larger rim manifoldly), reject pairs whose size
     ratio exceeds *max_ratio* (highly mismatched rims force the zipper
     or the tube fitter to fan multiple ring verts onto a single rim
-    vert, producing fan vertices and non-manifold edges).
+    vert, producing fan vertices and non-manifold edges), and reject a
+    loop paired with itself — both tips grown onto the same rim, as when
+    the two pieces are still glued — which the zipper folds into a
+    zero-length tube of non-manifold edges inside that rim.
 
     Returns ``None`` if the pair passes.
     """
@@ -1011,12 +1084,15 @@ def _validate_loop_pair(
         return (
             f"loop size mismatch ({na}v + {nb}v, ratio {ratio:.1f} > {max_ratio:.1f})"
         )
+    if set(la) == set(lb):
+        return f"both tips reached the same rim ({na}v)"
     return None
 
 
 def _removal_would_sever(
     sel: set[int],
     edge_to_faces: dict[tuple[int, int], list[int]],
+    faces: np.ndarray | None = None,
 ) -> bool:
     """Would removing the connected patch *sel* cut its surface in two?
 
@@ -1026,14 +1102,16 @@ def _removal_would_sever(
     annulus that wraps the surface — removing it leaves the far side
     disconnected, severing whatever lies beyond.
     """
-    loops = _trace_border_loops(sel, edge_to_faces)
+    loops = _trace_border_loops(sel, edge_to_faces, faces)
     return sum(1 for lp in loops if len(lp) >= 3) >= 2
 
 
 def _sever_cost(
     sel: set[int],
-    face_adj: dict[int, set[int]],
+    face_adj: dict[int, set[int]] | None,
     budget: int,
+    *,
+    topology=None,
 ) -> int:
     """How many faces removing *sel* would strand, capped at ``budget``.
 
@@ -1049,7 +1127,21 @@ def _sever_cost(
     work is bounded by the answer rather than by the mesh: at most one
     piece can exceed the budget and still be the largest, and if two do
     the cost already exceeds it.  Returns ``budget + 1`` in that case.
+
+    With a :class:`skeliner._rs.Topology` as *topology* the Rust core does
+    it and *face_adj* is not read.
     """
+    if topology is not None:
+        return topology.sever_cost(sel, budget)
+    return _sever_cost_py(sel, face_adj, budget)
+
+
+def _sever_cost_py(
+    sel: set[int],
+    face_adj: dict[int, set[int]],
+    budget: int,
+) -> int:
+    """:func:`_sever_cost` over the *face_adj* dict."""
     seeds: set[int] = set()
     for fi in sel:
         seeds.update(f for f in face_adj[fi] if f not in sel)
@@ -1071,6 +1163,8 @@ def _sever_cost(
             size += 1
             if size > budget:
                 over = True
+                # u is popped but not yet walked; the drain below walks it
+                stack.append(u)
                 break
             for v in face_adj[u]:
                 if v not in sel and v not in seen:
@@ -1127,11 +1221,12 @@ def _rescue_size(
 def _expand_tip_to_good_rim(
     tip: list[int],
     edge_to_faces: dict[tuple[int, int], list[int]],
-    face_adj: dict[int, set[int]],
+    face_adj: dict[int, set[int]] | None,
     *,
     target_verts: int = 6,
     max_iters: int = 20,
     max_eat_factor: int = 30,
+    faces: np.ndarray | None = None,
 ) -> tuple[set[int], list[int] | None]:
     """Iteratively peel BFS rings from *tip* until its border has at least
     *target_verts* vertices.
@@ -1144,8 +1239,34 @@ def _expand_tip_to_good_rim(
     triangle). Each expansion step adds the next BFS ring of
     edge-neighbors and re-traces the border. Expansion is capped at
     ``len(tip) * max_eat_factor`` faces to avoid swallowing the entire
-    component.
+    component.  *faces* is passed to :func:`_trace_border_loops`.  Given a
+    :class:`skeliner._rs.Topology` the Rust core does it and *face_adj* is
+    not read.
     """
+    if isinstance(edge_to_faces, _rs.Topology):
+        return edge_to_faces.expand_tip(tip, target_verts, max_iters, max_eat_factor)
+    return _expand_tip_to_good_rim_py(
+        tip,
+        edge_to_faces,
+        face_adj,
+        target_verts=target_verts,
+        max_iters=max_iters,
+        max_eat_factor=max_eat_factor,
+        faces=faces,
+    )
+
+
+def _expand_tip_to_good_rim_py(
+    tip: list[int],
+    edge_to_faces: dict[tuple[int, int], list[int]],
+    face_adj: dict[int, set[int]],
+    *,
+    target_verts: int = 6,
+    max_iters: int = 20,
+    max_eat_factor: int = 30,
+    faces: np.ndarray | None = None,
+) -> tuple[set[int], list[int] | None]:
+    """:func:`_expand_tip_to_good_rim` on the dict edge and face maps."""
     sel: set[int] = set(int(fi) for fi in tip)
     if not sel:
         return sel, None
@@ -1153,7 +1274,7 @@ def _expand_tip_to_good_rim(
 
     best_loop: list[int] | None = None
     for _ in range(max_iters):
-        loops = _trace_border_loops(sel, edge_to_faces)
+        loops = _trace_border_loops(sel, edge_to_faces, faces)
         loops = [lp for lp in loops if len(lp) >= 3]
         if loops:
             biggest = max(loops, key=len)
@@ -1175,11 +1296,12 @@ def _expand_tip_to_good_rim(
 def _expand_selection_per_group(
     sel: list[int] | set[int],
     edge_to_faces: dict[tuple[int, int], list[int]],
-    face_adj: dict[int, set[int]],
+    face_adj: dict[int, set[int]] | None,
     *,
     target_verts: int = 6,
     max_iters: int = 20,
     max_eat_factor: int = 30,
+    faces: np.ndarray | None = None,
 ) -> tuple[set[int], list[list[int]]]:
     """Split *sel* into edge-connected sub-groups, expand each
     independently with :func:`_expand_tip_to_good_rim`, then re-trace
@@ -1191,8 +1313,35 @@ def _expand_selection_per_group(
     rim grow toward similar sizes — `_zipper_stitch`'s KDTree weld
     only behaves manifoldly when the two rims are matched in vertex
     count, so symmetric per-side expansion is what unlocks a clean
-    bridge.
+    bridge.  Given a :class:`skeliner._rs.Topology` the Rust core does it
+    and *face_adj* is not read.
     """
+    if isinstance(edge_to_faces, _rs.Topology):
+        return edge_to_faces.expand_selection_per_group(
+            sel, target_verts, max_iters, max_eat_factor
+        )
+    return _expand_selection_per_group_py(
+        sel,
+        edge_to_faces,
+        face_adj,
+        target_verts=target_verts,
+        max_iters=max_iters,
+        max_eat_factor=max_eat_factor,
+        faces=faces,
+    )
+
+
+def _expand_selection_per_group_py(
+    sel: list[int] | set[int],
+    edge_to_faces: dict[tuple[int, int], list[int]],
+    face_adj: dict[int, set[int]],
+    *,
+    target_verts: int = 6,
+    max_iters: int = 20,
+    max_eat_factor: int = 30,
+    faces: np.ndarray | None = None,
+) -> tuple[set[int], list[list[int]]]:
+    """:func:`_expand_selection_per_group` on the dict edge and face maps."""
     sel_set: set[int] = set(int(fi) for fi in sel)
     if not sel_set:
         return sel_set, []
@@ -1220,18 +1369,19 @@ def _expand_selection_per_group(
     # Expand each group independently
     expanded: set[int] = set()
     for grp in groups:
-        sub_sel, _ = _expand_tip_to_good_rim(
+        sub_sel, _ = _expand_tip_to_good_rim_py(
             list(grp),
             edge_to_faces,
             face_adj,
             target_verts=target_verts,
             max_iters=max_iters,
             max_eat_factor=max_eat_factor,
+            faces=faces,
         )
         expanded |= sub_sel
 
     # Re-trace loops on the final merged selection
-    loops = _trace_border_loops(expanded, edge_to_faces)
+    loops = _trace_border_loops(expanded, edge_to_faces, faces)
     loops = [lp for lp in loops if len(lp) >= 3]
     return expanded, loops
 
@@ -1361,7 +1511,7 @@ def _zipper_stitch(
 
     def _resample_polar(angles, radii, n):
         """Resample a polar profile to *n* evenly-spaced angles."""
-        order = np.argsort(angles)
+        order = np.argsort(angles, kind="stable")
         a_sorted = angles[order]
         r_sorted = radii[order]
         # Close the loop
@@ -1490,7 +1640,7 @@ def _zipper_stitch(
         if m < 2 or n < m:
             # Cannot guarantee step <= 1; fall back to nearest (tiny loops).
             tree = KDTree(loop_pts)
-            _, idxs = tree.query(ring_pts)
+            _, idxs = _nearest(tree, ring_pts)
             return {ring[i]: loop[int(idxs[i])] for i in range(n)}
         cur = int(np.argmin(np.linalg.norm(loop_pts - ring_pts[0], axis=1)))
         wmap = {ring[0]: loop[cur]}
@@ -1610,9 +1760,9 @@ def merge_selected_faces(
     if not sel_input:
         return mesh
 
-    # Edge / face adjacency maps
-    edge_to_faces = _edge_to_faces(mesh)
-    face_adj = _face_adjacency(mesh, edge_to_faces)
+    # the Topology answers face adjacency too, so no face map is built
+    edge_to_faces = _edge_map(mesh)
+    face_adj = None
 
     if verbose:
         print(f"[skeliner.pre] Merge: requested {len(sel_input)} faces")
@@ -1623,7 +1773,9 @@ def merge_selected_faces(
     # as remove_gaps's per-side expansion — so the resulting rims
     # converge to matching sizes (`_zipper_stitch` only welds
     # manifoldly when both rims have similar vertex counts).
-    sel, loops = _expand_selection_per_group(sel_input, edge_to_faces, face_adj)
+    sel, loops = _expand_selection_per_group(
+        sel_input, edge_to_faces, face_adj, faces=np.asarray(mesh.faces)
+    )
 
     if verbose:
         if len(sel) != len(sel_input):
@@ -1910,170 +2062,6 @@ def _otsu_threshold(values: np.ndarray) -> tuple[float, float]:
     return best_thresh, best_between / total_var
 
 
-def _assign_soma_verts(
-    mesh: trimesh.Trimesh,
-    soma: "Soma",
-    main_fi: np.ndarray | None = None,
-    adj: dict | None = None,
-    verbose: bool = False,
-) -> "Soma":
-    """Assign mesh vertices to an existing soma ellipsoid.
-
-    Performs containment, edge-dilation, pocket absorption, and
-    disconnected-component absorption.  Refits the ellipsoid to the
-    final vertex set.
-
-    Parameters
-    ----------
-    mesh : trimesh.Trimesh
-        The mesh (may differ from the one used to detect the soma).
-    soma : Soma
-        Soma with fitted geometry (center/axes/R).
-    main_fi : np.ndarray or None
-        Face indices of the main component.  Computed if not provided.
-    adj : dict or None
-        Vertex adjacency on the main component.  Computed if not provided.
-    verbose : bool, default False
-        Print progress.
-    """
-
-    _log = "[skeliner.pre]   soma verts:"
-
-    if main_fi is None:
-        labels, main = _face_edge_components(mesh)
-        main_fi = np.where(labels == main)[0]
-
-    if adj is None:
-        adj = defaultdict(list)
-        for fi in main_fi:
-            v = mesh.faces[fi]
-            for i in range(3):
-                a, b = int(v[i]), int(v[(i + 1) % 3])
-                adj[a].append(b)
-                adj[b].append(a)
-
-    # Containment: main-component vertices inside the ellipsoid
-    all_main_verts = np.unique(mesh.faces[main_fi])
-    inside = soma.contains(mesh.vertices[all_main_verts])
-    soma_set: set[int] = set(all_main_verts[inside].tolist())
-    if verbose:
-        print(f"{_log} {len(soma_set):,} inside ellipsoid")
-
-    # Dilate along mesh edges (a few average edge lengths past the
-    # ellipsoid surface, measured in body-coord units).
-    avg_edge = float(mesh.edges_unique_length.mean())
-    edge_in_body = avg_edge / float(soma.axes.min())
-    dilation_limit = 1.0 + 3.0 * edge_in_body
-
-    n_dilated = 0
-    prev_size = 0
-    while len(soma_set) != prev_size:
-        prev_size = len(soma_set)
-        frontier = set()
-        for v in soma_set:
-            for nv in adj.get(v, []):
-                if nv not in soma_set:
-                    frontier.add(nv)
-        if not frontier:
-            break
-        frontier_arr = np.fromiter(frontier, dtype=np.intp)
-        body = soma._body_coords(mesh.vertices[frontier_arr])
-        body_dist = np.sqrt((body**2).sum(axis=1))
-        accept = frontier_arr[body_dist < dilation_limit]
-        if len(accept) == 0:
-            break
-        n_dilated += len(accept)
-        soma_set.update(accept.tolist())
-    if verbose:
-        print(f"{_log} +{n_dilated:,} dilated → {len(soma_set):,}")
-
-    # Absorb pockets: connected components of non-soma verts that are
-    # topologically trapped (only reachable through the soma).
-    # A neuron can have multiple neurite trees stemming from the soma;
-    # all of them are trapped by definition.  We separate neurites
-    # (large, preserve) from pockets (small surface artifacts, absorb)
-    # using Otsu on trapped component sizes.
-    all_main_set = set(all_main_verts.tolist())
-    n_absorbed_total = 0
-    n_skipped_neurite = 0
-    for _iteration in range(10):
-        outside = all_main_set - soma_set
-        visited: set[int] = set()
-        trapped_comps: list[list[int]] = []
-        for start in outside:
-            if start in visited:
-                continue
-            comp: list[int] = []
-            pocket_queue = deque([start])
-            while pocket_queue:
-                v = pocket_queue.popleft()
-                if v in visited:
-                    continue
-                visited.add(v)
-                comp.append(v)
-                for nv in adj[v]:
-                    if nv in outside and nv not in visited:
-                        pocket_queue.append(nv)
-            comp_set = set(comp)
-            trapped = all(
-                nv in soma_set or nv in comp_set for v in comp for nv in adj.get(v, [])
-            )
-            if trapped and len(comp) < len(soma_set):
-                trapped_comps.append(comp)
-
-        if not trapped_comps:
-            break
-
-        # Otsu on component sizes to split neurites from pockets
-        sizes = np.array([len(c) for c in trapped_comps], dtype=np.float64)
-        if len(sizes) >= 2:
-            size_thresh, _ = _otsu_threshold(sizes)
-        else:
-            size_thresh = 0.0  # single component — absorb it
-
-        absorbed = 0
-        for comp in trapped_comps:
-            if len(comp) > size_thresh:
-                n_skipped_neurite += len(comp)
-            else:
-                soma_set.update(comp)
-                absorbed += len(comp)
-        n_absorbed_total += absorbed
-        if absorbed == 0:
-            break
-    if verbose and n_absorbed_total:
-        print(f"{_log} +{n_absorbed_total:,} absorbed pockets → {len(soma_set):,}")
-    if verbose and n_skipped_neurite:
-        print(
-            f"{_log} {n_skipped_neurite:,} verts in {sum(1 for c in trapped_comps if len(c) > size_thresh)} neurite branches preserved"
-        )
-
-    # Absorb disconnected-component vertices inside the ellipsoid.
-    all_verts = np.arange(len(mesh.vertices))
-    non_main_mask = np.ones(len(mesh.vertices), dtype=bool)
-    non_main_mask[all_main_verts] = False
-    non_main_verts = all_verts[non_main_mask]
-    n_disconn = 0
-    if non_main_verts.size:
-        inside_non_main = soma.contains(mesh.vertices[non_main_verts])
-        n_disconn = int(inside_non_main.sum())
-        soma_set.update(non_main_verts[inside_non_main].tolist())
-    if verbose and n_disconn:
-        print(f"{_log} +{n_disconn:,} disconnected → {len(soma_set):,}")
-
-    # Refit ellipsoid to the final vertex set.
-    soma_verts_arr = np.fromiter(sorted(soma_set), dtype=np.intp)
-    if len(soma_verts_arr) >= 4:
-        try:
-            soma = Soma.fit(mesh.vertices[soma_verts_arr], verts=soma_verts_arr)
-        except ValueError:
-            soma.verts = soma_verts_arr
-    else:
-        soma.verts = soma_verts_arr
-
-    return soma
-
-
 def find_soma_via_ring_cutoff(
     mesh: trimesh.Trimesh,
     *,
@@ -2131,422 +2119,7 @@ def find_soma_via_ring_cutoff(
     if organelles is None:
         organelles = find_organelles(mesh)
 
-    # ── 2. Build soma-component vertex adjacency ─────────────────
-    #       The soma is on the component that contains the nucleus
-    #       seeds.  This may differ from the largest component when
-    #       the soma is disconnected from the main neurite surface
-    #       (a gap that remove_gaps would bridge later).
-    seed_vi = nuc.get("soma_seed_vi", np.array([], dtype=np.intp))
-
-    # Determine which component the nucleus seeds belong to
-    soma_ci = main
-    if len(seed_vi) > 0:
-        vert_comp = np.full(len(mesh.vertices), -1, dtype=np.intp)
-        for fi in range(len(mesh.faces)):
-            ci = int(labels[fi])
-            for v in mesh.faces[fi]:
-                vert_comp[int(v)] = ci
-        seed_comps = vert_comp[seed_vi]
-        valid = seed_comps >= 0
-        if valid.any():
-            soma_ci = Counter(seed_comps[valid].tolist()).most_common(1)[0][0]
-
-    soma_fi = np.where(labels == soma_ci)[0]
-    adj: dict[int, list[int]] = defaultdict(list)
-    for fi in soma_fi:
-        v = mesh.faces[fi]
-        for i in range(3):
-            a, b = int(v[i]), int(v[(i + 1) % 3])
-            adj[a].append(b)
-            adj[b].append(a)
-
-    # ── 3. BFS from soma surface at nucleus mid-Z ──────────────
-    #       Seed ring 0 with soma-cluster vertices at the nucleus
-    #       center Z-level (from find_nucleus_center).  These are
-    #       outer-surface vertices, tilt-invariant, and form a
-    #       symmetric band around the soma cross-section.
-    all_soma_verts = np.fromiter(adj.keys(), dtype=np.intp)
-    soma_set = set(adj.keys())
-    # Keep only seeds that are on the soma component
-    seed_verts = np.array([v for v in seed_vi if v in soma_set], dtype=np.intp)
-    if len(seed_verts) == 0:
-        # Fallback: single nearest vertex to nucleus center
-        seed_verts = all_soma_verts[
-            np.argmin(np.linalg.norm(mesh.vertices[all_soma_verts] - center, axis=1))
-        ].reshape(1)
-
-    ring_level: dict[int, int] = {}
-    queue: deque[int] = deque()
-    ring_verts: dict[int, list[int]] = defaultdict(list)
-    for sv in seed_verts:
-        vi = int(sv)
-        ring_level[vi] = 0
-        queue.append(vi)
-        ring_verts[0].append(vi)
-    while queue:
-        v = queue.popleft()
-        lv = ring_level[v]
-        for nv in adj[v]:
-            if nv not in ring_level:
-                ring_level[nv] = lv + 1
-                queue.append(nv)
-                ring_verts[lv + 1].append(nv)
-
-    # ── 4. Find soma boundary: largest connected ring component ────
-    #       Each BFS ring is split into connected components on the
-    #       mesh surface.  On the soma the largest component dominates
-    #       and grows; once the frontier enters neurites it fragments
-    #       into narrow strips and the largest component shrinks.
-    #       The cutoff is where the largest component peaks (Otsu on
-    #       the post-peak sizes determines the boundary).
-    max_ring = max(ring_verts.keys())
-    largest_comp_size = np.zeros(max_ring + 1)
-
-    for lv in range(max_ring + 1):
-        verts_in_ring = ring_verts.get(lv, [])
-        if not verts_in_ring:
-            continue
-        # Find connected components within this ring using mesh adjacency
-        ring_set = set(verts_in_ring)
-        visited_ring: set[int] = set()
-        max_comp = 0
-        for start in verts_in_ring:
-            if start in visited_ring:
-                continue
-            size = 0
-            rq = deque([start])
-            while rq:
-                v = rq.popleft()
-                if v in visited_ring:
-                    continue
-                visited_ring.add(v)
-                size += 1
-                for nv in adj[v]:
-                    if nv in ring_set and nv not in visited_ring:
-                        rq.append(nv)
-            if size > max_comp:
-                max_comp = size
-        largest_comp_size[lv] = max_comp
-
-    # Skip ring 0 (the injected seed set, not a natural BFS ring).
-    # Limit peak search to rings within 3× the nucleus Z-span
-    # (converted to ring count via average edge length) — peaks
-    # beyond that are neurite artifacts, not the soma.
-    avg_edge = float(mesh.edges_unique_length.mean())
-    z_span = nuc["z_range"][1] - nuc["z_range"][0]
-    max_soma_rings = max(int(z_span * 3 / avg_edge), 10)
-    search_end = min(max_soma_rings + 1, max_ring + 1)
-    peak_ring = 1 + int(np.argmax(largest_comp_size[1:search_end]))
-    post_peak = largest_comp_size[peak_ring:]
-    if len(post_peak) > 1:
-        count_thresh, _ = _otsu_threshold(post_peak)
-    else:
-        count_thresh = 0.0
-
-    cutoff = max_ring
-    for lv in range(peak_ring, max_ring + 1):
-        if largest_comp_size[lv] < count_thresh:
-            cutoff = lv
-            break
-
-    # Under-detection guard: the soma must at least span the nucleus
-    # Z-extent.  If it doesn't, extend the cutoff.
-    min_cutoff = max(int(z_span / avg_edge), 1)
-    if cutoff < min_cutoff:
-        cutoff = min_cutoff
-
-    # ── 5. Fit ellipsoid from BFS ring vertices ────────────────────
-    #       Include ring 0 (nucleus seed) in the soma vertex set.
-    bfs_set: set[int] = set()
-    for lv in range(cutoff + 1):
-        bfs_set.update(ring_verts[lv])
-    bfs_verts_arr = np.fromiter(bfs_set, dtype=np.intp)
-
-    initial_soma = Soma.fit(mesh.vertices[bfs_verts_arr])
-
-    soma = _assign_soma_verts(mesh, initial_soma, soma_fi, adj)
-
-    # ── 6. Prune neurite tubes from absorbed soma ─────────────────
-    #       Pocket absorption may swallow neurite stubs.  Find
-    #       connected components of soma vertices outside the initial
-    #       (pre-absorption) ellipsoid.  A component is a neurite
-    #       tube if it has a narrow attachment to the soma body
-    #       (ratio < 0.2) and is elongated (PCA: λ1 >> λ2 ≈ λ3).
-    #       After pruning tubes, drop any fragments that become
-    #       disconnected from the main soma body when the tube
-    #       boundary (soma verts adjacent to pruned verts) is
-    #       temporarily removed — these are axon sections inside
-    #       the ellipsoid connected only through the pruned tube.
-    soma_set = set(soma.verts.tolist())
-    soma_arr = np.fromiter(soma_set, dtype=np.intp)
-
-    if len(soma_arr) >= 4:
-        body_dist = np.sqrt(
-            (initial_soma._body_coords(mesh.vertices[soma_arr]) ** 2).sum(axis=1)
-        )
-        inside_set: set[int] = set()
-        outside_set: set[int] = set()
-        for i in range(len(soma_arr)):
-            vi = int(soma_arr[i])
-            (inside_set if body_dist[i] <= 1.0 else outside_set).add(vi)
-
-        neurite_prune: set[int] = set()
-        if outside_set:
-            # ── 6a. Prune neurite stubs ──────────────────────────
-            #        A stub connects the soma body to a neurite tree.
-            #        Identify stubs as outside components that border
-            #        a large non-soma connected component (the neurite
-            #        tree).  Fins protrude into extracellular space
-            #        and do NOT border a large non-soma CC.
-            #        "Large" is determined by Otsu on non-soma CC
-            #        sizes — fully data-driven, no hard thresholds.
-
-            # Find non-soma CCs on the soma component
-            all_comp_set = set(np.unique(mesh.faces[soma_fi]).tolist())
-            non_soma = all_comp_set - soma_set
-            vis_ns: set[int] = set()
-            neurite_tree: set[int] = set()
-            ns_sizes: list[int] = []
-            ns_ccs: list[list[int]] = []
-            for ns_start in non_soma:
-                if ns_start in vis_ns:
-                    continue
-                cc: list[int] = []
-                nsq = deque([ns_start])
-                while nsq:
-                    v = nsq.popleft()
-                    if v in vis_ns:
-                        continue
-                    vis_ns.add(v)
-                    cc.append(v)
-                    for nv in adj.get(v, []):
-                        if nv in non_soma and nv not in vis_ns:
-                            nsq.append(nv)
-                ns_ccs.append(cc)
-                ns_sizes.append(len(cc))
-
-            if len(ns_sizes) >= 2:
-                ns_thresh, _ = _otsu_threshold(np.array(ns_sizes, dtype=np.float64))
-                for cc, sz in zip(ns_ccs, ns_sizes):
-                    if sz > ns_thresh:
-                        neurite_tree.update(cc)
-            elif len(ns_sizes) == 1:
-                neurite_tree.update(ns_ccs[0])
-
-            # Find outside components; collect features
-            n_tubes = 0
-            outside_comps: list[tuple[list[int], bool, float]] = []
-            if neurite_tree:
-                visited_out: set[int] = set()
-                for start in outside_set:
-                    if start in visited_out:
-                        continue
-                    comp: list[int] = []
-                    oq = deque([start])
-                    while oq:
-                        v = oq.popleft()
-                        if v in visited_out:
-                            continue
-                        visited_out.add(v)
-                        comp.append(v)
-                        for nv in adj.get(v, []):
-                            if nv in outside_set and nv not in visited_out:
-                                oq.append(nv)
-
-                    if len(comp) < 20:
-                        continue
-
-                    # Does this component border the neurite tree?
-                    borders = any(
-                        nv in neurite_tree for v in comp for nv in adj.get(v, [])
-                    )
-                    # How far does it extend in body coords?
-                    comp_body = initial_soma._body_coords(mesh.vertices[np.array(comp)])
-                    max_ext = float(np.sqrt((comp_body**2).sum(axis=1)).max())
-                    outside_comps.append((comp, borders, max_ext))
-
-                # Prune components extending far beyond the typical
-                # near-surface bump.  Threshold = 2× the 25th
-                # percentile of extents — data-relative, adapts to
-                # ellipsoid fit quality.
-                all_ext = np.array(
-                    [e for _, _, e in outside_comps],
-                    dtype=np.float64,
-                )
-                q1 = float(np.percentile(all_ext, 25))
-                ext_thresh = 2.0 * q1
-
-                for comp, borders, ext in outside_comps:
-                    if ext > ext_thresh:
-                        neurite_prune.update(comp)
-                        n_tubes += 1
-
-            if neurite_prune:
-                soma_set -= neurite_prune
-
-        # ── 6b. Per-exit stub erosion ─────────────────────────────
-        #        For each neurite exit (cluster of boundary verts),
-        #        BFS inward into the soma independently.  Ring widths
-        #        start narrow (tube); stop when the ring widens into
-        #        the soma body (Otsu).  Erode each exit separately so
-        #        narrow tubes get deep erosion, wide junctions don't.
-        comp_vert_set = set(adj.keys())
-        non_comp_soma = soma_set - comp_vert_set
-        all_comp_set = set(np.unique(mesh.faces[soma_fi]).tolist())
-        non_soma = all_comp_set - soma_set
-
-        # Find soma boundary verts adjacent to non-soma.
-        # Only erode when step 6a pruned neurite chains.
-        exit_verts: set[int] = set()
-        if neurite_prune and non_soma:
-            for v in soma_set & comp_vert_set:
-                for nv in adj.get(v, []):
-                    if nv in non_soma:
-                        exit_verts.add(v)
-                        break
-
-        if exit_verts:
-            soma_main = soma_set & comp_vert_set
-
-            # Group exit verts into per-exit clusters
-            vis_ex: set[int] = set()
-            exit_clusters: list[set[int]] = []
-            for ex_start in exit_verts:
-                if ex_start in vis_ex:
-                    continue
-                cl: list[int] = []
-                exq = deque([ex_start])
-                while exq:
-                    v = exq.popleft()
-                    if v in vis_ex:
-                        continue
-                    vis_ex.add(v)
-                    cl.append(v)
-                    for nv in adj.get(v, []):
-                        if nv in exit_verts and nv not in vis_ex:
-                            exq.append(nv)
-                exit_clusters.append(set(cl))
-
-            # Erode each exit independently
-            all_stub: set[int] = set()
-            n_exits_eroded = 0
-            global_visited: set[int] = set()
-
-            for cluster in exit_clusters:
-                visited_er = set(cluster)
-                stub_verts = set(cluster)
-                current_ring = cluster
-                ring_sizes: list[int] = [len(current_ring)]
-
-                for _depth in range(200):
-                    next_ring: set[int] = set()
-                    for v in current_ring:
-                        for nv in adj.get(v, []):
-                            if (
-                                nv in soma_main
-                                and nv not in visited_er
-                                and nv not in global_visited
-                            ):
-                                next_ring.add(nv)
-                                visited_er.add(nv)
-                    if not next_ring:
-                        break
-
-                    # Stop at real branch (2+ CCs each ≥ 25%)
-                    # or when ring doubles from entry (soma body).
-                    if len(next_ring) > 2 * ring_sizes[0]:
-                        break
-                    vis_r: set[int] = set()
-                    cc_sizes_r: list[int] = []
-                    for rs in next_ring:
-                        if rs in vis_r:
-                            continue
-                        sz = 0
-                        rq = deque([rs])
-                        while rq:
-                            u = rq.popleft()
-                            if u in vis_r:
-                                continue
-                            vis_r.add(u)
-                            sz += 1
-                            for nu in adj.get(u, []):
-                                if nu in next_ring and nu not in vis_r:
-                                    rq.append(nu)
-                        cc_sizes_r.append(sz)
-                    quarter = len(next_ring) * 0.25
-                    if sum(1 for s in cc_sizes_r if s >= quarter) >= 2:
-                        break
-
-                    stub_verts.update(next_ring)
-                    current_ring = next_ring
-                    ring_sizes.append(len(next_ring))
-
-                if next_ring:  # actually eroded
-                    all_stub.update(stub_verts)
-                    global_visited.update(stub_verts)
-                    n_exits_eroded += 1
-
-            if all_stub and len(all_stub) < len(soma_main) * 0.5:
-                soma_set -= all_stub
-                soma_set |= non_comp_soma
-
-        # ── 6c. Drop small disconnected soma fragments ─────────────
-        #        Axon sections inside the ellipsoid may form small
-        #        CCs disconnected from the main soma body.
-        main_soma_final = soma_set & comp_vert_set
-        vis_final: set[int] = set()
-        largest_final: list[int] = []
-        for cc_start in main_soma_final:
-            if cc_start in vis_final:
-                continue
-            cc: list[int] = []
-            ccq = deque([cc_start])
-            while ccq:
-                v = ccq.popleft()
-                if v in vis_final:
-                    continue
-                vis_final.add(v)
-                cc.append(v)
-                for nv in adj.get(v, []):
-                    if nv in main_soma_final and nv not in vis_final:
-                        ccq.append(nv)
-            if len(cc) > len(largest_final):
-                largest_final = cc
-
-        n_frag = len(main_soma_final) - len(largest_final)
-        if n_frag > 0:
-            soma_set = set(largest_final) | non_comp_soma
-
-        # Refit ellipsoid to final pruned vertex set
-        if len(soma_set) != len(soma.verts):
-            sv = np.fromiter(sorted(soma_set), dtype=np.intp)
-            if len(sv) >= 4:
-                try:
-                    soma = Soma.fit(mesh.vertices[sv], verts=sv)
-                except ValueError:
-                    soma.verts = sv
-            else:
-                soma.verts = sv
-
-    # ── 7. Exclude organelle vertices from final soma ───────────
-    #       Only remove vertices that appear exclusively on organelle
-    #       faces.  Mouth vertices (shared between organelle and
-    #       non-organelle faces) must stay in the soma.
-    if organelles.mask.any():
-        org_verts = set(np.unique(mesh.faces[organelles.mask]).tolist())
-        non_org_verts = set(np.unique(mesh.faces[~organelles.mask]).tolist())
-        exclusive_org = org_verts - non_org_verts
-        soma_set = set(soma.verts.tolist()) - exclusive_org
-        n_removed = len(soma.verts) - len(soma_set)
-        if n_removed > 0:
-            sv = np.fromiter(sorted(soma_set), dtype=np.intp)
-            if len(sv) >= 4:
-                try:
-                    soma = Soma.fit(mesh.vertices[sv], verts=sv)
-                except ValueError:
-                    soma.verts = sv
-            else:
-                soma.verts = sv
+    soma, cutoff, max_ring = _ring_cutoff_soma(mesh, nuc, labels, main, organelles)
 
     if verbose:
         dt = time.perf_counter() - _t0
@@ -2572,6 +2145,49 @@ def find_soma_via_ring_cutoff(
     return soma
 
 
+def _ring_cutoff_soma(
+    mesh: trimesh.Trimesh,
+    nuc: dict,
+    labels: np.ndarray,
+    main: int,
+    organelles: Organelles,
+) -> tuple["Soma", int, int]:
+    """The soma :func:`find_soma_via_ring_cutoff` grows from nucleus *nuc*:
+    ``(soma, cutoff ring, last ring)``.
+
+    The rings, vertex assignment and pruning run in Rust; each ellipsoid
+    fit is :meth:`Soma.fit`, called back from there.
+    """
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    fits: list[Soma] = []
+
+    def fit(ids, refit):
+        try:
+            soma = Soma.fit(verts[ids], verts=ids if refit else None)
+        except ValueError:
+            if not refit:
+                raise
+            return None
+        fits.append(soma)
+        return soma.center, soma._W, float(soma.axes.min())
+
+    k, soma_verts, cutoff, max_ring = _rs.find_soma_ring_cutoff(
+        np.asarray(mesh.faces, dtype=np.int64),
+        verts,
+        np.asarray(labels, dtype=np.int64),
+        int(main),
+        np.asarray(nuc.get("soma_seed_vi", []), dtype=np.int64),
+        np.asarray(nuc["center"], dtype=np.float64),
+        float(nuc["z_range"][1] - nuc["z_range"][0]),
+        float(mesh.edges_unique_length.mean()),
+        np.asarray(organelles.mask, dtype=bool),
+        fit,
+    )
+    soma = fits[k]
+    soma.verts = soma_verts
+    return soma, cutoff, max_ring
+
+
 def _build_edge_to_faces(faces, mask):
     """Edge→face map for faces where *mask* is True."""
     fi_idx = np.where(mask)[0]
@@ -2587,59 +2203,6 @@ def _build_edge_to_faces(faces, mask):
     return result
 
 
-def _face_adjacency_pairs(faces: np.ndarray, fi: np.ndarray) -> np.ndarray:
-    """``(m, 2)`` pairs of edge-sharing faces drawn from *fi*.
-
-    Same notion of adjacency as :func:`_face_components`, non-manifold
-    edges included: every face on an edge links to the first face on
-    that edge, which spans the same connected components as the full
-    clique would at a fraction of the pairs.
-    """
-    fi = np.asarray(fi, dtype=np.intp)
-    if len(fi) == 0:
-        return np.empty((0, 2), dtype=np.intp)
-
-    gf = np.asarray(faces)[fi]
-    e = np.sort(
-        np.concatenate([gf[:, [0, 1]], gf[:, [1, 2]], gf[:, [0, 2]]], axis=0),
-        axis=1,
-    )
-    owner = np.concatenate([fi, fi, fi])
-
-    order = np.lexsort((e[:, 1], e[:, 0]))
-    e, owner = e[order], owner[order]
-
-    first = np.ones(len(e), dtype=bool)
-    first[1:] = (e[1:] != e[:-1]).any(axis=1)
-    root = owner[np.flatnonzero(first)][np.cumsum(first) - 1]
-
-    rest = ~first
-    return np.column_stack([root[rest], owner[rest]])
-
-
-def _label_face_components(faces: np.ndarray, fi: np.ndarray) -> np.ndarray:
-    """Connected-component label per entry of *fi*, by edge adjacency."""
-    from scipy.sparse import coo_matrix
-    from scipy.sparse.csgraph import connected_components
-
-    fi = np.asarray(fi, dtype=np.intp)
-    if len(fi) == 0:
-        return np.empty(0, dtype=np.intp)
-
-    local = np.full(int(fi.max()) + 1, -1, dtype=np.intp)
-    local[fi] = np.arange(len(fi))
-    pairs = _face_adjacency_pairs(faces, fi)
-    graph = coo_matrix(
-        (
-            np.ones(len(pairs), dtype=np.int8),
-            (local[pairs[:, 0]], local[pairs[:, 1]]),
-        ),
-        shape=(len(fi), len(fi)),
-    )
-    _, labels = connected_components(graph, directed=False)
-    return labels
-
-
 def _face_components_fast(faces, face_indices) -> list[np.ndarray]:
     """Connected components of *face_indices*, largest first.
 
@@ -2653,15 +2216,9 @@ def _face_components_fast(faces, face_indices) -> list[np.ndarray]:
     equal-sized ones in that order.  Sorting on ``(-size, min face id)``
     reproduces it without relying on the labeller's numbering.
     """
-    fi = np.asarray(face_indices, dtype=np.intp)
-    labels = _label_face_components(faces, fi)
-    if len(labels) == 0:
-        return []
-    order = np.argsort(labels, kind="stable")
-    bounds = np.flatnonzero(np.diff(labels[order])) + 1
-    comps = np.split(fi[order], bounds)
-    comps.sort(key=lambda c: (-len(c), int(c.min())))
-    return comps
+    return _rs.face_components(
+        np.asarray(faces, dtype=np.int64), np.asarray(face_indices, dtype=np.int64)
+    )
 
 
 def _face_components(faces, edge_to_faces, face_indices):
@@ -2863,47 +2420,16 @@ def break_up_mesh(
     usable = _usable_face_mask(mesh)
     soma_face = soma_face_mask(faces, soma.verts if soma is not None else None)
 
-    # --- Phase 1: reachability without crossing organelles ---
-    # For each mesh component, find its largest non-organelle body.
-    # Faces not in their component's body are trapped by organelles.
-    # This is per-component so disconnected neurite fragments are
-    # handled correctly (each has its own reachable body).
-    non_org = usable & ~organelles.mask
-    non_org_fi = np.where(non_org)[0]
-    non_org_comps = _face_components_fast(faces, non_org_fi)
-
-    # Label every non-org face with its non-org component id.
-    # The largest non-org component within each mesh component is
-    # that component's "body".
-    non_org_label = np.full(nF, -1, dtype=np.intp)
-    for ci, comp in enumerate(non_org_comps):
-        non_org_label[comp] = ci
-
-    # For each mesh component, find its largest non-org sub-component.
-    # Use usable-face edge components as the mesh components.
-    usable_fi = np.where(usable)[0]
-    mesh_comps = _face_components_fast(faces, usable_fi)
-
-    body_labels: set[int] = set()
-    for mc in mesh_comps:
-        # non-org labels present in this mesh component
-        labels_in_mc = non_org_label[mc]
-        labels_in_mc = labels_in_mc[labels_in_mc >= 0]
-        if len(labels_in_mc) == 0:
-            continue
-        unique, counts = np.unique(labels_in_mc, return_counts=True)
-        body_labels.add(int(unique[counts.argmax()]))
-
-    reachable = np.zeros(nF, dtype=bool)
-    for ci, comp in enumerate(non_org_comps):
-        if ci in body_labels:
-            reachable[comp] = True
-
-    # --- Phase 2: break at soma + organelles ---
-    remain = usable & ~soma_face & ~organelles.mask
-    remain_fi = np.where(remain)[0]
-
-    if len(remain_fi) == 0:
+    components, kinds = _break_up_pieces(
+        faces,
+        len(verts),
+        usable,
+        organelles.mask,
+        soma_face,
+        claimed_face,
+        soma is not None,
+    )
+    if len(components) == 0:
         org_out = _build_org_output(organelles, organelles.mask)
         return MeshComponents(
             soma=soma,
@@ -2911,11 +2437,6 @@ def break_up_mesh(
             neurites=Neurites([]),
             discarded=Discarded([]),
         )
-
-    components = _face_components_fast(faces, remain_fi)
-    # Still needed below, to count how much of each component's boundary
-    # is soma.  That is the only remaining use of the edge map.
-    ef_all = _build_edge_to_faces(faces, usable)
 
     # --- classify ---
     neurite_candidates: list[np.ndarray] = []
@@ -2925,43 +2446,18 @@ def break_up_mesh(
     n_soma_absorbed = 0
     n_claimed = 0
 
-    for comp in components:
-        claimed = bool(claimed_face[comp].any())
-        n_claimed += claimed
-
-        # Reachability: is any face in its mesh component's body?
-        in_main = reachable[comp].any()
-
-        if not in_main and not claimed:
+    for comp, kind in zip(components, kinds):
+        n_claimed += bool(claimed_face[comp].any())
+        if kind == _PIECE_TRAPPED:
             # trapped by organelles
             organelles_expanded[comp] = True
             n_trapped += len(comp)
-            continue
-
-        # Boundary analysis for soma detection (skipped without a soma)
-        if soma is not None and not claimed:
-            comp_set = set(comp.tolist())
-            n_soma = 0
-            n_total = 0
-            for fi in comp:
-                face = faces[fi]
-                for i in range(3):
-                    a, b = int(face[i]), int(face[(i + 1) % 3])
-                    e = (min(a, b), max(a, b))
-                    for nb in ef_all[e]:
-                        if nb not in comp_set:
-                            n_total += 1
-                            if soma_face[nb]:
-                                n_soma += 1
-
-            soma_frac = n_soma / n_total if n_total > 0 else 0.0
-            if soma_frac > 0.5:
-                comp_vi = np.unique(faces[comp])
-                extra_soma_vi.extend(comp_vi.tolist())
-                n_soma_absorbed += len(comp)
-                continue
-
-        neurite_candidates.append(comp)
+        elif kind == _PIECE_SOMA:
+            comp_vi = np.unique(faces[comp])
+            extra_soma_vi.extend(comp_vi.tolist())
+            n_soma_absorbed += len(comp)
+        else:
+            neurite_candidates.append(comp)
 
     # --- refit soma if we absorbed extra verts ---
     if soma is not None and extra_soma_vi:
@@ -3029,6 +2525,31 @@ def break_up_mesh(
 
 # Keep old name as alias
 break_at_soma = break_up_mesh
+
+
+# What :func:`_break_up_pieces` makes of a piece.
+_PIECE_CANDIDATE, _PIECE_TRAPPED, _PIECE_SOMA = 0, 1, 2
+
+
+def _break_up_pieces(
+    faces, n_vertices, usable, organelle, soma_face, claimed_face, has_soma
+) -> tuple[list[np.ndarray], np.ndarray]:
+    """The pieces :func:`break_up_mesh` classifies: components of the usable
+    faces that are neither soma nor organelle, largest first, and the kind
+    of each — :data:`_PIECE_TRAPPED` when only organelle faces connect it to
+    its mesh component's body, :data:`_PIECE_SOMA` when more than half its
+    outer edges meet soma faces (only with a soma), else
+    :data:`_PIECE_CANDIDATE`.  Claimed pieces are never trapped or soma.
+    """
+    return _rs.break_up_classify(
+        np.asarray(faces, dtype=np.int64),
+        int(n_vertices),
+        np.asarray(usable, dtype=bool),
+        np.asarray(organelle, dtype=bool),
+        np.asarray(soma_face, dtype=bool),
+        np.asarray(claimed_face, dtype=bool),
+        bool(has_soma),
+    )
 
 
 # ---------------------------------------------------------------------
@@ -4215,80 +3736,15 @@ def _refine_components_with_fusions(
         Largest sub-component after refinement, or unchanged ``main`` if
         nothing was relabelled.
     """
-    fusion_faces: set[int] = set()
-    for cluster in fusions:
-        for f in cluster:
-            fusion_faces.add(int(f))
-
-    # Every real component (skip the degenerate-face sentinel labels).
-    comp_face_idx = np.where(labels >= 0)[0]
-    comp_set = set(int(i) for i in comp_face_idx)
-    fusion_in_comps = fusion_faces & comp_set
-
-    # Edge bookkeeping over the WHOLE mesh:
-    # `edge_count` knows the total face uses (used to detect
-    # non-manifold edges that must be severed).  `edge_to_faces` maps
-    # each edge to its non-fusion faces (the BFS-walkable ones).
-    edge_count: dict[tuple[int, int], int] = defaultdict(int)
-    edge_to_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
-    for fi in comp_face_idx:
-        ifi = int(fi)
-        face = mesh.faces[ifi]
-        is_fusion = ifi in fusion_faces
-        for i in range(3):
-            a, b = int(face[i]), int(face[(i + 1) % 3])
-            e = (min(a, b), max(a, b))
-            edge_count[e] += 1
-            if not is_fusion:
-                edge_to_faces[e].append(ifi)
-
-    # BFS each component.  Walls:
-    #   1. Fusion-cluster faces (skipped as seeds and as neighbors)
-    #   2. Non-manifold edges (face-count > 2 in the original mesh):
-    #      these are the actual fusion structure; severing them is
-    #      what splits the glued branches.
-    #
-    # Severing a non-manifold edge does not over-segment same-branch
-    # faces in practice — two faces of one branch that share a
-    # non-manifold edge always have other manifold paths between them
-    # (otherwise the branch would be 2 faces, well below the < 7 filter).
-    new_labels = labels.copy()
-    visited: set[int] = set()
-    next_id = int(labels.max()) + 1
-    sub_sizes: dict[int, int] = {}
-    for seed in comp_face_idx:
-        seed = int(seed)
-        if seed in visited or seed in fusion_faces:
-            continue
-        cid = next_id
-        next_id += 1
-        size = 0
-        stack = [seed]
-        while stack:
-            fi = stack.pop()
-            if fi in visited:
-                continue
-            visited.add(fi)
-            new_labels[fi] = cid
-            size += 1
-            face = mesh.faces[fi]
-            for i in range(3):
-                a, b = int(face[i]), int(face[(i + 1) % 3])
-                e = (min(a, b), max(a, b))
-                if edge_count[e] > 2:
-                    continue  # non-manifold — sever
-                for nb in edge_to_faces.get(e, ()):
-                    if nb in visited or nb in fusion_faces:
-                        continue
-                    stack.append(nb)
-        sub_sizes[cid] = size
-
-    # Mark fusion faces with sentinel label -3.
-    for fi in fusion_in_comps:
-        new_labels[fi] = -3
-
-    new_main = max(sub_sizes, key=sub_sizes.get) if sub_sizes else main
-    return new_labels, new_main
+    labels = np.asarray(labels)
+    fusion = np.fromiter((int(f) for c in fusions for f in c), dtype=np.int64)
+    new_labels, new_main = _rs.refine_components_with_fusions(
+        np.asarray(mesh.faces, dtype=np.int64),
+        labels.astype(np.int64, copy=False),
+        int(main),
+        fusion,
+    )
+    return new_labels.astype(labels.dtype, copy=False), new_main
 
 
 def find_disconnected(
@@ -4346,8 +3802,6 @@ def find_disconnected(
     # fusion clusters so glued branches become separate components.
     if fusions:
         labels, main = _refine_components_with_fusions(mesh, labels, main, fusions)
-    n_faces = len(mesh.faces)
-
     # Locate soma so we can exclude components inside it
     if soma is None:
         soma = find_soma_via_ring_cutoff(
@@ -4356,82 +3810,29 @@ def find_disconnected(
             mesh_stats=mesh_stats,
         )
 
-    # Build KD-tree of main-component face centroids + normals
-    # for inside/outside classification
-    main_face_idx = np.where(labels == main)[0]
-    main_centroids = mesh.triangles_center[main_face_idx]
-    main_normals = mesh.face_normals[main_face_idx]
-    main_tree = KDTree(main_centroids)
-    # Local mesh scale — used to gate the enclosed test below.
-    median_edge_len = float(np.median(mesh.edges_unique_length))
-
-    # Collect non-main components (skip degenerate faces with label -2)
-    comp_faces: dict[int, list[int]] = {}
-    for fi in range(n_faces):
-        cid = int(labels[fi])
-        if cid == main or cid < 0:
-            continue
-        comp_faces.setdefault(cid, []).append(fi)
-
-    n_total_non_main = len(comp_faces)
-    components = []
-    n_soma_excluded = 0
-    n_organelle_excluded = 0
-    n_enclosed_excluded = 0
-    for cid, fis in comp_faces.items():
-        # Need at least 7 faces: 3 for each tip + 1 body face to
-        # bridge back to two other parts
-        if len(fis) < 7:
-            continue
-
-        # Skip components that are entirely organelle
-        if organelles is not None:
-            fis_arr = np.asarray(fis)
-            if organelles.mask[fis_arr].all():
-                n_organelle_excluded += 1
-                continue
-
-        verts = np.unique(mesh.faces[fis])
-        coords = mesh.vertices[verts]
-        centroid = coords.mean(axis=0)
-
-        # Exclude components whose centroid falls inside the soma ellipsoid
-        if soma is not None:
-            if soma.contains(centroid.reshape(1, -1))[0]:
-                n_soma_excluded += 1
-                continue
-
-        # Exclude components enclosed by the main mesh.
-        # For each component vertex, find the nearest main mesh face and
-        # check which side of that face the vertex is on: if the vector
-        # from the main face centroid to the vertex is opposite the main
-        # face normal, the vertex is on the interior side.
-        #
-        # The nearest-face-normal vote is only reliable when the
-        # component sits close to main: a true enclosed organelle is
-        # right against the inner surface. For components far from main,
-        # the nearest face may lie on a curved/concave region whose
-        # normal points the wrong way, producing false "inside" votes.
-        # Skip the test entirely when the component is clearly external.
-        _, nn_idx = main_tree.query(coords)
-        vecs = coords - main_centroids[nn_idx]
-        dists = np.linalg.norm(vecs, axis=1)
-        if np.median(dists) <= 5.0 * median_edge_len:
-            dots = np.einsum("ij,ij->i", vecs, main_normals[nn_idx])
-            # Component is enclosed if the majority of vertices are on
-            # the inward side (dot < 0)
-            if (dots < 0).sum() > len(dots) / 2:
-                n_enclosed_excluded += 1
-                continue
-
-        components.append((cid, fis))
-
-    # Sort largest-first
-    components.sort(key=lambda x: -len(x[1]))
+    found = _rs.find_disconnected(
+        np.asarray(mesh.faces, dtype=np.int64),
+        np.asarray(mesh.vertices, dtype=np.float64),
+        np.asarray(mesh.triangles_center, dtype=np.float64),
+        np.asarray(mesh.face_normals, dtype=np.float64),
+        float(np.median(mesh.edges_unique_length)),
+        np.asarray(labels, dtype=np.int64),
+        int(main),
+        None if organelles is None else np.asarray(organelles.mask, dtype=bool),
+        None if soma is None else np.asarray(soma.center, dtype=np.float64),
+        None if soma is None else np.asarray(soma.R / soma.axes, dtype=np.float64),
+    )
+    (
+        components,
+        n_total_non_main,
+        n_soma_excluded,
+        n_organelle_excluded,
+        n_enclosed_excluded,
+    ) = found
 
     if verbose:
         dt = time.perf_counter() - _t0
-        total = sum(len(fis) for _, fis in components)
+        total = sum(len(fis) for fis in components)
         excluded = []
         if n_soma_excluded:
             excluded.append(f"{n_soma_excluded} soma")
@@ -4447,7 +3848,7 @@ def find_disconnected(
             f"{exc_str} ({dt:.1f}s)"
         )
 
-    return [fis for _, fis in components]
+    return components
 
 
 def find_gaps(
@@ -4605,455 +4006,52 @@ def find_gaps(
             )
         return []
 
-    # Build the set of vertices touched by any fusion-cluster face.
-    # Components share these verts (fusion = "glued at the rim"), so
-    # excluding them is what reveals the real geometric gap distance.
-    fusion_vert_set: set[int] = set()
-    fusion_face_idx: list[int] = []
-    if fusions:
-        seen_ff: set[int] = set()
-        for cluster in fusions:
-            for fi in cluster:
-                ifi = int(fi)
-                if ifi not in seen_ff:
-                    seen_ff.add(ifi)
-                    fusion_face_idx.append(ifi)
-                for v in mesh.faces[ifi]:
-                    fusion_vert_set.add(int(v))
-
-    # Fusion proximity check: candidate gaps with both endpoints inside
-    # the fusion blast radius are kissing points, not real gaps.
-    # When the clearance-filtered distance exceeds the fallback
-    # threshold, the near-fusion connection is used instead — the
-    # component likely belongs at that fusion site.
-    fusion_face_tree: KDTree | None = None
-    fusion_clear: float = 0.0
     median_edge = float(np.median(mesh.edges_unique_length))
-    # 6x median_edge ≈ 95th percentile of normal gap distances
-    fusion_fallback = 6.0 * median_edge
-    # Size-aware bridge caps: gaps below the floor always bridge (small
-    # breaks are real); above it, the gap must be small relative to the
-    # smaller piece's extent (max_bridge_ratio) and never exceed the
-    # absolute ceiling.
-    bridge_floor = (
-        float(min_bridge_gap) if min_bridge_gap is not None else 8.0 * median_edge
+    fusion_faces = list(dict.fromkeys(int(f) for c in fusions or () for f in c))
+    gaps, n_capped, n_repaired = _rs.find_gaps(
+        np.asarray(mesh.faces, dtype=np.int64),
+        np.asarray(mesh.vertices, dtype=np.float64),
+        np.asarray(mesh.triangles_center, dtype=np.float64),
+        np.asarray(labels, dtype=np.int64),
+        np.asarray(labels_pre_fusion, dtype=np.int64),
+        int(main),
+        [[int(f) for f in d] for d in disc],
+        np.asarray(fusion_faces, dtype=np.int64),
+        tip_rings,
+        float(fusion_clearance) if fusion_clearance is not None else 10.0 * median_edge,
+        6.0 * median_edge,
+        float(max_bridge_ratio),
+        float(min_bridge_gap) if min_bridge_gap is not None else 8.0 * median_edge,
+        float(max_bridge_dist) if max_bridge_dist is not None else 75.0 * median_edge,
+        kiss_radius * median_edge,
+        float(kiss_penalty),
+        int(relay_min_faces),
+        bool(repair_stranded),
+        _svd_rows,
     )
-    bridge_abs_cap = (
-        float(max_bridge_dist) if max_bridge_dist is not None else 75.0 * median_edge
-    )
-    if fusion_face_idx:
-        fusion_centroids = mesh.triangles_center[fusion_face_idx]
-        fusion_face_tree = KDTree(fusion_centroids)
-        fusion_clear = (
-            float(fusion_clearance)
-            if fusion_clearance is not None
-            else 10.0 * median_edge
-        )
-
-    def _component_verts(fis: np.ndarray) -> np.ndarray:
-        verts = np.unique(mesh.faces[fis])
-        if not fusion_vert_set:
-            return verts
-        mask = np.array([int(v) not in fusion_vert_set for v in verts], dtype=bool)
-        kept = verts[mask]
-        # Fall back to the unfiltered set if filtering would empty the
-        # component (shouldn't happen for real branches but keeps the
-        # KDTree well-defined).
-        return kept if len(kept) > 0 else verts
-
-    # Build KD-trees: main component + each disconnected component
-    comp_data: dict[int, dict] = {}
-
-    def _attach_fusion_dists(coords: np.ndarray) -> np.ndarray | None:
-        if fusion_face_tree is None or len(coords) == 0:
-            return None
-        return fusion_face_tree.query(coords)[0]
-
-    def _bbox_diag(coords: np.ndarray) -> float:
-        if len(coords) == 0:
-            return 0.0
-        return float(np.linalg.norm(coords.max(axis=0) - coords.min(axis=0)))
-
-    # Main component
-    main_fi = np.where(labels == main)[0]
-    main_verts = _component_verts(main_fi)
-    main_coords = mesh.vertices[main_verts]
-    comp_data[main] = {
-        "fi": main_fi,
-        "verts": main_verts,
-        "coords": main_coords,
-        "tree": KDTree(main_coords),
-        "fusion_dist": _attach_fusion_dists(main_coords),
-        "bbox": _bbox_diag(main_coords),
-    }
-
-    # Disconnected components — identify by their label
-    for fis in disc:
-        cid = int(labels[fis[0]])
-        fis_arr = np.asarray(fis)
-        verts = _component_verts(fis_arr)
-        coords = mesh.vertices[verts]
-        comp_data[cid] = {
-            "fi": fis_arr,
-            "verts": verts,
-            "coords": coords,
-            "tree": KDTree(coords),
-            "fusion_dist": _attach_fusion_dists(coords),
-            "bbox": _bbox_diag(coords),
-        }
-
-    # For each disconnected component, find its nearest neighbour.
-    # Deduplicate: if A→B and B→A both exist, keep only one.
-    gaps = []
-    n_capped = [0]  # gaps skipped by the size-aware bridge cap
-    seen_pairs: set[tuple[int, int]] = set()
-    disc_cids = [int(labels[fis[0]]) for fis in disc]
-    all_cids = [main] + disc_cids
-
-    # Build face adjacency for BFS-based tip selection
-    non_degen = _non_degenerate(mesh.faces)
-    edge_to_faces_gap: dict[tuple[int, int], list[int]] = defaultdict(list)
-    for fi in range(len(mesh.faces)):
-        if not non_degen[fi]:
-            continue
-        face = mesh.faces[fi]
-        for i in range(3):
-            e = (
-                min(int(face[i]), int(face[(i + 1) % 3])),
-                max(int(face[i]), int(face[(i + 1) % 3])),
-            )
-            edge_to_faces_gap[e].append(fi)
-
-    face_adj: dict[int, list[int]] = defaultdict(list)
-    for e, fis_e in edge_to_faces_gap.items():
-        for i in range(len(fis_e)):
-            for j in range(i + 1, len(fis_e)):
-                face_adj[fis_e[i]].append(fis_e[j])
-                face_adj[fis_e[j]].append(fis_e[i])
-
-    def _tip_faces_bfs(comp_fi, tip_vert_idx, n_rings=tip_rings):
-        """BFS on face graph from the face nearest to tip vertex."""
-        comp_set = set(comp_fi.tolist())
-        vcoord = mesh.vertices[tip_vert_idx]
-        centroids = mesh.vertices[mesh.faces[comp_fi]].mean(axis=1)
-        seed_local = int(np.argmin(np.linalg.norm(centroids - vcoord, axis=1)))
-        seed = int(comp_fi[seed_local])
-        visited: set[int] = {seed}
-        frontier: set[int] = {seed}
-        for _ in range(n_rings):
-            next_frontier: set[int] = set()
-            for fi in frontier:
-                for nf in face_adj[fi]:
-                    if nf not in visited and nf in comp_set:
-                        visited.add(nf)
-                        next_frontier.add(nf)
-            if not next_frontier:
-                break
-            frontier = next_frontier
-        return sorted(visited)
-
-    def _bridge_cap(cid_a, cid_b):
-        """Longest bridge allowed between two components.
-
-        A real break leaves the ends close relative to the smaller
-        piece's own extent (and never longer than an absolute ceiling).
-        A gap that dwarfs its piece is a floating fragment, not a break.
-        """
-        smaller_bbox = min(comp_data[cid_a]["bbox"], comp_data[cid_b]["bbox"])
-        return min(
-            bridge_abs_cap,
-            max(bridge_floor, max_bridge_ratio * smaller_bbox),
-        )
-
-    def _add_gap(cid_a, cid_b, idx_a, idx_b, dist, fusion_join=False):
-        """Emit a bridge for one component pair.  True if one was emitted."""
-        pair_key = (min(cid_a, cid_b), max(cid_a, cid_b))
-        if pair_key in seen_pairs:
-            return False
-        seen_pairs.add(pair_key)
-        # A sub-1nm contact normally means the two components already
-        # share a vertex (a double layer) and need no bridge.  That does
-        # NOT hold when the shared vertex sits on a fusion: the join is
-        # about to be deleted by :func:`remove_fusions`, so the pieces
-        # must be stitched across the fusion site instead.
-        if dist < 1.0 and not fusion_join:
-            return False
-        if dist > _bridge_cap(cid_a, cid_b):
-            n_capped[0] += 1
-            return False
-        va = int(comp_data[cid_a]["verts"][idx_a])
-        vb = int(comp_data[cid_b]["verts"][idx_b])
-        fa = _tip_faces_bfs(comp_data[cid_a]["fi"], va)
-        fb = _tip_faces_bfs(comp_data[cid_b]["fi"], vb)
-        if not (fa and fb):
-            return False
-        # Map component IDs to disc indices (-1 for main)
-        disc_idx_a = disc_cids.index(cid_a) if cid_a in disc_cids else -1
-        disc_idx_b = disc_cids.index(cid_b) if cid_b in disc_cids else -1
-        gaps.append((fa, fb, dist, disc_idx_a, disc_idx_b))
-        return True
-
-    # Precompute pairwise distances between all components (main + disc).
-    # Then build an MST rooted at main so every disc component has a
-    # bridge path back to main — no missing chain links, no duplicates.
-    all_cids = [main] + disc_cids
-    # edge_info keyed by sorted pair:
-    #   (mst_cost, real_dist, a, ia, b, ib, fusion_join)
-    edge_info: dict[tuple[int, int], tuple[float, float, int, int, int, int, bool]] = {}
-
-    kiss_R = kiss_radius * median_edge
-
-    def _orig_label(cid: int) -> int:
-        """Component's label *before* fusion-wall refinement.
-
-        Refinement only splits, so every face of a refined component
-        carries the same pre-refinement label; siblings share it.
-        """
-        return int(labels_pre_fusion[int(comp_data[cid]["fi"][0])])
-
-    def _flank(cid: int, idx: int) -> float:
-        """Local two-sidedness at a candidate contact: 0 = the piece ENDS at
-        the contact (tip/cut → real break), ~1 = the piece CONTINUES past it
-        (a side-by-side crossing → kiss).  Measured in a bounded neighborhood
-        so branch length can't inflate it."""
-        cd = comp_data[cid]
-        p = cd["coords"][idx]
-        nb = cd["tree"].query_ball_point(p, kiss_R)
-        if len(nb) < 6:
-            return 0.0
-        nbr = cd["coords"][nb]
-        _, _, vh = np.linalg.svd(nbr - nbr.mean(0), full_matrices=False)
-        t = (nbr - p) @ vh[0]
-        return 2.0 * min(float(np.mean(t > 0)), float(np.mean(t < 0)))
-
-    for i, cid_a in enumerate(all_cids):
-        for cid_b in all_cids[i + 1 :]:
-            da = comp_data[cid_a]
-            db = comp_data[cid_b]
-            dists, idxs = db["tree"].query(da["coords"])
-            # Raw best match (before clearance masking).
-            raw_min_i = int(np.argmin(dists))
-            raw_dist = float(dists[raw_min_i])
-            # Mask candidate pairs whose endpoints lie within
-            # the fusion blast radius — those are kissing-point
-            # artifacts, not real gaps.  Both sides must be
-            # clear.  If the filtered distance exceeds the
-            # fallback threshold (6x median_edge ≈ 95th pctile
-            # of normal gaps), the near-fusion connection is
-            # kept instead — the component likely belongs at
-            # that fusion site.
-            if (
-                fusion_face_tree is not None
-                and da["fusion_dist"] is not None
-                and db["fusion_dist"] is not None
-            ):
-                a_clear = da["fusion_dist"] > fusion_clear
-                b_clear = db["fusion_dist"][idxs] > fusion_clear
-                valid = a_clear & b_clear
-                if not valid.any():
-                    # No candidates survive clearance — fall
-                    # back to raw match.  dist < 1.0 (shared vert =
-                    # already joined) keeps its real ~0 cost so the
-                    # MST uses the join and _add_gap emits no bridge.
-                    min_i = raw_min_i
-                    cost = raw_dist
-                else:
-                    masked = np.where(valid, dists, np.inf)
-                    filt_min_i = int(np.argmin(masked))
-                    filt_dist = float(masked[filt_min_i])
-                    if filt_dist > fusion_fallback and raw_dist >= 1.0:
-                        # Filtered gap too far — the
-                        # near-fusion connection is the real
-                        # reconnection point.
-                        min_i = raw_min_i
-                        cost = raw_dist
-                    else:
-                        min_i = filt_min_i
-                        # dist < 1.0 (shared vert) keeps its real ~0
-                        # cost — see the no-fusion branch below.
-                        cost = filt_dist
-            else:
-                min_i = raw_min_i
-                # dist < 1.0 means the two components share a vertex —
-                # they are already joined there (a double-layer, or a
-                # non-manifold edge that find_fusions did not report).
-                # Use the real (~0) distance as the cost so the MST
-                # satisfies the component via that join; _add_gap emits
-                # no bridge for dist < 1.0.  (Forcing inf here would
-                # push the component onto a far finite edge instead —
-                # the "stretched bridge across the cell" overshoot.)
-                cost = raw_dist
-            # Penalize a "kiss" candidate — one where BOTH surfaces continue
-            # past the contact (a side-by-side crossing) — so a real break
-            # (tip-to-tip or a planar cut, where at least one side ENDS at the
-            # contact) outranks a closer kiss in the MST.  cost < 1.0 is a
-            # shared-vertex join, not a gap, and is never penalized.
-            mst_cost = cost
-            if cost >= 1.0:
-                flank = min(
-                    _flank(cid_a, min_i),
-                    _flank(cid_b, int(idxs[min_i])),
-                )
-                mst_cost = cost * (1.0 + kiss_penalty * flank)
-            # Is a sub-1nm contact a durable join, or a fusion that
-            # remove_fusions will delete?  Only the latter needs a
-            # bridge, and only between SIBLINGS — two halves that a
-            # fusion wall split out of one original component.  Any
-            # other pair merely touches at a fusion; bridging there
-            # would put a stitch on a tube's flank, and the tip removal
-            # that precedes the stitch can sever the tube.
-            fusion_join = False
-            if (
-                cost < 1.0
-                and da["fusion_dist"] is not None
-                and db["fusion_dist"] is not None
-                and _orig_label(cid_a) == _orig_label(cid_b)
-            ):
-                fusion_join = (
-                    min(
-                        float(da["fusion_dist"][min_i]),
-                        float(db["fusion_dist"][int(idxs[min_i])]),
-                    )
-                    <= fusion_clear
-                )
-            key = (min(cid_a, cid_b), max(cid_a, cid_b))
-            edge_info[key] = (
-                mst_cost,  # MST selection cost (kiss-penalized)
-                cost,  # real bridge distance (for _add_gap)
-                cid_a,
-                min_i,  # idx into cid_a's coords
-                cid_b,
-                int(idxs[min_i]),  # idx into cid_b's coords
-                fusion_join,  # bridge across a doomed fusion join
-            )
-
-    # Track which components the tree actually joined.  A tree edge is
-    # *satisfied* when it produced a bridge, or when it is a sub-1nm
-    # contact that already joins the two (no bridge needed).
-    joined: dict[int, int] = {cid: cid for cid in all_cids}
-
-    def _root(cid: int) -> int:
-        r = cid
-        while joined[r] != r:
-            r = joined[r]
-        while joined[cid] != r:
-            joined[cid], cid = r, joined[cid]
-        return r
-
-    def _join(cid_a: int, cid_b: int) -> None:
-        ra, rb = _root(cid_a), _root(cid_b)
-        if ra != rb:
-            joined[ra] = rb
-
-    # Sub-1nm contacts join their components wherever they occur, not
-    # only along tree edges — record them all so the repair below does
-    # not mistake an already-joined component for a stranded one.
-    for (ka, kb), info in edge_info.items():
-        if info[1] < 1.0 and not info[6]:
-            _join(ka, kb)
-
-    # A fragment cannot carry a chain onward: remove_gaps peels a tip
-    # patch off each end of every bridge, and two patches erase a small
-    # component outright — destroying the very chain routed through it.
-    # Such a component may still be bridged, but only as an endpoint.
-    relay_ok = {
-        cid: cid == main or len(comp_data[cid]["fi"]) >= relay_min_faces
-        for cid in all_cids
-    }
-
-    # Prim's MST from main
-    connected: set[int] = {main}
-    remaining: set[int] = set(disc_cids)
-
-    while remaining:
-        best_edge = None
-        best_cost = float("inf")
-        for cid_r in remaining:
-            for cid_c in connected:
-                if not relay_ok[cid_c]:
-                    continue
-                key = (min(cid_r, cid_c), max(cid_r, cid_c))
-                cost = edge_info[key][0]
-                if cost < best_cost:
-                    best_cost = cost
-                    best_edge = (cid_r, cid_c, key)
-        if best_edge is None:
-            break
-        cid_r, cid_c, key = best_edge
-        connected.add(cid_r)
-        remaining.discard(cid_r)
-
-        _mst_cost, dist, ca, idx_a, cb, idx_b, fj = edge_info[key]
-        if _add_gap(ca, cb, idx_a, idx_b, dist, fusion_join=fj):
-            _join(ca, cb)
-
-    # Prim's minimises the kiss-penalised cost without knowing which
-    # edges `_add_gap` will accept, and a refused edge is never retried —
-    # so a component whose one tree edge lands on a small fragment (whose
-    # bbox sets a tight cap) loses its only path back to main, taking
-    # everything hanging off it along.  Retry each stranded cluster with
-    # the cheapest edge `_add_gap` does accept; a cluster with no
-    # acceptable edge at all stays disconnected, as before.
-    n_repaired = 0
-    while repair_stranded:
-        main_root = _root(main)
-        stranded = [c for c in disc_cids if _root(c) != main_root]
-        if not stranded:
-            break
-        clusters: dict[int, list[int]] = defaultdict(list)
-        for cid in stranded:
-            clusters[_root(cid)].append(cid)
-        progress = False
-        for members in clusters.values():
-            inside = set(members)
-            best_key = None
-            best_cost = float("inf")
-            for cid_in in members:
-                for cid_out in all_cids:
-                    if cid_out in inside:
-                        continue
-                    key = (min(cid_in, cid_out), max(cid_in, cid_out))
-                    mst_cost, dist, ca, _ia, cb, _ib, fj = edge_info[key]
-                    if dist < 1.0 and not fj:
-                        continue
-                    if dist > _bridge_cap(ca, cb):
-                        continue
-                    if mst_cost < best_cost:
-                        best_cost = mst_cost
-                        best_key = key
-            if best_key is None:
-                continue
-            _mst_cost, dist, ca, idx_a, cb, idx_b, fj = edge_info[best_key]
-            if _add_gap(ca, cb, idx_a, idx_b, dist, fusion_join=fj):
-                _join(ca, cb)
-                n_repaired += 1
-                progress = True
-        if not progress:
-            break
-
-    # Sort by gap distance
-    gaps.sort(key=lambda x: x[2])
-
     if verbose:
-        dt = time.perf_counter() - _t0
-        if gaps:
-            dists = [g[2] for g in gaps]
-            dist_str = (
-                f", dist {min(dists):.0f}–{max(dists):.0f}"
-                if len(dists) > 1
-                else f", dist {dists[0]:.0f}"
-            )
-        else:
-            dist_str = ""
-        cap_str = f", {n_capped[0]} too-far dropped" if n_capped[0] else ""
-        rep_str = f", {n_repaired} stranded re-bridged" if n_repaired else ""
-        print(
-            f"[skeliner.pre] Gaps: {len(gaps)} gaps "
-            f"across {len(disc)} disconnected components"
-            f"{dist_str}{cap_str}{rep_str} ({dt:.1f}s)"
-        )
-
+        _report_gaps(gaps, disc, n_capped, n_repaired, _t0)
     return gaps
+
+
+def _report_gaps(gaps, disc, n_capped: int, n_repaired: int, t0: float) -> None:
+    dt = time.perf_counter() - t0
+    if gaps:
+        dists = [g[2] for g in gaps]
+        dist_str = (
+            f", dist {min(dists):.0f}–{max(dists):.0f}"
+            if len(dists) > 1
+            else f", dist {dists[0]:.0f}"
+        )
+    else:
+        dist_str = ""
+    cap_str = f", {n_capped} too-far dropped" if n_capped else ""
+    rep_str = f", {n_repaired} stranded re-bridged" if n_repaired else ""
+    print(
+        f"[skeliner.pre] Gaps: {len(gaps)} gaps "
+        f"across {len(disc)} disconnected components"
+        f"{dist_str}{cap_str}{rep_str} ({dt:.1f}s)"
+    )
 
 
 def remove_gaps(
@@ -5107,77 +4105,15 @@ def remove_gaps(
             print(f"[skeliner.pre] remove_gaps: no gaps to bridge ({dt:.1f}s)")
         return mesh
 
-    # Build edge / face adjacency once
-    edge_to_faces = _edge_to_faces(mesh)
-    face_adj = _face_adjacency(mesh, edge_to_faces)
-
-    # Component labels for :func:`_rescue_size`.  Only a gap that actually
-    # trips the sever check needs them, and labelling a multi-million-face
-    # mesh costs ~19 s, so they are built on first use.
-    _sizes: dict = {}
-
-    def _lazy_rescue(fa: int, fb: int) -> int:
-        if not _sizes:
-            if mesh_stats is not None and mesh_stats.face_comp is not None:
-                labels = mesh_stats.face_comp
-            else:
-                labels, _ = _face_edge_components(mesh)
-            _sizes["labels"] = labels
-            _sizes["counts"] = Counter(int(x) for x in labels)
-        return _rescue_size(_sizes["labels"], _sizes["counts"], fa, fb)
-
-    # For each gap, expand each side's tip until both rims are real
-    # loops. The initial tip from find_gaps can produce a degenerate
-    # "rim" (e.g. 3 verts when the tip is a tongue attached at a single
-    # triangle); peeling more rings exposes a clean cross-section that
-    # the stitcher can bridge manifoldly.
-    faces_to_remove: set[int] = set()
-    loop_pairs: list[tuple[list[int], list[int]]] = []
-    n_skipped = 0
-    for gap_i, (faces_a, faces_b, dist, *_comp_ids) in enumerate(gaps):
-        sel_a, loop_a = _expand_tip_to_good_rim(faces_a, edge_to_faces, face_adj)
-        sel_b, loop_b = _expand_tip_to_good_rim(faces_b, edge_to_faces, face_adj)
-
-        if loop_a is None or loop_b is None:
-            n_skipped += 1
-            continue
-
-        # Final safety net: if expansion still didn't reach a clean
-        # pair (degenerate or wildly mismatched), skip rather than
-        # introduce a fusion.
-        reason = _validate_loop_pair(loop_a, loop_b)
-        if reason is not None:
-            n_skipped += 1
-            continue
-
-        # A bridge that lands on a tube's FLANK rather than its end peels
-        # a rim that wraps the circumference and strands everything
-        # distal.  Whether that is worth avoiding depends on how much it
-        # strands, not on the fact that it can: on 564241053 a 21 nm gap
-        # strands 13,438 f to rescue 54 f, while on 554656742 a patch of
-        # the same annular shape strands 4 f and rescues 4,160 f.  Skip
-        # only when the stitch costs more than it saves — two face
-        # counts, no distance scope and no threshold.
-        sev_a = _removal_would_sever(sel_a, edge_to_faces)
-        sev_b = _removal_would_sever(sel_b, edge_to_faces)
-        if sev_a or sev_b:
-            rescue = _lazy_rescue(faces_a[0], faces_b[0])
-            if (sev_a and _sever_cost(sel_a, face_adj, rescue) > rescue) or (
-                sev_b and _sever_cost(sel_b, face_adj, rescue) > rescue
-            ):
-                n_skipped += 1
-                continue
-
-        loop_pairs.append((loop_a, loop_b))
-        faces_to_remove |= sel_a | sel_b
-
-    if not loop_pairs:
+    labels = None
+    if mesh_stats is not None and mesh_stats.face_comp is not None:
+        labels = mesh_stats.face_comp
+    result, n_bridged, n_removed, n_skipped = _bridge_gaps(mesh, gaps, labels)
+    if result is None:
         if verbose:
             dt = time.perf_counter() - _t0
             print(f"[skeliner.pre] remove_gaps: no valid loop pairs ({dt:.1f}s)")
         return mesh
-
-    result = _stitch_and_rebuild(mesh, faces_to_remove, loop_pairs)
 
     # Invalidate topology (components merged); pad outward_dots for appended faces
     n_added = len(result.faces) - len(mesh.faces)
@@ -5196,8 +4132,8 @@ def remove_gaps(
 
     if verbose:
         dt = time.perf_counter() - _t0
-        parts = [f"bridged {len(loop_pairs)}/{len(gaps)} gaps"]
-        parts.append(f"removed {len(faces_to_remove):,}f")
+        parts = [f"bridged {n_bridged}/{len(gaps)} gaps"]
+        parts.append(f"removed {n_removed:,}f")
         if n_added > 0:
             parts.append(f"stitched +{n_added:,}f")
         if n_skipped:
@@ -5205,6 +4141,41 @@ def remove_gaps(
         print(f"[skeliner.pre] remove_gaps: {', '.join(parts)} ({dt:.1f}s)")
 
     return result
+
+
+def _bridge_gaps(mesh, gaps, labels):
+    """Peel each gap's tips to clean rims, skip pairs that cannot be stitched
+    or would strand more than they win back, and stitch the rest in one
+    rebuild: ``(mesh or None, n_bridged, n_removed, n_skipped)``.
+
+    *labels* are the raw face-edge components rescue sizes are read from
+    (computed on first need when None).  Each loop is fitted by
+    :func:`_fit_loop_circle`, called back from the Rust core.
+    """
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+
+    def fit(ids):
+        center, radius, normal = _fit_loop_circle(verts[ids])
+        return center, radius, normal
+
+    new_verts, faces, n_bridged, n_removed, n_skipped = _rs.remove_gaps(
+        np.asarray(mesh.faces, dtype=np.int64),
+        verts,
+        np.asarray(mesh.face_normals, dtype=np.float64),
+        float(np.median(mesh.edges_unique_length)),
+        None if labels is None else np.asarray(labels, dtype=np.int64),
+        [
+            (list(map(int, faces_a)), list(map(int, faces_b)))
+            for faces_a, faces_b, *_ in gaps
+        ],
+        fit,
+    )
+    if faces is None:
+        return None, 0, 0, n_skipped
+    if len(new_verts):
+        verts = np.vstack([verts, new_verts])
+    result = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    return result, n_bridged, n_removed, n_skipped
 
 
 def remove_islands(
@@ -5359,74 +4330,14 @@ def _outward_dot(
     np.ndarray
         (nFaces,) float64 array of outward dot products.
     """
-    verts = np.asarray(mesh.vertices, dtype=np.float64)
-    face_centers = np.asarray(mesh.triangles_center, dtype=np.float64)
-    face_normals = np.asarray(mesh.face_normals, dtype=np.float64)
-    n_faces = len(mesh.faces)
-    outward_dots = np.zeros(n_faces, dtype=np.float64)
-
-    def _compute_batch(vtree, v, face_idx):
-        """Compute outward-dot via sparse_distance_matrix (fully vectorized)."""
-        from scipy.sparse import csr_matrix
-
-        fc = face_centers[face_idx]
-        fn = face_normals[face_idx]
-
-        # Build a KDTree of face centers for this batch
-        fc_tree = KDTree(fc)
-
-        # All (face, vert) pairs within radius — returned as sparse matrix
-        sdm = fc_tree.sparse_distance_matrix(vtree, radius, output_type="coo_matrix")
-
-        if sdm.nnz == 0:
-            return
-
-        # Count neighbors per face
-        row = sdm.row
-        counts = np.bincount(row, minlength=len(face_idx))
-
-        # Build weight matrix: each entry = 1/count (for mean)
-        valid_entries = counts[row] >= 4
-        weights = np.zeros(len(row), dtype=np.float64)
-        weights[valid_entries] = 1.0 / counts[row[valid_entries]]
-
-        W = csr_matrix(
-            (weights, (row, sdm.col)),
-            shape=(len(face_idx), len(v)),
-            dtype=np.float64,
-        )
-
-        # COM = W @ v  (weighted mean of neighbor vertices)
-        local_com = W @ v  # (n_faces, 3)
-
-        # Direction
-        direction = fc - local_com
-        norms = np.linalg.norm(direction, axis=1)
-        valid = (counts >= 4) & (norms > 1e-10)
-
-        # Normalize and dot
-        direction[valid] /= norms[valid, None]
-        dots = np.einsum("ij,ij->i", fn, direction)
-
-        outward_dots[face_idx[valid]] = dots[valid]
-
-    if vert_comp is None:
-        vtree = KDTree(verts)
-        _compute_batch(vtree, verts, np.arange(n_faces))
-    else:
-        face_comp = vert_comp[mesh.faces[:, 0]]
-        for ci in np.unique(face_comp):
-            ci = int(ci)
-            comp_vert_mask = vert_comp == ci
-            comp_verts_idx = np.where(comp_vert_mask)[0]
-            if len(comp_verts_idx) < 4:
-                continue
-            comp_verts = verts[comp_verts_idx]
-            vtree = KDTree(comp_verts)
-            comp_face_idx = np.where(face_comp == ci)[0]
-            _compute_batch(vtree, comp_verts, comp_face_idx)
-
-    return outward_dots
+    return _rs.outward_dots(
+        np.asarray(mesh.vertices, dtype=np.float64),
+        np.asarray(mesh.faces, dtype=np.int64),
+        np.asarray(mesh.triangles_center, dtype=np.float64),
+        np.asarray(mesh.face_normals, dtype=np.float64),
+        float(radius),
+        None if vert_comp is None else np.asarray(vert_comp, dtype=np.int64),
+    )
 
 
 def _filter_small_clusters(
@@ -5450,49 +4361,13 @@ def _filter_small_clusters(
     np.ndarray
         Filtered boolean mask.
     """
-    flagged = set(int(fi) for fi in np.where(face_mask)[0])
-    if not flagged:
+    if not np.any(face_mask):
         return face_mask
-
-    # Build face adjacency restricted to flagged faces
-    faces_arr = np.asarray(mesh.faces)  # snapshot — avoids trimesh caching
-    edge_to_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
-    for fi in flagged:
-        f = faces_arr[fi]
-        for i in range(3):
-            e = (
-                min(int(f[i]), int(f[(i + 1) % 3])),
-                max(int(f[i]), int(f[(i + 1) % 3])),
-            )
-            edge_to_faces[e].append(fi)
-
-    int_list = sorted(flagged)
-    int_remap = {fi: i for i, fi in enumerate(int_list)}
-    edges = set()
-    for fi in int_list:
-        f = faces_arr[fi]
-        for i in range(3):
-            e = (
-                min(int(f[i]), int(f[(i + 1) % 3])),
-                max(int(f[i]), int(f[(i + 1) % 3])),
-            )
-            for nfi in edge_to_faces[e]:
-                if nfi != fi:
-                    a, b = int_remap[fi], int_remap[nfi]
-                    edges.add((min(a, b), max(a, b)))
-
-    g = ig.Graph(n=len(int_list), edges=list(edges), directed=False)
-    clusters = g.connected_components()
-
-    keep = set()
-    for cl in clusters:
-        if len(cl) >= min_cluster_size:
-            keep.update(int_list[i] for i in cl)
-
-    filtered = np.zeros(len(mesh.faces), dtype=bool)
-    for fi in keep:
-        filtered[fi] = True
-    return filtered
+    return _rs.filter_small_clusters(
+        np.asarray(mesh.faces, dtype=np.int64),
+        np.asarray(face_mask, dtype=bool),
+        int(min_cluster_size),
+    )
 
 
 def compute_mesh_stats(
@@ -5513,35 +4388,30 @@ def compute_mesh_stats(
         median_edge = float(np.median(mesh.edges_unique_length))
         radius = radius_multiplier * median_edge
 
-    face_comp, main_ci = _face_edge_components(mesh)
-
-    # Vertex component labels (needed by _outward_dot for per-component COM)
-    vert_comp = np.full(len(mesh.vertices), -1, dtype=np.intp)
-    for fi in range(len(mesh.faces)):
-        ci = int(face_comp[fi])
-        if ci < 0:
-            continue
-        for v in mesh.faces[fi]:
-            vert_comp[int(v)] = ci
-
-    outward_dots = _outward_dot(mesh, radius, vert_comp=vert_comp)
-
+    outward_dots, face_comp, main_ci = _rs.mesh_stats(
+        np.asarray(mesh.vertices, dtype=np.float64),
+        np.asarray(mesh.faces, dtype=np.int64),
+        np.asarray(mesh.triangles_center, dtype=np.float64),
+        np.asarray(mesh.face_normals, dtype=np.float64),
+        float(radius),
+    )
     if verbose:
-        dt = time.perf_counter() - _t0
-        n_comps = int(face_comp.max()) + 1 if len(face_comp) else 0
-        raw_neg = int((outward_dots < 0).sum())
-        pct = 100 * raw_neg / len(mesh.faces)
-        print(
-            f"[skeliner.pre] Mesh stats: "
-            f"{n_comps} components, radius={radius:.0f}, "
-            f"raw internal={raw_neg:,} ({pct:.1f}%) "
-            f"({dt:.1f}s)"
-        )
-
+        _report_mesh_stats(face_comp, outward_dots, radius, len(mesh.faces), _t0)
     return MeshStats(
-        outward_dots=outward_dots,
-        face_comp=face_comp,
-        main_ci=int(main_ci),
+        outward_dots=outward_dots, face_comp=face_comp, main_ci=int(main_ci)
+    )
+
+
+def _report_mesh_stats(face_comp, outward_dots, radius, n_faces, t0) -> None:
+    dt = time.perf_counter() - t0
+    n_comps = int(face_comp.max()) + 1 if len(face_comp) else 0
+    raw_neg = int((outward_dots < 0).sum())
+    pct = 100 * raw_neg / n_faces
+    print(
+        f"[skeliner.pre] Mesh stats: "
+        f"{n_comps} components, radius={radius:.0f}, "
+        f"raw internal={raw_neg:,} ({pct:.1f}%) "
+        f"({dt:.1f}s)"
     )
 
 
@@ -5625,35 +4495,6 @@ def _rim_enclosed_area(
         total_area += area
 
     return total_area
-
-
-def _count_edge_loops(edges: list[tuple[int, int]]) -> int:
-    """Count connected components of an edge list."""
-
-    if not edges:
-        return 0
-    vert_to_idx: dict[int, list[int]] = defaultdict(list)
-    for i, e in enumerate(edges):
-        vert_to_idx[e[0]].append(i)
-        vert_to_idx[e[1]].append(i)
-
-    visited: set[int] = set()
-    n_loops = 0
-    for start in range(len(edges)):
-        if start in visited:
-            continue
-        queue = deque([start])
-        while queue:
-            ei = queue.popleft()
-            if ei in visited:
-                continue
-            visited.add(ei)
-            for v in edges[ei]:
-                for nei in vert_to_idx[v]:
-                    if nei not in visited:
-                        queue.append(nei)
-        n_loops += 1
-    return n_loops
 
 
 def find_pocket_mouths(
@@ -5761,7 +4602,7 @@ def find_pocket_mouths(
         # Fold ratio: pocket surface area / mouth enclosed planar area.
         # A real pocket folds inward through a small opening (high ratio).
         # A flat patch has ratio near 1.
-        pocket_area = float(area_arr[cluster].sum())
+        pocket_area = float(area_arr[np.sort(cluster)].sum())
         opening_area = _rim_enclosed_area(boundary_edges, verts_arr)
         if opening_area <= 0:
             # Boundary loops with non-manifold junctions (vertex
@@ -5776,20 +4617,9 @@ def find_pocket_mouths(
             # produces false positives.
             on_non_main = _non_main_mask is not None and _non_main_mask[cluster[0]]
             if not on_non_main:
-                from scipy.spatial import ConvexHull
-
-                bverts = list({v for e in boundary_edges for v in e})
+                bverts = sorted({v for e in boundary_edges for v in e})
                 if len(bverts) >= 3:
-                    pts = verts_arr[bverts]
-                    centroid = pts.mean(axis=0)
-                    centered = pts - centroid
-                    _, _, vh = np.linalg.svd(centered)
-                    pts_2d = centered @ vh[:2].T
-                    try:
-                        hull = ConvexHull(pts_2d)
-                        opening_area = float(hull.volume)
-                    except Exception:
-                        pass
+                    opening_area = _mouth_hull_area(verts_arr[bverts])
             if opening_area <= 0:
                 continue
         fold_ratio = pocket_area / opening_area
@@ -6077,8 +4907,8 @@ def find_pocket_organelles(
                 if nfi not in comp_set:
                     cap_faces.add(nfi)
 
-        pocket_area = float(mesh.area_faces[comp].sum())
-        cap_area = float(mesh.area_faces[list(cap_faces)].sum()) if cap_faces else 0.0
+        pocket_area = float(mesh.area_faces[np.sort(comp)].sum())
+        cap_area = float(mesh.area_faces[sorted(cap_faces)].sum()) if cap_faces else 0.0
         if cap_area <= 0 or pocket_area / cap_area < min_fold_ratio:
             for fi in comp:
                 pocket[fi] = False
@@ -6170,9 +5000,9 @@ def find_isolated_organelles(
                 main_tree = KDTree(main_centroids)
             comp_verts = np.unique(mesh.faces[comp_face_idx])
             coords = mesh.vertices[comp_verts]
-            _, nn_idx = main_tree.query(coords)
+            _, nn_idx = _nearest(main_tree, coords)
             vecs = coords - main_centroids[nn_idx]
-            dots = np.einsum("ij,ij->i", vecs, main_normals[nn_idx])
+            dots = _row_dot(vecs, main_normals[nn_idx])
             is_internal = (dots < 0).sum() > len(dots) / 2
             n_via_geo += 1
 
@@ -6263,179 +5093,41 @@ def find_organelles(
     else:
         face_comp, main_ci = _face_edge_components(mesh)
 
-    # ── 2. Find isolated organelles (small internal components) ───
-    isolated = find_isolated_organelles(
-        mesh,
-        radius=radius,
-        radius_multiplier=radius_multiplier,
-        verbose=verbose,
-        mesh_stats=mesh_stats,
+    if verbose:
+        print("[skeliner.pre] Finding isolated organelles and pockets …")
+    pocket, isolated, rep = _rs.find_organelles(
+        np.asarray(mesh.vertices, dtype=np.float64),
+        np.asarray(mesh.faces, dtype=np.int64),
+        np.asarray(mesh.triangles_center, dtype=np.float64),
+        np.asarray(mesh.face_normals, dtype=np.float64),
+        np.asarray(mesh.area_faces, dtype=np.float64),
+        np.asarray(mesh_stats.outward_dots, dtype=np.float64),
+        np.asarray(face_comp, dtype=np.int64),
+        int(main_ci),
+        np.asarray(mesh.face_adjacency, dtype=np.int64),
+        _svd_rows,
+        _mouth_hull_area,
+        int(min_cluster_size),
     )
-
-    # ── 3. Identify structural components (non-isolated) ──────────
-    #       Build a mask covering all non-isolated components so that
-    #       find_pocket_organelles detects pockets on all of them in
-    #       a single pass (the outward dots are already per-component).
-    isolated_faces_set = set(np.where(isolated)[0].tolist())
-    structural_comps = []
-    for ci in np.unique(face_comp):
-        comp_face_idx = np.where(face_comp == ci)[0]
-        non_iso_count = sum(1 for fi in comp_face_idx if fi not in isolated_faces_set)
-        if non_iso_count >= min_cluster_size:
-            structural_comps.append(int(ci))
-
-    n_structural = len(structural_comps)
-
-    # ── 4. Run pocket detection on all structural components ──────
-    #       Replace main_face_mask with structural_face_mask in the
-    #       precomputed tuple so pocket detection covers all components.
-    structural_mask = np.zeros(len(mesh.faces), dtype=bool)
-    for ci in structural_comps:
-        structural_mask[face_comp == ci] = True
-
-    # Build a MeshStats where main_face_mask covers all structural components
-    # by mapping main_ci to a synthetic value that matches structural_mask.
-    # We achieve this by setting face_comp to 0 for structural faces and
-    # main_ci=0, so main_face_mask == structural_mask.
-    structural_face_comp = np.where(structural_mask, 0, -1).astype(face_comp.dtype)
-    precomputed_structural = MeshStats(
-        outward_dots=mesh_stats.outward_dots,
-        face_comp=structural_face_comp,
-        main_ci=0,
-    )
-
-    non_main_mask = np.zeros(len(mesh.faces), dtype=bool)
-    for ci in structural_comps:
-        if ci != main_ci:
-            non_main_mask[face_comp == ci] = True
-
-    pocket = find_pocket_organelles(
-        mesh,
-        radius=radius,
-        radius_multiplier=radius_multiplier,
-        min_cluster_size=min_cluster_size,
-        verbose=verbose,
-        mesh_stats=precomputed_structural,
-        _non_main_mask=non_main_mask,
-    )
-
-    # ── 5. Enclosure pass — find organelle interiors connected to
-    #       the surface through a narrow neck (articulation face).
-    #       Single-pass Tarjan's on a CSR graph tracks subtree size
-    #       and pocket enclosure inline.
-    _np_mask = structural_mask & ~pocket & ~isolated
-    _np_arr = np.where(_np_mask)[0]
-    enclosed_count = 0
-
-    if _np_arr.size > 0:
-        _fa = mesh.face_adjacency
-        _both = _np_mask[_fa[:, 0]] & _np_mask[_fa[:, 1]]
-        _pairs = _fa[_both]
-
-        # Per-face pocket boundary: edges crossing np ↔ non-np
-        _cross_a = _np_mask[_fa[:, 0]] & ~_np_mask[_fa[:, 1]]
-        _cross_b = _np_mask[_fa[:, 1]] & ~_np_mask[_fa[:, 0]]
-        _pbnd = np.zeros(len(mesh.faces), dtype=np.int32)
-        _tbnd = np.zeros(len(mesh.faces), dtype=np.int32)
-        if _cross_a.any():
-            np.add.at(_tbnd, _fa[_cross_a, 0], 1)
-            _pocket_a = _cross_a & pocket[_fa[:, 1]]
-            if _pocket_a.any():
-                np.add.at(_pbnd, _fa[_pocket_a, 0], 1)
-        if _cross_b.any():
-            np.add.at(_tbnd, _fa[_cross_b, 1], 1)
-            _pocket_b = _cross_b & pocket[_fa[:, 0]]
-            if _pocket_b.any():
-                np.add.at(_pbnd, _fa[_pocket_b, 1], 1)
-
-        # Build CSR adjacency for non-pocket faces
-        _edges = np.empty((len(_pairs) * 2, 2), dtype=np.int64)
-        _edges[: len(_pairs)] = _pairs
-        _edges[len(_pairs) :, 0] = _pairs[:, 1]
-        _edges[len(_pairs) :, 1] = _pairs[:, 0]
-        _ord = np.argsort(_edges[:, 0])
-        _dst = _edges[_ord, 1]
-        _usrc, _ucnt = np.unique(_edges[_ord, 0], return_counts=True)
-        _off = np.zeros(len(mesh.faces) + 1, dtype=np.int64)
-        _off[_usrc + 1] = _ucnt
-        np.cumsum(_off, out=_off)
-
-        # Tarjan's with subtree accumulation
-        nF = len(mesh.faces)
-        _disc = np.full(nF, -1, dtype=np.int32)
-        _low = np.full(nF, -1, dtype=np.int32)
-        _sub_sz = np.ones(nF, dtype=np.int32)
-        _sub_pb = _pbnd.copy()
-        _sub_tb = _tbnd.copy()
-        _tmr = 0
-        _to_claim: list[tuple[int, int]] = []
-
-        for _root in _np_arr:
-            if _disc[_root] >= 0:
-                continue
-            _disc[_root] = _low[_root] = _tmr
-            _tmr += 1
-            # stack: (node, parent, edge_cursor)
-            _stk: list[tuple[int, int, int]] = [(int(_root), -1, int(_off[_root]))]
-            _ccnt = np.zeros(nF, dtype=np.int8)
-            while _stk:
-                u, pu, ei = _stk[-1]
-                end_u = int(_off[u + 1])
-                if ei < end_u:
-                    _stk[-1] = (u, pu, ei + 1)
-                    v = int(_dst[ei])
-                    if _disc[v] < 0:
-                        _disc[v] = _low[v] = _tmr
-                        _tmr += 1
-                        _stk.append((v, u, int(_off[v])))
-                    elif v != pu:
-                        dv = _disc[v]
-                        if _low[u] > dv:
-                            _low[u] = dv
-                else:
-                    _stk.pop()
-                    if not _stk:
-                        break
-                    pu2 = _stk[-1][0]
-                    lu = _low[u]
-                    if _low[pu2] > lu:
-                        _low[pu2] = lu
-                    _sub_sz[pu2] += _sub_sz[u]
-                    _sub_pb[pu2] += _sub_pb[u]
-                    _sub_tb[pu2] += _sub_tb[u]
-                    _ccnt[pu2] += 1
-                    is_root = _stk[-1][1] == -1
-                    if lu >= _disc[pu2] and (not is_root or _ccnt[pu2] > 1):
-                        sz = int(_sub_sz[u])
-                        tb = int(_sub_tb[u])
-                        pb = int(_sub_pb[u])
-                        _pocket_n = int(pocket.sum())
-                        if (
-                            tb > 0
-                            and pb >= tb * 0.9
-                            and sz >= min_cluster_size
-                            and sz <= _pocket_n
-                        ):
-                            _to_claim.append((int(u), int(_disc[u])))
-
-        # Collect subtree faces for each claim via BFS
-        for _u, _d_u in _to_claim:
-            _q = deque([_u])
-            _vis: set[int] = set()
-            while _q:
-                c = _q.popleft()
-                if c in _vis:
-                    continue
-                _vis.add(c)
-                if not pocket[c]:
-                    pocket[c] = True
-                    enclosed_count += 1
-                s = int(_off[c])
-                e = int(_off[c + 1])
-                for i in range(s, e):
-                    nb = int(_dst[i])
-                    if nb not in _vis and _disc[nb] >= _d_u:
-                        _q.append(nb)
+    n_structural, enclosed_count = rep["n_structural"], rep["n_enclosed"]
+    if verbose:
+        print(
+            f"[skeliner.pre] Isolated organelles: "
+            f"{rep['n_internal']:,} fragments, "
+            f"{rep['n_internal_faces']:,} faces "
+            f"({rep['n_kept']:,} external kept; "
+            f"{rep['n_via_dots']:,} by dots, "
+            f"{rep['n_via_geometry']:,} by geometry)"
+        )
+        n_pocket = int(pocket.sum()) - enclosed_count
+        print(
+            f"[skeliner.pre] Pocket organelles: "
+            f"{n_pocket:,} faces from {rep['n_mouths']} mouths "
+            f"(fill {rep['n_initial']:,}, "
+            f"bridge +{rep['n_bridged']:,}, "
+            f"holes +{rep['n_holes']:,}, "
+            f"rejected {rep['n_rejected']})"
+        )
 
     dt_total = time.perf_counter() - t_total
     if verbose:
@@ -6469,184 +5161,29 @@ def _find_nonmanifold_fusions(
     mesh_stats: MeshStats | None = None,
 ) -> list[list[int]]:
     """Detect non-manifold fusions (shared edges, duplicate faces, pinch vertices)."""
-    areas = mesh.area_faces
-    zero_faces = set(np.where(areas < 1e-6)[0].tolist())
+    return _rs.find_nonmanifold_fusions(
+        np.asarray(mesh.faces, dtype=np.int64),
+        len(mesh.vertices),
+        np.asarray(mesh.area_faces, dtype=np.float64),
+        _outward_dots_for(mesh, radius, radius_multiplier, mesh_stats),
+        grow_rings,
+        min_branch_size,
+    )
 
-    edge_to_face = _edge_to_faces(mesh)
 
-    def _get_neighbors(fi: int) -> set[int]:
-        f = mesh.faces[fi]
-        nb: set[int] = set()
-        for i in range(3):
-            a, b = int(f[i]), int(f[(i + 1) % 3])
-            for nfi in edge_to_face[(min(a, b), max(a, b))]:
-                if nfi != fi:
-                    nb.add(nfi)
-        return nb
-
+def _outward_dots_for(mesh, radius, radius_multiplier, mesh_stats) -> np.ndarray:
+    """The outward dots in *mesh_stats*, or computed at *radius* (default
+    ``radius_multiplier`` median edges)."""
     if mesh_stats is not None and mesh_stats.outward_dots is not None:
-        outward_dots = mesh_stats.outward_dots
+        dots = mesh_stats.outward_dots
     else:
-        outward_dots = _outward_dot(
+        dots = _outward_dot(
             mesh,
             radius
             if radius is not None
             else radius_multiplier * float(np.median(mesh.edges_unique_length)),
         )
-
-    # Signal 1: negative-dot faces at non-manifold edges
-    nm_neg_faces: set[int] = set()
-    for e, faces in edge_to_face.items():
-        if len(faces) > 2:
-            for fi in faces:
-                if outward_dots[fi] < 0:
-                    nm_neg_faces.add(fi)
-
-    # Signal 2: exact duplicate faces with >3 neighbors
-    face_tuples = [tuple(sorted(int(v) for v in f)) for f in mesh.faces]
-    dupe_set = {ft for ft, c in Counter(face_tuples).items() if c > 1}
-    dupe_faces: set[int] = set()
-    for fi, ft in enumerate(face_tuples):
-        if ft in dupe_set and fi not in zero_faces:
-            nb: set[int] = set()
-            f = mesh.faces[fi]
-            for i in range(3):
-                a, b = int(f[i]), int(f[(i + 1) % 3])
-                for nfi in edge_to_face[(min(a, b), max(a, b))]:
-                    if nfi != fi:
-                        nb.add(nfi)
-            if len(nb) > 3:
-                dupe_faces.add(fi)
-
-    seed_faces = nm_neg_faces | dupe_faces
-
-    # Signal 3: fan vertices
-    _good = _non_degenerate(mesh.faces)
-    vert_to_face: list[list[int]] = [[] for _ in range(len(mesh.vertices))]
-    for fi, f in enumerate(mesh.faces):
-        if not _good[fi] or fi in zero_faces:
-            continue
-        for v in f:
-            vert_to_face[int(v)].append(fi)
-
-    fan_vertex_clusters: list[list[int]] = []
-    n_verts = len(mesh.vertices)
-    for vid in range(n_verts):
-        fan = vert_to_face[vid]
-        if len(fan) < 2:
-            continue
-        fan_set = set(fan)
-        fan_adj: dict[int, set[int]] = defaultdict(set)
-        for fi in fan:
-            f = mesh.faces[fi]
-            for i in range(3):
-                a, b = int(f[i]), int(f[(i + 1) % 3])
-                e = (min(a, b), max(a, b))
-                for nfi in edge_to_face[e]:
-                    if nfi in fan_set and nfi != fi:
-                        fan_adj[fi].add(nfi)
-        vis: set[int] = set()
-        q = deque([fan[0]])
-        while q:
-            curr = q.popleft()
-            if curr in vis:
-                continue
-            vis.add(curr)
-            for nfi in fan_adj.get(curr, set()):
-                if nfi not in vis:
-                    q.append(nfi)
-        if len(vis) < len(fan_set):
-            fan_vertex_clusters.append(sorted(fan))
-
-    if not seed_faces and not fan_vertex_clusters:
-        return []
-
-    # Cluster seeds
-    seed_adj: dict[int, set[int]] = defaultdict(set)
-    for e, faces in edge_to_face.items():
-        for i in range(len(faces)):
-            for j in range(i + 1, len(faces)):
-                if faces[i] in seed_faces and faces[j] in seed_faces:
-                    seed_adj[faces[i]].add(faces[j])
-                    seed_adj[faces[j]].add(faces[i])
-
-    visited: set[int] = set()
-    seed_clusters: list[list[int]] = []
-    for fi in seed_faces:
-        if fi in visited:
-            continue
-        cluster: list[int] = []
-        queue = deque([fi])
-        while queue:
-            curr = queue.popleft()
-            if curr in visited:
-                continue
-            visited.add(curr)
-            cluster.append(curr)
-            for nfi in seed_adj.get(curr, set()):
-                if nfi not in visited:
-                    queue.append(nfi)
-        seed_clusters.append(cluster)
-
-    # Grow region & split per cluster
-    def _manifold_components(region: set[int]) -> list[set[int]]:
-        m_adj: dict[int, set[int]] = defaultdict(set)
-        for fi in region:
-            f = mesh.faces[fi]
-            for i in range(3):
-                a, b = int(f[i]), int(f[(i + 1) % 3])
-                e = (min(a, b), max(a, b))
-                if len(edge_to_face[e]) == 2:
-                    for nfi in edge_to_face[e]:
-                        if nfi != fi and nfi in region:
-                            m_adj[fi].add(nfi)
-        vis: set[int] = set()
-        comps: list[set[int]] = []
-        for fi in region:
-            if fi in vis:
-                continue
-            comp: set[int] = set()
-            q = deque([fi])
-            while q:
-                curr = q.popleft()
-                if curr in vis:
-                    continue
-                vis.add(curr)
-                comp.add(curr)
-                for nfi in m_adj[curr]:
-                    if nfi not in vis:
-                        q.append(nfi)
-            comps.append(comp)
-        comps.sort(key=len, reverse=True)
-        return comps
-
-    result_clusters: list[list[int]] = []
-
-    for ci, seed_cluster in enumerate(seed_clusters):
-        region = set(seed_cluster)
-        for ring in range(1, grow_rings + 1):
-            boundary: set[int] = set()
-            for fi in region:
-                boundary.update(_get_neighbors(fi))
-            region = (region | boundary) - zero_faces
-            if ring < 3:
-                continue
-            comps = _manifold_components(region)
-            big = [c for c in comps if len(c) >= min_branch_size]
-            if len(big) >= 2:
-                branch0 = big[0]
-                branch1 = big[1]
-                fusion_boundary: set[int] = set()
-                for fi in branch0:
-                    for nfi in _get_neighbors(fi):
-                        if nfi in branch1:
-                            fusion_boundary.add(fi)
-                            fusion_boundary.add(nfi)
-                result_clusters.append(sorted(fusion_boundary))
-                break
-
-    result_clusters.extend(fan_vertex_clusters)
-    return result_clusters
+    return np.asarray(dots, dtype=np.float64)
 
 
 def find_fusions(
@@ -6699,15 +5236,15 @@ def find_fusions(
         print("[skeliner.pre] Finding fusions …")
         _t0 = time.perf_counter()
 
-    clusters = _find_nonmanifold_fusions(
-        mesh,
-        radius=radius,
-        radius_multiplier=radius_multiplier,
-        grow_rings=grow_rings,
-        min_branch_size=min_branch_size,
-        mesh_stats=mesh_stats,
+    clusters = _rs.find_nonmanifold_fusions(
+        np.asarray(mesh.faces, dtype=np.int64),
+        len(mesh.vertices),
+        np.asarray(mesh.area_faces, dtype=np.float64),
+        _outward_dots_for(mesh, radius, radius_multiplier, mesh_stats),
+        grow_rings,
+        min_branch_size,
+        sort=True,
     )
-    clusters.sort(key=len, reverse=True)
 
     if verbose:
         dt = time.perf_counter() - _t0
@@ -6733,92 +5270,25 @@ def _split_fan_vertices(
 
     Returns a new mesh with split vertices (more vertices, same faces).
     """
-
-    _good = _non_degenerate(mesh.faces)
-    vert_to_face: list[list[int]] = [[] for _ in range(len(mesh.vertices))]
-    for fi, f in enumerate(mesh.faces):
-        if _good[fi]:
-            for v in f:
-                vert_to_face[int(v)].append(fi)
-
-    edge_to_face = _edge_to_faces(mesh)
-
-    verts = mesh.vertices.copy()
-    faces = mesh.faces.copy()
-    # Topology snapshot: splitting a vertex is a pure relabel that preserves
-    # face-edge adjacency, so the fan must be analysed on the ORIGINAL vertex
-    # ids.  Reading the partially-relabelled `faces` instead would query
-    # `edge_to_face` (built once, from the original ids) with edges that do not
-    # exist in it, silently returning no neighbours and splitting fans that are
-    # actually connected.
-    orig_faces = mesh.faces.copy()
-    new_verts = list(verts)
-    n_split = 0
-
-    check = candidate_verts if candidate_verts is not None else range(len(verts))
-    for vid in check:
-        fan = vert_to_face[vid]
-        if len(fan) < 2:
-            continue
-
-        fan_set = set(fan)
-        fan_adj: dict[int, set[int]] = defaultdict(set)
-        for fi in fan:
-            f = orig_faces[fi]
-            for i in range(3):
-                a, b = int(f[i]), int(f[(i + 1) % 3])
-                e = (min(a, b), max(a, b))
-                for nfi in edge_to_face[e]:
-                    if nfi in fan_set and nfi != fi:
-                        fan_adj[fi].add(nfi)
-
-        # Find connected components of the face fan
-        vis: set[int] = set()
-        comps: list[set[int]] = []
-        for fi in fan:
-            if fi in vis:
-                continue
-            comp: set[int] = set()
-            q = deque([fi])
-            while q:
-                curr = q.popleft()
-                if curr in vis:
-                    continue
-                vis.add(curr)
-                comp.add(curr)
-                for nfi in fan_adj[curr]:
-                    if nfi not in vis:
-                        q.append(nfi)
-            comps.append(comp)
-
-        if len(comps) <= 1:
-            continue
-
-        # Keep first component with original vertex, duplicate for rest
-        for comp_faces in comps[1:]:
-            new_vid = len(new_verts)
-            new_verts.append(verts[vid].copy())
-            for fi in comp_faces:
-                for j in range(3):
-                    if int(faces[fi][j]) == vid:
-                        faces[fi][j] = new_vid
-            n_split += 1
-
-    if n_split == 0:
-        return mesh
-
-    result = trimesh.Trimesh(
-        vertices=np.array(new_verts),
-        faces=faces,
-        process=False,
+    candidates = (
+        None
+        if candidate_verts is None
+        else np.fromiter(sorted(candidate_verts), dtype=np.int64)
     )
-
+    faces, sources = _rs.split_fan_vertices(
+        np.asarray(mesh.faces, dtype=np.int64), len(mesh.vertices), candidates
+    )
+    if len(sources) == 0:
+        return mesh
+    verts = np.asarray(mesh.vertices)
+    result = trimesh.Trimesh(
+        vertices=np.vstack([verts, verts[sources]]), faces=faces, process=False
+    )
     if verbose:
         print(
-            f"[skeliner.pre] Split {n_split} fan vertices "
-            f"({len(verts):,} -> {len(new_verts):,} vertices)"
+            f"[skeliner.pre] Split {len(sources)} fan vertices "
+            f"({len(verts):,} -> {len(result.vertices):,} vertices)"
         )
-
     return result
 
 
@@ -6876,20 +5346,17 @@ def remove_fusions(
     for c in fusions:
         all_fusions.update(c)
 
-    candidate_verts: set[int] = set()
-    for fi in all_fusions:
-        for v in mesh.faces[fi]:
-            candidate_verts.add(int(v))
-
-    if all_fusions:
-        keep = np.ones(len(mesh.faces), dtype=bool)
-        for fi in all_fusions:
-            keep[fi] = False
-        mesh = _rebuild_mesh(mesh, keep)
-
-    # Step 2: split shared vertices near fusion sites
     n_verts_before = len(mesh.vertices)
-    mesh = _split_fan_vertices(mesh, candidate_verts)
+    if all_fusions:
+        faces, sources = _rs.remove_fusions(
+            np.asarray(mesh.faces, dtype=np.int64),
+            len(mesh.vertices),
+            [list(map(int, c)) for c in fusions],
+        )
+        verts = np.asarray(mesh.vertices)
+        if len(sources):
+            verts = np.vstack([verts, verts[sources]])
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
     n_split = len(mesh.vertices) - n_verts_before
 
     if verbose:
@@ -7161,11 +5628,10 @@ def find_parallel_patches(
     boundary_dist : float
         Max distance from a boundary plane in nm (default 30).
     expand_tilted : bool, default True
-        Run :func:`_expand_parallel_patches` at the end to absorb
-        tilted transition faces at the rim of each seed patch.
+        Grow each seed patch at the end to absorb the tilted transition
+        faces at its rim.
     loose_normal_thresh : float, default 0.9
-        Looser threshold used during rim expansion (passed to
-        :func:`_expand_parallel_patches`).
+        Looser threshold used during that rim expansion.
     min_sandwich_overlap : float, default 0.3
         After detection, drop patch pairs whose triangle-area overlap
         (in the perpendicular plane) is below this fraction of the
@@ -7188,301 +5654,20 @@ def find_parallel_patches(
     if boundaries is None:
         boundaries = find_chunk_boundaries(mesh)
 
-    verts = mesh.vertices
-    faces = mesh.faces
-    normals = mesh.face_normals
-    centroids = verts[faces].mean(axis=1)
-
-    # Perpendicular axes for overlap check
-    perp = {0: [1, 2], 1: [0, 2], 2: [0, 1]}
-
-    results = []
-
-    for axis, bvals in boundaries.items():
-        n_ax = normals[:, axis]
-        aligned = np.abs(n_ax) > normal_thresh
-
-        # For each face, find nearest boundary on this axis
-        near_mask = np.zeros(len(faces), dtype=bool)
-        face_bval = np.full(len(faces), -1, dtype=np.int64)
-        for bval in bvals:
-            m = np.abs(centroids[:, axis] - bval) < boundary_dist
-            near_mask |= m
-            face_bval[m] = int(round(bval))
-
-        target_mask = aligned & near_mask
-        target = np.where(target_mask)[0]
-        if len(target) < 2:
-            continue
-        target_set = set(int(fi) for fi in target)
-
-        # Face adjacency among target faces
-        edge_to_faces: dict[tuple, list[int]] = defaultdict(list)
-        for fi in target:
-            f = faces[fi]
-            for i in range(3):
-                a, b = int(f[i]), int(f[(i + 1) % 3])
-                e = (min(a, b), max(a, b))
-                edge_to_faces[e].append(int(fi))
-
-        # Connected components — same boundary only
-        visited: set[int] = set()
-        patches: list[tuple[list[int], int]] = []
-        for seed in target:
-            seed = int(seed)
-            if seed in visited:
-                continue
-            seed_bv = face_bval[seed]
-            comp: list[int] = []
-            queue = deque([seed])
-            visited.add(seed)
-            while queue:
-                fi = queue.popleft()
-                comp.append(fi)
-                f = faces[fi]
-                for i in range(3):
-                    a, b = int(f[i]), int(f[(i + 1) % 3])
-                    e = (min(a, b), max(a, b))
-                    for nb in edge_to_faces[e]:
-                        if (
-                            nb not in visited
-                            and nb in target_set
-                            and face_bval[nb] == seed_bv
-                        ):
-                            visited.add(nb)
-                            queue.append(nb)
-            patches.append((comp, int(seed_bv)))
-
-        # Check each patch for opposing faces
-        perp_axes = perp[axis]
-
-        def _any_face_overlaps(faces_a, faces_b):
-            """Check if any face from A overlaps any face from B in perp plane.
-
-            Projects triangles onto the perpendicular plane and checks
-            for vertex-in-triangle overlap.
-            """
-            # Get triangle vertices projected onto perp plane
-            verts_a = verts[faces[faces_a]][:, :, perp_axes]  # (Na, 3, 2)
-            verts_b = verts[faces[faces_b]][:, :, perp_axes]  # (Nb, 3, 2)
-
-            # Quick bbox pre-filter
-            a_min, a_max = verts_a.reshape(-1, 2).min(0), verts_a.reshape(-1, 2).max(0)
-            b_min, b_max = verts_b.reshape(-1, 2).min(0), verts_b.reshape(-1, 2).max(0)
-            if not (np.all(a_min <= b_max) and np.all(b_min <= a_max)):
-                return False
-
-            # Check if any vertex from A is strictly inside any triangle
-            # of B (and vice versa).  Use cross-product sign test with
-            # strict inequalities — points on edges/vertices don't count
-            # as "inside" so that adjacent (but non-overlapping) triangles
-            # sharing a vertex or edge are not flagged.
-            def _point_in_tri(px, py, tri):
-                """Test points strictly inside triangle tri (3,2)."""
-                x0, y0 = tri[0]
-                x1, y1 = tri[1]
-                x2, y2 = tri[2]
-                d00 = (x1 - x0) * (py - y0) - (y1 - y0) * (px - x0)
-                d01 = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
-                d02 = (x0 - x2) * (py - y2) - (y0 - y2) * (px - x2)
-                return ((d00 > 0) & (d01 > 0) & (d02 > 0)) | (
-                    (d00 < 0) & (d01 < 0) & (d02 < 0)
-                )
-
-            # Exclude shared vertices between A and B
-            vidx_a = set(int(v) for v in faces[faces_a].ravel())
-            vidx_b = set(int(v) for v in faces[faces_b].ravel())
-            shared_vidx = vidx_a & vidx_b
-
-            # Collect vertices from A (excluding shared), test against B
-            pts_a = verts_a.reshape(-1, 2)
-            mask_a = np.ones(len(pts_a), dtype=bool)
-            flat_vidx_a = faces[faces_a].ravel()
-            for k, vi in enumerate(flat_vidx_a):
-                if int(vi) in shared_vidx:
-                    mask_a[k] = False
-            pts_a_filtered = pts_a[mask_a]
-            if len(pts_a_filtered) > 0:
-                for tri in verts_b:
-                    if np.any(
-                        _point_in_tri(pts_a_filtered[:, 0], pts_a_filtered[:, 1], tri)
-                    ):
-                        return True
-
-            # Vice versa
-            pts_b = verts_b.reshape(-1, 2)
-            mask_b = np.ones(len(pts_b), dtype=bool)
-            flat_vidx_b = faces[faces_b].ravel()
-            for k, vi in enumerate(flat_vidx_b):
-                if int(vi) in shared_vidx:
-                    mask_b[k] = False
-            pts_b_filtered = pts_b[mask_b]
-            if len(pts_b_filtered) > 0:
-                for tri in verts_a:
-                    if np.any(
-                        _point_in_tri(pts_b_filtered[:, 0], pts_b_filtered[:, 1], tri)
-                    ):
-                        return True
-
-            return False
-
-        for comp, bv in patches:
-            fi_arr = np.array(comp)
-            n_ax_comp = n_ax[fi_arr]
-            pos_fi = fi_arr[n_ax_comp > normal_thresh]
-            neg_fi = fi_arr[n_ax_comp < -normal_thresh]
-
-            has_overlap = False
-
-            # Self-opposing: up/down within same patch
-            if len(pos_fi) > 0 and len(neg_fi) > 0:
-                if _any_face_overlaps(pos_fi, neg_fi):
-                    has_overlap = True
-
-            # Nearby opposing: other patches at same boundary
-            if not has_overlap:
-                comp_set = set(comp)
-                others = [
-                    int(fi)
-                    for fi in target
-                    if face_bval[fi] == bv and fi not in comp_set
-                ]
-                if others:
-                    other_nax = n_ax[others]
-                    mean_dir = n_ax_comp.mean()
-                    if mean_dir > 0:
-                        opp = [
-                            others[j]
-                            for j in range(len(others))
-                            if other_nax[j] < -normal_thresh
-                        ]
-                    else:
-                        opp = [
-                            others[j]
-                            for j in range(len(others))
-                            if other_nax[j] > normal_thresh
-                        ]
-                    if opp:
-                        if _any_face_overlaps(fi_arr, np.array(opp)):
-                            has_overlap = True
-
-            if has_overlap:
-                results.append(
-                    {
-                        "axis": axis,
-                        "bval": bv,
-                        "faces": [int(f) for f in fi_arr],
-                        "up_faces": [int(f) for f in pos_fi],
-                        "down_faces": [int(f) for f in neg_fi],
-                    }
-                )
-
-    # ── Neighbor expansion across all patches ──────────────────────
-    # Include non-target faces adjacent to 2+ faces from ANY flagged
-    # patch (catches slightly-tilted faces between patches).
-    all_patch_faces: set[int] = set()
-    for r in results:
-        all_patch_faces.update(r["faces"])
-
-    # Build full edge→face for faces near any boundary
-    all_near_set: set[int] = set()
-    for axis_k in boundaries:
-        near_k = np.abs(centroids[:, axis_k, np.newaxis] - boundaries[axis_k]) < 30.0
-        all_near_set.update(int(i) for i in np.where(near_k.any(axis=1))[0])
-
-    full_e2f: dict[tuple, list[int]] = defaultdict(list)
-    for fi in all_near_set:
-        f = faces[fi]
-        for i in range(3):
-            a, b = int(f[i]), int(f[(i + 1) % 3])
-            full_e2f[(min(a, b), max(a, b))].append(fi)
-
-    neighbor_count: dict[int, int] = defaultdict(int)
-    for fi in all_patch_faces:
-        f = faces[fi]
-        for i in range(3):
-            a, b = int(f[i]), int(f[(i + 1) % 3])
-            e = (min(a, b), max(a, b))
-            for nb in full_e2f[e]:
-                if nb not in all_patch_faces:
-                    neighbor_count[nb] += 1
-
-    expanded = {nb for nb, cnt in neighbor_count.items() if cnt >= 2}
-    all_patch_faces.update(expanded)
-
-    # ── Merge into connected patches ──────────────────────────────
-    # Re-run connected components on all flagged faces so that
-    # neighboring patches (possibly linked through expanded faces)
-    # form a single patch.
-    merge_e2f: dict[tuple, list[int]] = defaultdict(list)
-    for fi in all_patch_faces:
-        f = faces[fi]
-        for i in range(3):
-            a, b = int(f[i]), int(f[(i + 1) % 3])
-            merge_e2f[(min(a, b), max(a, b))].append(fi)
-
-    visited_merge: set[int] = set()
-    merged: list[list[int]] = []
-    for seed in all_patch_faces:
-        if seed in visited_merge:
-            continue
-        comp: list[int] = []
-        queue = deque([seed])
-        visited_merge.add(seed)
-        while queue:
-            fi = queue.popleft()
-            comp.append(fi)
-            f = faces[fi]
-            for i in range(3):
-                a, b = int(f[i]), int(f[(i + 1) % 3])
-                e = (min(a, b), max(a, b))
-                for nb in merge_e2f[e]:
-                    if nb not in visited_merge and nb in all_patch_faces:
-                        visited_merge.add(nb)
-                        queue.append(nb)
-        merged.append(comp)
-
-    # Rebuild results from merged components.  Determine axis from
-    # the dominant normal direction among perfectly-aligned faces.
-    results = []
-    for comp in merged:
-        fi_arr = np.array(comp)
-        # Find dominant axis: the one with most |n| > normal_thresh faces
-        best_axis = 0
-        best_count = 0
-        for ax in range(3):
-            cnt = int(np.sum(np.abs(normals[fi_arr, ax]) > normal_thresh))
-            if cnt > best_count:
-                best_count = cnt
-                best_axis = ax
-        # Determine boundary value from centroids
-        bv = int(round(float(np.median(centroids[fi_arr, best_axis]))))
-        # Find nearest actual boundary
-        bvals_ax = boundaries.get(best_axis, np.array([]))
-        if len(bvals_ax) > 0:
-            idx = np.argmin(np.abs(bvals_ax - bv))
-            bv = int(round(bvals_ax[idx]))
-
-        n_ax_comp = normals[fi_arr, best_axis]
-        pos_fi = fi_arr[n_ax_comp > 0.5]
-        neg_fi = fi_arr[n_ax_comp < -0.5]
-        results.append(
-            {
-                "axis": best_axis,
-                "bval": bv,
-                "faces": [int(f) for f in fi_arr],
-                "up_faces": [int(f) for f in pos_fi],
-                "down_faces": [int(f) for f in neg_fi],
-            }
-        )
-
-    if expand_tilted:
-        results = _expand_parallel_patches(
-            mesh,
-            results,
-            loose_normal_thresh=loose_normal_thresh,
-            boundary_dist=boundary_dist,
-        )
+    found = _rs.find_parallel_patches(
+        np.asarray(mesh.faces, dtype=np.int64),
+        np.asarray(mesh.vertices, dtype=np.float64),
+        np.asarray(mesh.face_normals, dtype=np.float64),
+        [(int(ax), [float(b) for b in bvals]) for ax, bvals in boundaries.items()],
+        normal_thresh,
+        boundary_dist,
+        expand_tilted,
+        loose_normal_thresh,
+    )
+    results = [
+        {"axis": a, "bval": b, "faces": f, "up_faces": up, "down_faces": dn}
+        for a, b, f, up, dn in found
+    ]
 
     if min_sandwich_overlap > 0:
         results = _filter_weak_sandwich_pairs(
@@ -7703,543 +5888,6 @@ def _filter_weak_sandwich_pairs(
     return [p for pi, p in enumerate(patches) if keep[pi]]
 
 
-def _expand_parallel_patches(
-    mesh: trimesh.Trimesh,
-    patches: list[dict],
-    *,
-    loose_normal_thresh: float = 0.9,
-    boundary_dist: float = 30.0,
-) -> list[dict]:
-    """Absorb tilted transition faces adjacent to strict-parallel seed
-    patches.
-
-    At the rim of a parallel sandwich patch, marching cubes often emits
-    a few slightly-tilted triangles that bridge the flat sheet to the
-    surrounding geometry.  These faces fail the strict ``normal_thresh``
-    test but should still be treated as part of the patch, otherwise
-    they split one logical sandwich into multiple disconnected seed
-    patches (and leave the rim contour broken).
-
-    For each seed patch this function BFS-expands through edge-adjacent
-    faces whose axis-aligned normal component satisfies
-
-    * same sign as the patch (``n_axis * sign > 0``),
-    * ``|n_axis| > loose_normal_thresh`` (default 0.9 — about 26° tilt),
-    * centroid within ``2 * boundary_dist`` of the patch's ``bval``,
-    * projection (in the plane perpendicular to the axis) overlapping
-      the bbox of an *opposing* patch at the same axis/bval.
-
-    Patches whose expansions share any absorbed face get merged into
-    one in the returned list.
-    """
-
-    if not patches:
-        return patches
-
-    verts = mesh.vertices
-    faces = mesh.faces
-    normals = mesh.face_normals
-    centroids = verts[faces].mean(axis=1)
-    perp = {0: [1, 2], 1: [0, 2], 2: [0, 1]}
-    expand_dist = 2.0 * boundary_dist
-
-    # Mesh-wide edge adjacency
-    full_ef: dict[tuple, list[int]] = defaultdict(list)
-    for fi in range(len(faces)):
-        f = faces[fi]
-        if f[0] == f[1] or f[1] == f[2] or f[0] == f[2]:
-            continue
-        for i in range(3):
-            a, b = int(f[i]), int(f[(i + 1) % 3])
-            full_ef[(min(a, b), max(a, b))].append(int(fi))
-
-    def patch_sign(p):
-        if p["up_faces"]:
-            return 1
-        if p["down_faces"]:
-            return -1
-        return 0
-
-    # Group patches by (axis, bval) and compute opposing XY bbox per sign.
-    groups: dict[tuple, list[int]] = defaultdict(list)
-    for pi, p in enumerate(patches):
-        groups[(int(p["axis"]), int(p["bval"]))].append(pi)
-
-    expansions: list[set[int]] = [set(p["faces"]) for p in patches]
-
-    for (axis, bval), group_pis in groups.items():
-        perp_axes = perp[axis]
-
-        opp_bbox: dict[int, tuple] = {}
-        for sign_val in (1, -1):
-            opp_vs: list[np.ndarray] = []
-            for pj in group_pis:
-                if patch_sign(patches[pj]) == -sign_val:
-                    opp_vs.append(verts[faces[patches[pj]["faces"]]].reshape(-1, 3))
-            if not opp_vs:
-                continue
-            stacked = np.vstack(opp_vs)
-            opp_bbox[sign_val] = (
-                stacked[:, perp_axes].min(0),
-                stacked[:, perp_axes].max(0),
-            )
-
-        for pi in group_pis:
-            sign_p = patch_sign(patches[pi])
-            if sign_p == 0 or sign_p not in opp_bbox:
-                continue
-            xy_min, xy_max = opp_bbox[sign_p]
-            q = deque(patches[pi]["faces"])
-            while q:
-                fi = q.popleft()
-                f = faces[fi]
-                for i in range(3):
-                    a, b = int(f[i]), int(f[(i + 1) % 3])
-                    e = (min(a, b), max(a, b))
-                    for nb in full_ef[e]:
-                        if nb in expansions[pi]:
-                            continue
-                        n_ax = normals[nb, axis]
-                        if n_ax * sign_p <= 0:
-                            continue
-                        if abs(n_ax) < loose_normal_thresh:
-                            continue
-                        if abs(centroids[nb, axis] - bval) > expand_dist:
-                            continue
-                        v = verts[faces[nb]][:, perp_axes]
-                        if not (
-                            (v.min(0) < xy_max).all() and (v.max(0) > xy_min).all()
-                        ):
-                            continue
-                        expansions[pi].add(int(nb))
-                        q.append(int(nb))
-
-    # Merge patches whose expansions share absorbed faces (same axis,
-    # bval, and sign).
-    parent = list(range(len(patches)))
-
-    def uf_find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def uf_union(a, b):
-        ra, rb = uf_find(a), uf_find(b)
-        if ra != rb:
-            parent[ra] = rb
-
-    for i in range(len(patches)):
-        for j in range(i + 1, len(patches)):
-            if patches[i]["axis"] != patches[j]["axis"]:
-                continue
-            if patches[i]["bval"] != patches[j]["bval"]:
-                continue
-            if patch_sign(patches[i]) != patch_sign(patches[j]):
-                continue
-            if expansions[i] & expansions[j]:
-                uf_union(i, j)
-
-    merged_groups: dict[int, list[int]] = defaultdict(list)
-    for i in range(len(patches)):
-        merged_groups[uf_find(i)].append(i)
-
-    new_patches: list[dict] = []
-    for root, members in merged_groups.items():
-        axis = int(patches[root]["axis"])
-        bval = int(patches[root]["bval"])
-        merged_faces: set[int] = set()
-        merged_up: set[int] = set()
-        merged_down: set[int] = set()
-        orig: set[int] = set()
-        for mi in members:
-            merged_faces |= expansions[mi]
-            merged_up.update(patches[mi]["up_faces"])
-            merged_down.update(patches[mi]["down_faces"])
-            orig.update(patches[mi]["faces"])
-        # Classify absorbed faces by their signed normal component
-        for fi in merged_faces - orig:
-            if normals[fi, axis] > 0:
-                merged_up.add(fi)
-            else:
-                merged_down.add(fi)
-        new_patches.append(
-            {
-                "axis": axis,
-                "bval": bval,
-                "faces": sorted(int(f) for f in merged_faces),
-                "up_faces": sorted(int(f) for f in merged_up),
-                "down_faces": sorted(int(f) for f in merged_down),
-            }
-        )
-
-    return new_patches
-
-
-def _find_fold_faces(mesh, patch):
-    """Find faces on fold edges within a patch.
-
-    A fold edge is where an up face shares an edge with a down face —
-    the surface turns 180°.  Returns the set of face indices directly
-    on fold edges.
-    """
-
-    up_set = set(patch["up_faces"])
-    down_set = set(patch["down_faces"])
-    faces = mesh.faces
-
-    edge_faces: dict[tuple, list[int]] = defaultdict(list)
-    for fi in patch["faces"]:
-        f = faces[fi]
-        for i in range(3):
-            e = (
-                min(int(f[i]), int(f[(i + 1) % 3])),
-                max(int(f[i]), int(f[(i + 1) % 3])),
-            )
-            edge_faces[e].append(fi)
-
-    fold: set[int] = set()
-    for e, fis in edge_faces.items():
-        has_up = any(fi in up_set for fi in fis)
-        has_down = any(fi in down_set for fi in fis)
-        if has_up and has_down:
-            fold.update(fis)
-
-    return fold
-
-
-def _trace_edge_loops(
-    edges: list[tuple[int, int]],
-) -> list[tuple[list[int], bool]]:
-    """Trace a set of undirected edges into ordered vertex sequences.
-
-    Returns a list of ``(vertex_sequence, is_closed)`` pairs.  For
-    closed loops the last vertex is implicitly connected back to the
-    first (i.e. the wrap-around edge exists in the input).  For open
-    chains the first and last vertices are the dangling endpoints.
-
-    Open chains are emitted first, starting at any degree-1 vertex.
-    Remaining unused edges form closed loops.  Non-manifold vertices
-    (degree ≥ 3) are split — each incident edge is walked at most
-    once, so a figure-8 becomes two separate loops touching at the
-    shared vertex.
-    """
-
-    if not edges:
-        return []
-
-    ve: dict[int, list[tuple[int, int]]] = defaultdict(list)
-    eset: set[tuple[int, int]] = set()
-    for e in edges:
-        key = (min(e[0], e[1]), max(e[0], e[1]))
-        if key in eset:
-            continue
-        eset.add(key)
-        ve[key[0]].append(key)
-        ve[key[1]].append(key)
-
-    used: set[tuple[int, int]] = set()
-    out: list[tuple[list[int], bool]] = []
-
-    def walk(start_edge: tuple[int, int]) -> tuple[list[int], bool]:
-        chain = [start_edge[0], start_edge[1]]
-        used.add(start_edge)
-        curr = start_edge[1]
-        closed = False
-        while True:
-            nxt_e = None
-            for cand in ve[curr]:
-                if cand not in used:
-                    nxt_e = cand
-                    break
-            if nxt_e is None:
-                break
-            used.add(nxt_e)
-            nxt = nxt_e[1] if nxt_e[0] == curr else nxt_e[0]
-            if nxt == chain[0]:
-                closed = True
-                break
-            chain.append(nxt)
-            curr = nxt
-        return chain, closed
-
-    # Open chains: start at degree-1 endpoints
-    endpoints = [v for v, es in ve.items() if len(es) == 1]
-    for v in endpoints:
-        for e in ve[v]:
-            if e in used:
-                continue
-            oriented = e if e[0] == v else (e[1], e[0])
-            chain, closed = walk(oriented)
-            out.append((chain, closed))
-
-    # Closed loops from any remaining unused edge
-    for e in eset:
-        if e in used:
-            continue
-        chain, closed = walk(e)
-        out.append((chain, closed))
-
-    return out
-
-
-def _zip_vertex_loops(
-    loop_a: list[int],
-    loop_b: list[int],
-    verts: np.ndarray,
-    *,
-    closed_a: bool = True,
-    closed_b: bool = True,
-) -> list[tuple[int, int, int]]:
-    """Zip two ordered vertex loops into a strip of triangles.
-
-    Both loops are walked in lock-step with a "shortest diagonal"
-    decision rule: at each step, advance whichever side produces the
-    shorter bridge edge to the other side's current vertex.  Each
-    source edge of loop_a and loop_b is consumed in exactly one new
-    triangle, so the result is manifold by construction (no fans, no
-    duplicate edges).
-
-    Before walking, this tries every starting offset and both winding
-    orders on ``loop_b`` and picks the alignment that minimises the
-    sum of bridge-edge lengths.  This is O((m + n) * n) which is fine
-    for small rim loops.
-    """
-    m = len(loop_a)
-    n = len(loop_b)
-    if m < 2 or n < 2:
-        return []
-
-    def walk(shifted_b: list[int]) -> tuple[float, list[tuple[int, int, int]]]:
-        tris: list[tuple[int, int, int]] = []
-        cost = 0.0
-        i, j = 0, 0
-        # Closed loops walk m + n steps total; open chains walk m-1 + n-1.
-        steps_a = m if closed_a else m - 1
-        steps_b = n if closed_b else n - 1
-        while i < steps_a or j < steps_b:
-            a_curr = loop_a[i % m]
-            a_next = loop_a[(i + 1) % m]
-            t_curr = shifted_b[j % n]
-            t_next = shifted_b[(j + 1) % n]
-            if i >= steps_a:
-                tris.append((a_curr, t_next, t_curr))
-                cost += float(np.linalg.norm(verts[t_next] - verts[a_curr]))
-                j += 1
-            elif j >= steps_b:
-                tris.append((a_curr, a_next, t_curr))
-                cost += float(np.linalg.norm(verts[a_next] - verts[t_curr]))
-                i += 1
-            else:
-                d_adv_a = float(np.linalg.norm(verts[a_next] - verts[t_curr]))
-                d_adv_b = float(np.linalg.norm(verts[a_curr] - verts[t_next]))
-                if d_adv_a <= d_adv_b:
-                    tris.append((a_curr, a_next, t_curr))
-                    cost += d_adv_a
-                    i += 1
-                else:
-                    tris.append((a_curr, t_next, t_curr))
-                    cost += d_adv_b
-                    j += 1
-        return cost, tris
-
-    best: tuple[float, list[tuple[int, int, int]]] | None = None
-    # Try both winding directions and all starting offsets on loop_b
-    # (for closed loops).  For open chains, only offset 0 is valid.
-    reverse_options = [False, True]
-    shift_options = range(n) if closed_b else [0]
-    for reverse in reverse_options:
-        base = list(loop_b[::-1] if reverse else loop_b)
-        for shift in shift_options:
-            shifted = base[shift:] + base[:shift]
-            cost, tris = walk(shifted)
-            if best is None or cost < best[0]:
-                best = (cost, tris)
-
-    return best[1] if best is not None else []
-
-
-def _stitch_mode_b(mesh, orig_faces, mode_b_faces, patches):
-    """Bridge gaps left by Mode B parallel-patch removal using
-    per-sandwich rim tracing and contour zipping.
-
-    For each ``(axis, bval)`` sandwich group in *patches*, collect the
-    rim edges on each sign side (edges where an up-removed or
-    down-removed face meets a surviving face), trace them into ordered
-    vertex loops, pair up-side loops with down-side loops by spatial
-    proximity, and zip each pair into a manifold triangle strip.
-
-    Bridges are emitted with :func:`_zip_vertex_loops`, which consumes
-    each rim edge exactly once in exactly one new triangle — so the
-    result has no fans, no duplicate faces, and no non-manifold edges
-    by construction.
-    """
-
-    verts = mesh.vertices
-    faces = mesh.faces
-    degen = np.all(faces == 0, axis=1)
-
-    # Edge → surviving faces map (excludes degenerates)
-    surv_ef: dict[tuple[int, int], set[int]] = defaultdict(set)
-    for fi in range(len(faces)):
-        if degen[fi]:
-            continue
-        f = faces[fi]
-        a, b, c = int(f[0]), int(f[1]), int(f[2])
-        if a == b or b == c or a == c:
-            continue
-        surv_ef[(min(a, b), max(a, b))].add(fi)
-        surv_ef[(min(b, c), max(b, c))].add(fi)
-        surv_ef[(min(a, c), max(a, c))].add(fi)
-
-    mode_b_set = set(int(fi) for fi in mode_b_faces)
-
-    def rim_edges_for(removed_side: set[int]) -> list[tuple[int, int]]:
-        """Return edges of *orig_faces* in removed_side where the
-        other side of the edge is a surviving face (not a degen or
-        another removed face)."""
-        out: list[tuple[int, int]] = []
-        seen: set[tuple[int, int]] = set()
-        for fi in removed_side:
-            f = orig_faces[fi]
-            for i in range(3):
-                a, b = int(f[i]), int(f[(i + 1) % 3])
-                if a == b:
-                    continue
-                e = (min(a, b), max(a, b))
-                if e in seen:
-                    continue
-                surv = surv_ef.get(e, set())
-                if len(surv) == 1:
-                    seen.add(e)
-                    out.append(e)
-        return out
-
-    # Group Mode-B patches by (axis, bval)
-    groups: dict[tuple[int, int], list[dict]] = defaultdict(list)
-    for p in patches:
-        pf = set(p["faces"])
-        if not (pf & mode_b_set):
-            continue
-        groups[(int(p["axis"]), int(p["bval"]))].append(p)
-
-    if not groups:
-        return mesh
-
-    all_new_tris: list[tuple[int, int, int]] = []
-    n_pairs = 0
-    n_skipped_loops = 0
-
-    for (_axis, _bval), group in groups.items():
-        up_removed: set[int] = set()
-        dn_removed: set[int] = set()
-        for p in group:
-            up_removed.update(int(f) for f in p["up_faces"] if int(f) in mode_b_set)
-            dn_removed.update(int(f) for f in p["down_faces"] if int(f) in mode_b_set)
-
-        up_rim = rim_edges_for(up_removed)
-        dn_rim = rim_edges_for(dn_removed)
-        if not up_rim or not dn_rim:
-            continue
-
-        up_traces = _trace_edge_loops(up_rim)
-        dn_traces = _trace_edge_loops(dn_rim)
-        # A real contour needs at least 3 vertices (closed) or 2
-        # vertices for a single-edge chain.  Drop anything smaller.
-        up_traces = [
-            (lp, c)
-            for lp, c in up_traces
-            if (c and len(lp) >= 3) or (not c and len(lp) >= 2)
-        ]
-        dn_traces = [
-            (lp, c)
-            for lp, c in dn_traces
-            if (c and len(lp) >= 3) or (not c and len(lp) >= 2)
-        ]
-        if not up_traces or not dn_traces:
-            continue
-
-        # Pair loops greedily by centroid distance — largest loops first.
-        # Perpendicular plane of the sandwich axis for bbox overlap check.
-        perp_axes = [i for i in range(3) if i != _axis]
-        up_info = []
-        for lp, c in up_traces:
-            pts = verts[lp]
-            up_info.append(
-                {
-                    "loop": lp,
-                    "closed": c,
-                    "pts": pts,
-                    "center": pts.mean(axis=0),
-                    "bmin": pts[:, perp_axes].min(0),
-                    "bmax": pts[:, perp_axes].max(0),
-                }
-            )
-        dn_info = []
-        for lp, c in dn_traces:
-            pts = verts[lp]
-            dn_info.append(
-                {
-                    "loop": lp,
-                    "closed": c,
-                    "pts": pts,
-                    "center": pts.mean(axis=0),
-                    "bmin": pts[:, perp_axes].min(0),
-                    "bmax": pts[:, perp_axes].max(0),
-                }
-            )
-
-        up_order = sorted(range(len(up_info)), key=lambda i: -len(up_info[i]["loop"]))
-        dn_used: set[int] = set()
-
-        for ui in up_order:
-            u = up_info[ui]
-            best_dn = -1
-            best_d = float("inf")
-            for di in range(len(dn_info)):
-                if di in dn_used:
-                    continue
-                d_info = dn_info[di]
-                # Require bbox overlap in the perpendicular plane —
-                # without this, a mixed-patch rim whose up and down
-                # sides cover different XY regions would get zipped
-                # into a twisted strip crossing empty space.
-                imin = np.maximum(u["bmin"], d_info["bmin"])
-                imax = np.minimum(u["bmax"], d_info["bmax"])
-                if not (imax > imin).all():
-                    continue
-                d = float(np.linalg.norm(u["center"] - d_info["center"]))
-                if d < best_d:
-                    best_d = d
-                    best_dn = di
-            if best_dn < 0:
-                n_skipped_loops += 1
-                continue
-            dn_used.add(best_dn)
-            d_info = dn_info[best_dn]
-            tris = _zip_vertex_loops(
-                u["loop"],
-                d_info["loop"],
-                verts,
-                closed_a=u["closed"],
-                closed_b=d_info["closed"],
-            )
-            if tris:
-                all_new_tris.extend(tris)
-                n_pairs += 1
-            else:
-                n_skipped_loops += 1
-
-        n_skipped_loops += len(dn_info) - len(dn_used)
-
-    if not all_new_tris:
-        return mesh
-
-    new_faces = np.array(all_new_tris, dtype=np.int64)
-    combined = np.vstack([faces, new_faces])
-    return trimesh.Trimesh(vertices=verts, faces=combined, process=False)
-
-
 def remove_parallel_patches(
     mesh: trimesh.Trimesh,
     *,
@@ -8250,8 +5898,8 @@ def remove_parallel_patches(
 ) -> trimesh.Trimesh:
     """Remove parallel-patch artifacts at chunk boundaries.
 
-    1. Classify each patch as Mode A (has fold edges) or Mode B (no
-       fold edges) using :func:`_find_fold_faces`.
+    1. Classify each patch as Mode A (has fold edges, where an up face
+       shares an edge with a down face) or Mode B (no fold edges).
     2. Remove all detected patch faces.
     3. Find new disconnected components created by the removal.
     4. For each new component, check which removed patches it borders:
@@ -8296,124 +5944,17 @@ def remove_parallel_patches(
     if not patches:
         return mesh
 
-    faces = mesh.faces
-
-    # ── Step 1: classify patches ──────────────────────────────────
-    mode_a_faces: set[int] = set()  # fold patches
-    mode_b_faces: set[int] = set()  # parallel patches
-    all_removed: set[int] = set()
-    n_a = 0
-    n_b = 0
-
-    for patch in patches:
-        fold = _find_fold_faces(mesh, patch)
-        patch_set = set(patch["faces"])
-        all_removed.update(patch_set)
-
-        has_up = bool(patch.get("up_faces"))
-        has_down = bool(patch.get("down_faces"))
-        if has_up and has_down:
-            # Sandwich with both sides → always stitch (mode B).
-            # Fold faces within the patch don't disqualify it —
-            # they just mark local non-manifold edges that get
-            # removed along with the rest.
-            mode_b_faces.update(patch_set)
-            n_b += 1
-            if fold:
-                mode_a_faces.update(fold)
-        elif fold:
-            mode_a_faces.update(patch_set)
-            n_a += 1
-        else:
-            mode_b_faces.update(patch_set)
-            n_b += 1
-
+    faces_out, n_removed, n_a, n_b, n_orphan, n_stitched = _rs.remove_parallel_patches(
+        np.asarray(mesh.faces, dtype=np.int64),
+        np.asarray(mesh.vertices, dtype=np.float64),
+        np.asarray(mesh.face_normals, dtype=np.float64),
+        [
+            (p["axis"], p["bval"], p["faces"], p["up_faces"], p["down_faces"])
+            for p in patches
+        ],
+    )
+    result = trimesh.Trimesh(vertices=mesh.vertices, faces=faces_out, process=False)
     n_trimmed = n_faces_before_trim - n_faces_after_trim
-
-    # ── Step 2: remove all patch faces ────────────────────────────
-    keep_mask = np.ones(len(faces), dtype=bool)
-    keep_mask[list(all_removed)] = False
-    result = _rebuild_mesh(mesh, keep_mask)
-
-    # ── Step 3: find NEWLY disconnected components ─────────────────
-    # Only consider faces that were in the main component before
-    # removal but ended up in a non-main component after.
-    labels_before, main_before = _face_edge_components(mesh)
-    was_main = set(int(i) for i in np.where(labels_before == main_before)[0])
-
-    labels_after, main_after = _face_edge_components(result)
-    degen = np.all(result.faces == 0, axis=1)
-
-    # Faces that were main, survived removal, but are now non-main
-    newly_disconnected: set[int] = set()
-    for fi in was_main:
-        if not degen[fi] and labels_after[fi] != main_after:
-            newly_disconnected.add(fi)
-
-    # ── Step 4: classify new orphan components ────────────────────
-    # Only applies to *newly* disconnected pieces (those that were in
-    # main_before but are non-main_after).  Mode B pre-existing
-    # disconnects are handled by the stitch step unconditionally.
-    if newly_disconnected:
-        # Build edge→type map for removed faces
-        removed_edge_type: dict[tuple, str] = {}
-        for fi in all_removed:
-            f = faces[fi]
-            typ = "a" if fi in mode_a_faces else "b"
-            for i in range(3):
-                e = (
-                    min(int(f[i]), int(f[(i + 1) % 3])),
-                    max(int(f[i]), int(f[(i + 1) % 3])),
-                )
-                # If any bordering removed face is Mode B, mark as "b"
-                if removed_edge_type.get(e) != "b":
-                    removed_edge_type[e] = typ
-
-        # Group newly disconnected faces by component
-        new_comp_ids = set(int(labels_after[fi]) for fi in newly_disconnected)
-        orphan_remove: set[int] = set()
-
-        for comp_id in new_comp_ids:
-            comp_face_idxs = [
-                fi
-                for fi in np.where(labels_after == comp_id)[0]
-                if fi in newly_disconnected or not degen[fi]
-            ]
-            borders_mode_b = False
-
-            for fi in comp_face_idxs:
-                if borders_mode_b:
-                    break
-                f = faces[fi]
-                for i in range(3):
-                    e = (
-                        min(int(f[i]), int(f[(i + 1) % 3])),
-                        max(int(f[i]), int(f[(i + 1) % 3])),
-                    )
-                    if removed_edge_type.get(e) == "b":
-                        borders_mode_b = True
-                        break
-
-            if not borders_mode_b:
-                orphan_remove.update(int(fi) for fi in comp_face_idxs)
-
-        if orphan_remove:
-            keep_mask2 = np.ones(len(faces), dtype=bool)
-            keep_mask2[list(all_removed)] = False
-            keep_mask2[list(orphan_remove)] = False
-            result = _rebuild_mesh(mesh, keep_mask2)
-    n_orphan = len(orphan_remove) if newly_disconnected else 0
-
-    # ── Step 5: stitch Mode B gaps ───────────────────────────────
-    n_before = len(result.faces)
-    if mode_b_faces:
-        result = _stitch_mode_b(
-            result,
-            faces,
-            mode_b_faces,
-            patches,
-        )
-    n_stitched = len(result.faces) - n_before
 
     # Invalidate topology; pad outward_dots for appended stitch faces
     if mesh_stats is not None:
@@ -8431,7 +5972,7 @@ def remove_parallel_patches(
 
     if verbose:
         parts = [
-            f"removed {len(all_removed):,}f ({n_a} fold + {n_b} parallel)",
+            f"removed {n_removed:,}f ({n_a} fold + {n_b} parallel)",
         ]
         if n_trimmed:
             parts.append(
@@ -8714,109 +6255,6 @@ def preprocess(
 # =====================================================================
 
 
-def _z_slice_cluster(
-    verts_xy: np.ndarray,
-    grid_res: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int] | None:
-    """Rasterize 2D points, find the largest connected cluster.
-
-    Returns ``(occ, soma_region, ix, iy, xy_min)`` or None if too few
-    points.  *occ* is the raw occupancy grid, *soma_region* is the
-    dilated largest-component mask, *ix/iy* are per-vertex grid indices,
-    *xy_min* is the grid origin.
-    """
-    from scipy.ndimage import binary_dilation, label
-
-    pts = verts_xy
-    if len(pts) < 10:
-        return None
-
-    xy_min = pts.min(axis=0) - grid_res * 3
-    nx = int((pts[:, 0].max() - xy_min[0] + grid_res * 6) / grid_res) + 1
-    ny = int((pts[:, 1].max() - xy_min[1] + grid_res * 6) / grid_res) + 1
-
-    occ = np.zeros((nx, ny), dtype=bool)
-    ix = ((pts[:, 0] - xy_min[0]) / grid_res).astype(int).clip(0, nx - 1)
-    iy = ((pts[:, 1] - xy_min[1]) / grid_res).astype(int).clip(0, ny - 1)
-    occ[ix, iy] = True
-
-    struct3 = np.ones((3, 3), dtype=bool)
-    dilated = binary_dilation(occ, struct3)
-    labeled, n_labels = label(dilated)
-    if n_labels == 0:
-        return None
-
-    sizes = np.bincount(labeled.ravel())[1:]
-    lid = int(np.argmax(sizes)) + 1
-    soma_region = labeled == lid
-
-    return occ, soma_region, ix, iy, xy_min
-
-
-def _z_slice_void(
-    occ: np.ndarray,
-    soma_region: np.ndarray,
-    xy_min: np.ndarray,
-    grid_res: float,
-) -> tuple[float, float, float, np.ndarray | None] | None:
-    """Detect the nucleus void within a soma cluster.
-
-    Returns ``(cx, cy, void_r, void_xy)`` or None if no void.
-    *void_xy* is ``(M, 2)`` world-coordinate points of the void region.
-    """
-    from scipy.ndimage import binary_fill_holes, distance_transform_edt, label
-
-    occ_s = occ & soma_region
-
-    # 4-ray enclosure
-    enc = np.ones_like(occ_s)
-    for ax in range(2):
-        enc &= np.maximum.accumulate(occ_s, axis=ax)
-        enc &= np.flip(
-            np.maximum.accumulate(np.flip(occ_s, axis=ax), axis=ax),
-            axis=ax,
-        )
-    # Confine to filled soma cluster (can't leak through pocket mouth)
-    soma_filled = binary_fill_holes(soma_region)
-    enc &= soma_filled
-
-    void = enc & ~occ_s
-    if not void.any():
-        return None
-
-    dt = distance_transform_edt(~occ_s)
-    dtv = dt * void
-    pk = np.unravel_index(dtv.argmax(), dtv.shape)
-    cx = float(xy_min[0] + pk[0] * grid_res + grid_res / 2)
-    cy = float(xy_min[1] + pk[1] * grid_res + grid_res / 2)
-    void_r = float(dtv.max()) * grid_res
-
-    # Keep only the connected component containing the peak,
-    # with dt > 2 to exclude small vertex-spacing gaps.
-    deep_void = void & (dt > 2)
-    if not deep_void.any():
-        return cx, cy, void_r, None
-
-    void_labeled, _ = label(deep_void)
-    peak_label = void_labeled[pk[0], pk[1]]
-    if peak_label == 0:
-        deep_ij = np.argwhere(deep_void)
-        dists = np.abs(deep_ij[:, 0] - pk[0]) + np.abs(deep_ij[:, 1] - pk[1])
-        peak_label = void_labeled[
-            deep_ij[np.argmin(dists)][0], deep_ij[np.argmin(dists)][1]
-        ]
-    nucleus_void = void_labeled == peak_label
-
-    void_ij = np.argwhere(nucleus_void)
-    void_xy = np.column_stack(
-        [
-            xy_min[0] + void_ij[:, 0] * grid_res + grid_res / 2,
-            xy_min[1] + void_ij[:, 1] * grid_res + grid_res / 2,
-        ]
-    )
-    return cx, cy, void_r, void_xy
-
-
 #  find_nucleus_center — nucleus detection via Z-slice void analysis
 # =====================================================================
 
@@ -8964,245 +6402,24 @@ def _z_scan(
     soma_mask), ...]``, *best_run* is the indices into *raw* of the
     nucleus chain (or None), and *nucleus_center* is ``(3,)`` or None.
     """
-    from scipy.ndimage import binary_dilation, label
     from scipy.spatial import ConvexHull
 
-    z_unique = np.unique(verts[:, 2])
-    z_step = 210.0
-    z_levels = np.arange(z_unique.min() + z_step, z_unique.max() - z_step, z_step)
-
-    all_vi = np.arange(len(verts))
-    raw: list[tuple] = []
-    # Each entry: (z, cx, cy, void_r, void_xy, vert_indices, soma_mask)
-    #   vert_indices: indices into mesh.vertices for verts near this Z
-    #   soma_mask: bool array over vert_indices, True = in soma cluster
-
-    # --- Pass 1: independent per-Z detection ---
-    # Also store the grid data for pass 2 re-processing.
-    grid_data: list[tuple | None] = []  # (occ, ix, iy, xy_min, labeled)
-
-    for z in z_levels:
-        near_z = np.abs(verts[:, 2] - z) < z_tol
-        vi = all_vi[near_z]
-        pts = verts[vi, :2]
-
-        cluster = _z_slice_cluster(pts, grid_res)
-        if cluster is None:
-            raw.append((z, np.nan, np.nan, 0.0, None, vi, None))
-            grid_data.append(None)
-            continue
-
-        occ, soma_region, ix, iy, xy_min = cluster
-        soma_mask = soma_region[ix, iy]
-
-        # Store labeled grid for pass 2
-        struct3 = np.ones((3, 3), dtype=bool)
-        dilated = binary_dilation(occ, struct3)
-        labeled, _ = label(dilated)
-        grid_data.append((occ, ix, iy, xy_min, labeled))
-
-        void_result = _z_slice_void(occ, soma_region, xy_min, grid_res)
-        if void_result is None:
-            raw.append((z, np.nan, np.nan, 0.0, None, vi, soma_mask))
-        else:
-            cx, cy, void_r, void_xy = void_result
-            raw.append((z, cx, cy, void_r, void_xy, vi, soma_mask))
-
-    # Spatial-coherence chains
-    runs: list[list[int]] = []
-    cur: list[int] = []
-    for i, entry in enumerate(raw):
-        z, cx, cy, r = entry[0], entry[1], entry[2], entry[3]
-        if r < min_void_r or np.isnan(cx):
-            if cur:
-                runs.append(cur)
-                cur = []
-            continue
-        if not cur:
-            cur = [i]
-        else:
-            pcx, pcy = raw[cur[-1]][1], raw[cur[-1]][2]
-            if np.sqrt((cx - pcx) ** 2 + (cy - pcy) ** 2) < max_shift:
-                cur.append(i)
-            else:
-                runs.append(cur)
-                cur = [i]
-    if cur:
-        runs.append(cur)
-
-    runs = [r for r in runs if len(r) >= 2]
-
-    if not runs:
-        return raw, None, None
-
-    best = max(runs, key=len)
-
-    if not retry_broken:
-        slices = np.array([(raw[i][0], raw[i][1], raw[i][2], raw[i][3]) for i in best])
-        center = np.array(
-            [np.nanmean(slices[:, 1]), np.nanmean(slices[:, 2]), np.mean(slices[:, 0])]
-        )
-        return raw, best, center
-
-    # --- Pass 2: hull-guided void detection for broken Z-levels ---
-    # When the soma ring has a gap (surface hole), the 4-ray enclosure
-    # and binary_fill_holes both fail.  Use the convex hull from the
-    # nearest good neighbor to define "inside" at broken levels.
-    best_set = set(best)
-    chain_lo, chain_hi = best[0], best[-1]
-
-    # Scan levels adjacent to the chain in both directions
-    retry_indices = []
-    for i in range(chain_lo - 1, -1, -1):
-        if grid_data[i] is None:
-            break
-        retry_indices.append(i)
-    for i in range(chain_hi + 1, len(raw)):
-        if grid_data[i] is None:
-            break
-        retry_indices.append(i)
-
-    for i in retry_indices:
-        if i in best_set:
-            continue
-        r_existing = raw[i][3]
-        if r_existing >= min_void_r and not np.isnan(raw[i][1]):
-            continue  # already good
-
-        gd = grid_data[i]
-        if gd is None:
-            continue
-        occ, ix, iy, xy_min, labeled = gd
-
-        # Find nearest good neighbor in the chain
-        ref_i = chain_lo if i < chain_lo else chain_hi
-
-        # Build convex hull from the reference soma vertices
-        ref_vi = raw[ref_i][5]
-        ref_sm = raw[ref_i][6]
-        if ref_sm is None:
-            continue
-        ref_pts = verts[ref_vi[ref_sm], :2]
-        if len(ref_pts) < 4:
-            continue
-        try:
-            ref_hull = ConvexHull(ref_pts)
-        except Exception:
-            continue
-
-        # Build hull mask on this level's grid: for each grid cell,
-        # test if its centre falls inside the reference convex hull.
-        nx, ny = occ.shape
-        gi, gj = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
-        gx = xy_min[0] + gi * grid_res + grid_res / 2
-        gy = xy_min[1] + gj * grid_res + grid_res / 2
-        grid_pts = np.column_stack([gx.ravel(), gy.ravel()])
-        inside_hull = np.ones(len(grid_pts), dtype=bool)
-        for eq in ref_hull.equations:
-            inside_hull &= grid_pts @ eq[:-1] + eq[-1] <= 0
-        hull_mask = inside_hull.reshape(nx, ny)
-
-        # Merge all clusters whose centroid is inside the hull
-        n_labels = labeled.max()
-        merged_region = np.zeros_like(occ)
-        for lid in range(1, n_labels + 1):
-            cij = np.argwhere(labeled == lid)
-            centroid = np.array(
-                [
-                    xy_min[0] + cij[:, 0].mean() * grid_res + grid_res / 2,
-                    xy_min[1] + cij[:, 1].mean() * grid_res + grid_res / 2,
-                ]
-            )
-            if all(
-                eq[:-1] @ centroid + eq[-1] <= grid_res for eq in ref_hull.equations
-            ):
-                merged_region |= labeled == lid
-        if not merged_region.any():
-            continue
-        soma_mask_new = merged_region[ix, iy]
-
-        # Hull-guided void detection: use hull_mask instead of
-        # binary_fill_holes to define the interior.
-        from scipy.ndimage import distance_transform_edt as _edt
-        from scipy.ndimage import label as _label
-
-        occ_h = occ & hull_mask
-        enc = np.ones_like(occ_h)
-        for ax in range(2):
-            enc &= np.maximum.accumulate(occ_h, axis=ax)
-            enc &= np.flip(
-                np.maximum.accumulate(np.flip(occ_h, axis=ax), axis=ax), axis=ax
-            )
-        enc &= hull_mask
-        void = enc & ~occ_h
-        if not void.any():
-            continue
-
-        dt = _edt(~occ_h)
-        dtv = dt * void
-        pk = np.unravel_index(dtv.argmax(), dtv.shape)
-        void_r = float(dtv.max()) * grid_res
-        cx = float(xy_min[0] + pk[0] * grid_res + grid_res / 2)
-        cy = float(xy_min[1] + pk[1] * grid_res + grid_res / 2)
-
-        deep_void = void & (dt > 2)
-        void_xy = None
-        if deep_void.any():
-            vl, _ = _label(deep_void)
-            pl = vl[pk[0], pk[1]]
-            if pl == 0:
-                dij = np.argwhere(deep_void)
-                dd = np.abs(dij[:, 0] - pk[0]) + np.abs(dij[:, 1] - pk[1])
-                pl = vl[dij[dd.argmin()][0], dij[dd.argmin()][1]]
-            nv = vl == pl
-            vij = np.argwhere(nv)
-            void_xy = np.column_stack(
-                [
-                    xy_min[0] + vij[:, 0] * grid_res + grid_res / 2,
-                    xy_min[1] + vij[:, 1] * grid_res + grid_res / 2,
-                ]
-            )
-
-        z = raw[i][0]
-        vi = raw[i][5]
-        raw[i] = (z, cx, cy, void_r, void_xy, vi, soma_mask_new)
-
-    # Re-run spatial coherence with potentially new void detections
-    runs2: list[list[int]] = []
-    cur2: list[int] = []
-    for i, entry in enumerate(raw):
-        z, cx, cy, r = entry[0], entry[1], entry[2], entry[3]
-        if r < min_void_r or np.isnan(cx):
-            if cur2:
-                runs2.append(cur2)
-                cur2 = []
-            continue
-        if not cur2:
-            cur2 = [i]
-        else:
-            pcx, pcy = raw[cur2[-1]][1], raw[cur2[-1]][2]
-            if np.sqrt((cx - pcx) ** 2 + (cy - pcy) ** 2) < max_shift:
-                cur2.append(i)
-            else:
-                runs2.append(cur2)
-                cur2 = [i]
-    if cur2:
-        runs2.append(cur2)
-
-    runs2 = [r for r in runs2 if len(r) >= 2]
-    if runs2:
-        best = max(runs2, key=len)
-
-    slices = np.array([(raw[i][0], raw[i][1], raw[i][2], raw[i][3]) for i in best])
-    center = np.array(
-        [
-            np.nanmean(slices[:, 1]),
-            np.nanmean(slices[:, 2]),
-            np.mean(slices[:, 0]),
-        ]
-    )
-
-    return raw, best, center
+    verts = np.asarray(verts, dtype=np.float64)
+    scan = _rs.ZScan(verts, grid_res, z_tol, min_void_r, max_shift)
+    if scan.best is not None and retry_broken:
+        # Pass 2 needs the convex hull of each chain end's soma cluster.
+        hulls = []
+        for ref_i in scan.chain_ends():
+            sv = scan.soma_vertices(ref_i)
+            eq = None
+            if sv is not None and len(sv) >= 4:
+                try:
+                    eq = ConvexHull(verts[sv, :2]).equations
+                except Exception:
+                    eq = None
+            hulls.append(eq)
+        scan.retry(*hulls)
+    return scan.raw(), scan.best, scan.center
 
 
 def _soma_hulls(

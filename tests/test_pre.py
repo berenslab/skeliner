@@ -581,6 +581,21 @@ class TestRemoveGaps:
         # Should still work with precomputed gaps
         assert n_comps < 2 or _live_faces(result) != _live_faces(mesh)
 
+    def test_a_loop_is_never_paired_with_itself(self):
+        assert "same rim" in pre._validate_loop_pair([1, 2, 3, 4, 5], [5, 4, 3, 2, 1])
+        # pieces glued at the rim share a few vertices; that alone is fine
+        assert pre._validate_loop_pair([1, 2, 3, 4, 5], [4, 5, 6, 7, 8]) is None
+
+    def test_tips_that_grow_onto_the_same_rim_are_not_stitched(self):
+        # Both sides of a gap end on one rim when the pieces are still glued
+        # together; stitching it to itself would fold a zero-length tube of
+        # non-manifold edges into the rim.
+        mesh = _two_cylinders(separation=1500.0)
+        fa, _, dist, ca, _ = pre.find_gaps(mesh, **NO_CAP)[0]
+        result = pre.remove_gaps(mesh, gaps=[(fa, list(fa), dist, ca, ca)])
+        assert np.array_equal(result.faces, mesh.faces)
+        assert len(result.vertices) == len(mesh.vertices)
+
 
 # ── _sever_cost ───────────────────────────────────────────────────────
 
@@ -597,6 +612,16 @@ class TestSeverCost:
 
     def _adj(self, mesh):
         return pre._face_adjacency(mesh, pre._edge_to_faces(mesh))
+
+    def test_a_piece_crossing_the_budget_is_walked_whole(self):
+        # A path of seven faces; removing the two ends leaves one piece of
+        # five, over the budget and the only piece, so nothing strands.  A
+        # walk that stops at the face crossing the budget without expanding
+        # it returns the faces beyond as a phantom second piece.
+        faces = np.array([[k, k + 1, k + 2] for k in range(7)])
+        vertices = np.random.default_rng(0).random((9, 3))
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        assert pre._sever_cost({0, 6}, self._adj(mesh), 2) == 0
 
     def test_band_across_a_tube_strands_the_shorter_side(self):
         mesh = _subdivided_tube()
@@ -1461,3 +1486,22 @@ def test_compaction_leaves_unnamed_neurites_unnamed():
     comp = pre.break_up_mesh(mesh, soma, org, rescued=stub[:1])
     _, out = pre.compact_mesh(mesh, comp)
     assert out.neurites.named is False
+
+
+class TestNearest:
+    def test_exact_ties_go_to_the_lowest_index(self):
+        from scipy.spatial import KDTree
+
+        pts = np.array([[1, 0, 0], [-1, 0, 0], [0, -1, 0], [0, 0, 5]], dtype=float)
+        tree = KDTree(
+            pts[::-1].copy()
+        )  # reversed, so index order is not insertion order
+        d, i = pre._nearest(tree, np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 4.0]]))
+        assert i.tolist() == [1, 0]
+        assert d.tolist() == [1.0, 1.0]
+
+    def test_a_single_point_tree(self):
+        from scipy.spatial import KDTree
+
+        d, i = pre._nearest(KDTree(np.zeros((1, 3))), np.ones((2, 3)))
+        assert i.tolist() == [0, 0]

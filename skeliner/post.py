@@ -1,5 +1,6 @@
 """skeliner.post – post-processing functions for skeletons."""
 
+import functools
 import time
 from contextlib import contextmanager
 from typing import Iterable, Set, cast
@@ -9,7 +10,7 @@ import numpy as np
 import trimesh
 from numpy.typing import ArrayLike
 
-from . import dx
+from . import _rs, dx
 from ._core import (
     _bridge_gaps,
     _build_mst,
@@ -1738,13 +1739,21 @@ def downsample(
 def submesh_by_vertices(
     mesh: trimesh.Trimesh,
     vertex_indices: np.ndarray,
+    *,
+    vertex_faces=None,
 ) -> trimesh.Trimesh:
     """
     Reduce mesh to a subset of vertices and corresponding faces.
+
+    *vertex_faces*, a :class:`skeliner._rs.VertexFaces` of *mesh*, finds the
+    faces from the vertices' own instead of testing every face of the mesh.
     """
     vertex_indices = np.asarray(vertex_indices, dtype=np.int64)
-    used = np.isin(mesh.faces, vertex_indices).all(axis=1)
-    faces = mesh.faces[used]
+    if vertex_faces is not None:
+        faces = mesh.faces[vertex_faces.faces_within(vertex_indices)]
+    else:
+        used = np.isin(mesh.faces, vertex_indices).all(axis=1)
+        faces = mesh.faces[used]
 
     # build mapping from old → new vertex indices
     old_to_new = -np.ones(len(mesh.vertices), dtype=np.int64)
@@ -1755,6 +1764,19 @@ def submesh_by_vertices(
     new_vertices = mesh.vertices[vertex_indices]
 
     return trimesh.Trimesh(vertices=new_vertices, faces=new_faces, process=False)
+
+
+@functools.cache
+def _embree_intersector():
+    """trimesh's embree ``RayMeshIntersector``, or None without embree.
+
+    Asked once: a failing import is slow, and calibration asks per node.
+    """
+    try:
+        from trimesh.ray.ray_pyembree import RayMeshIntersector
+    except ImportError:
+        return None
+    return RayMeshIntersector
 
 
 def filter_inner_surfaces_raycast(mesh, num_rays=20, thresh=0.2, sample=True):
@@ -1802,15 +1824,18 @@ def filter_inner_surfaces_raycast(mesh, num_rays=20, thresh=0.2, sample=True):
     directions_flat = directions[active_idx[1]]
 
     # ---- Fast intersector ----
-    try:
-        from trimesh.ray.ray_pyembree import RayMeshIntersector
-
-        intersector = RayMeshIntersector(mesh)
-    except ImportError:
-        intersector = mesh.ray
-
-    hits = intersector.intersects_first(origins_flat, directions_flat)
-    hit_mask = hits != -1
+    embree = _embree_intersector()
+    if embree is None:
+        # trimesh's own `ray_triangle` test, on the Rust core
+        hit_mask = _rs.ray_hits(
+            np.asarray(mesh.triangles, dtype=np.float64).reshape(-1, 9),
+            np.asarray(N, dtype=np.float64),
+            np.ascontiguousarray(origins_flat, dtype=np.float64),
+            np.ascontiguousarray(directions_flat, dtype=np.float64),
+        )
+    else:
+        hits = embree(mesh).intersects_first(origins_flat, directions_flat)
+        hit_mask = hits != -1
 
     # Count hits for each face
     hit_count = np.zeros(F, dtype=int)
@@ -1904,6 +1929,9 @@ def calibrate_radii(
 
     log_steps = (np.array([0, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0]) * n_total).astype(int)
     log_steps[-1] = n_total - 1
+    vertex_faces = _rs.VertexFaces(
+        np.asarray(mesh.faces, dtype=np.int64), len(mesh_vertices)
+    )
 
     with _post_stage("calibrate_radii", verbose=verbose) as log:
         log(
@@ -1931,7 +1959,7 @@ def calibrate_radii(
         outer_success = False
         if n_verts[i] >= min_n_verts_bulb and min_verts_q_outer < 100.0:
             n_inner = len(vids)
-            mesh_i = submesh_by_vertices(mesh, vids)
+            mesh_i = submesh_by_vertices(mesh, vids, vertex_faces=vertex_faces)
             assert len(mesh_i.vertices) == len(vids)
             outer_vids = filter_inner_surfaces_raycast(
                 mesh_i,

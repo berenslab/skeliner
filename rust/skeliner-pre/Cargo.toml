@@ -1,0 +1,14 @@
+[package]
+name = "skeliner-pre"
+version = "0.1.0"
+description = "skeliner's mesh preprocessing pipeline."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+meshcore.workspace = true
+rayon = "1"
+
+[lints]
+workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "skeliner-py"
+version = "0.1.0"
+description = "Python bindings for skeliner's Rust core."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+meshcore.workspace = true
+skeliner-pre.workspace = true
+numpy = "0.30"
+pyo3 = { version = "0.30", features = ["abi3-py311"] }
+rayon = "1"
+
+[lints]
+workspace = true

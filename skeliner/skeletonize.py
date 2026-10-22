@@ -9,6 +9,7 @@ import numpy as np
 import trimesh
 from scipy.spatial import KDTree
 
+from . import _rs
 from ._core import (
     TRIM_FRACTION,
     _bridge_gaps,
@@ -140,6 +141,15 @@ def _surface_graph(mesh: trimesh.Trimesh) -> ig.Graph:
     g = ig.Graph(n=len(mesh.vertices), edges=edges, directed=False)
     g.es["weight"] = mesh.edges_unique_length.astype(float).tolist()
     return g
+
+
+def _surface_graph_rs(mesh: trimesh.Trimesh):
+    """:func:`_surface_graph` as a :class:`skeliner._rs.SurfaceGraph`."""
+    return _rs.SurfaceGraph(
+        len(mesh.vertices),
+        np.asarray(mesh.edges_unique, dtype=np.int64),
+        np.asarray(mesh.edges_unique_length, dtype=np.float64),
+    )
 
 
 def _dist_vec_for_component(
@@ -849,6 +859,71 @@ def _make_nodes(
     return nodes_arr, radii_dict, node2verts, vert2node
 
 
+def _branch_donations(
+    nodes_arr: np.ndarray,
+    adj: dict[int, set[int]],
+    degree: np.ndarray,
+    node2verts: list[np.ndarray],
+    mesh_vertices: np.ndarray,
+) -> dict[tuple[int, int], list[int]]:
+    """For each branch node's bin, which vertices face which neighbour: each
+    vertex goes to the neighbour its offset projects onto most."""
+    donated: dict[tuple[int, int], list[int]] = {}
+    for b in range(len(nodes_arr)):
+        if degree[b] < 3:
+            continue
+        bv = np.asarray(node2verts[b], dtype=np.int64)
+        if len(bv) < 3:
+            continue
+        nbrs = sorted(adj[b])
+        dirs = nodes_arr[nbrs] - nodes_arr[b]
+        ln = np.linalg.norm(dirs, axis=1, keepdims=True)
+        dirs = np.divide(dirs, ln, out=np.zeros_like(dirs), where=ln > 1e-6)
+        proj = (mesh_vertices[bv] - nodes_arr[b]) @ dirs.T
+        best = np.argmax(proj, axis=1)
+        for k, nb in enumerate(nbrs):
+            donated[(b, nb)] = bv[best == k].tolist()
+    return donated
+
+
+def _perpendicular_rebin_rs(
+    nodes_arr: np.ndarray,
+    edges_mst: np.ndarray,
+    node2verts: list[np.ndarray],
+    mesh_vertices: np.ndarray,
+    radius_estimators: list[str],
+    radii_dict: dict[str, np.ndarray],
+):
+    """:func:`_perpendicular_rebin` with the chains on the Rust core; the
+    branch donations stay numpy's (their projection goes through BLAS)."""
+    n_skel = len(nodes_arr)
+    if n_skel < 2 or edges_mst.size == 0:
+        return _perpendicular_rebin(
+            nodes_arr,
+            edges_mst,
+            node2verts,
+            mesh_vertices,
+            radius_estimators,
+            radii_dict,
+        )
+    adj: dict[int, set[int]] = {i: set() for i in range(n_skel)}
+    for a, b in edges_mst:
+        adj[int(a)].add(int(b))
+        adj[int(b)].add(int(a))
+    degree = np.array([len(adj[i]) for i in range(n_skel)])
+    donated = _branch_donations(nodes_arr, adj, degree, node2verts, mesh_vertices)
+    out, vids, dists = _rs.rebin_chains(
+        np.asarray(nodes_arr, dtype=np.float64),
+        np.asarray(edges_mst, dtype=np.int64).reshape(-1, 2),
+        [np.asarray(v, dtype=np.int64).tolist() for v in node2verts],
+        mesh_vertices,
+        np.asarray(radii_dict[radius_estimators[0]], dtype=np.float64),
+        [(b, nb, v) for (b, nb), v in donated.items()],
+    )
+    shells = [[v] for v in out if len(v)]
+    return shells, dict(zip(vids.tolist(), dists.tolist()))
+
+
 def _perpendicular_rebin(
     nodes_arr: np.ndarray,
     edges_mst: np.ndarray,
@@ -889,27 +964,13 @@ def _perpendicular_rebin(
     anchors = set(i for i in range(n_skel) if degree[i] != 2)
 
     # -- dissolve branch-point bins --
-    donated: dict[tuple[int, int], list[int]] = {}
-    for b in range(n_skel):
-        if degree[b] < 3:
-            continue
-        bv = np.asarray(node2verts[b], dtype=np.int64)
-        if len(bv) < 3:
-            continue
-        nbrs = sorted(adj[b])
-        dirs = nodes_arr[nbrs] - nodes_arr[b]
-        ln = np.linalg.norm(dirs, axis=1, keepdims=True)
-        dirs = np.divide(dirs, ln, out=np.zeros_like(dirs), where=ln > 1e-6)
-        proj = (mesh_vertices[bv] - nodes_arr[b]) @ dirs.T
-        best = np.argmax(proj, axis=1)
-        for k, nb in enumerate(nbrs):
-            donated[(b, nb)] = bv[best == k].tolist()
+    donated = _branch_donations(nodes_arr, adj, degree, node2verts, mesh_vertices)
 
     # -- extract chains (degree-2 paths between anchors) --
     chains: list[list[int]] = []
     visited_edges: set[tuple[int, int]] = set()
     for anchor in sorted(anchors):
-        for nbr in adj[anchor]:
+        for nbr in sorted(adj[anchor]):
             edge = (min(anchor, nbr), max(anchor, nbr))
             if edge in visited_edges:
                 continue
@@ -945,7 +1006,7 @@ def _perpendicular_rebin(
                 all_vids_set.update(donated[key])
             else:
                 all_vids_set.update(int(v) for v in node2verts[ni])
-        all_vids = [v for v in all_vids_set if not assigned[v]]
+        all_vids = [v for v in sorted(all_vids_set) if not assigned[v]]
         if not all_vids:
             continue
 
@@ -1082,6 +1143,25 @@ def _skeletonize_component(
     ``centerline`` radius that cannot be recovered from the vertices alone;
     keeping it lets that radius be recomputed after a bin is edited.
     """
+    if isinstance(gsurf, _rs.SurfaceGraph):
+        if soma_verts or merge_nested or split_elongated_shells:
+            raise ValueError(
+                "the Rust surface graph serves the preprocessing track only "
+                "(no soma exclusion, nested merge or elongated-shell split)"
+            )
+        return _skeletonize_component_rs(
+            mesh,
+            gsurf,
+            vert_ids,
+            seed_vid=seed_vid,
+            radius_estimators=radius_estimators,
+            step_size=step_size,
+            target_shell_count=target_shell_count,
+            min_shell_vertices=min_shell_vertices,
+            max_shell_width_factor=max_shell_width_factor,
+            second_pass=second_pass,
+            stage=stage,
+        )
     mesh_vertices = mesh.vertices.view(np.ndarray)
     e_m = float(mesh.edges_unique_length.mean())
     vid_cl_dist: dict[int, float] = {}
@@ -1195,7 +1275,7 @@ def _skeletonize_component(
                 vset = set(int(v) for v in comp)
                 seen: set[int] = set()
                 out: list[list[int]] = []
-                for start in vset:
+                for start in sorted(vset):
                     if start in seen:
                         continue
                     queue = deque([start])
@@ -1334,6 +1414,114 @@ def _skeletonize_component(
         edges_arr,
         vid_cl_dist,
     )
+
+
+def _make_nodes_rs(shells, vertices, radius_estimators):
+    """:func:`_make_nodes` without the nested merge, on the Rust core."""
+    node2verts = [np.asarray(b, dtype=np.int64) for band in shells for b in band]
+    if not node2verts:
+        empty = {k: np.asarray(np.array([])) for k in radius_estimators}
+        return np.asarray([], dtype=np.float64), empty, [], {}
+    nodes, radii = _rs.skeleton_nodes(
+        [[b.tolist() for b in band] for band in shells],
+        vertices,
+        list(radius_estimators),
+    )
+    vert2node: dict[int, int] = {}
+    for nid, bin_ids in enumerate(node2verts):
+        for vid in bin_ids.tolist():
+            vert2node[vid] = nid
+    return nodes, dict(zip(radius_estimators, radii)), node2verts, vert2node
+
+
+def _skeletonize_component_rs(
+    mesh: trimesh.Trimesh,
+    sgraph,
+    vert_ids: np.ndarray,
+    *,
+    seed_vid: int | np.ndarray,
+    radius_estimators: list[str],
+    step_size: float | None,
+    target_shell_count: int,
+    min_shell_vertices: int,
+    max_shell_width_factor: float,
+    second_pass: bool,
+    stage,
+):
+    """:func:`_skeletonize_component` on the preprocessing track with the
+    binning, the bin clean-up and the nodes in the Rust core; the spanning
+    tree, the perpendicular re-binning and the edges stay as they are."""
+    mesh_vertices = mesh.vertices.view(np.ndarray)
+    e_m = float(mesh.edges_unique_length.mean())
+    vid_cl_dist: dict[int, float] = {}
+    verts = np.asarray(vert_ids, dtype=np.int64)
+
+    with stage("bin vertices by geodesic distance"):
+        all_shells = sgraph.bin_component(
+            verts,
+            np.atleast_1d(np.asarray(seed_vid, dtype=np.int64)),
+            e_m,
+            step_size,
+            target_shell_count,
+            min_shell_vertices,
+            max_shell_width_factor,
+        )
+
+    with stage("compute bin centroids and radii"):
+        nodes_arr, radii_dict, node2verts, vert2node = _make_nodes_rs(
+            all_shells, mesh_vertices, radius_estimators
+        )
+
+    with stage("derive edges from mesh edges"):
+        edges_arr = _edges_from_mesh(
+            mesh.edges_unique, vert2node, n_mesh_verts=len(mesh.vertices)
+        )
+
+    if second_pass and len(nodes_arr) > 1 and edges_arr.size:
+        with stage("re-bin perpendicular to the centreline"):
+            edges_mst = _build_mst(nodes_arr, edges_arr)
+            rebin_shells, vid_cl_dist = _perpendicular_rebin_rs(
+                nodes_arr,
+                edges_mst,
+                node2verts,
+                mesh_vertices,
+                radius_estimators,
+                radii_dict,
+            )
+
+        def _lists(shells):
+            return [[b.tolist() for b in band] for band in shells]
+
+        with stage("re-check rings, merge non-rings"):
+            final_shells = sgraph.recheck_rings(_lists(rebin_shells), verts)
+
+        with stage("reunite bins split across the surface"):
+            final_shells = sgraph.reunite_bins(_lists(final_shells))
+
+        with stage("split bins that wrap a branch point"):
+            final_shells = sgraph.split_branch_bins(_lists(final_shells))
+
+        with stage("recompute centroids and centerline radii"):
+            nodes_arr, radii_dict, node2verts, vert2node = _make_nodes_rs(
+                final_shells, mesh_vertices, radius_estimators
+            )
+            cl_radii = np.empty(len(nodes_arr))
+            for ni, n2v in enumerate(node2verts):
+                dists = np.array([vid_cl_dist.get(int(v), 0.0) for v in n2v])
+                if len(dists) > 0:
+                    cl_radii[ni] = _estimate_radius(
+                        dists, method="trim", trim_fraction=TRIM_FRACTION
+                    )
+                else:
+                    cl_radii[ni] = 0.0
+            radii_dict["centerline"] = cl_radii
+
+        with stage("re-derive edges from mesh edges"):
+            edges_arr = _edges_from_mesh(
+                mesh.edges_unique, vert2node, n_mesh_verts=len(mesh.vertices)
+            )
+
+    return nodes_arr, radii_dict, node2verts, vert2node, edges_arr, vid_cl_dist
 
 
 # -----------------------------------------------------------------------------
@@ -1611,7 +1799,7 @@ def _skeletonize_preproc(
         )
 
     with _timed("↳  build surface graph", verbose=verbose):
-        gsurf = _surface_graph(mesh)
+        gsurf = _surface_graph_rs(mesh)
 
     mesh_vertices = mesh.vertices.view(np.ndarray)
 

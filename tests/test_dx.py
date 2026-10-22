@@ -276,9 +276,7 @@ class TestCheckBins:
 # Which node pairs the mesh joins, against which ones the tree carries.
 # This is a classifier for the edge-editing verbs — restore (the surface
 # supports it) versus graft (it does not) — and nothing more.  It is
-# deliberately not a defect report: see the docstring, and the entry
-# 2026-08-05-skeleton-as-derived-state in the labbook for the measurement
-# that ruled that out.
+# deliberately not a defect report: see the docstring.
 # ---------------------------------------------------------------------
 @pytest.fixture(scope="session")
 def torus():

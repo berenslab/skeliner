@@ -45,3 +45,7 @@ dev/
 *.obj
 
 .claude
+# Rust build output, and the extension module editable installs build in place
+rust/target/
+skeliner/_rs*.so
+skeliner/_rs*.pyd

@@ -39,7 +39,8 @@ robust contact‑site mapping between pairs of cells using both skeletons and me
 pip install skeliner
 ```
 
-or from source:
+or from source, which builds the Rust core and so needs a Rust toolchain
+([rustup](https://rustup.rs)):
 
 ```bash
 git clone https://github.com/berenslab/skeliner.git
