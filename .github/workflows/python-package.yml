@@ -50,11 +50,14 @@ jobs:
             - name: Set up Rust
               uses: dtolnay/rust-toolchain@stable
             - name: Install dependencies
-              # Installing the package builds its Rust extension with maturin.
+              # Editable, so maturin builds the Rust extension into skeliner/:
+              # tests/ is a package, so pytest puts the repo root first on
+              # sys.path and imports skeliner from the checkout, not from
+              # site-packages.
               run: |
                   python -m pip install --upgrade pip
                   python -m pip install flake8 pytest
-                  python -m pip install .[dev]
+                  python -m pip install -e .[dev]
                   if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
             - name: Lint with flake8
               run: |
