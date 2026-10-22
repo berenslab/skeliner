@@ -5205,13 +5205,11 @@ def view3d(
     _launch_app(app, host=host, port=port, no_browser=no_browser)
 
 
-# One colour per contact kind (`skeliner.pair.label_contacts`): crossings,
-# the contacts usually not wanted, in red.
+# One colour per contact kind (`skeliner.pair.label_contacts`): blobs, the
+# likeliest synapses, in orange; kinds from older files fall back to violet.
 _KIND_COLORS = {
-    "crossing": [0.90, 0.15, 0.15],  # red
-    "parallel": [0.20, 0.55, 1.00],  # blue
-    "tip": [0.10, 0.75, 0.30],  # green
     "blob": [1.00, 0.60, 0.10],  # orange
+    "crossing": [0.20, 0.55, 1.00],  # blue
     "other": [0.55, 0.35, 0.85],  # violet
 }
 _SITE_COLORS = [

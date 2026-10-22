@@ -7,7 +7,8 @@ Two ways to find contact sites, both returning ``ContactSites``:
   :func:`approximate_contact_sites` (skeletons only);
 - from the meshes alone: :func:`scan_contacts`, which searches every face,
   finds the contacts the skeletons miss, and labels each site's kind
-  (:func:`label_contacts`) — crossing branches, a blob on a neurite, ….
+  (:func:`label_contacts`) — a blob on a neurite, crossing branches, or
+  other.
 
 :func:`compute_contact_stats`, :func:`filter_contact_sites`,
 :func:`label_contacts` and :func:`pick_contacts` take either.
@@ -1403,7 +1404,6 @@ def scan_contacts(
     return_pairs: bool = False,
     unit: str = "nm^2",
     label: bool = True,
-    radius: float = 1000.0,
 ) -> ContactSites:
     """
     Every contact site between two meshes, found from the meshes alone — no
@@ -1428,8 +1428,8 @@ def scan_contacts(
     each side's faces, bounding boxes, and with *return_pairs* the
     ``(A face, B face, area)`` pairs. Sites are ordered by their first face.
     Every site is kept; with *label* (the default) each also gets its kind
-    and branch geometry from :func:`label_contacts` (neighbourhood
-    *radius*), so crossings can be told apart from other contacts later.
+    — blob, crossing or other — and branch geometry from
+    :func:`label_contacts`, to pick the synapse candidates to check.
     """
     if tol is None:
         tol = 0.5 * float(np.median([median_edge_length(A), median_edge_length(B)]))
@@ -1534,38 +1534,89 @@ def scan_contacts(
         bbox=_union_aabbs(bbox_A, bbox_B),
         meta=meta,
     )
-    return label_contacts(A, B, sites, radius=radius) if label else sites
+    return label_contacts(A, B, sites) if label else sites
 
 
-def _local_branch(
-    mesh: trimesh.Trimesh,
-    tree: KDTree,
+class _Branches:
+    """One mesh, indexed to measure the branch around each contact site."""
+
+    def __init__(self, mesh: trimesh.Trimesh):
+        self.faces = np.asarray(mesh.faces, np.int64)
+        self.vertices = np.asarray(mesh.vertices, np.float64)
+        self.centers = np.asarray(mesh.triangles_center, np.float64)
+        self.normals = np.asarray(mesh.face_normals, np.float64)
+        self.tree = KDTree(self.centers)
+        self.topology = _rs.Topology(self.faces, len(self.vertices))
+        self.bvh = _rs.TriangleBvh(
+            np.asarray(mesh.triangles, np.float64).reshape(-1, 9), self.normals
+        )
+        self._thickness = np.full(len(self.faces), np.nan)
+        self._measured = np.zeros(len(self.faces), bool)
+
+    def thickness(self, faces: np.ndarray) -> np.ndarray:
+        """Per face, how far an inward ray from its centre (along -normal)
+        travels to the next face of the mesh; NaN when it hits none."""
+        faces = np.asarray(faces, np.int64)
+        todo = np.unique(faces[~self._measured[faces]])
+        if len(todo):
+            self._thickness[todo] = self.bvh.first_hits(
+                self.centers[todo], -self.normals[todo], todo, 1e-6
+            )
+            self._measured[todo] = True
+        return self._thickness[faces]
+
+    def piece(
+        self, center: np.ndarray, site: np.ndarray, radius: float
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """The faces within *radius* of *center* connected there to the
+        *site* faces — the branch the site is on, not others nearby — and
+        their distances from *center*."""
+        near = np.asarray(self.tree.query_ball_point(center, radius), np.int64)
+        near = np.union1d(near, site)
+        a, b = _shared_edge_links(self.faces, near)
+        graph = coo_matrix((np.ones(len(a)), (a, b)), shape=(len(near), len(near)))
+        _, label = connected_components(graph, directed=False)
+        piece = near[np.isin(label, np.unique(label[np.isin(near, site)]))]
+        return piece, np.linalg.norm(self.centers[piece] - center, axis=1)
+
+
+def _median(x: np.ndarray) -> float:
+    x = x[np.isfinite(x)]
+    return float(np.median(x)) if len(x) else np.nan
+
+
+def _branch_shape(
+    side: _Branches,
     center: np.ndarray,
-    site_faces: np.ndarray,
-    radius: float,
-) -> tuple[np.ndarray, float, float]:
-    """``(axis, elongation, radius)`` of the surface piece holding
-    *site_faces* within *radius* of *center*; NaNs when it is too small."""
-    near = np.asarray(tree.query_ball_point(center, radius), np.int64)
-    nan = (np.full(3, np.nan), np.nan, np.nan)
-    if len(near) < 3:
-        return nan
-    # keep the connected piece the site is on, not other branches nearby
-    near = np.union1d(near, site_faces)
-    a, b = _shared_edge_links(np.asarray(mesh.faces), near)
-    graph = coo_matrix((np.ones(len(a)), (a, b)), shape=(len(near), len(near)))
-    _, label = connected_components(graph, directed=False)
-    on_site = np.isin(near, site_faces)
-    piece = near[np.isin(label, np.unique(label[on_site]))]
-    pts = mesh.vertices[np.unique(np.asarray(mesh.faces)[piece])]
-    if len(pts) < 10:
-        return nan
-    x = pts - pts.mean(axis=0)
-    w, v = np.linalg.eigh(x.T @ x / len(x))
-    axis = v[:, 2]
-    elongation = float(np.sqrt(w[2] / max(w[1], 1e-12)))
-    off_axis = x - np.outer(x @ axis, axis)
-    return axis, elongation, float(np.median(np.linalg.norm(off_axis, axis=1)))
+    site: np.ndarray,
+    *,
+    ball_scale: float,
+    ball_min: float,
+    ball_max: float,
+) -> dict[str, float | np.ndarray]:
+    """One side's measurements for :func:`label_contacts`, plus the branch
+    ``axis`` (a unit vector, NaN unless it has two exits)."""
+    thickness = _median(side.thickness(site))
+    ball = ball_min
+    if np.isfinite(thickness):
+        ball = float(np.clip(ball_scale * thickness, ball_min, ball_max))
+    piece, d = side.piece(center, site, ball)
+    loops = [lp for lp in side.topology.border_loops(piece.tolist()) if len(lp) >= 3]
+    axis = np.full(3, np.nan)
+    if len(loops) == 2:
+        a, b = (side.vertices[lp].mean(axis=0) for lp in loops)
+        axis = (b - a) / (np.linalg.norm(b - a) + 1e-12)
+    away = _median(side.thickness(piece[d >= 0.6 * ball]))
+    return dict(
+        thickness=thickness,
+        ball=ball,
+        exits=float(len(loops)),
+        swelling=thickness / away if away > 0 else np.nan,
+        axis=axis,
+    )
+
+
+_SHAPE_KEYS = ("thickness", "ball", "exits", "swelling")
 
 
 def _contact_geometry(
@@ -1573,84 +1624,57 @@ def _contact_geometry(
     B: trimesh.Trimesh,
     contacts: ContactSites,
     *,
-    radius: float,
-    tol: float | None,
+    ball_scale: float,
+    ball_min: float,
+    ball_max: float,
 ) -> dict[str, np.ndarray]:
-    """Per-site branch geometry; see :func:`label_contacts`."""
-    if tol is None:
-        tol = contacts.meta.get("tol")
-    tol = np.nan if tol is None else float(tol)
+    """Per-site branch measurements; see :func:`label_contacts`."""
     M = len(contacts.faces_A)
-    out = {
-        k: np.full(M, np.nan)
-        for k in (
-            "crossing_deg",
-            "axis_normal_A",
-            "axis_normal_B",
-            "elongation_A",
-            "elongation_B",
-            "radius_A",
-            "radius_B",
-            "conformity",
-        )
-    }
+    keys = [f"{k}_{s}" for k in _SHAPE_KEYS for s in "AB"] + ["crossing_deg"]
+    out = {k: np.full(M, np.nan) for k in keys}
     if M == 0:
         return out
-    treeA, treeB = KDTree(A.triangles_center), KDTree(B.triangles_center)
+    ball = dict(ball_scale=ball_scale, ball_min=ball_min, ball_max=ball_max)
+    sides = {"A": _Branches(A), "B": _Branches(B)}
+    meshes = {"A": A, "B": B}
     for i in range(M):
-        fa = np.asarray(contacts.faces_A[i], np.int64)
-        fb = np.asarray(contacts.faces_B[i], np.int64)
-        sides = [(A, fa, 1.0), (B, fb, -1.0)]
-        w = np.concatenate([A.area_faces[fa], B.area_faces[fb]])
-        c = np.vstack([A.triangles_center[fa], B.triangles_center[fb]])
+        site = {
+            "A": np.asarray(contacts.faces_A[i], np.int64),
+            "B": np.asarray(contacts.faces_B[i], np.int64),
+        }
+        w = np.concatenate([meshes[s].area_faces[site[s]] for s in "AB"])
         if w.sum() <= 0:
             continue
+        c = np.vstack([meshes[s].triangles_center[site[s]] for s in "AB"])
         center = (c * w[:, None]).sum(axis=0) / w.sum()
-        mesh, faces, sign = next((s for s in sides if len(s[1])), sides[0])
-        n = sign * (mesh.face_normals[faces] * mesh.area_faces[faces, None]).sum(0)
-        n /= np.linalg.norm(n) + 1e-12
-        axA, eA, rA = _local_branch(A, treeA, center, fa, radius)
-        axB, eB, rB = _local_branch(B, treeB, center, fb, radius)
-        out["crossing_deg"][i] = np.degrees(np.arccos(np.minimum(1.0, abs(axA @ axB))))
-        out["axis_normal_A"][i] = abs(axA @ n)
-        out["axis_normal_B"][i] = abs(axB @ n)
-        out["elongation_A"][i], out["elongation_B"][i] = eA, eB
-        out["radius_A"][i], out["radius_B"][i] = rA, rB
-        out["conformity"][i] = contacts.area_mean[i] / (
-            2 * np.pi * tol * np.sqrt(rA * rB)
-        )
+        axes = {}
+        for s in "AB":
+            if not len(site[s]):
+                continue
+            shape = _branch_shape(sides[s], center, site[s], **ball)
+            for k in _SHAPE_KEYS:
+                out[f"{k}_{s}"][i] = shape[k]
+            axes[s] = shape["axis"]
+        if len(axes) == 2:
+            cos = abs(float(axes["A"] @ axes["B"]))
+            out["crossing_deg"][i] = np.degrees(np.arccos(np.minimum(cos, 1.0)))
     return out
 
 
 def _contact_kinds(
     geometry: dict[str, np.ndarray],
     *,
+    swelling_min: float,
     crossing_min_deg: float,
-    parallel_max_deg: float,
-    flank_max: float,
-    tip_min: float,
-    tube_min: float,
-    blob_max: float,
 ) -> np.ndarray:
-    """Per-site kind from the geometry, first match wins; see
-    :func:`label_contacts`."""
+    """Per-site kind from the geometry; see :func:`label_contacts`."""
     g = {k: np.asarray(v, float) for k, v in geometry.items()}
-    tube = (g["elongation_A"] >= tube_min) & (g["elongation_B"] >= tube_min)
-    flanks = (g["axis_normal_A"] < flank_max) & (g["axis_normal_B"] < flank_max)
-    tip = ((g["elongation_A"] >= tube_min) & (g["axis_normal_A"] >= tip_min)) | (
-        (g["elongation_B"] >= tube_min) & (g["axis_normal_B"] >= tip_min)
-    )
-    blob = (g["elongation_A"] < blob_max) | (g["elongation_B"] < blob_max)
+    blob = (g["swelling_A"] >= swelling_min) | (g["swelling_B"] >= swelling_min)
+    through = (g["exits_A"] == 2) & (g["exits_B"] == 2)
+    crossing = ~blob & through & (g["crossing_deg"] >= crossing_min_deg)
     kinds = np.full(len(g["crossing_deg"]), "other", dtype=object)
-    for label, mask in reversed(
-        [
-            ("crossing", tube & flanks & (g["crossing_deg"] >= crossing_min_deg)),
-            ("parallel", tube & flanks & (g["crossing_deg"] <= parallel_max_deg)),
-            ("tip", tip),
-            ("blob", blob),
-        ]
-    ):
-        kinds[mask] = label
+    kinds[crossing] = "crossing"
+    kinds[blob] = "blob"
     return kinds.astype(str)
 
 
@@ -1659,69 +1683,61 @@ def label_contacts(
     B: trimesh.Trimesh,
     contacts: ContactSites,
     *,
-    radius: float = 1000.0,
-    tol: float | None = None,
+    swelling_min: float = 1.5,
+    crossing_min_deg: float = 45.0,
+    ball_scale: float = 3.0,
+    ball_min: float = 600.0,
+    ball_max: float = 3000.0,
     recompute: bool = False,
-    crossing_min_deg: float = 60.0,
-    parallel_max_deg: float = 30.0,
-    flank_max: float = 0.5,
-    tip_min: float = 0.7,
-    tube_min: float = 2.0,
-    blob_max: float = 1.5,
 ) -> ContactSites:
     """
-    Say what kind of contact each site is, from the branches around it, and
-    store it on *contacts* — ``contacts.kind`` (one str per site) and
+    Say what kind of contact each site is, to triage synapse candidates,
+    and store it on *contacts* — ``contacts.kind`` (one str per site) and
     ``contacts.geometry`` (the measurements below) — without dropping any
     site. Works on sites from :func:`scan_contacts` or
     :func:`map_contact_sites`. Returns *contacts*.
 
-    Per site, each side's local branch is the surface piece holding the
-    site's faces within *radius* of the site: its axis is the piece's
-    principal axis and its radius the median distance of its vertices from
-    that axis. The contact normal is the area-weighted mean normal of side
-    A's faces (of side B's, reversed, when A has none). ``contacts.geometry``:
+    ``contacts.kind``:
 
-    - crossing_deg: angle between the two branch axes, 0..90 (0 = parallel).
-    - axis_normal_A, axis_normal_B: |cos| between each axis and the contact
-      normal; ~0 when the contact is on that branch's flank, ~1 when the
-      branch points at the other one (a tip).
-    - elongation_A, elongation_B: sqrt(l1 / l2) of the piece's spread; a
-      tube is well above 1, a blob (soma, swelling, branch point) near 1,
-      and there the axis means little.
-    - radius_A, radius_B: the local branch radii.
-    - conformity: area_mean over 2 pi tol sqrt(radius_A radius_B), the area
-      two convex tubes of those radii crossing touch over within *tol*; ~1
-      for a kiss, more where the surfaces mould to each other. *tol*
-      defaults to the one the sites were found with (``contacts.meta``).
+    - "blob": a side swells where it touches — it is at least
+      *swelling_min* times thicker at the site than farther along its own
+      branch: a varicosity or bouton, the likeliest place for a synapse;
+    - "crossing": two branches pass across each other and only touch —
+      each side runs straight through the site (two exits, not swollen) and
+      their directions differ by at least *crossing_min_deg*;
+    - "other": everything else — branches side by side, a branch ending or
+      forking at the site, a soma, or a side that could not be measured.
 
-    ``contacts.kind``, first match wins:
+    Per site and side, the branch is the surface piece connected to the
+    site's faces within a ball around the site's centre (the area-weighted
+    centroid of both sides' faces). The ball's radius is *ball_scale* times
+    the side's thickness at the site, within [*ball_min*, *ball_max*] nm, so
+    that it reaches past a swelling of about that size. Thickness is how far
+    an inward ray from a face travels to the opposite wall.
+    ``contacts.geometry``, NaN where a side has no faces:
 
-    - "crossing": two tubes (elongation >= *tube_min*) touching flank to
-      flank (axis_normal < *flank_max* on both) at >= *crossing_min_deg* —
-      two branches that cross and kiss;
-    - "parallel": the same at <= *parallel_max_deg* — side by side;
-    - "tip": a tube whose axis points at the other side (axis_normal >=
-      *tip_min*) — a branch ending on the other;
-    - "blob": a side that is not a tube (elongation < *blob_max*) — a
-      swelling, a soma or a branch point;
-    - "other": everything else, sites without geometry included.
+    - thickness_A, thickness_B: the median thickness at the site's faces;
+    - ball_A, ball_B: the ball radius used;
+    - exits_A, exits_B: how many times the branch leaves the ball — 2 for
+      a branch passing through, 1 for a tip or a soma, 3+ at a fork;
+    - swelling_A, swelling_B: thickness at the site over the median
+      thickness in the ball's outer shell (0.6 to 1 ball radius);
+    - crossing_deg: the angle between the two branches, each the line
+      between its two exits; 0..90 (0 = parallel), NaN unless both sides
+      have two exits.
 
-    The geometry is reused when *contacts* already has it, so relabelling
-    with other thresholds is cheap; *recompute* measures it again.
+    The geometry is reused when *contacts* has it from the same
+    *ball_scale*, *ball_min* and *ball_max*, so relabelling with other
+    thresholds is cheap; *recompute* measures it again regardless.
     """
-    if contacts.geometry is None or recompute:
-        contacts.geometry = _contact_geometry(A, B, contacts, radius=radius, tol=tol)
-    thresholds = dict(
-        crossing_min_deg=crossing_min_deg,
-        parallel_max_deg=parallel_max_deg,
-        flank_max=flank_max,
-        tip_min=tip_min,
-        tube_min=tube_min,
-        blob_max=blob_max,
-    )
+    ball = dict(ball_scale=ball_scale, ball_min=ball_min, ball_max=ball_max)
+    old = (contacts.meta or {}).get("label", {})
+    stale = any(old.get(k) != v for k, v in ball.items())
+    if contacts.geometry is None or recompute or stale:
+        contacts.geometry = _contact_geometry(A, B, contacts, **ball)
+    thresholds = dict(swelling_min=swelling_min, crossing_min_deg=crossing_min_deg)
     contacts.kind = _contact_kinds(contacts.geometry, **thresholds)
-    contacts.meta = dict(contacts.meta, label=dict(thresholds, radius=radius))
+    contacts.meta = dict(contacts.meta or {}, label=dict(thresholds, **ball))
     return contacts
 
 

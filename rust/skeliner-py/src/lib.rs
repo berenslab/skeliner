@@ -1010,6 +1010,18 @@ fn filter_small_clusters<'py>(
     Ok(Array1::from(keep).into_pyarray(py))
 }
 
+/// Triangles given as `(F, 3, 3)` flattened to `(F, 9)`.
+fn triangles9(a: &PyReadonlyArray2<'_, f64>) -> PyResult<Vec<[[f64; 3]; 3]>> {
+    let t = a.as_array();
+    if t.ncols() != 9 {
+        return Err(PyValueError::new_err("triangles must be (F, 9)"));
+    }
+    Ok(t.rows()
+        .into_iter()
+        .map(|r| [[r[0], r[1], r[2]], [r[3], r[4], r[5]], [r[6], r[7], r[8]]])
+        .collect())
+}
+
 /// Which rays hit any of the triangles, with trimesh's `ray_triangle` test
 /// (`triangles` `(F, 3, 3)` flattened to `(F, 9)`, `normals` their face
 /// normals).
@@ -1021,15 +1033,7 @@ fn ray_hits<'py>(
     origins: PyReadonlyArray2<'py, f64>,
     directions: PyReadonlyArray2<'py, f64>,
 ) -> PyResult<Bound<'py, PyArray1<bool>>> {
-    let t = triangles.as_array();
-    if t.ncols() != 9 {
-        return Err(PyValueError::new_err("triangles must be (F, 9)"));
-    }
-    let tris: Vec<[[f64; 3]; 3]> = t
-        .rows()
-        .into_iter()
-        .map(|r| [[r[0], r[1], r[2]], [r[3], r[4], r[5]], [r[6], r[7], r[8]]])
-        .collect();
+    let tris = triangles9(&triangles)?;
     let normals = rows3("N", &normals)?;
     if normals.len() != tris.len() {
         return Err(PyValueError::new_err("one normal per triangle"));
@@ -1047,6 +1051,67 @@ fn ray_hits<'py>(
             .collect()
     });
     Ok(Array1::from(hits).into_pyarray(py))
+}
+
+/// A BVH over triangles (`(F, 3, 3)` flattened to `(F, 9)`, `normals`
+/// their face normals), built once to cast many rays at, with trimesh's
+/// `ray_triangle` test.
+#[pyclass(name = "TriangleBvh", module = "skeliner._rs", frozen)]
+struct PyTriangleBvh {
+    inner: meshcore::ray::TriangleBvh,
+}
+
+#[pymethods]
+impl PyTriangleBvh {
+    #[new]
+    fn new(
+        py: Python<'_>,
+        triangles: PyReadonlyArray2<'_, f64>,
+        normals: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Self> {
+        let tris = triangles9(&triangles)?;
+        let normals = rows3("N", &normals)?;
+        if normals.len() != tris.len() {
+            return Err(PyValueError::new_err("one normal per triangle"));
+        }
+        Ok(Self {
+            inner: py.detach(|| meshcore::ray::TriangleBvh::new(tris, normals)),
+        })
+    }
+
+    /// How far each ray travels before it first hits a triangle: per ray
+    /// from `origins` along `directions`, the distance (ray parameter) to
+    /// the first triangle past `min_t`, leaving out triangle `skip` (the one
+    /// the ray starts on; -1 for none); NaN when it hits nothing.
+    fn first_hits<'py>(
+        &self,
+        py: Python<'py>,
+        origins: PyReadonlyArray2<'py, f64>,
+        directions: PyReadonlyArray2<'py, f64>,
+        skip: numpy::PyReadonlyArray1<'py, i64>,
+        min_t: f64,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let (o, d) = (rows3("O", &origins)?, rows3("D", &directions)?);
+        let skip: Vec<i64> = skip.as_array().to_vec();
+        if o.len() != d.len() || o.len() != skip.len() {
+            return Err(PyValueError::new_err(
+                "one direction and one skip per origin",
+            ));
+        }
+        let dist: Vec<f64> = py.detach(|| {
+            use rayon::prelude::*;
+            (0..o.len())
+                .into_par_iter()
+                .map(|k| {
+                    let s = usize::try_from(skip[k]).ok();
+                    self.inner
+                        .first_hit(o[k], d[k], min_t, s)
+                        .map_or(f64::NAN, |(_, h)| h)
+                })
+                .collect()
+        });
+        Ok(Array1::from(dist).into_pyarray(py))
+    }
 }
 
 /// Which faces of one mesh touch another: per face, the other mesh's
@@ -1075,15 +1140,7 @@ fn contact_faces<'py>(
     if normals.len() != centers.len() {
         return Err(PyValueError::new_err("one normal per face"));
     }
-    let t = triangles.as_array();
-    if t.ncols() != 9 {
-        return Err(PyValueError::new_err("triangles must be (G, 9)"));
-    }
-    let tris: Vec<[[f64; 3]; 3]> = t
-        .rows()
-        .into_iter()
-        .map(|r| [[r[0], r[1], r[2]], [r[3], r[4], r[5]], [r[6], r[7], r[8]]])
-        .collect();
+    let tris = triangles9(&triangles)?;
     let other_normals = rows3("M", &other_normals)?;
     if other_normals.len() != tris.len() {
         return Err(PyValueError::new_err("one normal per triangle"));
@@ -2048,6 +2105,7 @@ fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyZScan>()?;
     m.add_class::<PySurfaceGraph>()?;
     m.add_class::<PyVertexFaces>()?;
+    m.add_class::<PyTriangleBvh>()?;
     m.add_function(wrap_pyfunction!(mesh_roundtrip, m)?)?;
     m.add_function(wrap_pyfunction!(face_edge_components, m)?)?;
     m.add_function(wrap_pyfunction!(face_components, m)?)?;

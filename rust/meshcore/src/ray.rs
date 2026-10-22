@@ -24,10 +24,17 @@ fn sub(a: V3, b: V3) -> V3 {
 
 /// Does the ray from `o` along `d` hit triangle `t` with normal `n`?
 pub fn hits_triangle(o: V3, d: V3, t: &[V3; 3], n: V3) -> bool {
+    hit_distance(o, d, t, n).is_some()
+}
+
+/// Where the ray from `o` along `d` hits triangle `t` (normal `n`), as the
+/// ray parameter — the distance along a unit `d` — or `None` when
+/// [`hits_triangle`] says it misses.
+pub fn hit_distance(o: V3, d: V3, t: &[V3; 3], n: V3) -> Option<f64> {
     let proj_ori = dd(sub(t[0], o), n);
     let proj_dir = dd(d, n);
     if proj_dir.abs() <= 1e-5 {
-        return false;
+        return None;
     }
     let distance = proj_ori / proj_dir;
     let p = [0, 1, 2].map(|k| d[k] * distance + o[k]);
@@ -41,9 +48,9 @@ pub fn hits_triangle(o: V3, d: V3, t: &[V3; 3], n: V3) -> bool {
     let b0 = 1.0 - b1 - b2;
     let zero = 1e-13;
     if ![b0, b1, b2].iter().all(|&b| b > -zero && b < 1.0 + zero) {
-        return false;
+        return None;
     }
-    dd(sub(p, o), d) > -1e-6
+    (dd(sub(p, o), d) > -1e-6).then_some(distance)
 }
 
 fn add(a: V3, b: V3) -> V3 {
@@ -186,6 +193,52 @@ impl TriangleBvh {
         false
     }
 
+    /// The first triangle the ray from `o` along `d` hits past `min_t`, as
+    /// `(index, ray parameter)`, leaving out triangle `skip` (the one the
+    /// ray starts on); ties to the lowest index.
+    pub fn first_hit(&self, o: V3, d: V3, min_t: f64, skip: Option<usize>) -> Option<(usize, f64)> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+        let inv = d.map(|c| 1.0 / c);
+        let mut best: Option<(usize, f64)> = None;
+        let mut stack = vec![0usize];
+        while let Some(i) = stack.pop() {
+            let n = &self.nodes[i];
+            let Some(entry) = slab_entry(o, inv, n.lo, n.hi) else {
+                continue;
+            };
+            if best.is_some_and(|(_, bt)| entry > bt) {
+                continue;
+            }
+            if n.left == usize::MAX {
+                for &t in &self.order[n.start..n.end] {
+                    let t = t as usize;
+                    if Some(t) == skip {
+                        continue;
+                    }
+                    let Some(h) = hit_distance(o, d, &self.tris[t], self.normals[t]) else {
+                        continue;
+                    };
+                    if h <= min_t {
+                        continue;
+                    }
+                    let better = match best {
+                        None => true,
+                        Some((bt, bh)) => h < bh || (h == bh && t < bt),
+                    };
+                    if better {
+                        best = Some((t, h));
+                    }
+                }
+            } else {
+                stack.push(n.left);
+                stack.push(n.right);
+            }
+        }
+        best
+    }
+
     /// The triangle closest to `p` no farther than `r`, as `(index,
     /// squared distance)`; exact ties go to the lowest index.
     pub fn closest_within(&self, p: V3, r: f64) -> Option<(usize, f64)> {
@@ -312,6 +365,28 @@ fn build(
     me
 }
 
+/// Where the ray enters the (padded) box, if it reaches it — as [`slab`]
+/// decides, so no triangle the hit test would accept is culled.
+fn slab_entry(o: V3, inv: V3, lo: V3, hi: V3) -> Option<f64> {
+    let pad = |v: f64| 1e-6 * v.abs().max(1.0);
+    let mut tmin = f64::NEG_INFINITY;
+    let mut tmax = f64::INFINITY;
+    for k in 0..3 {
+        let (l, h) = (lo[k] - pad(lo[k]), hi[k] + pad(hi[k]));
+        if inv[k].is_infinite() {
+            if o[k] < l || o[k] > h {
+                return None;
+            }
+            continue;
+        }
+        let (t1, t2) = ((l - o[k]) * inv[k], (h - o[k]) * inv[k]);
+        let (a, b) = if t1 < t2 { (t1, t2) } else { (t2, t1) };
+        tmin = tmin.max(a);
+        tmax = tmax.min(b);
+    }
+    (tmax >= tmin && tmax >= -1e-3).then_some(tmin)
+}
+
 /// Does the ray reach the box, from slightly behind its origin on?  The
 /// box is padded so a triangle the hit test would accept is never culled.
 fn slab(o: V3, inv: V3, lo: V3, hi: V3) -> bool {
@@ -363,6 +438,51 @@ mod tests {
         assert!(!bvh.any_hit([0.5, 0.5, 1.0], [1.0, 0.0, 0.0]), "parallel");
         // on the shared diagonal counts (barycentric tolerance)
         assert!(bvh.any_hit([0.5, 0.5, 1.0], [0.0, 0.0, -1.0]));
+    }
+
+    #[test]
+    fn the_first_hit_agrees_with_testing_every_triangle() {
+        let mut state = 19u64;
+        let mut rnd = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 11) as f64 / (1u64 << 53) as f64) * 10.0 - 5.0
+        };
+        let mut tris = Vec::new();
+        let mut normals = Vec::new();
+        for _ in 0..300 {
+            let a = [rnd(), rnd(), rnd()];
+            let t = [
+                a,
+                [a[0] + rnd() * 0.4, a[1] + rnd() * 0.4, a[2]],
+                [a[0], a[1] + rnd() * 0.4, a[2] + rnd() * 0.4],
+            ];
+            let (e0, e1) = (sub(t[1], t[0]), sub(t[2], t[0]));
+            let c = [
+                e0[1] * e1[2] - e0[2] * e1[1],
+                e0[2] * e1[0] - e0[0] * e1[2],
+                e0[0] * e1[1] - e0[1] * e1[0],
+            ];
+            let l = dd(c, c).sqrt();
+            normals.push(c.map(|x| x / l));
+            tris.push(t);
+        }
+        let bvh = TriangleBvh::new(tris.clone(), normals.clone());
+        let mut found = 0;
+        for k in 0..2000 {
+            let o = [rnd(), rnd(), rnd()];
+            let d = [rnd(), rnd(), rnd()];
+            let skip = (k % 3 == 0).then_some(k % tris.len());
+            let brute = (0..tris.len())
+                .filter(|&t| Some(t) != skip)
+                .filter_map(|t| hit_distance(o, d, &tris[t], normals[t]).map(|h| (t, h)))
+                .filter(|&(_, h)| h > 1e-9)
+                .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+            assert_eq!(bvh.first_hit(o, d, 1e-9, skip), brute);
+            found += brute.is_some() as usize;
+        }
+        assert!(found > 100, "the fixture should hit triangles: {found}");
     }
 
     #[test]

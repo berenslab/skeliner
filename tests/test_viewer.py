@@ -2708,12 +2708,12 @@ def test_contact_sites_are_coloured_and_labelled_by_kind(two_kinds):
     from skeliner.plot.viewer import _KIND_COLORS
 
     a, b, sites = two_kinds
-    assert sorted(sites.kind.tolist()) == ["crossing", "parallel"]
+    assert sorted(sites.kind.tolist()) == ["crossing", "other"]
     ann, state = _overlay(a, b, sites)
     for h in ann["highlights"]:
         kind = next(k for k in _KIND_COLORS if f" · {k} " in h["label"])
         assert h["color"] == _KIND_COLORS[kind]
-    assert [k["kind"] for k in state["kinds"]] == ["crossing", "parallel"]
+    assert [k["kind"] for k in state["kinds"]] == ["crossing", "other"]
     assert [k["count"] for k in state["kinds"]] == [1, 1]
     assert all(" · " in g["label"] for g in ann["edge_groups"])
 

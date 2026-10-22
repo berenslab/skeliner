@@ -7,17 +7,32 @@ import trimesh
 from skeliner import pair
 
 
-def _tube(axis, center, radius=200.0, length=2000.0, step=25.0, around=64, cap=False):
+def _tube(
+    axis,
+    center,
+    radius=200.0,
+    length=4000.0,
+    step=25.0,
+    around=64,
+    cap=False,
+    bead=None,
+):
     """A tube along unit vector *axis* through *center*, finely meshed, faces
-    wound outward; open, or with *cap* a flat disc closing its +axis end."""
+    wound outward; open, or with *cap* a flat disc closing its +axis end.
+    *bead* ``(peak, width)`` swells it at *center*: the radius rises to
+    *peak* there and falls back over *width* (a Gaussian)."""
     axis = np.asarray(axis, float) / np.linalg.norm(axis)
     u = np.cross(axis, [0.0, 0.0, 1.0] if abs(axis[2]) < 0.9 else [1.0, 0.0, 0.0])
     u /= np.linalg.norm(u)
     v = np.cross(axis, u)
     ang = np.arange(around) * (2 * np.pi / around)
-    ring = radius * (np.outer(np.cos(ang), u) + np.outer(np.sin(ang), v))
+    unit = np.outer(np.cos(ang), u) + np.outer(np.sin(ang), v)
     zs = np.arange(-length / 2, length / 2 + step / 2, step)
-    verts = np.vstack([ring + z * axis for z in zs]) + center
+    radii = np.full(len(zs), radius)
+    if bead is not None:
+        peak, width = bead
+        radii += (peak - radius) * np.exp(-((zs / width) ** 2))
+    verts = np.vstack([r * unit + z * axis for r, z in zip(radii, zs)]) + center
     faces = []
     for k in range(len(zs) - 1):
         for i in range(around):
@@ -32,7 +47,7 @@ def _tube(axis, center, radius=200.0, length=2000.0, step=25.0, around=64, cap=F
         prev = list(range(last, last + around))
         for r in rings:
             ids = list(range(len(verts), len(verts) + around))
-            verts = np.vstack([verts, r * (ring / radius) + zs[-1] * axis + center])
+            verts = np.vstack([verts, r * unit + zs[-1] * axis + center])
             for i in range(around):
                 j = (i + 1) % around
                 faces += [[prev[i], prev[j], ids[j]], [prev[i], ids[j], ids[i]]]
@@ -110,37 +125,47 @@ def _labelled(a, b):
     return sites
 
 
-def _geometry(a, b):
-    return {k: float(v[0]) for k, v in _labelled(a, b).geometry.items()}
+def _geometry(sites):
+    return {k: float(v[0]) for k, v in sites.geometry.items()}
 
 
-def test_a_crossing_reads_as_two_flanks_at_right_angles(tube_z):
-    g = _geometry(tube_z, _tube([1, 0, 0], [0.0, 405.0, 0.0]))
-    assert g["crossing_deg"] > 80
-    assert g["axis_normal_A"] < 0.2 and g["axis_normal_B"] < 0.2
-    assert g["elongation_A"] > 2 and g["elongation_B"] > 2
-    assert abs(g["radius_A"] - 200) < 20 and abs(g["radius_B"] - 200) < 20
-    assert 0.3 < g["conformity"] < 3
+def test_crossing_branches_pass_straight_through_at_right_angles(tube_z):
+    sites = _labelled(tube_z, _tube([1, 0, 0], [0.0, 405.0, 0.0]))
+    g = _geometry(sites)
+    assert sites.kind.tolist() == ["crossing"]
+    assert g["exits_A"] == 2 and g["exits_B"] == 2
+    assert g["crossing_deg"] > 85
+    assert abs(g["thickness_A"] - 400) < 20 and abs(g["thickness_B"] - 400) < 20
+    assert g["ball_A"] == pytest.approx(3 * g["thickness_A"])
+    assert abs(g["swelling_A"] - 1) < 0.1 and abs(g["swelling_B"] - 1) < 0.1
 
 
-def test_tubes_side_by_side_read_as_parallel_and_conforming(tube_z):
-    g = _geometry(tube_z, _tube([0, 0, 1], [405.0, 0.0, 0.0]))
-    crossing = _geometry(tube_z, _tube([1, 0, 0], [0.0, 405.0, 0.0]))
-    assert g["crossing_deg"] < 10
-    assert g["conformity"] > 3 * crossing["conformity"]
+def test_a_swelling_where_it_touches_is_a_blob(tube_z):
+    bead = _tube([1, 0, 0], [0.0, 505.0, 0.0], radius=100.0, bead=(300.0, 200.0))
+    sites = _labelled(tube_z, bead)
+    g = _geometry(sites)
+    assert sites.kind.tolist() == ["blob"]
+    # measured across the bead, against the thin tube it is on
+    assert abs(g["thickness_B"] - 600) < 40
+    assert g["swelling_B"] > 2.5 and abs(g["swelling_A"] - 1) < 0.1
+    assert g["exits_B"] == 2
 
 
-def test_a_tube_ending_on_a_flank_reads_as_a_tip(tube_z):
-    g = _geometry(tube_z, _tube([0, -1, 0], [0.0, 1205.0, 0.0], cap=True))
-    assert g["axis_normal_B"] > 0.9 and g["axis_normal_A"] < 0.2
+def test_branches_at_a_shallow_angle_are_not_a_crossing(tube_z):
+    tilt = np.radians(20.0)
+    beside = _tube([0, np.sin(tilt), np.cos(tilt)], [405.0, 0.0, 0.0])
+    sites = _labelled(tube_z, beside)
+    g = _geometry(sites)
+    assert g["exits_A"] == 2 and g["exits_B"] == 2
+    assert abs(g["crossing_deg"] - 20) < 3
+    assert sites.kind.tolist() == ["other"]
 
 
-def test_every_site_is_kept_and_labelled(tube_z):
-    crossing = _tube([1, 0, 0], [0.0, 405.0, 0.0])
-    beside = _tube([0, 0, 1], [405.0, 0.0, 0.0])
-    tip = _tube([0, -1, 0], [0.0, 1205.0, 0.0], cap=True)
-    for other, kind in ((crossing, "crossing"), (beside, "parallel"), (tip, "tip")):
-        assert _labelled(tube_z, other).kind.tolist() == [kind]
+def test_a_branch_ending_at_the_site_leaves_its_ball_once(tube_z):
+    tip = _tube([0, -1, 0], [0.0, 1205.0, 0.0], length=2000.0, cap=True)
+    g = _geometry(_labelled(tube_z, tip))
+    assert g["exits_A"] == 2 and g["exits_B"] == 1
+    assert np.isnan(g["crossing_deg"])
 
 
 def test_unlabelled_sites_have_no_kind(tube_z):
@@ -150,7 +175,7 @@ def test_unlabelled_sites_have_no_kind(tube_z):
     assert sites.kind is None and sites.geometry is None
 
 
-def test_relabelling_reuses_the_geometry(tube_z):
+def test_relabelling_reuses_the_geometry_from_the_same_ball(tube_z):
     crossing = _tube([1, 0, 0], [0.0, 405.0, 0.0])
     sites = pair.scan_contacts(tube_z, crossing, tol=20.0)
     geometry = sites.geometry
@@ -158,6 +183,12 @@ def test_relabelling_reuses_the_geometry(tube_z):
     assert sites.geometry is geometry
     assert sites.kind.tolist() == ["other"]
     assert sites.meta["label"]["crossing_min_deg"] == 95.0
+    pair.label_contacts(tube_z, crossing, sites, ball_scale=2.0)
+    assert sites.geometry is not geometry
+    assert sites.geometry["ball_A"][0] == pytest.approx(
+        2 * sites.geometry["thickness_A"][0]
+    )
+    assert sites.kind.tolist() == ["crossing"]
 
 
 def test_sites_without_geometry_are_other(tube_z):
@@ -174,13 +205,13 @@ def test_picking_sites_keeps_their_faces_kinds_and_stats(tube_z):
     sites = pair.compute_contact_stats(
         tube_z, both, pair.scan_contacts(tube_z, both, tol=20.0)
     )
-    assert sorted(sites.kind.tolist()) == ["crossing", "parallel"]
-    picked = pair.pick_contacts(sites, sites.kind == "parallel")
-    i = int(np.flatnonzero(sites.kind == "parallel")[0])
-    assert len(picked.faces_A) == 1 and picked.kind.tolist() == ["parallel"]
+    assert sorted(sites.kind.tolist()) == ["crossing", "other"]
+    picked = pair.pick_contacts(sites, sites.kind == "other")
+    i = int(np.flatnonzero(sites.kind == "other")[0])
+    assert len(picked.faces_A) == 1 and picked.kind.tolist() == ["other"]
     assert np.array_equal(picked.faces_A[0], sites.faces_A[i])
     assert picked.stats_A["aspect"][0] == sites.stats_A["aspect"][i]
-    assert picked.geometry["crossing_deg"][0] == sites.geometry["crossing_deg"][i]
+    assert picked.geometry["swelling_A"][0] == sites.geometry["swelling_A"][i]
 
 
 def test_kinds_survive_a_round_trip_and_old_files_load(tube_z, tmp_path):
@@ -192,7 +223,7 @@ def test_kinds_survive_a_round_trip_and_old_files_load(tube_z, tmp_path):
     back = load_contact_sites_npz(tmp_path / "labelled.npz")
     assert back.kind.tolist() == sites.kind.tolist()
     assert back.geometry.keys() == sites.geometry.keys()
-    assert back.geometry["conformity"][0] == sites.geometry["conformity"][0]
+    assert back.geometry["swelling_A"][0] == sites.geometry["swelling_A"][0]
     plain = pair.scan_contacts(tube_z, crossing, tol=20.0, label=False)
     plain.to_npz(tmp_path / "plain.npz")
     back = load_contact_sites_npz(tmp_path / "plain.npz")
