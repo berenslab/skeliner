@@ -1,11 +1,27 @@
-"""skeliner.pair – pairwise contact detection between two skeletons and meshes."""
+"""skeliner.pair – pairwise contact detection between two skeletons and meshes.
+
+Two ways to find contact sites, both returning ``ContactSites``:
+
+- from skeletons first: :func:`find_contact_seeds` (skeleton contacts),
+  then :func:`map_contact_sites` (the mesh faces around each seed), or
+  :func:`approximate_contact_sites` (skeletons only);
+- from the meshes alone: :func:`scan_contacts`, which searches every face,
+  finds the contacts the skeletons miss, and labels each site's kind
+  (:func:`label_contacts`) — crossing branches, a blob on a neurite, ….
+
+:func:`compute_contact_stats`, :func:`filter_contact_sites`,
+:func:`label_contacts` and :func:`pick_contacts` take either.
+"""
 
 from typing import Iterable
 
 import numpy as np
 import trimesh
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 from scipy.spatial import ConvexHull, KDTree
 
+from . import _rs
 from .dataclass import ContactSeeds, ContactSites, ProxySites, Skeleton
 
 ####################
@@ -1360,6 +1376,365 @@ def map_contact_sites(
     )
 
 
+# ------------------------ mesh-only finder -----------------------------
+
+
+def _shared_edge_links(
+    faces: np.ndarray, ids: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pairs of positions in *ids* whose faces share an edge."""
+    tri = np.sort(faces[ids], axis=1)
+    e = np.concatenate([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [0, 2]]])
+    owner = np.tile(np.arange(len(ids)), 3)
+    real = e[:, 0] != e[:, 1]
+    e, owner = e[real], owner[real]
+    order = np.lexsort((e[:, 1], e[:, 0]))
+    e, owner = e[order], owner[order]
+    same = np.all(e[1:] == e[:-1], axis=1)
+    return owner[:-1][same], owner[1:][same]
+
+
+def scan_contacts(
+    A: trimesh.Trimesh,
+    B: trimesh.Trimesh,
+    *,
+    tol: float | None = None,
+    normal_opposition_dot: float = -0.2,
+    return_pairs: bool = False,
+    unit: str = "nm^2",
+    label: bool = True,
+    radius: float = 1000.0,
+) -> ContactSites:
+    """
+    Every contact site between two meshes, found from the meshes alone — no
+    skeletons and no seeds (compare :func:`find_contact_seeds` +
+    :func:`map_contact_sites`, which search only around skeleton contacts).
+
+    A face touches the other mesh when its centroid lies within *tol* of the
+    other surface and the closest face there opposes it (normal dot <=
+    *normal_opposition_dot*) — :func:`map_contact_sites`' rule with
+    ``sample_scheme="1c"``, applied to every face instead of around skeleton
+    seeds, so it also finds the contacts the skeletons miss. Touching faces
+    that share an edge, or face each other across the gap, form one site.
+
+    Steps:
+      1) per face of A, the closest face of B within tol, and the reverse;
+      2) keep the pairs whose normals are opposed;
+      3) sites: groups joined by shared edges on each side and by the pairs.
+
+    Returns the ``ContactSites`` that :func:`map_contact_sites` returns:
+    per site the touching faces and their area on each side (every face
+    counted whole), ``seeds_A`` / ``seeds_B`` the area-weighted centroid of
+    each side's faces, bounding boxes, and with *return_pairs* the
+    ``(A face, B face, area)`` pairs. Sites are ordered by their first face.
+    Every site is kept; with *label* (the default) each also gets its kind
+    and branch geometry from :func:`label_contacts` (neighbourhood
+    *radius*), so crossings can be told apart from other contacts later.
+    """
+    if tol is None:
+        tol = 0.5 * float(np.median([median_edge_length(A), median_edge_length(B)]))
+    tol = float(tol)
+
+    def touching(src, dst):
+        return _rs.contact_faces(
+            np.asarray(src.triangles_center, np.float64),
+            np.asarray(src.face_normals, np.float64),
+            np.asarray(dst.triangles, np.float64).reshape(-1, 9),
+            np.asarray(dst.face_normals, np.float64),
+            tol,
+            float(normal_opposition_dot),
+        )
+
+    fa, fb_of_a, _ = touching(A, B)
+    fb, fa_of_b, _ = touching(B, A)
+
+    # one node per face on either side that touches or is touched
+    na = np.unique(np.concatenate([fa, fa_of_b]))
+    nb = np.unique(np.concatenate([fb, fb_of_a]))
+    off = len(na)
+    la, ra = _shared_edge_links(np.asarray(A.faces), na)
+    lb, rb = _shared_edge_links(np.asarray(B.faces), nb)
+    src = np.concatenate(
+        [la, lb + off, np.searchsorted(na, fa), np.searchsorted(na, fa_of_b)]
+    )
+    dst = np.concatenate(
+        [
+            ra,
+            rb + off,
+            np.searchsorted(nb, fb_of_a) + off,
+            np.searchsorted(nb, fb) + off,
+        ]
+    )
+    n = off + len(nb)
+    if n:
+        graph = coo_matrix((np.ones(len(src)), (src, dst)), shape=(n, n))
+        _, node_site = connected_components(graph, directed=False)
+        # number the sites by their first node
+        _, first = np.unique(node_site, return_index=True)
+        rank = np.empty(len(first), np.int64)
+        rank[np.argsort(first)] = np.arange(len(first))
+        node_site = rank[node_site]
+    else:
+        node_site = np.zeros(0, np.int64)
+    n_sites = int(node_site.max()) + 1 if n else 0
+
+    site_of_a = node_site[np.searchsorted(na, fa)] if len(fa) else np.zeros(0, np.int64)
+    site_of_b = (
+        node_site[np.searchsorted(nb, fb) + off] if len(fb) else np.zeros(0, np.int64)
+    )
+
+    def split(faces, site):
+        order = np.lexsort((faces, site))
+        bounds = np.searchsorted(site[order], np.arange(n_sites + 1))
+        return [faces[order][bounds[i] : bounds[i + 1]] for i in range(n_sites)]
+
+    faces_A = split(fa, site_of_a)
+    faces_B = split(fb, site_of_b)
+    areaA, areaB = A.area_faces, B.area_faces
+    area_A = np.array([float(areaA[f].sum()) for f in faces_A])
+    area_B = np.array([float(areaB[f].sum()) for f in faces_B])
+
+    def centroids(mesh, groups):
+        out = np.full((len(groups), 3), np.nan)
+        for i, f in enumerate(groups):
+            if len(f):
+                w = mesh.area_faces[f]
+                out[i] = (mesh.triangles_center[f] * w[:, None]).sum(0) / w.sum()
+        return out
+
+    pairs = None
+    if return_pairs:
+        pa = np.column_stack([fa, fb_of_a, areaA[fa]]).astype(np.float64)
+        pb = np.column_stack([fa_of_b, fb, areaB[fb]]).astype(np.float64)
+        pairs = [
+            np.vstack([pa[site_of_a == i], pb[site_of_b == i]]) for i in range(n_sites)
+        ]
+    bbox_A = _aabbs_for_patches(A, faces_A)
+    bbox_B = _aabbs_for_patches(B, faces_B)
+    meta = dict(
+        tol=tol,
+        normal_opposition_dot=float(normal_opposition_dot),
+        engine="mesh-to-mesh: closest faces within tol (Rust BVH) → union",
+        sides="both",
+        unit=unit,
+        K_patches=n_sites,
+        seed_to_patch=np.zeros(0, dtype=np.int64),
+    )
+    sites = ContactSites(
+        faces_A=faces_A,
+        faces_B=faces_B,
+        area_A=area_A,
+        area_B=area_B,
+        area_mean=0.5 * (area_A + area_B),
+        seeds_A=centroids(A, faces_A),
+        seeds_B=centroids(B, faces_B),
+        pairs_AB=pairs,
+        bbox_A=bbox_A,
+        bbox_B=bbox_B,
+        bbox=_union_aabbs(bbox_A, bbox_B),
+        meta=meta,
+    )
+    return label_contacts(A, B, sites, radius=radius) if label else sites
+
+
+def _local_branch(
+    mesh: trimesh.Trimesh,
+    tree: KDTree,
+    center: np.ndarray,
+    site_faces: np.ndarray,
+    radius: float,
+) -> tuple[np.ndarray, float, float]:
+    """``(axis, elongation, radius)`` of the surface piece holding
+    *site_faces* within *radius* of *center*; NaNs when it is too small."""
+    near = np.asarray(tree.query_ball_point(center, radius), np.int64)
+    nan = (np.full(3, np.nan), np.nan, np.nan)
+    if len(near) < 3:
+        return nan
+    # keep the connected piece the site is on, not other branches nearby
+    near = np.union1d(near, site_faces)
+    a, b = _shared_edge_links(np.asarray(mesh.faces), near)
+    graph = coo_matrix((np.ones(len(a)), (a, b)), shape=(len(near), len(near)))
+    _, label = connected_components(graph, directed=False)
+    on_site = np.isin(near, site_faces)
+    piece = near[np.isin(label, np.unique(label[on_site]))]
+    pts = mesh.vertices[np.unique(np.asarray(mesh.faces)[piece])]
+    if len(pts) < 10:
+        return nan
+    x = pts - pts.mean(axis=0)
+    w, v = np.linalg.eigh(x.T @ x / len(x))
+    axis = v[:, 2]
+    elongation = float(np.sqrt(w[2] / max(w[1], 1e-12)))
+    off_axis = x - np.outer(x @ axis, axis)
+    return axis, elongation, float(np.median(np.linalg.norm(off_axis, axis=1)))
+
+
+def _contact_geometry(
+    A: trimesh.Trimesh,
+    B: trimesh.Trimesh,
+    contacts: ContactSites,
+    *,
+    radius: float,
+    tol: float | None,
+) -> dict[str, np.ndarray]:
+    """Per-site branch geometry; see :func:`label_contacts`."""
+    if tol is None:
+        tol = contacts.meta.get("tol")
+    tol = np.nan if tol is None else float(tol)
+    M = len(contacts.faces_A)
+    out = {
+        k: np.full(M, np.nan)
+        for k in (
+            "crossing_deg",
+            "axis_normal_A",
+            "axis_normal_B",
+            "elongation_A",
+            "elongation_B",
+            "radius_A",
+            "radius_B",
+            "conformity",
+        )
+    }
+    if M == 0:
+        return out
+    treeA, treeB = KDTree(A.triangles_center), KDTree(B.triangles_center)
+    for i in range(M):
+        fa = np.asarray(contacts.faces_A[i], np.int64)
+        fb = np.asarray(contacts.faces_B[i], np.int64)
+        sides = [(A, fa, 1.0), (B, fb, -1.0)]
+        w = np.concatenate([A.area_faces[fa], B.area_faces[fb]])
+        c = np.vstack([A.triangles_center[fa], B.triangles_center[fb]])
+        if w.sum() <= 0:
+            continue
+        center = (c * w[:, None]).sum(axis=0) / w.sum()
+        mesh, faces, sign = next((s for s in sides if len(s[1])), sides[0])
+        n = sign * (mesh.face_normals[faces] * mesh.area_faces[faces, None]).sum(0)
+        n /= np.linalg.norm(n) + 1e-12
+        axA, eA, rA = _local_branch(A, treeA, center, fa, radius)
+        axB, eB, rB = _local_branch(B, treeB, center, fb, radius)
+        out["crossing_deg"][i] = np.degrees(np.arccos(np.minimum(1.0, abs(axA @ axB))))
+        out["axis_normal_A"][i] = abs(axA @ n)
+        out["axis_normal_B"][i] = abs(axB @ n)
+        out["elongation_A"][i], out["elongation_B"][i] = eA, eB
+        out["radius_A"][i], out["radius_B"][i] = rA, rB
+        out["conformity"][i] = contacts.area_mean[i] / (
+            2 * np.pi * tol * np.sqrt(rA * rB)
+        )
+    return out
+
+
+def _contact_kinds(
+    geometry: dict[str, np.ndarray],
+    *,
+    crossing_min_deg: float,
+    parallel_max_deg: float,
+    flank_max: float,
+    tip_min: float,
+    tube_min: float,
+    blob_max: float,
+) -> np.ndarray:
+    """Per-site kind from the geometry, first match wins; see
+    :func:`label_contacts`."""
+    g = {k: np.asarray(v, float) for k, v in geometry.items()}
+    tube = (g["elongation_A"] >= tube_min) & (g["elongation_B"] >= tube_min)
+    flanks = (g["axis_normal_A"] < flank_max) & (g["axis_normal_B"] < flank_max)
+    tip = ((g["elongation_A"] >= tube_min) & (g["axis_normal_A"] >= tip_min)) | (
+        (g["elongation_B"] >= tube_min) & (g["axis_normal_B"] >= tip_min)
+    )
+    blob = (g["elongation_A"] < blob_max) | (g["elongation_B"] < blob_max)
+    kinds = np.full(len(g["crossing_deg"]), "other", dtype=object)
+    for label, mask in reversed(
+        [
+            ("crossing", tube & flanks & (g["crossing_deg"] >= crossing_min_deg)),
+            ("parallel", tube & flanks & (g["crossing_deg"] <= parallel_max_deg)),
+            ("tip", tip),
+            ("blob", blob),
+        ]
+    ):
+        kinds[mask] = label
+    return kinds.astype(str)
+
+
+def label_contacts(
+    A: trimesh.Trimesh,
+    B: trimesh.Trimesh,
+    contacts: ContactSites,
+    *,
+    radius: float = 1000.0,
+    tol: float | None = None,
+    recompute: bool = False,
+    crossing_min_deg: float = 60.0,
+    parallel_max_deg: float = 30.0,
+    flank_max: float = 0.5,
+    tip_min: float = 0.7,
+    tube_min: float = 2.0,
+    blob_max: float = 1.5,
+) -> ContactSites:
+    """
+    Say what kind of contact each site is, from the branches around it, and
+    store it on *contacts* — ``contacts.kind`` (one str per site) and
+    ``contacts.geometry`` (the measurements below) — without dropping any
+    site. Works on sites from :func:`scan_contacts` or
+    :func:`map_contact_sites`. Returns *contacts*.
+
+    Per site, each side's local branch is the surface piece holding the
+    site's faces within *radius* of the site: its axis is the piece's
+    principal axis and its radius the median distance of its vertices from
+    that axis. The contact normal is the area-weighted mean normal of side
+    A's faces (of side B's, reversed, when A has none). ``contacts.geometry``:
+
+    - crossing_deg: angle between the two branch axes, 0..90 (0 = parallel).
+    - axis_normal_A, axis_normal_B: |cos| between each axis and the contact
+      normal; ~0 when the contact is on that branch's flank, ~1 when the
+      branch points at the other one (a tip).
+    - elongation_A, elongation_B: sqrt(l1 / l2) of the piece's spread; a
+      tube is well above 1, a blob (soma, swelling, branch point) near 1,
+      and there the axis means little.
+    - radius_A, radius_B: the local branch radii.
+    - conformity: area_mean over 2 pi tol sqrt(radius_A radius_B), the area
+      two convex tubes of those radii crossing touch over within *tol*; ~1
+      for a kiss, more where the surfaces mould to each other. *tol*
+      defaults to the one the sites were found with (``contacts.meta``).
+
+    ``contacts.kind``, first match wins:
+
+    - "crossing": two tubes (elongation >= *tube_min*) touching flank to
+      flank (axis_normal < *flank_max* on both) at >= *crossing_min_deg* —
+      two branches that cross and kiss;
+    - "parallel": the same at <= *parallel_max_deg* — side by side;
+    - "tip": a tube whose axis points at the other side (axis_normal >=
+      *tip_min*) — a branch ending on the other;
+    - "blob": a side that is not a tube (elongation < *blob_max*) — a
+      swelling, a soma or a branch point;
+    - "other": everything else, sites without geometry included.
+
+    The geometry is reused when *contacts* already has it, so relabelling
+    with other thresholds is cheap; *recompute* measures it again.
+    """
+    if contacts.geometry is None or recompute:
+        contacts.geometry = _contact_geometry(A, B, contacts, radius=radius, tol=tol)
+    thresholds = dict(
+        crossing_min_deg=crossing_min_deg,
+        parallel_max_deg=parallel_max_deg,
+        flank_max=flank_max,
+        tip_min=tip_min,
+        tube_min=tube_min,
+        blob_max=blob_max,
+    )
+    contacts.kind = _contact_kinds(contacts.geometry, **thresholds)
+    contacts.meta = dict(contacts.meta, label=dict(thresholds, radius=radius))
+    return contacts
+
+
+def pick_contacts(contacts: ContactSites, keep: np.ndarray) -> ContactSites:
+    """
+    The sites where *keep* (one bool per site) is True, as a new
+    ``ContactSites`` with everything per site carried along — e.g.
+    ``pick_contacts(sites, sites.kind == "crossing")`` for
+    ``sk.plot.view_contacts``.
+    """
+    return _subset_contact_sites(contacts, keep)
+
+
 # ------------------------ stats & filters -------------------------------
 
 
@@ -1595,6 +1970,10 @@ def _subset_contact_sites(
         stats_B = {k: np.asarray(v)[idx] for k, v in contacts.stats_B.items()}
     if contacts.stats_pair is not None:
         stats_pair = {k: np.asarray(v)[idx] for k, v in contacts.stats_pair.items()}
+    kind = None if contacts.kind is None else np.asarray(contacts.kind)[idx]
+    geometry = None
+    if contacts.geometry is not None:
+        geometry = {k: np.asarray(v)[idx] for k, v in contacts.geometry.items()}
 
     # Meta: shallow copy, add filter info and remap seed_to_patch if present
     meta = dict(contacts.meta)
@@ -1624,6 +2003,8 @@ def _subset_contact_sites(
         stats_A=stats_A,
         stats_B=stats_B,
         stats_pair=stats_pair,
+        kind=kind,
+        geometry=geometry,
     )
 
 

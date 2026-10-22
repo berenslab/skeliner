@@ -1049,6 +1049,84 @@ fn ray_hits<'py>(
     Ok(Array1::from(hits).into_pyarray(py))
 }
 
+/// Which faces of one mesh touch another: per face, the other mesh's
+/// triangle closest to its `center` — of several equally close (meeting at
+/// the closest point), the one whose normal most opposes the face's, then
+/// the lowest index — kept when it lies within `tol` and `dot <= max_dot`.
+/// Returns `(faces, other_faces, distances)` for the faces kept.
+/// `triangles` are the other mesh's `(G, 3, 3)` flattened to `(G, 9)`.
+#[pyfunction]
+#[allow(clippy::type_complexity)]
+fn contact_faces<'py>(
+    py: Python<'py>,
+    centers: PyReadonlyArray2<'py, f64>,
+    normals: PyReadonlyArray2<'py, f64>,
+    triangles: PyReadonlyArray2<'py, f64>,
+    other_normals: PyReadonlyArray2<'py, f64>,
+    tol: f64,
+    max_dot: f64,
+) -> PyResult<(
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<f64>>,
+)> {
+    let centers = rows3("C", &centers)?;
+    let normals = rows3("N", &normals)?;
+    if normals.len() != centers.len() {
+        return Err(PyValueError::new_err("one normal per face"));
+    }
+    let t = triangles.as_array();
+    if t.ncols() != 9 {
+        return Err(PyValueError::new_err("triangles must be (G, 9)"));
+    }
+    let tris: Vec<[[f64; 3]; 3]> = t
+        .rows()
+        .into_iter()
+        .map(|r| [[r[0], r[1], r[2]], [r[3], r[4], r[5]], [r[6], r[7], r[8]]])
+        .collect();
+    let other_normals = rows3("M", &other_normals)?;
+    if other_normals.len() != tris.len() {
+        return Err(PyValueError::new_err("one normal per triangle"));
+    }
+    let found: Vec<Option<(usize, f64)>> = py.detach(|| {
+        use rayon::prelude::*;
+        let bvh = meshcore::ray::TriangleBvh::new(tris, other_normals);
+        centers
+            .par_iter()
+            .zip(normals.par_iter())
+            .map(|(&c, &n)| {
+                let (_, d2) = bvh.closest_within(c, tol)?;
+                let dot = |t: usize| {
+                    let m = bvh.normal(t);
+                    n[0] * m[0] + n[1] * m[1] + n[2] * m[2]
+                };
+                // the triangles that share the closest distance, rounding aside
+                let tied = d2 + 1e-8;
+                let (best_dot, best) = bvh
+                    .within(c, tied.sqrt())
+                    .into_iter()
+                    .filter(|&(_, e2)| e2 <= tied)
+                    .map(|(t, _)| (dot(t), t))
+                    .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))?;
+                (best_dot <= max_dot).then_some((best, d2.sqrt()))
+            })
+            .collect()
+    });
+    let (mut faces, mut others, mut dist) = (Vec::new(), Vec::new(), Vec::new());
+    for (f, hit) in found.into_iter().enumerate() {
+        if let Some((t, d)) = hit {
+            faces.push(f as i64);
+            others.push(t as i64);
+            dist.push(d);
+        }
+    }
+    Ok((
+        Array1::from(faces).into_pyarray(py),
+        Array1::from(others).into_pyarray(py),
+        Array1::from(dist).into_pyarray(py),
+    ))
+}
+
 /// `skeliner.dx.distance` in centreline mode against a whitelist: per point,
 /// the distance to the nearest of the `centres` (node ids) or of the
 /// `segments` (node-id pairs), each computed as `_point_segment_distance`
@@ -1991,6 +2069,7 @@ fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(skeleton_nodes, m)?)?;
     m.add_function(wrap_pyfunction!(rebin_chains, m)?)?;
     m.add_function(wrap_pyfunction!(ray_hits, m)?)?;
+    m.add_function(wrap_pyfunction!(contact_faces, m)?)?;
     m.add_function(wrap_pyfunction!(segment_distances, m)?)?;
     Ok(())
 }

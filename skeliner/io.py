@@ -1001,12 +1001,15 @@ def save_contact_sites_npz(res, path: str | Path, *, compress: bool = True) -> N
         bbox_B=np.asarray(res.bbox_B, np.float64),
         bbox=np.asarray(res.bbox, np.float64),
         meta_json=_json_encode_meta(res.meta),
-        _schema=np.array("ContactSitesResult@2", dtype="U"),
+        _schema=np.array("ContactSitesResult@3", dtype="U"),
     )
+    if getattr(res, "kind", None) is not None:
+        payload["kind"] = np.asarray(res.kind, dtype="U")
     # Optional stats: flattened into many arrays with explicit key list per group
     _save_stats_to_payload(getattr(res, "stats_A", None), "stats_A", payload)
     _save_stats_to_payload(getattr(res, "stats_B", None), "stats_B", payload)
     _save_stats_to_payload(getattr(res, "stats_pair", None), "stats_pair", payload)
+    _save_stats_to_payload(getattr(res, "geometry", None), "geometry", payload)
     if compress:
         np.savez_compressed(path, **payload)
     else:
@@ -1035,6 +1038,8 @@ def load_contact_sites_npz(path: str | Path):
         stats_A = _load_stats_from_npz(z, "stats_A")
         stats_B = _load_stats_from_npz(z, "stats_B")
         stats_pair = _load_stats_from_npz(z, "stats_pair")
+        geometry = _load_stats_from_npz(z, "geometry")
+        kind = z["kind"].astype(str) if "kind" in z else None
 
         if stats_A is None and isinstance(meta.get("stats_A"), dict):
             stats_A = {k: np.asarray(v, np.float64) for k, v in meta["stats_A"].items()}
@@ -1067,6 +1072,8 @@ def load_contact_sites_npz(path: str | Path):
             stats_A=stats_A,
             stats_B=stats_B,
             stats_pair=stats_pair,
+            kind=kind,
+            geometry=geometry,
         )
 
 

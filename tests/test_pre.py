@@ -586,6 +586,44 @@ class TestRemoveGaps:
         # pieces glued at the rim share a few vertices; that alone is fine
         assert pre._validate_loop_pair([1, 2, 3, 4, 5], [4, 5, 6, 7, 8]) is None
 
+    def test_tips_side_by_side_are_filled_not_tubed(self):
+        # Two tips on one surface whose rims share vertices: they are glued
+        # along those vertices (a fusion join).  A tube from rim to rim
+        # would fold over the glue; removing both and closing the one hole
+        # they leave keeps the surface manifold.
+        from skeliner import _rs
+
+        mesh = _subdivided_tube()
+        topo = _rs.Topology(np.asarray(mesh.faces, np.int64), len(mesh.vertices))
+        centre_z = mesh.vertices[mesh.faces].mean(axis=1)[:, 2]
+        fa = [int(np.argmin(np.abs(centre_z)))]
+        sel_a, rim_a = pre._expand_tip_to_good_rim(fa, topo, None)
+        # a second tip three faces away grows a patch beside the first
+        adj = pre._face_adjacency(mesh)
+        ring, seen = set(fa), set(fa)
+        for _ in range(3):
+            ring = {g for f in ring for g in adj[f]} - seen
+            seen |= ring
+        for f in sorted(ring):
+            sel_b, rim_b = pre._expand_tip_to_good_rim([f], topo, None)
+            if len(set(rim_a) & set(rim_b)) >= 2 and not sel_a & sel_b:
+                fb = [f]
+                break
+        else:
+            pytest.fail("no side-by-side tip on the fixture")
+        out = pre.remove_gaps(mesh, gaps=[(fa, fb, 1.0, -1, 0)])
+
+        def edge_uses(m):
+            f = np.asarray(m.faces)
+            f = np.sort(f[_non_degenerate(f)], axis=1)
+            e = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [0, 2]]])
+            return np.unique(e, axis=0, return_counts=True)[1]
+
+        assert _live_faces(out) != _live_faces(mesh)
+        assert len(out.vertices) == len(mesh.vertices) + 1  # the fan's centre
+        assert (edge_uses(out) <= 2).all()
+        assert (edge_uses(out) == 1).sum() == (edge_uses(mesh) == 1).sum()
+
     def test_tips_that_grow_onto_the_same_rim_are_not_stitched(self):
         # Both sides of a gap end on one rim when the pieces are still glued
         # together; stitching it to itself would fold a zero-length tube of

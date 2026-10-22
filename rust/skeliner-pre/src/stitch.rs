@@ -426,13 +426,14 @@ fn zipper_stitch<E>(
     Ok(tris)
 }
 
-/// `_stitch_and_rebuild`: the faces of `sel` become `[0, 0, 0]` and each
-/// loop pair's tube is appended.  Returns the new vertices (to append) and
-/// the full face list.
+/// `_stitch_and_rebuild`: the faces of `sel` become `[0, 0, 0]`, each loop
+/// pair's tube is appended, and each loop of `fills` is closed with a fan.
+/// Returns the new vertices (to append) and the full face list.
 pub fn stitch_and_rebuild<E>(
     m: &StitchMesh<'_>,
     sel: &BTreeSet<u32>,
     pairs: &[(Vec<u32>, Vec<u32>)],
+    fills: &[Vec<u32>],
     fit: &mut impl FnMut(&[u32]) -> Result<LoopFit, E>,
 ) -> Result<(Vec<V3>, Vec<[u32; 3]>), E> {
     let mut vert_to_faces: Vec<Vec<u32>> = vec![Vec::new(); m.verts.len()];
@@ -456,12 +457,61 @@ pub fn stitch_and_rebuild<E>(
             fit,
         )?);
     }
+    for lp in fills {
+        stitched.extend(fan_fill(m, lp, &vert_to_faces, &mut new_verts));
+    }
     let mut faces = m.faces.to_vec();
     for &f in sel {
         faces[f as usize] = [0, 0, 0];
     }
     faces.extend(stitched);
     Ok((new_verts, faces))
+}
+
+/// Close the hole bounded by `lp` with a fan from its centroid, wound so
+/// that every border edge runs against the kept face beside it.
+/// `vert_to_faces` lists the kept faces at each vertex.
+fn fan_fill(
+    m: &StitchMesh<'_>,
+    lp: &[u32],
+    vert_to_faces: &[Vec<u32>],
+    new_verts: &mut Vec<V3>,
+) -> Vec<[u32; 3]> {
+    let n = lp.len();
+    let (mut along, mut against) = (0usize, 0usize);
+    for i in 0..n {
+        let (u, v) = (lp[i], lp[(i + 1) % n]);
+        for &f in &vert_to_faces[u as usize] {
+            let t = m.faces[f as usize];
+            for k in 0..3 {
+                let e = (t[k], t[(k + 1) % 3]);
+                along += (e == (u, v)) as usize;
+                against += (e == (v, u)) as usize;
+            }
+        }
+    }
+    let ring: Vec<u32> = if along >= against {
+        lp.iter().rev().copied().collect()
+    } else {
+        lp.to_vec()
+    };
+    let mut c = [0.0; 3];
+    for &v in lp {
+        let q = m.verts[v as usize];
+        c = [c[0] + q[0], c[1] + q[1], c[2] + q[2]];
+    }
+    let centre = (m.verts.len() + new_verts.len()) as u32;
+    new_verts.push(c.map(|x| x / n as f64));
+    (0..n)
+        .map(|i| [ring[i], ring[(i + 1) % n], centre])
+        .collect()
+}
+
+fn vertex_set(l: &[u32]) -> Vec<u32> {
+    let mut s = l.to_vec();
+    s.sort_unstable();
+    s.dedup();
+    s
 }
 
 /// One gap as `find_gaps` reports it: the tip faces on each side.
@@ -491,18 +541,18 @@ fn loop_pair_ok(a: &[u32], b: &[u32]) -> bool {
     if (na.max(nb) as f64 / na.min(nb) as f64) > 5.0 {
         return false;
     }
-    let vertex_set = |l: &[u32]| {
-        let mut s = l.to_vec();
-        s.sort_unstable();
-        s.dedup();
-        s
-    };
     vertex_set(a) != vertex_set(b)
 }
 
 /// `skeliner.pre.remove_gaps` once the gaps are known: per gap, peel both
 /// tips to clean rims, skip pairs that fail validation or whose removal
 /// would strand more than the stitch wins back, then stitch and rebuild.
+///
+/// Rims that share two or more vertices belong to tips lying side by side,
+/// glued along those vertices (a fusion join); a tube from rim to rim would
+/// weld both of its ends onto the glue and fold over it. Such a gap is
+/// bridged by removing both tips and closing the one hole they leave with a
+/// fan — or skipped when their union does not leave exactly one hole.
 ///
 /// `labels` are the raw face-edge components the rescue sizes are read
 /// from, computed here on first need when not given.
@@ -517,6 +567,7 @@ pub fn remove_gaps<E>(
     let mut counts: Option<HashMap<i64, usize>> = None;
     let mut remove: BTreeSet<u32> = BTreeSet::new();
     let mut pairs: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
+    let mut fills: Vec<Vec<u32>> = Vec::new();
     let mut n_skipped = 0;
     for g in gaps {
         let (sel_a, loop_a) = expand_tip_to_good_rim(topo, &g.faces_a, 6, 20, 30);
@@ -525,6 +576,25 @@ pub fn remove_gaps<E>(
             n_skipped += 1;
             continue;
         };
+        let (set_a, set_b) = (vertex_set(&loop_a), vertex_set(&loop_b));
+        let shared = set_a
+            .iter()
+            .filter(|v| set_b.binary_search(v).is_ok())
+            .count();
+        if shared >= 2 && set_a != set_b {
+            let union: Vec<u32> = sel_a.union(&sel_b).copied().collect();
+            let holes: Vec<Vec<u32>> = border_loops(topo, &union)
+                .into_iter()
+                .filter(|lp| lp.len() >= 3)
+                .collect();
+            if let [hole] = holes.as_slice() {
+                fills.push(hole.clone());
+                remove.extend(union);
+            } else {
+                n_skipped += 1;
+            }
+            continue;
+        }
         if !loop_pair_ok(&loop_a, &loop_b) {
             n_skipped += 1;
             continue;
@@ -563,7 +633,7 @@ pub fn remove_gaps<E>(
         remove.extend(sel_a);
         remove.extend(sel_b);
     }
-    if pairs.is_empty() {
+    if pairs.is_empty() && fills.is_empty() {
         return Ok(GapsRemoved {
             new_verts: Vec::new(),
             faces: None,
@@ -572,11 +642,11 @@ pub fn remove_gaps<E>(
             n_skipped,
         });
     }
-    let (new_verts, faces) = stitch_and_rebuild(m, &remove, &pairs, fit)?;
+    let (new_verts, faces) = stitch_and_rebuild(m, &remove, &pairs, &fills, fit)?;
     Ok(GapsRemoved {
         new_verts,
         faces: Some(faces),
-        n_bridged: pairs.len(),
+        n_bridged: pairs.len() + fills.len(),
         n_removed: remove.len(),
         n_skipped,
     })
@@ -596,6 +666,84 @@ mod tests {
             interp(&[-1.0, 0.5, 1.0, 2.0, 3.0, 4.0], &xp, &fp),
             vec![0.0, 5.0, 20.0, 30.0, 40.0, 40.0]
         );
+    }
+
+    #[test]
+    fn a_fan_closes_a_hole_against_the_faces_around_it() {
+        // a 3 x 3 grid of squares in z = 0, wound counter-clockwise, its
+        // middle square removed
+        let vid = |i: u32, j: u32| j * 4 + i;
+        let verts: Vec<V3> = (0..16)
+            .map(|k| [(k % 4) as f64, (k / 4) as f64, 0.0])
+            .collect();
+        let mut faces = Vec::new();
+        for j in 0..3 {
+            for i in 0..3 {
+                let (a, b, c, d) = (vid(i, j), vid(i + 1, j), vid(i + 1, j + 1), vid(i, j + 1));
+                faces.push([a, b, c]);
+                faces.push([a, c, d]);
+            }
+        }
+        let normals = vec![[0.0, 0.0, 1.0]; faces.len()];
+        let m = StitchMesh {
+            faces: &faces,
+            verts: &verts,
+            face_normals: &normals,
+            median_edge: 1.0,
+        };
+        let removed: BTreeSet<u32> = [8, 9].into_iter().collect();
+        let mut vert_to_faces = vec![Vec::new(); verts.len()];
+        for (fi, f) in faces.iter().enumerate() {
+            if !removed.contains(&(fi as u32)) {
+                for &v in f {
+                    vert_to_faces[v as usize].push(fi as u32);
+                }
+            }
+        }
+        // the hole's border, walked either way round
+        let hole = [vid(1, 1), vid(1, 2), vid(2, 2), vid(2, 1)];
+        let mut reversed = hole;
+        reversed.reverse();
+        let mut other = Vec::new();
+        let flipped = fan_fill(&m, &reversed, &vert_to_faces, &mut other);
+        let mut new_verts = Vec::new();
+        let fan = fan_fill(&m, &hole, &vert_to_faces, &mut new_verts);
+        let directed = |f: &[[u32; 3]]| -> BTreeSet<(u32, u32)> {
+            f.iter()
+                .flat_map(|t| (0..3).map(move |k| (t[k], t[(k + 1) % 3])))
+                .collect()
+        };
+        assert_eq!(
+            directed(&flipped),
+            directed(&fan),
+            "the same winding either way"
+        );
+        assert_eq!(new_verts, vec![[1.5, 1.5, 0.0]]);
+        assert_eq!(fan.len(), 4);
+        let mut uses: HashMap<(u32, u32), usize> = HashMap::new();
+        for (fi, f) in faces.iter().enumerate() {
+            if removed.contains(&(fi as u32)) {
+                continue;
+            }
+            for k in 0..3 {
+                *uses.entry((f[k], f[(k + 1) % 3])).or_insert(0) += 1;
+            }
+        }
+        for f in &fan {
+            for k in 0..3 {
+                *uses.entry((f[k], f[(k + 1) % 3])).or_insert(0) += 1;
+            }
+        }
+        // every directed edge once: the patch is consistently wound, and
+        // each border edge has its kept face and its fan face
+        assert!(uses.values().all(|&n| n == 1), "{uses:?}");
+        for i in 0..4 {
+            let (u, v) = (hole[i], hole[(i + 1) % 4]);
+            assert_eq!(
+                uses.get(&(u, v)).copied().unwrap_or(0) + uses.get(&(v, u)).copied().unwrap_or(0),
+                2
+            );
+        }
     }
 
     #[test]

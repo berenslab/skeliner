@@ -1125,6 +1125,11 @@ class ContactSites:
     stats_A: dict[str, np.ndarray] | None = None
     stats_B: dict[str, np.ndarray] | None = None
     stats_pair: dict[str, np.ndarray] | None = None
+    # what kind of contact each site is ("crossing", "parallel", "tip",
+    # "blob", "other") and the branch geometry that says so; set by
+    # `skeliner.pair.label_contacts`, None until then
+    kind: np.ndarray | None = None
+    geometry: dict[str, np.ndarray] | None = None
 
     def to_npz(self, path: str | Path, *, compress: bool = True) -> None:
         from .io import save_contact_sites_npz
