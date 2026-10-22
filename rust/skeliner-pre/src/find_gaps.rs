@@ -216,10 +216,12 @@ pub fn find_gaps(
             .as_ref()
             .filter(|_| !coords.is_empty())
             .map(|t| {
-                coords
-                    .par_iter()
-                    .map(|p| t.nearest(p).expect("non-empty").1)
-                    .collect()
+                crate::threads::install(|| {
+                    coords
+                        .par_iter()
+                        .map(|p| t.nearest(p).expect("non-empty").1)
+                        .collect()
+                })
             });
         let bbox = if coords.is_empty() {
             0.0
@@ -264,11 +266,12 @@ pub fn find_gaps(
     for (i, &cid_a) in all_cids.iter().enumerate() {
         for &cid_b in &all_cids[i + 1..] {
             let (da, db) = (&comps[&cid_a], &comps[&cid_b]);
-            let found: Vec<(u32, f64)> = da
-                .coords
-                .par_iter()
-                .map(|p| db.tree.nearest(p).expect("non-empty"))
-                .collect();
+            let found: Vec<(u32, f64)> = crate::threads::install(|| {
+                da.coords
+                    .par_iter()
+                    .map(|p| db.tree.nearest(p).expect("non-empty"))
+                    .collect()
+            });
             let first_min = |valid: &dyn Fn(usize) -> bool| {
                 let mut best: Option<(usize, f64)> = None;
                 for (k, &(_, d)) in found.iter().enumerate() {

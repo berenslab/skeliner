@@ -16,3 +16,4 @@ pub mod skeleton;
 pub mod soma;
 pub mod stats;
 pub mod stitch;
+pub mod threads;

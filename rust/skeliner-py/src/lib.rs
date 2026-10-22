@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use numpy::ndarray::{Array1, Array2};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2};
-use pyo3::exceptions::{PyKeyError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyIterator, PyList, PyTuple};
 
@@ -1045,10 +1045,12 @@ fn ray_hits<'py>(
     let hits: Vec<bool> = py.detach(|| {
         use rayon::prelude::*;
         let bvh = meshcore::ray::TriangleBvh::new(tris, normals);
-        o.par_iter()
-            .zip(d.par_iter())
-            .map(|(&o, &d)| bvh.any_hit(o, d))
-            .collect()
+        skeliner_pre::threads::install(|| {
+            o.par_iter()
+                .zip(d.par_iter())
+                .map(|(&o, &d)| bvh.any_hit(o, d))
+                .collect()
+        })
     });
     Ok(Array1::from(hits).into_pyarray(py))
 }
@@ -1100,15 +1102,17 @@ impl PyTriangleBvh {
         }
         let dist: Vec<f64> = py.detach(|| {
             use rayon::prelude::*;
-            (0..o.len())
-                .into_par_iter()
-                .map(|k| {
-                    let s = usize::try_from(skip[k]).ok();
-                    self.inner
-                        .first_hit(o[k], d[k], min_t, s)
-                        .map_or(f64::NAN, |(_, h)| h)
-                })
-                .collect()
+            skeliner_pre::threads::install(|| {
+                (0..o.len())
+                    .into_par_iter()
+                    .map(|k| {
+                        let s = usize::try_from(skip[k]).ok();
+                        self.inner
+                            .first_hit(o[k], d[k], min_t, s)
+                            .map_or(f64::NAN, |(_, h)| h)
+                    })
+                    .collect()
+            })
         });
         Ok(Array1::from(dist).into_pyarray(py))
     }
@@ -1148,26 +1152,28 @@ fn contact_faces<'py>(
     let found: Vec<Option<(usize, f64)>> = py.detach(|| {
         use rayon::prelude::*;
         let bvh = meshcore::ray::TriangleBvh::new(tris, other_normals);
-        centers
-            .par_iter()
-            .zip(normals.par_iter())
-            .map(|(&c, &n)| {
-                let (_, d2) = bvh.closest_within(c, tol)?;
-                let dot = |t: usize| {
-                    let m = bvh.normal(t);
-                    n[0] * m[0] + n[1] * m[1] + n[2] * m[2]
-                };
-                // the triangles that share the closest distance, rounding aside
-                let tied = d2 + 1e-8;
-                let (best_dot, best) = bvh
-                    .within(c, tied.sqrt())
-                    .into_iter()
-                    .filter(|&(_, e2)| e2 <= tied)
-                    .map(|(t, _)| (dot(t), t))
-                    .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))?;
-                (best_dot <= max_dot).then_some((best, d2.sqrt()))
-            })
-            .collect()
+        skeliner_pre::threads::install(|| {
+            centers
+                .par_iter()
+                .zip(normals.par_iter())
+                .map(|(&c, &n)| {
+                    let (_, d2) = bvh.closest_within(c, tol)?;
+                    let dot = |t: usize| {
+                        let m = bvh.normal(t);
+                        n[0] * m[0] + n[1] * m[1] + n[2] * m[2]
+                    };
+                    // the triangles that share the closest distance, rounding aside
+                    let tied = d2 + 1e-8;
+                    let (best_dot, best) = bvh
+                        .within(c, tied.sqrt())
+                        .into_iter()
+                        .filter(|&(_, e2)| e2 <= tied)
+                        .map(|(t, _)| (dot(t), t))
+                        .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))?;
+                    (best_dot <= max_dot).then_some((best, d2.sqrt()))
+                })
+                .collect()
+        })
     });
     let (mut faces, mut others, mut dist) = (Vec::new(), Vec::new(), Vec::new());
     for (f, hit) in found.into_iter().enumerate() {
@@ -2098,6 +2104,31 @@ impl PyZScan {
     }
 }
 
+/// Run skeliner's parallel loops on a pool of `n` threads from now on, or
+/// on rayon's global pool again with `None` (all cores, or
+/// `RAYON_NUM_THREADS`).
+#[pyfunction]
+#[pyo3(signature = (n=None))]
+fn set_threads(n: Option<usize>) -> PyResult<()> {
+    let n = match n {
+        Some(0) => return Err(PyValueError::new_err("threads must be at least 1")),
+        n => n.and_then(std::num::NonZeroUsize::new),
+    };
+    skeliner_pre::threads::set(n).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
+/// The pool size `set_threads` chose, or None for rayon's global pool.
+#[pyfunction]
+fn thread_override() -> Option<usize> {
+    skeliner_pre::threads::chosen()
+}
+
+/// How many threads skeliner's next parallel loop runs on.
+#[pyfunction]
+fn current_threads() -> usize {
+    skeliner_pre::threads::current()
+}
+
 #[pymodule]
 fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTopology>()?;
@@ -2129,5 +2160,8 @@ fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ray_hits, m)?)?;
     m.add_function(wrap_pyfunction!(contact_faces, m)?)?;
     m.add_function(wrap_pyfunction!(segment_distances, m)?)?;
+    m.add_function(wrap_pyfunction!(set_threads, m)?)?;
+    m.add_function(wrap_pyfunction!(thread_override, m)?)?;
+    m.add_function(wrap_pyfunction!(current_threads, m)?)?;
     Ok(())
 }

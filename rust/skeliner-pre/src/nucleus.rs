@@ -260,35 +260,36 @@ impl ZScan {
             arange(zmin + Z_STEP, zmax - Z_STEP, Z_STEP)
         };
         let xy: Vec<[f64; 2]> = verts.iter().map(|v| [v[0], v[1]]).collect();
-        let (levels, has_slab): (Vec<Level>, Vec<bool>) = zs
-            .par_iter()
-            .map(|&z| {
-                let vi: Vec<u32> = (0..verts.len() as u32)
-                    .filter(|&v| (verts[v as usize][2] - z).abs() < p.z_tol)
-                    .collect();
-                let pts: Vec<[f64; 2]> = vi.iter().map(|&v| xy[v as usize]).collect();
-                let mut level = Level {
-                    z,
-                    cx: f64::NAN,
-                    cy: f64::NAN,
-                    void_r: 0.0,
-                    void_xy: None,
-                    vi,
-                    soma_mask: None,
-                };
-                let Some((slab, region)) = rasterise(&pts, p.grid_res) else {
-                    return (level, false);
-                };
-                level.soma_mask = Some(slab.cell.iter().map(|&c| region[c]).collect());
-                if let Some(v) = slice_void(&slab, &region, p.grid_res) {
-                    level.cx = v.cx;
-                    level.cy = v.cy;
-                    level.void_r = v.void_r;
-                    level.void_xy = v.void_xy;
-                }
-                (level, true)
-            })
-            .unzip();
+        let (levels, has_slab): (Vec<Level>, Vec<bool>) = crate::threads::install(|| {
+            zs.par_iter()
+                .map(|&z| {
+                    let vi: Vec<u32> = (0..verts.len() as u32)
+                        .filter(|&v| (verts[v as usize][2] - z).abs() < p.z_tol)
+                        .collect();
+                    let pts: Vec<[f64; 2]> = vi.iter().map(|&v| xy[v as usize]).collect();
+                    let mut level = Level {
+                        z,
+                        cx: f64::NAN,
+                        cy: f64::NAN,
+                        void_r: 0.0,
+                        void_xy: None,
+                        vi,
+                        soma_mask: None,
+                    };
+                    let Some((slab, region)) = rasterise(&pts, p.grid_res) else {
+                        return (level, false);
+                    };
+                    level.soma_mask = Some(slab.cell.iter().map(|&c| region[c]).collect());
+                    if let Some(v) = slice_void(&slab, &region, p.grid_res) {
+                        level.cx = v.cx;
+                        level.cy = v.cy;
+                        level.void_r = v.void_r;
+                        level.void_xy = v.void_xy;
+                    }
+                    (level, true)
+                })
+                .unzip()
+        });
         let best = longest_chain(&levels, &p);
         ZScan {
             levels,
@@ -345,16 +346,17 @@ impl ZScan {
                 !(l.void_r >= p.min_void_r && !l.cx.is_nan())
             })
             .collect();
-        let found: Vec<(usize, Void, Vec<bool>)> = todo
-            .par_iter()
-            .filter_map(|&i| {
-                let hull = if i < lo { hull_lo } else { hull_hi }?;
-                let l = &self.levels[i];
-                let pts: Vec<[f64; 2]> = l.vi.iter().map(|&v| self.xy[v as usize]).collect();
-                let (slab, _) = rasterise(&pts, p.grid_res)?;
-                hull_guided_void(&slab, hull, p.grid_res).map(|(v, m)| (i, v, m))
-            })
-            .collect();
+        let (levels, xy) = (&self.levels, &self.xy);
+        let found: Vec<(usize, Void, Vec<bool>)> = crate::threads::install(|| {
+            todo.par_iter()
+                .filter_map(|&i| {
+                    let hull = if i < lo { hull_lo } else { hull_hi }?;
+                    let pts: Vec<[f64; 2]> = levels[i].vi.iter().map(|&v| xy[v as usize]).collect();
+                    let (slab, _) = rasterise(&pts, p.grid_res)?;
+                    hull_guided_void(&slab, hull, p.grid_res).map(|(v, m)| (i, v, m))
+                })
+                .collect()
+        });
         for (i, v, mask) in found {
             let l = &mut self.levels[i];
             l.cx = v.cx;

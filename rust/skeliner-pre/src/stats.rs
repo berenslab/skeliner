@@ -81,13 +81,15 @@ pub fn outward_dots(
             continue;
         }
         let tree = KdTree::new(members.iter().map(|&v| verts[v]).collect(), Sum::Plain);
-        let dots: Vec<f64> = face_ids
-            .par_iter()
-            .map(|&fi| {
-                let near = tree.within(&centers[fi], radius);
-                face_dot(&centers[fi], &normals[fi], tree.points(), &near)
-            })
-            .collect();
+        let dots: Vec<f64> = crate::threads::install(|| {
+            face_ids
+                .par_iter()
+                .map(|&fi| {
+                    let near = tree.within(&centers[fi], radius);
+                    face_dot(&centers[fi], &normals[fi], tree.points(), &near)
+                })
+                .collect()
+        });
         for (&fi, d) in face_ids.iter().zip(dots) {
             out[fi] = d;
         }
