@@ -344,7 +344,6 @@ def _create_app(
         "buffers": None,  # JSON-serialisable mesh data
         "path": None,  # source file path
         "centroid": np.zeros(3, dtype=np.float32),
-        "offsets": None,  # cached from detect_offsets
         "mesh_stats": None,  # cached from compute_mesh_stats
         "organelles": None,  # dict(pocket, isolated, expanded) bool masks, or None
         "fusion_clusters": None,  # cached from detect_fusions
@@ -1201,204 +1200,6 @@ def _create_app(
         state_path.write_text(json.dumps(current, indent=2), encoding="utf-8")
         return JSONResponse({"ok": True})
 
-    async def detect_offsets(_request):
-        """Run offset detection and write results to annotations."""
-        if mesh_state["mesh"] is None:
-            return JSONResponse(
-                {"ok": False, "error": "No mesh loaded"}, status_code=400
-            )
-
-        from skeliner.pre import find_offsets
-
-        mesh = mesh_state["mesh"]
-        await _log("[skeliner.pre] Detecting offsets...")
-        offsets = await _run_with_log(find_offsets, mesh, verbose=True)
-        mesh_state["offsets"] = offsets
-
-        if not offsets:
-            await _log("[skeliner.pre] No offsets found")
-            return JSONResponse({"ok": True, "nOffsets": 0})
-
-        ann = {}
-        if annotations_path.exists():
-            ann = json.loads(annotations_path.read_text(encoding="utf-8"))
-        if "highlights" not in ann:
-            ann["highlights"] = []
-        if "edge_groups" not in ann:
-            ann["edge_groups"] = []
-
-        # Clear previous offset annotations
-        ann["highlights"] = [
-            h for h in ann["highlights"] if not h.get("label", "").startswith("offset ")
-        ]
-        ann["edge_groups"] = [
-            eg
-            for eg in ann["edge_groups"]
-            if not eg.get("label", "").startswith("offset ")
-        ]
-
-        colors = [
-            [1.0, 0.3, 0.3],
-            [0.3, 1.0, 0.3],
-            [0.3, 0.3, 1.0],
-            [1.0, 1.0, 0.3],
-            [1.0, 0.3, 1.0],
-            [0.3, 1.0, 1.0],
-        ]
-
-        for i, o in enumerate(offsets):
-            dx, dy = o["offset"]
-            color = colors[i % len(colors)]
-            ann["highlights"].append(
-                {
-                    "faces": o["cap_faces"].tolist(),
-                    "color": color,
-                    "label": (
-                        f"offset {i}: z={o['z_floor']:.0f}→{o['z_ceil']:.0f} "
-                        f"d=({dx:.0f},{dy:.0f}) "
-                        f"err={o['match_error']:.0f} "
-                        f"{len(o['shifted_verts']):,}v"
-                    ),
-                }
-            )
-
-            # Add a direction vector: red (floor) → green (ceil)
-            # Coordinates must be centroid-relative for the viewer
-            centroid = mesh_state["centroid"]
-            start = (o["floor_center"] - centroid).tolist()
-            end = (o["ceil_center"] - centroid).tolist()
-            midpt = [(s + e) / 2 for s, e in zip(start, end)]
-            ann["edge_groups"].append(
-                {
-                    "segments": [[start, midpt]],
-                    "color": [1.0, 0.2, 0.2],
-                    "label": f"offset {i} from",
-                }
-            )
-            ann["edge_groups"].append(
-                {
-                    "segments": [[midpt, end]],
-                    "color": [0.2, 1.0, 0.2],
-                    "label": f"offset {i} to",
-                }
-            )
-
-        annotations_path.write_text(json.dumps(ann), encoding="utf-8")
-        return JSONResponse({"ok": True, "nOffsets": len(offsets)})
-
-    async def do_remove_offsets(_request):
-        """Remove detected offsets from the mesh."""
-        if mesh_state["mesh"] is None:
-            return JSONResponse(
-                {"ok": False, "error": "No mesh loaded"}, status_code=400
-            )
-
-        from skeliner.pre import remove_offsets
-
-        mesh = mesh_state["mesh"]
-        cached = mesh_state.get("offsets")
-        ms = mesh_state.get("mesh_stats")
-
-        def _do_remove():
-            return remove_offsets(mesh, offsets=cached, verbose=True, mesh_stats=ms)
-
-        new_mesh = await _run_with_log(_do_remove)
-        await _apply_new_mesh(new_mesh)
-
-        # Clear cached offsets; mesh_stats invalidated in-place by remove_offsets
-        mesh_state["offsets"] = None
-
-        return JSONResponse({"ok": True})
-
-    async def save_offsets(_request):
-        """Save detected offsets to a file."""
-        cached = mesh_state.get("offsets")
-        if not cached:
-            return JSONResponse(
-                {"ok": False, "error": "No offsets detected"}, status_code=400
-            )
-        import pickle
-
-        save_path = port_dir / "offsets.pkl"
-        with open(save_path, "wb") as f:
-            pickle.dump(cached, f)
-        return JSONResponse({"ok": True, "path": str(save_path), "n": len(cached)})
-
-    async def load_offsets(_request):
-        """Load previously saved offsets and apply annotations."""
-        import pickle
-
-        save_path = port_dir / "offsets.pkl"
-        if not save_path.exists():
-            return JSONResponse(
-                {"ok": False, "error": "No saved offsets found"}, status_code=404
-            )
-        with open(save_path, "rb") as f:
-            offsets = pickle.load(f)
-        mesh_state["offsets"] = offsets
-
-        # Rebuild annotations
-        ann = {}
-        if annotations_path.exists():
-            ann = json.loads(annotations_path.read_text(encoding="utf-8"))
-        if "highlights" not in ann:
-            ann["highlights"] = []
-        if "edge_groups" not in ann:
-            ann["edge_groups"] = []
-        ann["highlights"] = [
-            h for h in ann["highlights"] if not h.get("label", "").startswith("offset ")
-        ]
-        ann["edge_groups"] = [
-            eg
-            for eg in ann["edge_groups"]
-            if not eg.get("label", "").startswith("offset ")
-        ]
-
-        colors = [
-            [1.0, 0.3, 0.3],
-            [0.3, 1.0, 0.3],
-            [0.3, 0.3, 1.0],
-            [1.0, 1.0, 0.3],
-            [1.0, 0.3, 1.0],
-            [0.3, 1.0, 1.0],
-        ]
-        centroid = mesh_state["centroid"]
-        for i, o in enumerate(offsets):
-            dx, dy = o["offset"]
-            color = colors[i % len(colors)]
-            ann["highlights"].append(
-                {
-                    "faces": o["cap_faces"].tolist(),
-                    "color": color,
-                    "label": (
-                        f"offset {i}: z={o['z_floor']:.0f}→{o['z_ceil']:.0f} "
-                        f"d=({dx:.0f},{dy:.0f}) "
-                        f"err={o['match_error']:.0f} "
-                        f"{len(o['shifted_verts']):,}v"
-                    ),
-                }
-            )
-            start = (o["floor_center"] - centroid).tolist()
-            end = (o["ceil_center"] - centroid).tolist()
-            midpt = [(s + e) / 2 for s, e in zip(start, end)]
-            ann["edge_groups"].append(
-                {
-                    "segments": [[start, midpt]],
-                    "color": [1.0, 0.2, 0.2],
-                    "label": f"offset {i} from",
-                }
-            )
-            ann["edge_groups"].append(
-                {
-                    "segments": [[midpt, end]],
-                    "color": [0.2, 1.0, 0.2],
-                    "label": f"offset {i} to",
-                }
-            )
-
-        annotations_path.write_text(json.dumps(ann), encoding="utf-8")
-        return JSONResponse({"ok": True, "nOffsets": len(offsets)})
-
     async def detect_organelles(request):
         """Run organelle detection."""
         if mesh_state["mesh"] is None:
@@ -2126,63 +1927,6 @@ def _create_app(
                 "nClusters": len(clusters),
             }
         )
-
-    async def detect_rims(_request):
-        """Run rim detection and write results as edge annotations."""
-        if mesh_state["mesh"] is None:
-            return JSONResponse(
-                {"ok": False, "error": "No mesh loaded"}, status_code=400
-            )
-
-        from skeliner.pre import compute_mesh_stats, find_rims
-
-        mesh = mesh_state["mesh"]
-        centroid = mesh_state["centroid"]
-
-        # Reuse cached precomputed data
-        ms = mesh_state.get("mesh_stats")
-        if ms is None or len(ms.outward_dots) != len(mesh.faces):
-            ms = compute_mesh_stats(mesh, None, 5.0, True)
-            mesh_state["mesh_stats"] = ms
-
-        def _run():
-            rims = find_rims(mesh, verbose=True, mesh_stats=ms)
-            verts = np.asarray(mesh.vertices, dtype=np.float32)
-            colors = [
-                [0.2, 1.0, 0.6],
-                [0.1, 0.8, 0.9],
-                [0.9, 1.0, 0.2],
-                [1.0, 0.5, 0.8],
-                [0.5, 1.0, 0.4],
-                [0.3, 0.7, 1.0],
-            ]
-            edge_groups = []
-            for i, rim_edges in enumerate(rims):
-                color = colors[i % len(colors)]
-                segments = []
-                for e in rim_edges:
-                    a = (verts[e[0]] - centroid).tolist()
-                    b = (verts[e[1]] - centroid).tolist()
-                    segments.append([a, b])
-                edge_groups.append(
-                    {
-                        "segments": segments,
-                        "color": color,
-                        "label": f"rim {i}",
-                    }
-                )
-            return edge_groups, len(rims)
-
-        edge_groups, n_rims = await _run_with_log(_run)
-
-        ann = {}
-        if annotations_path.exists():
-            ann = json.loads(annotations_path.read_text(encoding="utf-8"))
-        if "edge_groups" not in ann:
-            ann["edge_groups"] = []
-        ann["edge_groups"].extend(edge_groups)
-        annotations_path.write_text(json.dumps(ann), encoding="utf-8")
-        return JSONResponse({"ok": True, "nFaces": n_rims})
 
     def _clear_annotations(*prefixes: str) -> None:
         """Remove highlight annotations whose label starts with any prefix."""
@@ -4340,8 +4084,7 @@ def _create_app(
         # `arm_pairing` used to ride along here and was removed, because its
         # score is purely directional and cannot tell a 0.8 um binning stub
         # from a 261 um dendrite — so it paired stubs with major arms and
-        # ranked its most destructive proposals highest.  See
-        # `.claude/labbook/2026-08-11-arm-pairing-retracted.md`.
+        # ranked its most destructive proposals highest.
         out = []
         for nid in flagged:
             d = sorted(stats[nid]["distal_cables"], reverse=True)
@@ -5148,10 +4891,6 @@ def _create_app(
             Route("/remove", remove_item, methods=["POST"]),
             Route("/update_state", post_state, methods=["POST"]),
             Route("/update_selection", post_selection, methods=["POST"]),
-            Route("/detect_offsets", detect_offsets, methods=["POST"]),
-            Route("/save_offsets", save_offsets, methods=["POST"]),
-            Route("/load_offsets", load_offsets, methods=["POST"]),
-            Route("/remove_offsets", do_remove_offsets, methods=["POST"]),
             Route("/detect_organelles", detect_organelles, methods=["POST"]),
             Route("/chunk_grid", chunk_grid, methods=["POST"]),
             Route(
@@ -5159,7 +4898,6 @@ def _create_app(
             ),
             Route("/remove_parallel_patches", do_remove_parallel, methods=["POST"]),
             Route("/detect_fusions", detect_fusions, methods=["POST"]),
-            Route("/detect_rims", detect_rims, methods=["POST"]),
             Route("/detect_holes", detect_holes, methods=["POST"]),
             Route("/remove_organelles", do_remove_organelles, methods=["POST"]),
             Route("/remove_fusions", do_remove_fusions, methods=["POST"]),
@@ -5467,6 +5205,146 @@ def view3d(
     _launch_app(app, host=host, port=port, no_browser=no_browser)
 
 
+# One colour per contact kind (`skeliner.pair.label_contacts`): blobs, the
+# likeliest synapses, in orange; kinds from older files fall back to violet.
+_KIND_COLORS = {
+    "blob": [1.00, 0.60, 0.10],  # orange
+    "crossing": [0.20, 0.55, 1.00],  # blue
+    "other": [0.55, 0.35, 0.85],  # violet
+}
+_SITE_COLORS = [
+    [1.0, 0.4, 0.1],  # orange
+    [0.2, 0.6, 1.0],  # blue
+    [0.1, 0.9, 0.4],  # green
+    [0.9, 0.2, 0.8],  # magenta
+    [1.0, 0.9, 0.1],  # yellow
+    [0.0, 0.85, 0.7],  # teal
+    [0.95, 0.5, 0.5],  # salmon
+    [0.6, 0.4, 1.0],  # violet
+]
+
+
+def _contact_overlay(
+    A: trimesh.Trimesh,
+    B: trimesh.Trimesh,
+    centroid: np.ndarray,
+    contacts,
+    *,
+    sides: str,
+    show_aabb: bool,
+    aabb_mode: str,
+    color_by: str,
+) -> tuple[dict, dict]:
+    """The annotations (face highlights, AABB wireframes) and the contact
+    state that :func:`view_contacts` shows for *contacts*.
+
+    Sites are coloured by their kind when *color_by* is ``"kind"`` and the
+    sites have one (``contacts.kind``), else each in turn from a palette;
+    labels name the kind whenever it is known.
+    """
+    s = sides.lower()
+    doA = s in ("a", "both")
+    doB = s in ("b", "both")
+    n_sites = max(
+        len(contacts.faces_A) if doA else 0,
+        len(contacts.faces_B) if doB else 0,
+    )
+    kinds = getattr(contacts, "kind", None)
+    kinds = None if kinds is None else [str(k) for k in kinds]
+    by_kind = color_by == "kind" and kinds is not None
+
+    def colour(i: int) -> list[float]:
+        if by_kind:
+            return _KIND_COLORS.get(kinds[i], _KIND_COLORS["other"])
+        return _SITE_COLORS[i % len(_SITE_COLORS)]
+
+    highlights = []
+    edge_groups = []
+    for i in range(n_sites):
+        col = colour(i)
+        tag = f" · {kinds[i]}" if kinds is not None else ""
+        bbox_a, bbox_b = None, None
+
+        if doA and i < len(contacts.faces_A):
+            fa = np.asarray(contacts.faces_A[i], np.int64)
+            if fa.size > 0:
+                bbox_a = _bbox_from_faces(A, fa, centroid)
+                side_label = "A" if (doA and doB) else ""
+                highlights.append(
+                    {
+                        "faces": fa.tolist(),
+                        "color": col,
+                        "label": f"Site {i}{side_label}{tag} ({fa.size} faces)",
+                        "meshKey": "primary",
+                    }
+                )
+
+        if doB and i < len(contacts.faces_B):
+            fb = np.asarray(contacts.faces_B[i], np.int64)
+            if fb.size > 0:
+                bbox_b = _bbox_from_faces(B, fb, centroid)
+                side_label = "B" if (doA and doB) else ""
+                highlights.append(
+                    {
+                        "faces": fb.tolist(),
+                        "color": col,
+                        "label": f"Site {i}{side_label}{tag} ({fb.size} faces)",
+                        "meshKey": "mesh_B",
+                    }
+                )
+
+        # AABB wireframe as edge_group
+        if show_aabb:
+            box = None
+            if aabb_mode == "union":
+                box = _bbox_union(bbox_a, bbox_b)
+            elif aabb_mode == "split":
+                for bb in (bbox_a, bbox_b):
+                    if bb is not None:
+                        edge_groups.append(
+                            {
+                                "segments": _bbox_segments(bb),
+                                "color": col,
+                                "label": f"AABB {i}{tag}",
+                            }
+                        )
+                continue  # skip union path
+            if box is not None:
+                edge_groups.append(
+                    {
+                        "segments": _bbox_segments(box),
+                        "color": col,
+                        "label": f"AABB {i}{tag}",
+                    }
+                )
+
+    annotations = {}
+    if highlights:
+        annotations["highlights"] = highlights
+    if edge_groups:
+        annotations["edge_groups"] = edge_groups
+
+    contact_state = {
+        "sides": sides,
+        "nSites": n_sites,
+    }
+    if by_kind:
+        counts: dict[str, int] = {}
+        for k in kinds[:n_sites]:
+            counts[k] = counts.get(k, 0) + 1
+        order = [k for k in _KIND_COLORS if k in counts]
+        order += sorted(k for k in counts if k not in _KIND_COLORS)
+        contact_state["kinds"] = [
+            {
+                "kind": k,
+                "count": counts[k],
+                "color": _KIND_COLORS.get(k, _KIND_COLORS["other"]),
+            }
+            for k in order
+        ]
+    return annotations, contact_state
+
+
 def view_contacts(
     A: trimesh.Trimesh,
     B: trimesh.Trimesh,
@@ -5478,11 +5356,18 @@ def view_contacts(
     sides: str = "A",
     show_aabb: bool = True,
     aabb_mode: str = "union",
+    color_by: str = "kind",
     host: str = "127.0.0.1",
     port: int = 8777,
     no_browser: bool = False,
 ):
-    """Visualize two meshes with contact-site overlays in the web viewer."""
+    """Visualize two meshes with contact-site overlays in the web viewer.
+
+    When the sites have kinds (``skeliner.pair.label_contacts``, done by
+    ``scan_contacts``), each site is coloured by its kind and the panel
+    lists the kinds with their counts; ``color_by="site"`` colours each site
+    in turn instead, as for sites without kinds.
+    """
     # Shared centroid from both meshes
     all_verts = np.concatenate(
         [A.vertices.astype(np.float32), B.vertices.astype(np.float32)]
@@ -5509,96 +5394,16 @@ def view_contacts(
         },
     }
 
-    # Build contact sites as annotations (highlights + edge_groups)
-    SITE_COLORS = [
-        [1.0, 0.4, 0.1],  # orange
-        [0.2, 0.6, 1.0],  # blue
-        [0.1, 0.9, 0.4],  # green
-        [0.9, 0.2, 0.8],  # magenta
-        [1.0, 0.9, 0.1],  # yellow
-        [0.0, 0.85, 0.7],  # teal
-        [0.95, 0.5, 0.5],  # salmon
-        [0.6, 0.4, 1.0],  # violet
-    ]
-
-    s = sides.lower()
-    doA = s in ("a", "both")
-    doB = s in ("b", "both")
-    n_sites = max(
-        len(contacts.faces_A) if doA else 0,
-        len(contacts.faces_B) if doB else 0,
+    annotations, contact_state = _contact_overlay(
+        A_scaled,
+        B_scaled,
+        centroid,
+        contacts,
+        sides=sides,
+        show_aabb=show_aabb,
+        aabb_mode=aabb_mode,
+        color_by=color_by,
     )
-
-    highlights = []
-    edge_groups = []
-
-    for i in range(n_sites):
-        col = SITE_COLORS[i % len(SITE_COLORS)]
-        bbox_a, bbox_b = None, None
-
-        if doA and i < len(contacts.faces_A):
-            fa = np.asarray(contacts.faces_A[i], np.int64)
-            if fa.size > 0:
-                bbox_a = _bbox_from_faces(A_scaled, fa, centroid)
-                side_label = "A" if (doA and doB) else ""
-                highlights.append(
-                    {
-                        "faces": fa.tolist(),
-                        "color": col,
-                        "label": f"Site {i}{side_label} ({fa.size} faces)",
-                        "meshKey": "primary",
-                    }
-                )
-
-        if doB and i < len(contacts.faces_B):
-            fb = np.asarray(contacts.faces_B[i], np.int64)
-            if fb.size > 0:
-                bbox_b = _bbox_from_faces(B_scaled, fb, centroid)
-                side_label = "B" if (doA and doB) else ""
-                highlights.append(
-                    {
-                        "faces": fb.tolist(),
-                        "color": col,
-                        "label": f"Site {i}{side_label} ({fb.size} faces)",
-                        "meshKey": "mesh_B",
-                    }
-                )
-
-        # AABB wireframe as edge_group
-        if show_aabb:
-            box = None
-            if aabb_mode == "union":
-                box = _bbox_union(bbox_a, bbox_b)
-            elif aabb_mode == "split":
-                for bb in (bbox_a, bbox_b):
-                    if bb is not None:
-                        edge_groups.append(
-                            {
-                                "segments": _bbox_segments(bb),
-                                "color": col,
-                                "label": f"AABB {i}",
-                            }
-                        )
-                continue  # skip union path
-            if box is not None:
-                edge_groups.append(
-                    {
-                        "segments": _bbox_segments(box),
-                        "color": col,
-                        "label": f"AABB {i}",
-                    }
-                )
-
-    annotations = {}
-    if highlights:
-        annotations["highlights"] = highlights
-    if edge_groups:
-        annotations["edge_groups"] = edge_groups
-
-    contact_state = {
-        "sides": sides,
-        "nSites": n_sites,
-    }
 
     app = _create_app(
         port=port,

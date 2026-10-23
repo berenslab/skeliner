@@ -1,0 +1,12 @@
+[package]
+name = "mesh"
+version = "0.1.0"
+description = "Topology and spatial queries on triangle meshes that need not be closed or manifold."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

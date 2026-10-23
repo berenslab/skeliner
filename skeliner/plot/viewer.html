@@ -343,6 +343,7 @@
             <div style="color:#adf;font-weight:bold;margin-bottom:4px">Contact Sites</div>
             <div><span class="label">Sites: </span><span id="contactNSites">-</span></div>
             <div><span class="label">Side: </span><span id="contactSide">-</span></div>
+            <div id="contactKinds" style="margin-top:4px"></div>
             <div style="margin-top:6px;color:#888;font-size:11px">
               <div>A &mdash; toggle mesh A</div>
               <div>B &mdash; toggle mesh B</div>
@@ -1014,6 +1015,18 @@ let meshCentroid = [0, 0, 0];
                         cp.style.display = '';
                         document.getElementById('contactNSites').textContent = contactData.nSites || '?';
                         document.getElementById('contactSide').textContent = contactData.sides || '?';
+                        // one swatch per kind of site, when the sites have kinds
+                        const kindsEl = document.getElementById('contactKinds');
+                        kindsEl.innerHTML = '';
+                        for (const k of contactData.kinds || []) {
+                            const row = document.createElement('div');
+                            const swatch = document.createElement('span');
+                            const rgb = k.color.map((c) => Math.round(c * 255)).join(',');
+                            swatch.style.cssText = `display:inline-block;width:10px;height:10px;margin-right:6px;background:rgb(${rgb})`;
+                            row.appendChild(swatch);
+                            row.appendChild(document.createTextNode(`${k.kind}: ${k.count}`));
+                            kindsEl.appendChild(row);
+                        }
                     }
                     // Load contact annotations immediately (don't wait for file watcher)
                     const annResp = await fetch("/annotations");

@@ -1,0 +1,13 @@
+[package]
+name = "threads"
+version = "0.1.0"
+description = "The thread pools skeliner's parallel loops run on (`sk.threads`)."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rayon.workspace = true
+
+[lints]
+workspace = true

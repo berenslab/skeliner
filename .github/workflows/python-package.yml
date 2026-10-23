@@ -10,6 +10,29 @@ on:
         branches: ["main"]
 
 jobs:
+    rust:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.13"
+            - name: Set up Rust
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  components: clippy, rustfmt
+            - name: rustfmt
+              working-directory: skeliner/rust
+              run: cargo fmt --all --check
+            - name: clippy
+              working-directory: skeliner/rust
+              run: cargo clippy --workspace --all-targets -- -D warnings
+            - name: cargo test
+              working-directory: skeliner/rust
+              # _rs is the extension module; pytest covers it.
+              run: cargo test --workspace --exclude _rs
+
     build:
         runs-on: ubuntu-latest
         strategy:
@@ -20,14 +43,21 @@ jobs:
         steps:
             - uses: actions/checkout@v4
             - name: Set up Python ${{ matrix.python-version }}
-              uses: actions/setup-python@v3
+              uses: actions/setup-python@v5
               with:
                   python-version: ${{ matrix.python-version }}
+                  allow-prereleases: true
+            - name: Set up Rust
+              uses: dtolnay/rust-toolchain@stable
             - name: Install dependencies
+              # Editable, so maturin builds the Rust extension into skeliner/:
+              # tests/ is a package, so pytest puts the repo root first on
+              # sys.path and imports skeliner from the checkout, not from
+              # site-packages.
               run: |
                   python -m pip install --upgrade pip
                   python -m pip install flake8 pytest
-                  python -m pip install .[dev]
+                  python -m pip install -e .[dev]
                   if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
             - name: Lint with flake8
               run: |

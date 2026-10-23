@@ -39,7 +39,8 @@ robust contact‑site mapping between pairs of cells using both skeletons and me
 pip install skeliner
 ```
 
-or from source:
+or from source, which builds the Rust core and so needs a Rust toolchain
+([rustup](https://rustup.rs)):
 
 ```bash
 git clone https://github.com/berenslab/skeliner.git
@@ -133,11 +134,11 @@ A = sk.skeletonize(meshA)
 B = sk.skeletonize(meshB)
 
 # 1) skeleton-based seeds (delta in the same unit as the skeletons/meshes)
-seeds = pair.find_contact_seeds(A, B, exclude_soma=True)
+seeds = sk.pair.find_contact_seeds(A, B, exclude_soma=True)
 print("seed count:", seeds.n)
 
 # 2) mesh-based contact patches around the seed midpoints
-sites = pair.map_contact_sites(meshA, meshB, seeds.pos, unit="nm^2")
+sites = sk.pair.map_contact_sites(meshA, meshB, seeds.pos, unit="nm^2")
 print("contact patches:", len(sites.faces_A))
 print("mean areas (mesh units^2):", sites.area_mean)
 
@@ -150,6 +151,21 @@ print("mean areas (mesh units^2):", sites.area_mean)
   <img src=".github/media/contacts-one-mesh-with-patches.png" width="30%">
   <img src=".github/media/contacts-no-meshes-patches-only.png" width="30%">
 </p>
+
+### Threads
+
+The Rust core runs its heaviest loops on every core by default. To use fewer
+(a shared machine, or several cells at once on one node), set
+`RAYON_NUM_THREADS` before Python starts, or in a notebook's first cell
+(`%env RAYON_NUM_THREADS=4`), or switch at any time from Python:
+
+```python
+sk.threads(4)          # from now on
+with sk.threads(2):    # for this block only
+    mesh, components = sk.preprocess(mesh)
+sk.threads(None)       # back to the default: every core, or RAYON_NUM_THREADS
+sk.threads.get()       # how many threads the next parallel loop runs on
+```
 
 ---
 

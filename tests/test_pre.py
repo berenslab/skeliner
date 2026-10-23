@@ -21,6 +21,8 @@ from skeliner.dataclass import (
 )
 from skeliner.pre import _non_degenerate
 
+from ._parity import assert_parity, both
+
 
 def _live_faces(mesh):
     """Count non-degenerate faces (degenerate = removed by _rebuild_mesh)."""
@@ -441,6 +443,33 @@ PINNED_CAP = dict(min_bridge_gap=0.0, max_bridge_dist=5000.0)
 
 
 class TestFindGaps:
+    def test_is_the_same_on_both_paths(self):
+        from pathlib import Path
+
+        from skeliner.io import load_mesh
+
+        reference = load_mesh(Path(__file__).parent / "data" / "60427.obj")
+        cyl = _two_cylinders(separation=300.0)
+        first = np.arange(len(cyl.faces) // 2)
+        # the first cylinder's faces nearest the gap, posing as a fusion
+        near = first[np.argsort(-cyl.triangles_center[first, 0])[:6]].tolist()
+        cases = [
+            (reference, {}),
+            (_two_cylinders(separation=1500.0), NO_CAP),
+            (cyl, NO_CAP),
+            (cyl, {"fusions": [near], **NO_CAP}),
+            (cyl, {"fusions": [near], "fusion_clearance": 1e4, **NO_CAP}),
+            (_main_debris_piece(), PINNED_CAP),
+            (_main_relay_piece(), {"relay_min_faces": 0, **PINNED_CAP}),
+            (_main_relay_piece(), PINNED_CAP),
+        ]
+        n_gaps = 0
+        for mesh, kwargs in cases:
+            rust, python = both(pre.find_gaps, mesh, **kwargs)
+            assert_parity(rust, python)
+            n_gaps += len(rust)
+        assert n_gaps > 10
+
     def test_single_component_no_gaps(self):
         mesh = _icosphere()
         gaps = pre.find_gaps(mesh)
@@ -554,6 +583,22 @@ class TestFindGaps:
 
 
 class TestRemoveGaps:
+    def test_is_the_same_on_both_paths(self):
+        added = 0
+        cases = [
+            (_two_cylinders(separation=1500.0), NO_CAP),
+            (_two_cylinders(separation=300.0), NO_CAP),
+            (_main_debris_piece(), PINNED_CAP),
+            (_main_relay_piece(), {"relay_min_faces": 0, **PINNED_CAP}),
+        ]
+        for mesh, kwargs in cases:
+            gaps = pre.find_gaps(mesh, **kwargs)
+            rust, python = both(pre.remove_gaps, mesh, gaps=gaps)
+            assert_parity(np.asarray(rust.vertices), np.asarray(python.vertices))
+            assert_parity(np.asarray(rust.faces), np.asarray(python.faces))
+            added += len(rust.faces) - len(mesh.faces)
+        assert added > 0
+
     def test_noop_single_component(self):
         mesh = _icosphere()
         result = pre.remove_gaps(mesh)
@@ -581,6 +626,61 @@ class TestRemoveGaps:
         # Should still work with precomputed gaps
         assert n_comps < 2 or _live_faces(result) != _live_faces(mesh)
 
+    def test_a_loop_is_never_paired_with_itself(self):
+        assert "same rim" in pre._validate_loop_pair([1, 2, 3, 4, 5], [5, 4, 3, 2, 1])
+        # pieces glued at the rim share a few vertices; that alone is fine
+        assert pre._validate_loop_pair([1, 2, 3, 4, 5], [4, 5, 6, 7, 8]) is None
+
+    def test_tips_side_by_side_are_filled_not_tubed_on_both_paths(self):
+        # Two tips on one surface whose rims share vertices: they are glued
+        # along those vertices (a fusion join).  A tube from rim to rim
+        # would fold over the glue; removing both and closing the one hole
+        # they leave keeps the surface manifold.
+        from skeliner import _rs
+
+        mesh = _subdivided_tube()
+        topo = _rs.mesh.Topology(np.asarray(mesh.faces, np.int64), len(mesh.vertices))
+        centre_z = mesh.vertices[mesh.faces].mean(axis=1)[:, 2]
+        fa = [int(np.argmin(np.abs(centre_z)))]
+        sel_a, rim_a = pre._expand_tip_to_good_rim(fa, topo, None)
+        # a second tip three faces away grows a patch beside the first
+        adj = pre._face_adjacency(mesh)
+        ring, seen = set(fa), set(fa)
+        for _ in range(3):
+            ring = {g for f in ring for g in adj[f]} - seen
+            seen |= ring
+        for f in sorted(ring):
+            sel_b, rim_b = pre._expand_tip_to_good_rim([f], topo, None)
+            if len(set(rim_a) & set(rim_b)) >= 2 and not sel_a & sel_b:
+                fb = [f]
+                break
+        else:
+            pytest.fail("no side-by-side tip on the fixture")
+        out, python = both(pre.remove_gaps, mesh, gaps=[(fa, fb, 1.0, -1, 0)])
+        assert_parity(np.asarray(out.vertices), np.asarray(python.vertices))
+        assert_parity(np.asarray(out.faces), np.asarray(python.faces))
+
+        def edge_uses(m):
+            f = np.asarray(m.faces)
+            f = np.sort(f[_non_degenerate(f)], axis=1)
+            e = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [0, 2]]])
+            return np.unique(e, axis=0, return_counts=True)[1]
+
+        assert _live_faces(out) != _live_faces(mesh)
+        assert len(out.vertices) == len(mesh.vertices) + 1  # the fan's centre
+        assert (edge_uses(out) <= 2).all()
+        assert (edge_uses(out) == 1).sum() == (edge_uses(mesh) == 1).sum()
+
+    def test_tips_that_grow_onto_the_same_rim_are_not_stitched(self):
+        # Both sides of a gap end on one rim when the pieces are still glued
+        # together; stitching it to itself would fold a zero-length tube of
+        # non-manifold edges into the rim.
+        mesh = _two_cylinders(separation=1500.0)
+        fa, _, dist, ca, _ = pre.find_gaps(mesh, **NO_CAP)[0]
+        result = pre.remove_gaps(mesh, gaps=[(fa, list(fa), dist, ca, ca)])
+        assert np.array_equal(result.faces, mesh.faces)
+        assert len(result.vertices) == len(mesh.vertices)
+
 
 # ── _sever_cost ───────────────────────────────────────────────────────
 
@@ -597,6 +697,16 @@ class TestSeverCost:
 
     def _adj(self, mesh):
         return pre._face_adjacency(mesh, pre._edge_to_faces(mesh))
+
+    def test_a_piece_crossing_the_budget_is_walked_whole(self):
+        # A path of seven faces; removing the two ends leaves one piece of
+        # five, over the budget and the only piece, so nothing strands.  A
+        # walk that stops at the face crossing the budget without expanding
+        # it returns the faces beyond as a phantom second piece.
+        faces = np.array([[k, k + 1, k + 2] for k in range(7)])
+        vertices = np.random.default_rng(0).random((9, 3))
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        assert pre._sever_cost({0, 6}, self._adj(mesh), 2) == 0
 
     def test_band_across_a_tube_strands_the_shorter_side(self):
         mesh = _subdivided_tube()
@@ -1461,3 +1571,22 @@ def test_compaction_leaves_unnamed_neurites_unnamed():
     comp = pre.break_up_mesh(mesh, soma, org, rescued=stub[:1])
     _, out = pre.compact_mesh(mesh, comp)
     assert out.neurites.named is False
+
+
+class TestNearest:
+    def test_exact_ties_go_to_the_lowest_index(self):
+        from scipy.spatial import KDTree
+
+        pts = np.array([[1, 0, 0], [-1, 0, 0], [0, -1, 0], [0, 0, 5]], dtype=float)
+        tree = KDTree(
+            pts[::-1].copy()
+        )  # reversed, so index order is not insertion order
+        d, i = pre._nearest(tree, np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 4.0]]))
+        assert i.tolist() == [1, 0]
+        assert d.tolist() == [1.0, 1.0]
+
+    def test_a_single_point_tree(self):
+        from scipy.spatial import KDTree
+
+        d, i = pre._nearest(KDTree(np.zeros((1, 3))), np.ones((2, 3)))
+        assert i.tolist() == [0, 0]

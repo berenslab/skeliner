@@ -7,6 +7,7 @@ from typing import Iterable, List
 import numpy as np
 import trimesh
 
+from ._backend import kernels
 from ._core import _bfs_parents
 from ._state import rebuild_vert2node
 from .dataclass import (
@@ -60,24 +61,39 @@ _META_JSON = re.compile(r"#\s*meta\s+(\{.*\})")  #  single-line JSON
 
 
 def load_mesh(filepath: str | Path) -> trimesh.Trimesh:
+    """Read a mesh file as ``trimesh.load_mesh(filepath, process=False)``
+    reads it.
+
+    OBJ files of plain vertices and triangles, the form EyeWire 2, MICrONS
+    and FlyWire meshes come in and skeliner's own pipeline writes, are read
+    by skeliner's own reader on the active path (:class:`skeliner.backend`),
+    to the same arrays. An OBJ with anything more (normals, texture
+    coordinates, groups, polygons, ...) and every other format are read by
+    trimesh.
+
+    ``.ctm`` (OpenCTM) has a reader of its own here, but it is only for
+    reading EyeWire 1's meshes
+    (https://drive.google.com/file/d/1-qmE1sEL3AIGpNfi0w50MEOgm2WIF4_1/view),
+    which trimesh cannot read without ``python-openctm`` (x86-64 and Python
+    3.11 at most): OpenCTM v5 with RAW, MG1 or MG2 compression, vertices and
+    triangles only, no normals, UV maps or attribute maps.
+    """
     filepath = Path(filepath)
-    if filepath.suffix.lower() == ".ctm":
-        print(
-            "CTM file detected.  skeliner no longer bundles explicit OpenCTM "
-            "support.  Loading will fall back to trimesh’s limited reader.\n"
-            "Full read/write support is still possible on compatible setups:\n"
-            "  • Python ≤ 3.11, x86-64  →  pip install python-openctm\n"
-            "Then load manually:\n"
-            "    import openctm, trimesh\n"
-            "    mesh = openctm.import_mesh(filepath)\n"
-            "    mesh = trimesh.Trimesh(vertices=mesh.vertices,\n"
-            "                            faces=mesh.faces,\n"
-            "                            process=False)\n"
-        )
 
-    mesh = trimesh.load_mesh(filepath, process=False)
-
-    return mesh
+    # OBJ and EyeWire 1's CTM on the active path; the readers decline (None)
+    # whatever else such a file holds, and trimesh reads it
+    reader = {".obj": "read_obj", ".ctm": "read_ctm"}.get(filepath.suffix.lower())
+    if reader is not None:
+        found = getattr(kernels.io, reader)(str(filepath))
+        if found is not None:
+            vertices, faces = found
+            return trimesh.Trimesh(
+                vertices=vertices,
+                faces=faces,
+                process=False,
+                metadata={"name": filepath.name, "node": filepath.name},
+            )
+    return trimesh.load_mesh(filepath, process=False)
 
 
 def save_mesh(mesh: trimesh.Trimesh, path: str | Path) -> None:
@@ -285,8 +301,9 @@ def save_skeleton_swc(
         for idx, (coord, r, pa, t) in enumerate(
             zip(nodes[:, axis_order] * scale, radii * scale, parent, ntype), start=1
         ):
+            # ensure soma has type -1 or +1
             fh.write(
-                f"{idx} {int(-1 if ((idx == 1) and t not in [-1, 1]) else t)} "  # ensure soma has type -1 or +1
+                f"{idx} {int(-1 if ((idx == 1) and t not in [-1, 1]) else t)} "
                 f"{coord[0]} {coord[1]} {coord[2]} {r} "
                 f"{(pa + 1) if pa != -1 else -1}\n"
             )
@@ -937,7 +954,8 @@ def _unpack_ragged_2d_fixed(stacked: np.ndarray, ptr: np.ndarray) -> list[np.nda
 
 
 def _save_stats_to_payload(stats: dict | None, prefix: str, payload: dict) -> None:
-    """Pack dict of 1D arrays into NPZ payload using '<prefix>_keys' + '<prefix>__{key}'."""
+    """Pack dict of 1D arrays into NPZ payload using '<prefix>_keys' +
+    '<prefix>__{key}'."""
     if not stats:
         return
     keys = list(stats.keys())
@@ -1001,12 +1019,15 @@ def save_contact_sites_npz(res, path: str | Path, *, compress: bool = True) -> N
         bbox_B=np.asarray(res.bbox_B, np.float64),
         bbox=np.asarray(res.bbox, np.float64),
         meta_json=_json_encode_meta(res.meta),
-        _schema=np.array("ContactSitesResult@2", dtype="U"),
+        _schema=np.array("ContactSitesResult@3", dtype="U"),
     )
+    if getattr(res, "kind", None) is not None:
+        payload["kind"] = np.asarray(res.kind, dtype="U")
     # Optional stats: flattened into many arrays with explicit key list per group
     _save_stats_to_payload(getattr(res, "stats_A", None), "stats_A", payload)
     _save_stats_to_payload(getattr(res, "stats_B", None), "stats_B", payload)
     _save_stats_to_payload(getattr(res, "stats_pair", None), "stats_pair", payload)
+    _save_stats_to_payload(getattr(res, "geometry", None), "geometry", payload)
     if compress:
         np.savez_compressed(path, **payload)
     else:
@@ -1035,6 +1056,8 @@ def load_contact_sites_npz(path: str | Path):
         stats_A = _load_stats_from_npz(z, "stats_A")
         stats_B = _load_stats_from_npz(z, "stats_B")
         stats_pair = _load_stats_from_npz(z, "stats_pair")
+        geometry = _load_stats_from_npz(z, "geometry")
+        kind = z["kind"].astype(str) if "kind" in z else None
 
         if stats_A is None and isinstance(meta.get("stats_A"), dict):
             stats_A = {k: np.asarray(v, np.float64) for k, v in meta["stats_A"].items()}
@@ -1067,6 +1090,8 @@ def load_contact_sites_npz(path: str | Path):
             stats_A=stats_A,
             stats_B=stats_B,
             stats_pair=stats_pair,
+            kind=kind,
+            geometry=geometry,
         )
 
 

@@ -1,0 +1,28 @@
+[package]
+name = "_rs"
+version = "0.1.0"
+description = "The extension module `skeliner._rs`: Python bindings for every crate."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+mesh.workspace = true
+threads.workspace = true
+pre.workspace = true
+skeletonize.workspace = true
+post.workspace = true
+dx.workspace = true
+pair.workspace = true
+io.workspace = true
+numpy = "0.30"
+pyo3 = { version = "0.30", features = ["abi3-py311"] }
+rayon.workspace = true
+
+[lints]
+workspace = true

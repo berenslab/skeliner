@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Sequence, Set, Tuple
 import igraph as ig
 import numpy as np
 
+from ._backend import kernels
+
 __skeleton__ = [
     "check_connectivity",
     "connectivity",
@@ -723,6 +725,29 @@ def distance(
                 continue
             a, b = (u2, v2) if u2 < v2 else (v2, u2)
             allowed_edges_set.add((a, b))
+
+    if (
+        use_whitelist
+        and not surface
+        and allowed_edges_set is None
+        and scale_in == 1.0
+        and scale_out == 1.0
+    ):
+        # the same minimum over the allowed centres and their edges, once
+        segments = sorted(
+            {
+                (min(nid, int(nb)), max(nid, int(nb)))
+                for nid in allowed_nodes_set
+                for nb in neighbours[nid]
+            }
+        )
+        distances = kernels.dx.segment_distances(
+            pts,
+            np.asarray(nodes, dtype=np.float64),
+            sorted(allowed_nodes_set),
+            segments,
+        )
+        return float(distances[0]) if single_input else distances
 
     for i, p in enumerate(pts):
         p_skel = p * scale_in
@@ -1471,22 +1496,32 @@ def extract_neurites(
     N = len(skel.nodes)
     if root < 0 or root >= N:
         raise ValueError("root is out of range")
+    return sorted(_subtree(_distal_children(skel), root, include_root))
 
-    # 1. shortest‑path distance from soma to EVERY node (unweighted graph)
+
+def _distal_children(skel) -> List[List[int]]:
+    """Each node's children, every edge pointing away from the soma (node 0).
+
+    Edges are oriented by unweighted shortest-path distance to the soma; an
+    edge between two nodes at the same distance, which a tree cannot have, is
+    left out, and so is every edge of a forest's other trees, which the soma
+    does not reach.
+    """
     g = skel._igraph()
-    dists = np.asarray(g.shortest_paths(source=[0])[0], dtype=int)
-
-    # 2. build children[]: edge directed along *increasing* distance
-    children: List[List[int]] = [[] for _ in range(N)]
+    # hops from the soma, infinite where it does not reach
+    dists = np.asarray(g.distances(source=[0])[0], dtype=np.float64)
+    children: List[List[int]] = [[] for _ in range(len(skel.nodes))]
     for a, b in skel.edges:
         da, db = dists[a], dists[b]
         if da == db:
-            # should not happen in a tree, but guard anyway
             continue
         parent, child = (a, b) if da < db else (b, a)
         children[parent].append(child)
+    return children
 
-    # 3. DFS from root collecting all downstream vertices
+
+def _subtree(children: List[List[int]], root: int, include_root: bool) -> List[int]:
+    """*root* and every node below it in *children*, depth first."""
     out: List[int] = []
     stack = [root]
     while stack:
@@ -1494,8 +1529,7 @@ def extract_neurites(
         if v != root or include_root:
             out.append(v)
         stack.extend(children[v])
-
-    return sorted(out)
+    return out
 
 
 def neurite_names(skel) -> Dict[int, str]:
@@ -1598,17 +1632,11 @@ def neurites_out_of_bounds(
     if not outside.any():
         return []
 
-    # ------------------------------------------------------------------
-    # one igraph shortest-path pass from soma (vertex 0)
-    # ------------------------------------------------------------------
-    g = skel._igraph()
-    dists = np.asarray(g.shortest_paths(source=[0])[0], dtype=int)
-
-    # For every edge (u,v) orient from proximal→distal
-    children: list[list[int]] = [[] for _ in range(len(coords))]
-    for u, v in skel.edges:
-        parent, child = (u, v) if dists[u] < dists[v] else (v, u)
-        children[parent].append(child)
+    # one BFS from the soma (vertex 0) and one orientation of the edges, shared
+    # by every out-of-bounds node; igraph gives the soma the parent -1 and a
+    # node it does not reach -2, so each of those starts a subtree of its own
+    parents = skel._igraph().bfs(0, mode="ALL")[2]
+    children = _distal_children(skel)
 
     # ------------------------------------------------------------------
     # Treat each *first* out-of-bounds node as a neurite root
@@ -1616,10 +1644,10 @@ def neurites_out_of_bounds(
     targets: set[int] = set()
     for nid in np.where(outside)[0]:
         # ensure nid is indeed the *first* outside node on its path
-        par = g.bfs(0, mode="ALL")[2][nid]
-        if par != -1 and outside[par]:
+        par = parents[nid]
+        if par >= 0 and outside[par]:
             continue  # ancestor already outside – skip
-        targets.update(extract_neurites(skel, int(nid), include_root=include_root))
+        targets.update(sorted(_subtree(children, int(nid), include_root)))
 
     return sorted(targets)
 

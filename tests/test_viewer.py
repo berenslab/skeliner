@@ -2678,3 +2678,66 @@ def test_a_marker_can_name_the_node_it_marks():
     assert 'panelMode !== "skeleton"' in body, (
         "bin selection is attempted outside the mode that has a bin panel"
     )
+
+
+# ── contact sites ─────────────────────────────────────────────────────
+
+
+@pytest.fixture(scope="module")
+def two_kinds():
+    """A tube touched by one tube crossing it and one lying beside it."""
+    from skeliner import pair
+
+    from .test_pair import _tube
+
+    a = _tube([0, 0, 1], [0.0, 0.0, 0.0])
+    b = trimesh.util.concatenate(
+        [_tube([1, 0, 0], [0.0, 405.0, 0.0]), _tube([0, 0, 1], [405.0, 0.0, 0.0])]
+    )
+    return a, b, pair.scan_contacts(a, b, tol=20.0)
+
+
+def _overlay(a, b, sites, **kw):
+    from skeliner.plot.viewer import _contact_overlay
+
+    args = dict(sides="both", show_aabb=True, aabb_mode="union", color_by="kind")
+    return _contact_overlay(a, b, np.zeros(3), sites, **{**args, **kw})
+
+
+def test_contact_sites_are_coloured_and_labelled_by_kind(two_kinds):
+    from skeliner.plot.viewer import _KIND_COLORS
+
+    a, b, sites = two_kinds
+    assert sorted(sites.kind.tolist()) == ["crossing", "other"]
+    ann, state = _overlay(a, b, sites)
+    for h in ann["highlights"]:
+        kind = next(k for k in _KIND_COLORS if f" · {k} " in h["label"])
+        assert h["color"] == _KIND_COLORS[kind]
+    assert [k["kind"] for k in state["kinds"]] == ["crossing", "other"]
+    assert [k["count"] for k in state["kinds"]] == [1, 1]
+    assert all(" · " in g["label"] for g in ann["edge_groups"])
+
+
+def test_colouring_by_site_keeps_the_kinds_in_the_labels(two_kinds):
+    from skeliner.plot.viewer import _SITE_COLORS
+
+    a, b, sites = two_kinds
+    ann, state = _overlay(a, b, sites, color_by="site")
+    colours = {h["label"].split(" ")[1][:-1]: h["color"] for h in ann["highlights"]}
+    assert colours == {"0": _SITE_COLORS[0], "1": _SITE_COLORS[1]}
+    assert all(" · " in h["label"] for h in ann["highlights"])
+    assert "kinds" not in state
+
+
+def test_sites_without_kinds_look_as_before(two_kinds):
+    from skeliner import pair
+    from skeliner.plot.viewer import _SITE_COLORS
+
+    a, b, _ = two_kinds
+    plain = pair.scan_contacts(a, b, tol=20.0, label=False)
+    ann, state = _overlay(a, b, plain)
+    assert all(" · " not in h["label"] for h in ann["highlights"])
+    assert {tuple(h["color"]) for h in ann["highlights"]} <= {
+        tuple(c) for c in _SITE_COLORS
+    }
+    assert "kinds" not in state and state["nSites"] == 2
