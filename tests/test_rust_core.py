@@ -11,6 +11,8 @@ import trimesh
 from skeliner import _rs, pre
 from skeliner.io import load_mesh
 
+from ._parity import assert_parity, both
+
 
 def assert_identical(a, b):
     np.testing.assert_array_equal(a, b, strict=True)
@@ -96,7 +98,7 @@ class TestTopology:
     def test_reads_like_the_python_edge_map(self, dirty_mesh, reference_mesh):
         for mesh in _meshes(dirty_mesh, reference_mesh):
             faces = np.asarray(mesh.faces, dtype=np.int64)
-            topo = _rs.Topology(faces, len(mesh.vertices))
+            topo = _rs.mesh.Topology(faces, len(mesh.vertices))
             expected = pre._edge_to_faces(mesh)
             assert list(topo.as_dict().items()) == list(expected.items())
             assert list(topo.items()) == list(expected.items())
@@ -107,7 +109,7 @@ class TestTopology:
 
     def test_lookups(self, dirty_mesh):
         faces = np.asarray(dirty_mesh.faces, dtype=np.int64)
-        topo = _rs.Topology(faces, len(dirty_mesh.vertices))
+        topo = _rs.mesh.Topology(faces, len(dirty_mesh.vertices))
         expected = pre._edge_to_faces(dirty_mesh)
         a, b = next(k for k, fs in expected.items() if len(fs) >= 3)
         assert topo[(a, b)] == expected[(a, b)]
@@ -122,7 +124,7 @@ class TestTopology:
 
     def test_csr_matches_the_lookups(self, dirty_mesh):
         faces = np.asarray(dirty_mesh.faces, dtype=np.int64)
-        topo = _rs.Topology(faces, len(dirty_mesh.vertices))
+        topo = _rs.mesh.Topology(faces, len(dirty_mesh.vertices))
         ptr, fs = topo.edge_faces_csr()
         edges = topo.edges()
         assert len(ptr) == len(edges) + 1 == topo.n_edges + 1
@@ -132,10 +134,14 @@ class TestTopology:
     def test_refuses_an_index_past_the_vertex_count(self, dirty_mesh):
         faces = np.asarray(dirty_mesh.faces, dtype=np.int64)
         with pytest.raises(ValueError, match="names vertex"):
-            _rs.Topology(faces, int(faces.max()))
+            _rs.mesh.Topology(faces, int(faces.max()))
 
 
 class TestFaceEdgeComponents:
+    def test_is_the_same_on_both_paths(self, dirty_mesh, reference_mesh):
+        for mesh in _meshes(dirty_mesh, reference_mesh):
+            assert_parity(*both(pre._face_edge_components, mesh))
+
     def test_the_fixture_has_several_components(self, dirty_mesh):
         labels, main = pre._face_edge_components(dirty_mesh)
         assert (labels == -2).sum() == 2
@@ -144,6 +150,23 @@ class TestFaceEdgeComponents:
 
 
 class TestFaceComponentsFast:
+    @staticmethod
+    def _subsets(n_faces, rng):
+        yield np.arange(n_faces)
+        yield rng.permutation(n_faces)[: n_faces // 2]
+        yield rng.permutation(n_faces)[: n_faces // 5]
+        repeated = rng.integers(0, n_faces, size=n_faces // 3)
+        assert len(np.unique(repeated)) < len(repeated)
+        yield repeated
+        yield np.array([], dtype=np.int64)
+
+    def test_is_the_same_on_both_paths(self, dirty_mesh, reference_mesh):
+        rng = np.random.default_rng(7)
+        for mesh in _meshes(dirty_mesh, reference_mesh):
+            faces = np.asarray(mesh.faces)
+            for fi in self._subsets(len(faces), rng):
+                assert_parity(*both(pre._face_components_fast, faces, fi))
+
     def test_degenerate_faces_still_connect_through_their_edges(self, dirty_mesh):
         faces = np.asarray(dirty_mesh.faces)
         degenerate = np.flatnonzero(~pre._non_degenerate(faces))
@@ -165,33 +188,55 @@ def square_pair():
 class TestRoundTrip:
     def test_returns_what_it_was_given(self, square_pair):
         vertices, faces = square_pair
-        v, f = _rs.mesh_roundtrip(vertices, faces)
+        v, f = _rs.mesh.mesh_roundtrip(vertices, faces)
         assert_identical(v, vertices)
         assert_identical(f, faces)
 
     def test_accepts_non_contiguous_input(self, square_pair):
         vertices, faces = square_pair
-        v, f = _rs.mesh_roundtrip(np.asfortranarray(vertices), np.asfortranarray(faces))
+        v, f = _rs.mesh.mesh_roundtrip(
+            np.asfortranarray(vertices), np.asfortranarray(faces)
+        )
         assert_identical(v, vertices)
         assert_identical(f, faces)
 
     def test_refuses_a_face_naming_a_missing_vertex(self, square_pair):
         vertices, _ = square_pair
         with pytest.raises(ValueError, match="names vertex 5"):
-            _rs.mesh_roundtrip(vertices, np.array([[0, 1, 5]], dtype=np.int64))
+            _rs.mesh.mesh_roundtrip(vertices, np.array([[0, 1, 5]], dtype=np.int64))
 
     def test_refuses_a_negative_index(self, square_pair):
         vertices, _ = square_pair
         with pytest.raises(ValueError, match="names vertex -1"):
-            _rs.mesh_roundtrip(vertices, np.array([[0, -1, 2]], dtype=np.int64))
+            _rs.mesh.mesh_roundtrip(vertices, np.array([[0, -1, 2]], dtype=np.int64))
 
     def test_refuses_the_wrong_shape(self, square_pair):
         vertices, faces = square_pair
         with pytest.raises(ValueError, match="expected"):
-            _rs.mesh_roundtrip(vertices[:, :2].copy(), faces)
+            _rs.mesh.mesh_roundtrip(vertices[:, :2].copy(), faces)
 
 
 class TestRefineComponentsWithFusions:
+    @staticmethod
+    def _cases(mesh, rng):
+        labels, main = pre._face_edge_components(mesh)
+        n = len(mesh.faces)
+        yield labels, main, []
+        yield labels, main, pre.find_fusions(mesh)
+        clusters = [rng.choice(n, size=max(1, n // 20), replace=False).tolist()]
+        clusters.append(rng.choice(n, size=3, replace=False).tolist())
+        yield labels, main, clusters
+
+    def test_is_the_same_on_both_paths(self, dirty_mesh, reference_mesh):
+        rng = np.random.default_rng(11)
+        for mesh in _meshes(dirty_mesh, reference_mesh):
+            for labels, main, fusions in self._cases(mesh, rng):
+                assert_parity(
+                    *both(
+                        pre._refine_components_with_fusions, mesh, labels, main, fusions
+                    )
+                )
+
     def test_fusion_faces_are_walls_on_the_dirty_mesh(self, dirty_mesh):
         labels, main = pre._face_edge_components(dirty_mesh)
         fusions = pre.find_fusions(dirty_mesh)
@@ -237,7 +282,7 @@ class TestBorderLoops:
         n_loops = 0
         for mesh in _meshes(dirty_mesh, reference_mesh):
             faces = np.asarray(mesh.faces)
-            topo = _rs.Topology(faces.astype(np.int64), len(mesh.vertices))
+            topo = _rs.mesh.Topology(faces.astype(np.int64), len(mesh.vertices))
             as_dict = pre._edge_to_faces(mesh)
             for sel in _patches(mesh, rng):
                 loops = pre._trace_border_loops(sel, topo, faces)
@@ -253,7 +298,7 @@ class TestBorderLoops:
         rng = np.random.default_rng(5)
         for mesh in _meshes(dirty_mesh, reference_mesh):
             faces = np.asarray(mesh.faces)
-            topo = _rs.Topology(faces.astype(np.int64), len(mesh.vertices))
+            topo = _rs.mesh.Topology(faces.astype(np.int64), len(mesh.vertices))
             as_dict = pre._edge_to_faces(mesh)
             adj = pre._face_adjacency(mesh, as_dict)
             for _ in range(10):
@@ -272,7 +317,9 @@ class TestGapStitchSelection:
         rng = np.random.default_rng(13)
         costs = set()
         for mesh in meshes:
-            topo = _rs.Topology(np.asarray(mesh.faces, np.int64), len(mesh.vertices))
+            topo = _rs.mesh.Topology(
+                np.asarray(mesh.faces, np.int64), len(mesh.vertices)
+            )
             adj = pre._face_adjacency(mesh, pre._edge_to_faces(mesh))
             sels = list(_patches(mesh, rng, n=6))
             if mesh is tube:
@@ -290,7 +337,7 @@ class TestGapStitchSelection:
         rng = np.random.default_rng(17)
         for mesh in _meshes(dirty_mesh, reference_mesh):
             faces = np.asarray(mesh.faces)
-            topo = _rs.Topology(faces.astype(np.int64), len(mesh.vertices))
+            topo = _rs.mesh.Topology(faces.astype(np.int64), len(mesh.vertices))
             as_dict = pre._edge_to_faces(mesh)
             adj = pre._face_adjacency(mesh, as_dict)
             for _ in range(6):
@@ -301,6 +348,59 @@ class TestGapStitchSelection:
 
 
 class TestFusions:
+    def test_finding_them_is_the_same_on_both_paths(self, dirty_mesh, reference_mesh):
+        from .test_pre import _subdivided_tube
+
+        found = 0
+        for mesh in [_subdivided_tube(), *_meshes(dirty_mesh, reference_mesh)]:
+            rust, python = both(pre._find_nonmanifold_fusions, mesh)
+            assert_parity(rust, python)
+            assert_parity(*both(pre.find_fusions, mesh))
+            found += len(rust)
+        assert found > 5
+
+    def test_splitting_fans_is_the_same_on_both_paths(self, dirty_mesh, reference_mesh):
+        rng = np.random.default_rng(23)
+        split = 0
+        for mesh in _meshes(dirty_mesh, reference_mesh):
+            n_v = len(mesh.vertices)
+            fusion_verts = {
+                int(v) for c in pre.find_fusions(mesh) for f in c for v in mesh.faces[f]
+            }
+            candidates = [
+                None,
+                fusion_verts,
+                set(rng.choice(n_v, size=n_v // 3).tolist()),
+            ]
+            for cand in candidates:
+                rust, python = both(pre._split_fan_vertices, mesh, cand)
+                assert_parity(np.asarray(rust.vertices), np.asarray(python.vertices))
+                assert_parity(np.asarray(rust.faces), np.asarray(python.faces))
+                split += len(rust.vertices) - n_v
+        assert split > 10
+
+    def test_removing_them_is_the_same_on_both_paths(self, dirty_mesh, reference_mesh):
+        from .test_pre import _subdivided_tube
+
+        # two triangles meeting at vertex 0, held together by face 2
+        bowtie = trimesh.Trimesh(
+            vertices=[[0, 0, 0], [1, 0, 0], [1, 1, 0], [-1, 1, 0], [-1, 0, 0]],
+            faces=[[0, 1, 2], [0, 3, 4], [0, 2, 3]],
+            process=False,
+        )
+        removed = split = 0
+        cases = [(bowtie, [[2]])]
+        for mesh in [_subdivided_tube(), *_meshes(dirty_mesh, reference_mesh)]:
+            cases.append((mesh, pre.find_fusions(mesh)))
+        for mesh, fusions in cases:
+            for fus in (fusions, []):
+                rust, python = both(pre.remove_fusions, mesh, fusions=fus)
+                assert_parity(np.asarray(rust.vertices), np.asarray(python.vertices))
+                assert_parity(np.asarray(rust.faces), np.asarray(python.faces))
+                split += len(rust.vertices) - len(mesh.vertices)
+            removed += sum(len(c) for c in fusions)
+        assert removed > 5 and split > 0
+
     def test_removing_a_fusion_splits_the_fan_it_leaves(self):
         # two triangles meeting at vertex 0, held together by face 2
         bowtie = trimesh.Trimesh(
@@ -316,6 +416,45 @@ class TestFusions:
         assert_identical(out.vertices[faces[1]], bowtie.vertices[[0, 3, 4]])
 
 
+class TestFilterSmallClusters:
+    def test_is_the_same_on_both_paths(self, dirty_mesh, reference_mesh):
+        rng = np.random.default_rng(29)
+        dropped = 0
+        for mesh in _meshes(dirty_mesh, reference_mesh):
+            n = len(mesh.faces)
+            for frac, min_size in ((0.3, 3), (0.6, 10), (0.9, 50)):
+                mask = rng.random(n) < frac
+                rust, python = both(pre._filter_small_clusters, mesh, mask, min_size)
+                assert_parity(rust, python)
+                dropped += int(mask.sum() - rust.sum())
+        assert dropped > 100
+
+
+class TestOutwardDot:
+    def test_is_the_same_on_both_paths(self, dirty_mesh, reference_mesh):
+        from .test_pre import _subdivided_tube
+
+        for mesh in [_subdivided_tube(), *_meshes(dirty_mesh, reference_mesh)]:
+            radius = 5.0 * float(np.median(mesh.edges_unique_length))
+            labels, _ = pre._face_edge_components(mesh)
+            vert_comp = np.full(len(mesh.vertices), -1, dtype=np.int64)
+            for fi in np.flatnonzero(labels >= 0):
+                vert_comp[mesh.faces[fi]] = labels[fi]
+            for vc in (None, vert_comp):
+                rust, python = both(pre._outward_dot, mesh, radius, vert_comp=vc)
+                assert_parity(rust, python)
+                assert (rust != 0).sum() > len(rust) // 4
+
+
+class TestComputeMeshStats:
+    def test_is_the_same_on_both_paths(self, dirty_mesh, reference_mesh):
+        for mesh in _meshes(dirty_mesh, reference_mesh):
+            rust, python = both(pre.compute_mesh_stats, mesh)
+            assert_parity(rust.face_comp, python.face_comp)
+            assert rust.main_ci == python.main_ci
+            assert_parity(rust.outward_dots, python.outward_dots)
+
+
 class TestKdTree:
     def _grid_points(self, rng, n):
         # integer coordinates, as on a voxel grid: exact distance ties abound
@@ -328,7 +467,7 @@ class TestKdTree:
         points = np.unique(self._grid_points(rng, 600), axis=0)
         queries = self._grid_points(rng, 2000) + 0.5
         d_ref, i_ref = pre._nearest(KDTree(points), queries)
-        d, i = _rs.KdTree(points).query(queries)
+        d, i = _rs.mesh.KdTree(points).query(queries)
         assert_identical(d, d_ref)
         assert_identical(i, i_ref)
         _, i_scipy = KDTree(points).query(queries)
@@ -341,7 +480,7 @@ class TestKdTree:
         points = self._grid_points(rng, 3000)
         queries = rng.random((300, 3)) * 12
         ref = KDTree(points).query_ball_point(queries, 2.0, return_sorted=True)
-        ours = _rs.KdTree(points).query_ball_point(queries, 2.0)
+        ours = _rs.mesh.KdTree(points).query_ball_point(queries, 2.0)
         assert [h.tolist() for h in ours] == [list(r) for r in ref]
         assert sum(len(r) for r in ref) > 1000
 
@@ -377,8 +516,56 @@ def _islands():
     return mesh, ranges
 
 
+class TestFindOrganelles:
+    def test_is_the_same_on_both_paths(self, dirty_mesh, reference_mesh):
+        from .test_pre import _sphere_with_internal, _subdivided_tube
+
+        found = {}
+        meshes = {
+            "flask": _flask(),
+            "internal": _sphere_with_internal(),
+            "tube": _subdivided_tube(),
+            "dirty": dirty_mesh,
+            "reference": reference_mesh,
+        }
+        for name, mesh in meshes.items():
+            for radius in (None, 50.0):
+                rust, python = both(pre.find_organelles, mesh, radius=radius)
+                assert_parity(rust.pocket, python.pocket, name)
+                assert_parity(rust.isolated, python.isolated, name)
+                found[name, radius] = (int(rust.pocket.sum()), int(rust.isolated.sum()))
+        # a pocket in the flask, an isolated fragment in the sphere
+        assert found["flask", None][0] > 1000
+        assert found["internal", None][1] > 0
+
+    def test_the_enclosure_pass_is_the_same_on_both_paths(
+        self, dirty_mesh, reference_mesh
+    ):
+        from skeliner.python import pre as python_pre
+
+        from .test_pre import _subdivided_tube
+
+        rng = np.random.default_rng(19)
+        added_total = 0
+        for mesh in [
+            _subdivided_tube(),
+            _flask(),
+            *_meshes(dirty_mesh, reference_mesh),
+        ]:
+            adjacency = np.asarray(mesh.face_adjacency, dtype=np.int64)
+            n = len(mesh.faces)
+            for frac, min_size in ((0.7, 1), (0.85, 2), (0.6, 5)):
+                np_mask = rng.random(n) < frac
+                pocket = ~np_mask & (rng.random(n) < 0.95)
+                args = (adjacency, np_mask, pocket, min_size)
+                rust = _rs.pre.enclosure_pass(*args)
+                assert_parity(rust, python_pre.enclosure_pass(*args))
+                added_total += rust[1]
+        assert added_total > 50
+
+
 class TestFindDisconnected:
-    def test_every_rule_fires(self):
+    def test_every_rule_fires_the_same_on_both_paths(self):
         from skeliner.dataclass import Organelles, Soma
 
         mesh, ranges = _islands()
@@ -391,11 +578,13 @@ class TestFindDisconnected:
         soma = Soma(
             center=np.array([30.0, 0, 0]), axes=np.array([5.0, 4.0, 3.0]), R=np.eye(3)
         )
-        found = pre.find_disconnected(mesh, soma=soma, organelles=org)
+        found, python = both(pre.find_disconnected, mesh, soma=soma, organelles=org)
+        assert_parity(found, python)
         kept = {next(k for k, (a, b) in ranges.items() if a <= c[0] < b) for c in found}
         assert kept == {"outside", "far"}
         # without the soma and organelles, those come back
-        found = pre.find_disconnected(mesh, soma=None, organelles=None)
+        found, python = both(pre.find_disconnected, mesh, soma=None, organelles=None)
+        assert_parity(found, python)
         kept = {next(k for k, (a, b) in ranges.items() if a <= c[0] < b) for c in found}
         assert {"outside", "far"} <= kept and "enclosed" not in kept
 
@@ -418,6 +607,15 @@ def _hollow_soma(gap_above: float = 1000.0) -> np.ndarray:
 
 
 class TestZScan:
+    def test_is_the_same_on_both_paths_with_and_without_the_hull_pass(self):
+        v = _hollow_soma()
+        assert_parity(*both(pre._z_scan, v))
+        assert_parity(*both(pre._z_scan, v, retry_broken=False))
+        no_chain = v[np.abs(v[:, 2]) < 200]
+        assert_parity(*both(pre._z_scan, no_chain))
+        mesh = trimesh.Trimesh(vertices=v, process=False)
+        assert_parity(*both(pre.find_nucleus_center, mesh))
+
     def test_the_hull_pass_lengthens_the_chain(self):
         v = _hollow_soma()
         both_passes = pre._z_scan(v)
@@ -459,6 +657,31 @@ def _revolved(profile, spacing=180.0):
     return np.round(np.array(verts)), np.array(faces)
 
 
+def _flask(r_out=3000.0, r_neck=250.0, r_chamber=1500.0, step=150.0):
+    """A cell whose top folds inward through a narrow neck into a chamber
+    ridged around its wall: a pocket organelle, behind two mouths."""
+    prof = []
+    top = np.pi / 2 - np.arcsin(r_neck / r_out)
+    for a in np.linspace(-np.pi / 2 + 0.05, top, 60):
+        prof.append((r_out * np.cos(a), r_out * np.sin(a)))
+    z_top = prof[-1][1]
+    for z in np.arange(z_top - step, z_top - 1200.0, -step):
+        prof.append((r_neck, z))
+    a0 = np.arcsin(r_neck / r_chamber)
+    zc = prof[-1][1] - r_chamber * np.cos(a0)
+    for a in np.linspace(a0, np.pi - 0.15, 40):
+        r = r_chamber * (1 + 0.06 * np.sin(12 * a))
+        prof.append((r * np.sin(a), zc + r * np.cos(a)))
+    v, f = _revolved(prof)
+    return trimesh.Trimesh(v, f, process=False)
+
+
+def _icosphere_soma():
+    """A sphere whose every cross-section's hollow is under the 500 nm void
+    minimum: no nucleus."""
+    return trimesh.creation.icosphere(subdivisions=3, radius=300.0)
+
+
 def _soma_cell():
     """A 3 um soma tapering into two neurites, with a small sphere inside
     marked as an organelle: ``(mesh, organelles)``."""
@@ -478,6 +701,27 @@ def _soma_cell():
 
 
 class TestFindSomaViaRingCutoff:
+    def test_is_the_same_on_both_paths(self, monkeypatch):
+        from skeliner.dataclass import Soma
+
+        mesh, org = _soma_cell()
+        fits = []
+        fit = Soma.fit.__func__
+
+        def counted(cls, pts, verts=None):
+            fits.append(len(pts))
+            return fit(cls, pts, verts=verts)
+
+        monkeypatch.setattr(Soma, "fit", classmethod(counted))
+        rust, python = both(pre.find_soma_via_ring_cutoff, mesh, organelles=org)
+        for k in ("center", "axes", "R", "verts"):
+            assert_parity(getattr(rust, k), getattr(python, k), k)
+        assert_parity(rust.nucleus, python.nucleus)
+        # both paths fit the same points: rings, assignment, pruning,
+        # organelle exclusion
+        assert len(fits) == 8 and fits[:4] == fits[4:]
+        assert both(pre.find_soma_via_ring_cutoff, _icosphere_soma()) == (None, None)
+
     def test_finds_the_soma_and_leaves_out_the_organelle(self):
         mesh, org = _soma_cell()
         soma = pre.find_soma_via_ring_cutoff(mesh, organelles=org)
@@ -504,7 +748,7 @@ class TestBreakUpMesh:
         org.isolated[band] = True
         return int(band.sum())
 
-    def test_the_stranded_tip_is_trapped_unless_rescued(self):
+    def test_the_stranded_tip_is_trapped_unless_rescued_on_both_paths(self):
         mesh, org = _soma_cell()
         assert self._cut(mesh, org) > 0
         soma = pre.find_soma_via_ring_cutoff(mesh, organelles=org)
@@ -515,7 +759,13 @@ class TestBreakUpMesh:
             {"released": np.arange(len(mesh.faces)), "claim_min_faces": 50},
         ):
             for s in (soma, None):
-                comps = pre.break_up_mesh(mesh, s, org, **kwargs)
+                comps, python = both(pre.break_up_mesh, mesh, s, org, **kwargs)
+                for part in ("neurites", "discarded"):
+                    assert_parity(
+                        getattr(comps, part).components,
+                        getattr(python, part).components,
+                    )
+                assert_parity(comps.organelles.expanded, python.organelles.expanded)
                 found.append(int(comps.organelles.expanded.sum()))
         # the stranded tip is trapped unless a claim releases it
         assert found[0] > 0 and found[2] == 0
@@ -586,13 +836,92 @@ def _has_fold(mesh, patch) -> bool:
 
 
 class TestParallelPatches:
-    def test_the_sandwich_is_found_and_zipped(self):
+    def test_the_sandwich_is_found_and_zipped_on_both_paths(self):
         mesh = _sandwich()
-        patches = pre.find_parallel_patches(mesh, boundaries={0: np.array([0])})
+        b = {0: np.array([0])}
+        patches, python = both(pre.find_parallel_patches, mesh, boundaries=b)
+        assert_parity(patches, python)
         assert len(patches) == 3
         assert any(_has_fold(mesh, p) for p in patches)
-        out = pre.remove_parallel_patches(mesh, patches=patches)
+        out, python = both(pre.remove_parallel_patches, mesh, patches=patches)
+        assert_parity(np.asarray(out.faces), np.asarray(python.faces))
         # the caps are gone and the rims zipped: one tube
         labels, _ = pre._face_edge_components(out)
         assert len(set(labels.tolist()) - {-2}) == 1
         assert len(out.faces) > len(mesh.faces)
+
+
+class TestPythonPath:
+    """The ``mesh`` crate's Python twins compute what the Rust ones do."""
+
+    def test_topology(self, dirty_mesh, reference_mesh):
+        from skeliner.python import mesh as python_mesh
+
+        from ._parity import assert_parity
+
+        rng = np.random.default_rng(23)
+        n_loops = 0
+        for mesh in _meshes(dirty_mesh, reference_mesh):
+            faces = np.asarray(mesh.faces, np.int64)
+            rs = _rs.mesh.Topology(faces, len(mesh.vertices))
+            py = python_mesh.Topology(faces, len(mesh.vertices))
+            assert (py.n_faces, py.n_vertices, py.n_edges, len(py)) == (
+                rs.n_faces,
+                rs.n_vertices,
+                rs.n_edges,
+                len(rs),
+            )
+            assert py.items() == rs.items()
+            assert list(py) == list(rs)
+            assert py.as_dict() == rs.as_dict()
+            assert_parity(py.edges(), rs.edges())
+            assert_parity(py.edge_faces_csr(), rs.edge_faces_csr())
+            for sel in _patches(mesh, rng, n=6):
+                assert py.border_edges(sel) == rs.border_edges(sel)
+                loops = rs.border_loops(sel)
+                n_loops += len(loops)
+                assert py.border_loops(sel) == loops
+                for budget in (0, 5, 10**9):
+                    assert py.sever_cost(sel, budget) == rs.sever_cost(sel, budget)
+            for _ in range(5):
+                tip = rng.choice(len(faces), size=3, replace=False).tolist()
+                assert py.expand_tip(tip) == rs.expand_tip(tip)
+                assert py.expand_selection_per_group(
+                    tip
+                ) == rs.expand_selection_per_group(tip)
+        assert n_loops > 20
+
+    def test_kd_tree(self):
+        from skeliner.python import mesh as python_mesh
+
+        from ._parity import assert_parity
+
+        rng = np.random.default_rng(31)
+        points = np.unique(
+            rng.integers(0, 12, size=(600, 3)).astype(np.float64), axis=0
+        )
+        queries = rng.integers(0, 12, size=(2000, 3)).astype(np.float64) + 0.5
+        rs, py = _rs.mesh.KdTree(points), python_mesh.KdTree(points)
+        assert len(rs) == len(py)
+        assert_parity(py.query(queries), rs.query(queries))
+        assert_parity(
+            py.query_ball_point(queries, 2.0), rs.query_ball_point(queries, 2.0)
+        )
+
+    def test_mesh_roundtrip(self, square_pair):
+        from skeliner.python import mesh as python_mesh
+
+        from ._parity import assert_parity
+
+        vertices, faces = square_pair
+        assert_parity(
+            python_mesh.mesh_roundtrip(vertices, faces),
+            _rs.mesh.mesh_roundtrip(vertices, faces),
+        )
+        for bad in ([[0, 1, 5]], [[0, -1, 2]]):
+            bad = np.array(bad, dtype=np.int64)
+            with pytest.raises(ValueError) as rs_err:
+                _rs.mesh.mesh_roundtrip(vertices, bad)
+            with pytest.raises(ValueError) as py_err:
+                python_mesh.mesh_roundtrip(vertices, bad)
+            assert str(py_err.value) == str(rs_err.value)

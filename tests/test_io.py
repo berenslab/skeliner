@@ -13,7 +13,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import skeliner as sk
 from skeliner import Skeleton, Soma, dx, skeletonize
+from skeliner._backend import PATHS
 from skeliner.dataclass import MeshStats, Organelles
 from skeliner.io import (
     load_mesh,
@@ -25,6 +27,7 @@ from skeliner.io import (
     load_organelles_npz,
     save_mesh_stats_npz,
     load_mesh_stats_npz,
+    save_mesh,
 )
 
 SAMPLES_DIR = Path(__file__).parent / "data"
@@ -455,3 +458,261 @@ class TestSkeletonProvenance:
         assert back.meta["track"] == skel.meta["track"]
         assert back.meta["params"] == skel.meta["params"]
         assert back.meta["skeliner_version"] == skel.meta["skeliner_version"]
+
+
+# ---------------------------------------------------------------------
+# mesh readers: the Rust and the Python path read OBJ as trimesh does, and
+# leave anything else to it
+# ---------------------------------------------------------------------
+def _trimesh_arrays(path):
+    import trimesh
+
+    m = trimesh.load_mesh(path, process=False)
+    return np.asarray(m.vertices, np.float64), np.asarray(m.faces, np.int64)
+
+
+def _obj_files(reference_mesh, tmp_path):
+    """OBJ files both readers read."""
+    files = [Path(__file__).parent / "data" / "60427.obj"]
+    written = tmp_path / "written.obj"
+    save_mesh(reference_mesh, written)  # trimesh's export, with its header
+    files.append(written)
+    loose = tmp_path / "loose.obj"  # a vertex no face names, and CRLF
+    loose.write_bytes(b"v 0 0 0\r\nv 9 9 9\r\nv 1 0 0\r\nv 0 1 0\r\n\r\nf 1 3 4\r\n")
+    files.append(loose)
+    numbers = tmp_path / "numbers.obj"  # decimals as writers spell them
+    numbers.write_bytes(
+        b"v 1e3 -2.5E-2 +3.\nv .5 -0 0.1000000000000000055511151231257827\n"
+        b"v 515088.00000 510594.00000 46431.00000\n"
+        b"v 1.7976931348623157e308 4.9e-324 -123456789.123456789\n"
+        b"f 1 2 3\nf 2 3 4\n"
+    )
+    files.append(numbers)
+    return files
+
+
+def test_mesh_readers_read_as_trimesh_on_both_paths(reference_mesh, tmp_path):
+    from skeliner import _rs
+    from skeliner.python import io as python_io
+
+    from ._parity import assert_parity, both
+
+    for path in _obj_files(reference_mesh, tmp_path):
+        want = _trimesh_arrays(path)
+        rust = _rs.io.read_obj(str(path))
+        python = python_io.read_obj(str(path))
+        assert rust is not None, path.name
+        assert_parity(rust, python, path.name)
+        for got in (rust[0], rust[1], python[0], python[1]):
+            assert got.flags.c_contiguous
+        # bit for bit, signed zeros included
+        assert rust[0].tobytes() == want[0].tobytes(), path.name
+        assert np.array_equal(rust[1], want[1]), path.name
+        for mesh in both(load_mesh, path):
+            assert mesh.vertices.tobytes() == want[0].tobytes(), path.name
+            assert np.array_equal(mesh.faces, want[1]), path.name
+    # the vertex no face names is dropped, as trimesh drops it
+    assert len(load_mesh(tmp_path / "loose.obj").vertices) == 3
+
+
+def test_what_the_readers_do_not_read_goes_to_trimesh(reference_mesh, tmp_path):
+    import trimesh
+
+    from skeliner import _rs
+    from skeliner.python import io as python_io
+
+    from ._parity import both
+
+    tri = b"v 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\n"
+    declined = {
+        "normals.obj": tri + b"vn 0 0 1\nf 1//1 2//1 3//1\n",
+        "quad.obj": tri + b"f 1 2 4 3\n",
+        "objects.obj": b"o a\n" + tri + b"f 1 2 3\no b\nf 1 3 2\n",
+        "relative.obj": tri + b"f -4 -3 -2\n",
+        "colours.obj": b"v 0 0 0 1 0 0\nv 1 0 0 1 0 0\nv 0 1 0 1 0 0\nf 1 2 3\n",
+    }
+    for name, data in declined.items():
+        (tmp_path / name).write_bytes(data)
+        assert _rs.io.read_obj(str(tmp_path / name)) is None, name
+        assert python_io.read_obj(str(tmp_path / name)) is None, name
+    # formats skeliner has no reader for go to trimesh directly
+    others = ["mesh.ply", "mesh.stl", "mesh.off"]
+    for name in others:
+        reference_mesh.export(tmp_path / name)
+    for name in [*declined, *others]:
+        path = tmp_path / name
+        want = trimesh.load_mesh(path, process=False)
+        for mesh in both(load_mesh, path):
+            assert type(mesh) is type(want), name
+            assert np.array_equal(mesh.vertices, want.vertices), name
+            assert np.array_equal(mesh.faces, want.faces), name
+
+
+def test_a_ctm_the_reader_does_not_read_goes_to_trimesh(tmp_path):
+    import trimesh
+
+    from skeliner import _rs
+    from skeliner.python import io as python_io
+
+    path = tmp_path / "other.ctm"
+    path.write_bytes(b"not a CTM file")
+    assert _rs.io.read_ctm(str(path)) is None
+    assert python_io.read_ctm(str(path)) is None
+    # whatever trimesh makes of it (here: no python-openctm), load_mesh does
+    with pytest.raises(Exception) as trimesh_error:
+        trimesh.load_mesh(path, process=False)
+    for name in PATHS:
+        with sk.backend(name), pytest.raises(trimesh_error.type):
+            load_mesh(path)
+
+
+def test_a_missing_mesh_file_raises_as_open_does_on_both_paths(tmp_path):
+    from skeliner import _rs
+    from skeliner.python import io as python_io
+
+    missing = str(tmp_path / "missing.obj")
+    for read in (_rs.io.read_obj, _rs.io.read_ctm):
+        with pytest.raises(FileNotFoundError) as rust:
+            read(missing)
+        with pytest.raises(FileNotFoundError) as python:
+            getattr(python_io, read.__name__)(missing)
+        assert str(rust.value) == str(python.value)
+        assert rust.value.filename == missing
+    with pytest.raises(IsADirectoryError):
+        _rs.io.read_obj(str(tmp_path))
+
+
+# ---------------------------------------------------------------------
+# OpenCTM, for EyeWire 1's meshes: files built here, as the format lays
+# them out, read on both paths
+# ---------------------------------------------------------------------
+def _ctm_block(words) -> bytes:
+    """A packed CTM block of 32-bit *words* ``(count, size)``: four byte
+    planes, most significant first, each component by component, LZMA1
+    packed after its five property bytes."""
+    import lzma
+    import struct
+
+    w = np.asarray(words, dtype=np.uint32).reshape(len(words), -1)
+    planes = np.stack([(w >> s).astype(np.uint8) for s in (24, 16, 8, 0)])
+    alone = lzma.compress(planes.transpose(0, 2, 1).tobytes(), format=lzma.FORMAT_ALONE)
+    # an "alone" stream: properties, unpacked size, data; CTM keeps no size
+    return struct.pack("<I", len(alone) - 13) + alone[:5] + alone[13:]
+
+
+def _ctm_index_deltas(faces) -> np.ndarray:
+    """MG1 / MG2 triangle deltas, as the reference encoder makes them."""
+    w = np.asarray(faces, dtype=np.int64).copy()
+    for i in range(len(w) - 1, -1, -1):
+        if i >= 1 and w[i, 0] == w[i - 1, 0]:
+            w[i, 1] -= w[i - 1, 1]
+        else:
+            w[i, 1] -= w[i, 0]
+        w[i, 2] -= w[i, 0]
+        if i >= 1:
+            w[i, 0] -= w[i - 1, 0]
+    return w & 0xFFFFFFFF
+
+
+def _ctm_file(method: str, vertices, faces) -> tuple[bytes, np.ndarray, np.ndarray]:
+    """An OpenCTM v5 file of *vertices* and *faces*, and what it decodes to:
+    ``(data, vertices, faces)``."""
+    import struct
+
+    v = np.asarray(vertices, dtype=np.float32)
+    f = np.asarray(faces, dtype=np.int64)
+    head = b"OCTM" + struct.pack("<I", 5) + method.encode().ljust(4, b"\0")
+    head += struct.pack("<5I", len(v), len(f), 0, 0, 0) + struct.pack("<I", 4) + b"note"
+    if method == "RAW":
+        body = b"INDX" + f.astype("<u4").tobytes() + b"VERT" + v.astype("<f4").tobytes()
+        return head + body, v.astype(np.float64), f
+    if method == "MG1":
+        body = b"INDX" + _ctm_block(_ctm_index_deltas(f))
+        body += b"VERT" + _ctm_block(v.view(np.uint32))
+        return head + body, v.astype(np.float64), f
+    # MG2: each vertex on a 4 x 4 x 4 grid, in steps of the precision from
+    # its cell's corner; vertices sorted by cell, x a delta within one
+    precision, div = np.float32(0.5), np.array([4, 4, 4])
+    lo, hi = v.min(axis=0) - 1, v.max(axis=0) + 1
+    size = (hi - lo) / div.astype(np.float32)
+    g = np.minimum(((v - lo) / size).astype(np.int64), div - 1)
+    cell = g[:, 0] + div[0] * (g[:, 1] + div[1] * g[:, 2])
+    origin = g.astype(np.float32) * size + lo
+    ints = np.round((v - origin) / precision).astype(np.int64)
+    order = np.lexsort((ints[:, 0], cell))
+    cell, ints, origin = cell[order], ints[order], origin[order]
+    new_id = np.empty(len(v), dtype=np.int64)
+    new_id[order] = np.arange(len(v))
+    f = new_id[f]
+    x = ints[:, 0].copy()
+    same = np.r_[False, cell[1:] == cell[:-1]]
+    x[1:][same[1:]] -= ints[:-1, 0][same[1:]]
+    stored = np.column_stack([x, ints[:, 1], ints[:, 2]])
+    mg2h = b"MG2H" + struct.pack("<8f", precision, 0.0, *lo, *hi)
+    mg2h += struct.pack("<3I", *div)
+    body = mg2h + b"VERT" + _ctm_block(stored)
+    body += b"GIDX" + _ctm_block(np.diff(cell, prepend=0)[:, None])
+    body += b"INDX" + _ctm_block(_ctm_index_deltas(f))
+    expected = precision * ints.astype(np.float32) + origin
+    return head + body, expected.astype(np.float64), f
+
+
+@pytest.mark.parametrize("method", ["RAW", "MG1", "MG2"])
+def test_eyewire_ctm_reads_on_both_paths(tmp_path, method):
+    import trimesh
+
+    from skeliner import _rs
+    from skeliner.python import io as python_io
+
+    from ._parity import assert_parity, both
+
+    sphere = trimesh.creation.icosphere(subdivisions=2, radius=40.0)
+    vertices = sphere.vertices + [100.0, 50.0, 7.0]
+    data, want_v, want_f = _ctm_file(method, vertices, sphere.faces)
+    path = tmp_path / f"{method}.ctm"
+    path.write_bytes(data)
+    rust = _rs.io.read_ctm(str(path))
+    assert_parity(rust, python_io.read_ctm(str(path)))
+    assert np.array_equal(rust[0], want_v) and np.array_equal(rust[1], want_f)
+    # the same triangles; MG2's corners within half its precision (0.5)
+    tol = 0.25 + 1e-4 if method == "MG2" else 1e-4
+    assert np.abs(rust[0][rust[1]] - vertices[sphere.faces]).max() <= tol
+    for mesh in both(load_mesh, path):
+        assert np.array_equal(mesh.vertices, want_v)
+        assert np.array_equal(mesh.faces, want_f)
+
+
+def test_eyewire_ctm_refuses_the_same_broken_files_on_both_paths(tmp_path):
+    import lzma
+
+    import trimesh
+
+    from skeliner import _rs
+    from skeliner.python import io as python_io
+
+    sphere = trimesh.creation.icosphere(subdivisions=1)
+    data, _, _ = _ctm_file("MG2", sphere.vertices, sphere.faces)
+    gidx = data.index(b"GIDX")
+    vert = data.index(b"VERT")
+    cases = {
+        "short.ctm": (data[:-7], ValueError, "ends early"),
+        "unordered.ctm": (
+            data[:gidx] + b"XXXX" + data[gidx + 4 :],
+            ValueError,
+            "missing or out of place",
+        ),
+        # VERT's first LZMA property byte past the largest valid one
+        "packed.ctm": (
+            data[: vert + 8] + b"\xff" + data[vert + 9 :],
+            lzma.LZMAError,
+            None,
+        ),
+    }
+    for name, (blob, error, match) in cases.items():
+        path = tmp_path / name
+        path.write_bytes(blob)
+        with pytest.raises(error, match=match) as rust:
+            _rs.io.read_ctm(str(path))
+        with pytest.raises(error, match=match) as python:
+            python_io.read_ctm(str(path))
+        assert str(rust.value) == str(python.value), name

@@ -10,7 +10,9 @@ import numpy as np
 import trimesh
 from scipy.spatial import KDTree
 
-from skeliner import _rs
+from skeliner._backend import kernels
+from skeliner.python import mesh as _py_mesh
+from skeliner.python import pre as _py_pre
 from skeliner.dataclass import (
     Discarded,
     MeshComponents,
@@ -78,50 +80,26 @@ def _timed(label: str, *, verbose: bool):
             print(f"      └─ {m}")
 
 
-def _non_degenerate(faces: np.ndarray) -> np.ndarray:
-    """Boolean mask of faces with 3 distinct vertices."""
-    return (
-        (faces[:, 0] != faces[:, 1])
-        & (faces[:, 1] != faces[:, 2])
-        & (faces[:, 0] != faces[:, 2])
-    )
+_non_degenerate = _py_mesh.non_degenerate
 
 
 def _edge_to_faces(mesh: trimesh.Trimesh) -> dict[tuple[int, int], list[int]]:
     """Build edge→face adjacency, skipping degenerate faces."""
-    result: dict[tuple[int, int], list[int]] = defaultdict(list)
-    faces = np.asarray(mesh.faces)  # snapshot — avoids trimesh caching overhead
-    good = _non_degenerate(faces)
-    # Vectorised edge extraction: 3 edges per face
-    fi_idx = np.where(good)[0]
-    gf = faces[fi_idx]
-    for col_a, col_b in ((0, 1), (1, 2), (0, 2)):
-        va = gf[:, col_a].astype(np.intp)
-        vb = gf[:, col_b].astype(np.intp)
-        lo = np.minimum(va, vb)
-        hi = np.maximum(va, vb)
-        for k in range(len(fi_idx)):
-            result[(int(lo[k]), int(hi[k]))].append(int(fi_idx[k]))
-    return result
+    return _py_mesh.edge_to_faces(np.asarray(mesh.faces))
 
 
 def _edge_map(mesh: trimesh.Trimesh):
-    """Edge → faces of *mesh* as a :class:`skeliner._rs.Topology`.
+    """Edge → faces of *mesh* as the active path's ``Topology``.
 
     It reads like the dict :func:`_edge_to_faces` builds — keys, face lists
     and iteration order — so code written against the dict takes it.
     """
-    return _rs.Topology(np.asarray(mesh.faces, dtype=np.int64), len(mesh.vertices))
+    return kernels.mesh.Topology(
+        np.asarray(mesh.faces, dtype=np.int64), len(mesh.vertices)
+    )
 
 
-def _row_dot(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Dot product of each row of two ``(n, 3)`` arrays, summed left to right.
-
-    ``np.einsum("ij,ij->i", ...)`` follows no single per-row order, so its
-    last bit — and the sign of a dot near zero — is not reproducible; this
-    order is the Rust core's.
-    """
-    return (a[:, 0] * b[:, 0] + a[:, 1] * b[:, 1]) + a[:, 2] * b[:, 2]
+_row_dot = _py_mesh.row_dot
 
 
 def _svd_rows(x: np.ndarray, full_matrices: bool) -> np.ndarray:
@@ -144,27 +122,7 @@ def _mouth_hull_area(pts: np.ndarray) -> float:
         return 0.0
 
 
-def _nearest(tree: KDTree, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Nearest point of *tree* to each of *points*: ``(distances, indices)``.
-
-    Exact ties go to the lowest index.  scipy's own pick among equally near
-    points depends on how its tree was built, and on these grid-snapped
-    meshes such ties are common — 2% of face-centroid queries on one cell.
-    """
-    points = np.atleast_2d(np.asarray(points, dtype=np.float64))
-    if tree.n < 2 or len(points) == 0:
-        return tree.query(points)
-    d2, i2 = tree.query(points, k=2)
-    d, i = d2[:, 0].copy(), i2[:, 0].copy()
-    tied = np.flatnonzero(d2[:, 1] <= d2[:, 0])
-    if len(tied):
-        reach = d[tied] * (1 + 1e-9) + 1e-12
-        data = tree.data
-        for row, cand in zip(tied, tree.query_ball_point(points[tied], reach)):
-            cand = np.asarray(cand)
-            sq = ((data[cand] - points[row]) ** 2).sum(axis=1)
-            i[row] = cand[sq == sq.min()].min()
-    return d, i
+_nearest = _py_mesh.nearest
 
 
 def _face_edge_components(mesh: trimesh.Trimesh) -> tuple[np.ndarray, int]:
@@ -182,7 +140,7 @@ def _face_edge_components(mesh: trimesh.Trimesh) -> tuple[np.ndarray, int]:
         Component id of the largest component, ties to the lowest id.
     """
     faces = np.asarray(mesh.faces, dtype=np.int64)
-    return _rs.face_edge_components(faces, len(mesh.vertices))
+    return kernels.pre.face_edge_components(faces, len(mesh.vertices))
 
 
 def find_holes(
@@ -953,42 +911,7 @@ def fill_holes(
 # ── Merge selected faces ────────────────────────────────────────────
 
 
-# The three vertex-column pairs that make a face's edges.
-_EDGE_COLS = ((0, 1), (1, 2), (0, 2))
-
-
-def _border_edges(
-    sel: set[int],
-    edge_to_faces: dict[tuple[int, int], list[int]],
-    faces: np.ndarray | None,
-) -> list[tuple[int, int]]:
-    """Edges shared by a face in *sel* and a face outside it, sorted.
-
-    Without *faces* the whole map is scanned.  With *faces* — the array
-    *edge_to_faces* was built from — only the selection's own edges are
-    examined, so the cost follows the selection rather than the mesh.
-    Both return the same list.
-    """
-    if faces is None:
-        return sorted(
-            e
-            for e, fis in edge_to_faces.items()
-            if any(fi in sel for fi in fis) and any(fi not in sel for fi in fis)
-        )
-    found: set[tuple[int, int]] = set()
-    seen: set[tuple[int, int]] = set()
-    for fi in sel:
-        f = faces[fi]
-        for a, b in _EDGE_COLS:
-            u, v = int(f[a]), int(f[b])
-            e = (u, v) if u < v else (v, u)
-            if e in seen:
-                continue
-            seen.add(e)
-            fis = edge_to_faces.get(e)
-            if fis and any(x in sel for x in fis) and any(x not in sel for x in fis):
-                found.add(e)
-    return sorted(found)
+_border_edges = _py_mesh.border_edges
 
 
 def _trace_border_loops(
@@ -1000,110 +923,23 @@ def _trace_border_loops(
 
     Each loop starts at its smallest vertex and, wherever the border offers
     a choice, steps to the smallest unvisited neighbour, so the loops depend
-    only on which edges are on the border.  Given a
-    :class:`skeliner._rs.Topology` the Rust core traces them; given the dict,
-    pass *faces* to examine only the selection's edges (see
+    only on which edges are on the border.  Given a ``Topology`` (of
+    either path, :func:`_edge_map`) it traces them; given the dict, pass
+    *faces* to examine only the selection's edges (see
     :func:`_border_edges`).
     """
-    if isinstance(edge_to_faces, _rs.Topology):
+    if hasattr(edge_to_faces, "border_loops"):  # a Topology, of either path
         return edge_to_faces.border_loops(sel)
     return _trace_border_loops_py(sel, edge_to_faces, faces)
 
 
-def _trace_border_loops_py(
-    sel: set[int],
-    edge_to_faces: dict[tuple[int, int], list[int]],
-    faces: np.ndarray | None = None,
-) -> list[list[int]]:
-    """:func:`_trace_border_loops` on the dict :func:`_edge_to_faces` builds."""
-    border_edges = _border_edges(sel, edge_to_faces, faces)
-
-    if len(border_edges) < 3:
-        return []
-
-    adj: dict[int, set[int]] = defaultdict(set)
-    for v1, v2 in border_edges:
-        adj[v1].add(v2)
-        adj[v2].add(v1)
-
-    visited: set[int] = set()
-    loops: list[list[int]] = []
-    for start in sorted(adj):
-        if start in visited:
-            continue
-        loop = [start]
-        visited.add(start)
-        current, prev = start, -1
-        while True:
-            nbs = [n for n in adj[current] if n != prev]
-            if not nbs:
-                break
-            closed = False
-            for n in nbs:
-                if n == start and len(loop) > 2:
-                    loops.append(loop)
-                    closed = True
-                    break
-            if closed:
-                break
-            nxt = min((n for n in nbs if n not in visited), default=None)
-            if nxt is None:
-                break
-            visited.add(nxt)
-            loop.append(nxt)
-            prev, current = current, nxt
-
-    return loops
+_trace_border_loops_py = _py_mesh.border_loops
 
 
-def _validate_loop_pair(
-    la: list[int],
-    lb: list[int],
-    *,
-    min_verts: int = 4,
-    max_ratio: float = 5.0,
-) -> str | None:
-    """Return a reason string if the loop pair is unsuitable for stitching.
-
-    Reject 3-vertex "loops" (degenerate triangle holes that no stitcher
-    can bridge to a larger rim manifoldly), reject pairs whose size
-    ratio exceeds *max_ratio* (highly mismatched rims force the zipper
-    or the tube fitter to fan multiple ring verts onto a single rim
-    vert, producing fan vertices and non-manifold edges), and reject a
-    loop paired with itself — both tips grown onto the same rim, as when
-    the two pieces are still glued — which the zipper folds into a
-    zero-length tube of non-manifold edges inside that rim.
-
-    Returns ``None`` if the pair passes.
-    """
-    na, nb = len(la), len(lb)
-    if na < min_verts or nb < min_verts:
-        return f"loop too small ({na}v + {nb}v, min {min_verts})"
-    ratio = max(na, nb) / min(na, nb)
-    if ratio > max_ratio:
-        return (
-            f"loop size mismatch ({na}v + {nb}v, ratio {ratio:.1f} > {max_ratio:.1f})"
-        )
-    if set(la) == set(lb):
-        return f"both tips reached the same rim ({na}v)"
-    return None
+_validate_loop_pair = _py_pre.validate_loop_pair
 
 
-def _removal_would_sever(
-    sel: set[int],
-    edge_to_faces: dict[tuple[int, int], list[int]],
-    faces: np.ndarray | None = None,
-) -> bool:
-    """Would removing the connected patch *sel* cut its surface in two?
-
-    ``_expand_tip_to_good_rim`` grows a patch by BFS, so *sel* is always
-    connected and its border is a single closed curve when it sits at a
-    tube END (a cap).  Two or more border loops mean the patch is an
-    annulus that wraps the surface — removing it leaves the far side
-    disconnected, severing whatever lies beyond.
-    """
-    loops = _trace_border_loops(sel, edge_to_faces, faces)
-    return sum(1 for lp in loops if len(lp) >= 3) >= 2
+_removal_would_sever = _py_pre.removal_would_sever
 
 
 def _sever_cost(
@@ -1128,94 +964,18 @@ def _sever_cost(
     piece can exceed the budget and still be the largest, and if two do
     the cost already exceeds it.  Returns ``budget + 1`` in that case.
 
-    With a :class:`skeliner._rs.Topology` as *topology* the Rust core does
-    it and *face_adj* is not read.
+    With a ``Topology`` (of either path) as *topology* it does it and
+    *face_adj* is not read.
     """
     if topology is not None:
         return topology.sever_cost(sel, budget)
     return _sever_cost_py(sel, face_adj, budget)
 
 
-def _sever_cost_py(
-    sel: set[int],
-    face_adj: dict[int, set[int]],
-    budget: int,
-) -> int:
-    """:func:`_sever_cost` over the *face_adj* dict."""
-    seeds: set[int] = set()
-    for fi in sel:
-        seeds.update(f for f in face_adj[fi] if f not in sel)
-    if not seeds:
-        return 0
-
-    seen: set[int] = set()
-    closed: list[int] = []
-    n_over = 0
-    for seed in sorted(seeds):
-        if seed in seen:
-            continue
-        stack = [seed]
-        seen.add(seed)
-        size = 0
-        over = False
-        while stack:
-            u = stack.pop()
-            size += 1
-            if size > budget:
-                over = True
-                # u is popped but not yet walked; the drain below walks it
-                stack.append(u)
-                break
-            for v in face_adj[u]:
-                if v not in sel and v not in seen:
-                    seen.add(v)
-                    stack.append(v)
-        if over:
-            n_over += 1
-            if n_over >= 2:
-                return budget + 1
-            # drain the rest of this piece so its faces are not revisited
-            while stack:
-                u = stack.pop()
-                for v in face_adj[u]:
-                    if v not in sel and v not in seen:
-                        seen.add(v)
-                        stack.append(v)
-        else:
-            closed.append(size)
-
-    if n_over:
-        # the oversized piece is the largest; everything closed is lost
-        return sum(closed)
-    if not closed:
-        return 0
-    return sum(closed) - max(closed)
+_sever_cost_py = _py_pre.sever_cost
 
 
-def _rescue_size(
-    labels: np.ndarray,
-    counts: dict[int, int],
-    fa: int,
-    fb: int,
-) -> int:
-    """How many faces a stitch between faces *fa* and *fb* wins back.
-
-    The counterpart to :func:`_sever_cost`: what the stitch buys, to weigh
-    against what removing its rims would strand.  Bridging joins two
-    surface components, and the smaller of them is what would otherwise
-    be left behind, so that is the benefit.
-
-    *labels* and *counts* come from :func:`_face_edge_components` and a
-    ``Counter`` over it — raw connectivity, before fusions are parted.
-    """
-    la, lb = int(labels[fa]), int(labels[fb])
-    if la == lb:
-        # A fusion join: the two sides are still glued here and only
-        # `remove_fusions` will part them, so raw connectivity cannot say
-        # how big the far side is.  Claiming no benefit keeps the original
-        # rule for these — never sever to bridge a fusion.
-        return 0
-    return min(counts.get(la, 0), counts.get(lb, 0))
+_rescue_size = _py_pre.rescue_size
 
 
 def _expand_tip_to_good_rim(
@@ -1240,10 +1000,9 @@ def _expand_tip_to_good_rim(
     edge-neighbors and re-traces the border. Expansion is capped at
     ``len(tip) * max_eat_factor`` faces to avoid swallowing the entire
     component.  *faces* is passed to :func:`_trace_border_loops`.  Given a
-    :class:`skeliner._rs.Topology` the Rust core does it and *face_adj* is
-    not read.
+    ``Topology`` (of either path) it does it and *face_adj* is not read.
     """
-    if isinstance(edge_to_faces, _rs.Topology):
+    if hasattr(edge_to_faces, "expand_tip"):  # a Topology, of either path
         return edge_to_faces.expand_tip(tip, target_verts, max_iters, max_eat_factor)
     return _expand_tip_to_good_rim_py(
         tip,
@@ -1256,41 +1015,7 @@ def _expand_tip_to_good_rim(
     )
 
 
-def _expand_tip_to_good_rim_py(
-    tip: list[int],
-    edge_to_faces: dict[tuple[int, int], list[int]],
-    face_adj: dict[int, set[int]],
-    *,
-    target_verts: int = 6,
-    max_iters: int = 20,
-    max_eat_factor: int = 30,
-    faces: np.ndarray | None = None,
-) -> tuple[set[int], list[int] | None]:
-    """:func:`_expand_tip_to_good_rim` on the dict edge and face maps."""
-    sel: set[int] = set(int(fi) for fi in tip)
-    if not sel:
-        return sel, None
-    max_size = max(len(sel) * max_eat_factor, target_verts * 4)
-
-    best_loop: list[int] | None = None
-    for _ in range(max_iters):
-        loops = _trace_border_loops(sel, edge_to_faces, faces)
-        loops = [lp for lp in loops if len(lp) >= 3]
-        if loops:
-            biggest = max(loops, key=len)
-            best_loop = biggest
-            if len(biggest) >= target_verts:
-                return sel, biggest
-        # Expand by one BFS ring
-        next_sel = set(sel)
-        for fi in sel:
-            for nfi in face_adj.get(fi, ()):
-                next_sel.add(nfi)
-        if next_sel == sel or len(next_sel) > max_size:
-            break
-        sel = next_sel
-
-    return sel, best_loop
+_expand_tip_to_good_rim_py = _py_pre.expand_tip_to_good_rim
 
 
 def _expand_selection_per_group(
@@ -1310,13 +1035,13 @@ def _expand_selection_per_group(
     This is the user-driven merge analogue of the per-side expansion
     in :func:`remove_gaps`. Expanding each connected sub-selection on
     its own (rather than the whole selection at once) lets each side's
-    rim grow toward similar sizes — `_zipper_stitch`'s KDTree weld
+    rim grow toward similar sizes — the zipper stitch's KDTree weld
     only behaves manifoldly when the two rims are matched in vertex
     count, so symmetric per-side expansion is what unlocks a clean
-    bridge.  Given a :class:`skeliner._rs.Topology` the Rust core does it
-    and *face_adj* is not read.
+    bridge.  Given a ``Topology`` (of either path) it does it and
+    *face_adj* is not read.
     """
-    if isinstance(edge_to_faces, _rs.Topology):
+    if hasattr(edge_to_faces, "expand_selection_per_group"):  # a Topology
         return edge_to_faces.expand_selection_per_group(
             sel, target_verts, max_iters, max_eat_factor
         )
@@ -1331,59 +1056,7 @@ def _expand_selection_per_group(
     )
 
 
-def _expand_selection_per_group_py(
-    sel: list[int] | set[int],
-    edge_to_faces: dict[tuple[int, int], list[int]],
-    face_adj: dict[int, set[int]],
-    *,
-    target_verts: int = 6,
-    max_iters: int = 20,
-    max_eat_factor: int = 30,
-    faces: np.ndarray | None = None,
-) -> tuple[set[int], list[list[int]]]:
-    """:func:`_expand_selection_per_group` on the dict edge and face maps."""
-    sel_set: set[int] = set(int(fi) for fi in sel)
-    if not sel_set:
-        return sel_set, []
-
-    # Split sel into edge-connected sub-groups via BFS over face_adj,
-    # restricted to faces inside sel_set.
-    groups: list[set[int]] = []
-    visited: set[int] = set()
-    for seed in sel_set:
-        if seed in visited:
-            continue
-        group: set[int] = set()
-        stack = [seed]
-        while stack:
-            f = stack.pop()
-            if f in visited:
-                continue
-            visited.add(f)
-            group.add(f)
-            for nf in face_adj.get(f, ()):
-                if nf in sel_set and nf not in visited:
-                    stack.append(nf)
-        groups.append(group)
-
-    # Expand each group independently
-    expanded: set[int] = set()
-    for grp in groups:
-        sub_sel, _ = _expand_tip_to_good_rim_py(
-            list(grp),
-            edge_to_faces,
-            face_adj,
-            target_verts=target_verts,
-            max_iters=max_iters,
-            max_eat_factor=max_eat_factor,
-            faces=faces,
-        )
-        expanded |= sub_sel
-
-    # Re-trace loops on the final merged selection
-    loops = _trace_border_loops(expanded, edge_to_faces, faces)
-    loops = [lp for lp in loops if len(lp) >= 3]
-    return expanded, loops
+_expand_selection_per_group_py = _py_pre.expand_selection_per_group
 
 
 def _fit_loop_circle(pts: np.ndarray) -> tuple[np.ndarray, float, np.ndarray]:
@@ -1398,335 +1071,26 @@ def _fit_loop_circle(pts: np.ndarray) -> tuple[np.ndarray, float, np.ndarray]:
     return center, radius, normal
 
 
-def _hermite_spline(
-    p0: np.ndarray,
-    t0: np.ndarray,
-    p1: np.ndarray,
-    t1: np.ndarray,
-    n: int,
-) -> np.ndarray:
-    """Evaluate cubic Hermite spline at *n* evenly spaced stations.
-
-    Returns ``(n, 3)`` array including endpoints.
-    """
-    s = np.linspace(0, 1, n)[:, None]
-    h00 = 2 * s**3 - 3 * s**2 + 1
-    h10 = s**3 - 2 * s**2 + s
-    h01 = -2 * s**3 + 3 * s**2
-    h11 = s**3 - s**2
-    return h00 * p0 + h10 * t0 + h01 * p1 + h11 * t1
-
-
-def _zipper_stitch(
-    mesh: trimesh.Trimesh,
-    loop_a: list[int],
-    loop_b: list[int],
-    vert_to_faces: list[list[int]],
-    new_verts: list[np.ndarray] | None = None,
-) -> list[list[int]]:
-    """Bridge two boundary loops with a tubular surface, returning new triangles.
-
-    Generates circular cross-sections along a curved Hermite-spline
-    centerline so the result looks like a realistic neurite segment.
-    The radius interpolates smoothly between the two loop radii, and
-    parallel transport keeps the frame twist-free.
-
-    Parameters
-    ----------
-    new_verts : list or None
-        Mutable list to which any newly created vertex coordinates are
-        appended.  Vertex indices in the returned triangles reference
-        ``mesh.vertices`` for existing verts and
-        ``len(mesh.vertices) + i`` for ``new_verts[i]``.
-    """
-
-    if new_verts is None:
-        new_verts_local: list[np.ndarray] = []
-    else:
-        new_verts_local = new_verts
-
-    la = list(loop_a)
-    lb = list(loop_b)
-
-    # ── Fit loops and build curved centerline ───────────────────
-    ca_fit, ra, na = _fit_loop_circle(mesh.vertices[la])
-    cb_fit, rb, nb = _fit_loop_circle(mesh.vertices[lb])
-
-    direction = cb_fit - ca_fit
-    gap_dist = float(np.linalg.norm(direction))
-    if np.dot(na, direction) < 0:
-        na = -na
-    if np.dot(nb, direction) < 0:
-        nb = -nb
-
-    median_edge = float(np.median(mesh.edges_unique_length))
-    n_rings = max(1, int(round(gap_dist / median_edge)) - 1)
-
-    # Hermite tangents: scale by gap distance for natural curvature
-    tangent_a = na * gap_dist
-    tangent_b = nb * gap_dist
-
-    # n_rings intermediate + 2 endpoints = n_rings + 2 stations
-    n_stations = n_rings + 2
-    centers = _hermite_spline(ca_fit, tangent_a, cb_fit, tangent_b, n_stations)
-    n_ring_pts = max(len(la), len(lb))
-    n_existing = len(mesh.vertices)
-
-    # Tangent at each station via finite differences
-    tangents = np.zeros_like(centers)
-    tangents[0] = centers[1] - centers[0]
-    tangents[-1] = centers[-1] - centers[-2]
-    for i in range(1, len(centers) - 1):
-        tangents[i] = centers[i + 1] - centers[i - 1]
-    tangents /= np.linalg.norm(tangents, axis=1, keepdims=True) + 1e-10
-
-    # Parallel-transport a stable "up" vector along the centerline
-    up = np.zeros_like(tangents)
-    t0 = tangents[0]
-    seed_up = np.array([0.0, 0.0, 1.0])
-    if abs(np.dot(seed_up, t0)) > 0.9:
-        seed_up = np.array([0.0, 1.0, 0.0])
-    up[0] = seed_up - np.dot(seed_up, t0) * t0
-    up[0] /= np.linalg.norm(up[0]) + 1e-10
-    for i in range(1, len(centers)):
-        u = up[i - 1] - np.dot(up[i - 1], tangents[i]) * tangents[i]
-        norm = np.linalg.norm(u)
-        up[i] = u / norm if norm > 1e-10 else up[i - 1]
-
-    # ── Resample both loops as polar offsets (angle, radius) ────────
-    # Express each loop vertex as (angle, radius) in its station's
-    # local frame, resample to n_ring_pts at evenly-spaced angles,
-    # then blend between the two profiles.  Angle-based resampling
-    # ensures the vertex correspondence is stable across the blend.
-    def _to_polar_offsets(pts_3d, center, tangent, up_vec):
-        """Project 3D loop to (angle, radius) in the local frame."""
-        right_vec = np.cross(tangent, up_vec)
-        right_vec /= np.linalg.norm(right_vec) + 1e-10
-        rel = pts_3d - center
-        u_coords = np.dot(rel, up_vec)
-        r_coords = np.dot(rel, right_vec)
-        angles = np.arctan2(r_coords, u_coords)
-        radii = np.sqrt(u_coords**2 + r_coords**2)
-        return angles, radii
-
-    def _resample_polar(angles, radii, n):
-        """Resample a polar profile to *n* evenly-spaced angles."""
-        order = np.argsort(angles, kind="stable")
-        a_sorted = angles[order]
-        r_sorted = radii[order]
-        # Close the loop
-        a_closed = np.concatenate(
-            [a_sorted - 2 * np.pi, a_sorted, a_sorted + 2 * np.pi]
-        )
-        r_closed = np.concatenate([r_sorted, r_sorted, r_sorted])
-        target_angles = np.linspace(-np.pi, np.pi, n, endpoint=False)
-        resampled_r = np.interp(target_angles, a_closed, r_closed)
-        return target_angles, resampled_r
-
-    ang_a, rad_a = _to_polar_offsets(mesh.vertices[la], centers[0], tangents[0], up[0])
-    ang_b, rad_b = _to_polar_offsets(
-        mesh.vertices[lb], centers[-1], tangents[-1], up[-1]
-    )
-    target_angles, profile_a = _resample_polar(ang_a, rad_a, n_ring_pts)
-    _, profile_b = _resample_polar(ang_b, rad_b, n_ring_pts)
-
-    # ── Generate ALL rings including at endpoint stations ─────────
-    # We generate rings at every station (including 0 and N-1) so that
-    # ALL ring-to-ring connections are between uniform vertex counts.
-    # The boundary loops (la, lb) are stitched to their co-located
-    # endpoint rings separately — this avoids the cross-opening fan
-    # that occurs when stitching an irregular boundary loop directly
-    # to a uniform ring at a different station.
-    ring_ids: list[list[int]] = []
-
-    for si in range(n_stations):
-        t = si / (n_stations - 1)  # 0 at A, 1 at B
-        c = centers[si]
-        u_vec = up[si]
-        right_vec = np.cross(tangents[si], u_vec)
-        right_vec /= np.linalg.norm(right_vec) + 1e-10
-        profile = profile_a * (1 - t) + profile_b * t
-        ids = []
-        for j in range(n_ring_pts):
-            r = profile[j]
-            angle = target_angles[j]
-            pt = c + r * (np.cos(angle) * u_vec + np.sin(angle) * right_vec)
-            ids.append(n_existing + len(new_verts_local))
-            new_verts_local.append(pt)
-        ring_ids.append(ids)
-
-    # ── Stitch: boundary loops → endpoint rings → ring chain ─────
-    # Sequence: la → ring[0] → ring[1] → ... → ring[-1] → lb
-    triangles: list[list[int]] = []
-
-    def _vpos(vid):
-        if vid < n_existing:
-            return mesh.vertices[vid]
-        return new_verts_local[vid - n_existing]
-
-    # Only stitch ring-to-ring (no boundary→ring bands that seal ends).
-    all_bands: list[tuple[list[int], list[int]]] = []
-    for ri in range(len(ring_ids) - 1):
-        all_bands.append((ring_ids[ri], ring_ids[ri + 1]))
-
-    for ra_ids, rb_ids in all_bands:
-        na_r, nb_r = len(ra_ids), len(rb_ids)
-
-        # Align start of rb to closest vertex in ra
-        best_j = 0
-        best_d = float("inf")
-        p0 = _vpos(ra_ids[0])
-        for j in range(nb_r):
-            d = float(np.linalg.norm(_vpos(rb_ids[j]) - p0))
-            if d < best_d:
-                best_d = d
-                best_j = j
-        rb_ids = list(rb_ids[best_j:]) + list(rb_ids[:best_j])
-
-        if na_r == nb_r:
-            # Equal uniform rings (always the case here: every ring has
-            # n_ring_pts verts).  A plain quad split never folds — each
-            # vertical edge (ra[i], rb[i]) lands in exactly two triangles.
-            # The greedy walk below can re-emit an edge at closure on a very
-            # short (one-ring) tube, producing a non-manifold edge.
-            for i in range(na_r):
-                i2 = (i + 1) % na_r
-                triangles.append([ra_ids[i], ra_ids[i2], rb_ids[i]])
-                triangles.append([ra_ids[i2], rb_ids[i2], rb_ids[i]])
-            continue
-
-        ia, ib, sa, sb = 0, 0, 0, 0
-        while sa < na_r or sb < nb_r:
-            ia_n = (ia + 1) % na_r
-            ib_n = (ib + 1) % nb_r
-            can_a, can_b = sa < na_r, sb < nb_r
-            if can_a and can_b:
-                da = float(np.linalg.norm(_vpos(ra_ids[ia_n]) - _vpos(rb_ids[ib])))
-                db = float(np.linalg.norm(_vpos(ra_ids[ia]) - _vpos(rb_ids[ib_n])))
-                adv_a = da <= db
-            else:
-                adv_a = can_a
-            if adv_a:
-                triangles.append([ra_ids[ia], ra_ids[ia_n], rb_ids[ib]])
-                ia = ia_n
-                sa += 1
-            else:
-                triangles.append([ra_ids[ia], rb_ids[ib_n], rb_ids[ib]])
-                ib = ib_n
-                sb += 1
-
-    # ── Weld endpoint ring verts to boundary loop verts ──────────
-    # Replace each ring[0] / ring[-1] vertex ID in the triangles with a
-    # boundary loop vertex.  This connects the tube to the existing mesh
-    # without creating cap faces across the opening.
-    def _build_weld_map(ring, loop):
-        """Order-preserving surjective weld of the uniform endpoint ring
-        onto the boundary loop.
-
-        Consecutive ring verts map to the same or the *next* loop vert
-        (cyclic step <= 1), so every welded seam edge coincides with an
-        actual boundary edge ``(loop_i, loop_{i+1})`` — never an interior
-        chord across the loop.  A nearest-neighbour weld can map two
-        adjacent ring verts onto non-adjacent loop verts, dropping the seam
-        triangle onto an existing two-face edge and creating a non-manifold
-        edge; this monotone walk cannot.  The ring is at least as long as
-        the loop (``n_ring_pts = max(len(la), len(lb))``), so exactly
-        ``m - 1`` advances distribute over the ``n - 1`` transitions and the
-        cyclic seam closes on a rim edge.
-        """
-        n, m = len(ring), len(loop)
-        ring_pts = np.array([_vpos(v) for v in ring])
-        loop_pts = np.array([_vpos(v) for v in loop])
-        if m < 2 or n < m:
-            # Cannot guarantee step <= 1; fall back to nearest (tiny loops).
-            tree = KDTree(loop_pts)
-            _, idxs = _nearest(tree, ring_pts)
-            return {ring[i]: loop[int(idxs[i])] for i in range(n)}
-        cur = int(np.argmin(np.linalg.norm(loop_pts - ring_pts[0], axis=1)))
-        wmap = {ring[0]: loop[cur]}
-        adv = 0
-        for j in range(n - 1):
-            remaining_dec = (n - 1) - j
-            remaining_adv = (m - 1) - adv
-            if remaining_adv > 0:
-                nxt = (cur + 1) % m
-                closer = float(np.linalg.norm(loop_pts[nxt] - ring_pts[j + 1])) < float(
-                    np.linalg.norm(loop_pts[cur] - ring_pts[j + 1])
-                )
-                # Force an advance once we can no longer afford to stay, so
-                # all m-1 advances land and the seam covers every rim edge.
-                if remaining_adv >= remaining_dec or closer:
-                    cur = nxt
-                    adv += 1
-            wmap[ring[j + 1]] = loop[cur]
-        return wmap
-
-    weld = {}
-    weld.update(_build_weld_map(ring_ids[0], la))
-    weld.update(_build_weld_map(ring_ids[-1], lb))
-
-    if weld:
-        triangles = [[weld.get(v, v) for v in tri] for tri in triangles]
-
-    # Orient consistently with surrounding mesh
-    ref_fis: list[int] = []
-    for vi in la[:5]:
-        ref_fis.extend(vert_to_faces[vi][:5])
-    if ref_fis:
-        ref_n = mesh.face_normals[ref_fis].mean(axis=0)
-        tri_normals = [
-            np.cross(
-                _vpos(t[1]) - _vpos(t[0]),
-                _vpos(t[2]) - _vpos(t[0]),
-            )
-            for t in triangles
-        ]
-        if np.dot(np.mean(tri_normals, axis=0), ref_n) < 0:
-            triangles = [[t[0], t[2], t[1]] for t in triangles]
-
-    return triangles
-
-
 def _stitch_and_rebuild(
     mesh: trimesh.Trimesh,
     sel: set[int],
     loop_pairs: list[tuple[list[int], list[int]]],
 ) -> trimesh.Trimesh:
     """Remove *sel* faces, stitch each loop pair, rebuild mesh once."""
-    # Vert-to-face for orientation (non-removed faces only)
-    vert_to_faces: list[list[int]] = [[] for _ in range(len(mesh.vertices))]
-    non_degen = _non_degenerate(mesh.faces)
-    for fi, face in enumerate(mesh.faces):
-        if fi not in sel and non_degen[fi]:
-            for v in face:
-                vert_to_faces[int(v)].append(fi)
-
-    all_stitch: list[list[int]] = []
-    new_verts: list[np.ndarray] = []
-    for loop_a, loop_b in loop_pairs:
-        tris = _zipper_stitch(mesh, loop_a, loop_b, vert_to_faces, new_verts)
-        all_stitch.extend(tris)
-
-    # Degenerate removed faces, append stitch faces at the end
-    new_faces = mesh.faces.copy()
-    for fi in sel:
-        new_faces[fi] = 0
-
-    # Combine existing + new vertices
-    if new_verts:
-        all_vertices = np.vstack([mesh.vertices, np.array(new_verts)])
-    else:
-        all_vertices = mesh.vertices
-
-    if all_stitch:
-        stitch_faces = np.array(all_stitch, dtype=np.int64)
-        new_faces = np.vstack([new_faces, stitch_faces])
-
-    return trimesh.Trimesh(
-        vertices=all_vertices,
-        faces=new_faces,
-        process=False,
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    new_verts, faces = kernels.pre.stitch_and_rebuild(
+        np.asarray(mesh.faces, dtype=np.int64),
+        verts,
+        np.asarray(mesh.face_normals, dtype=np.float64),
+        float(np.median(mesh.edges_unique_length)),
+        sel,
+        loop_pairs,
+        [],
+        lambda ids: _fit_loop_circle(verts[ids]),
     )
+    if len(new_verts):
+        verts = np.vstack([verts, new_verts])
+    return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
 
 
 def merge_selected_faces(
@@ -1771,7 +1135,7 @@ def merge_selected_faces(
     # real rim (not a 3-vert tongue base). Each edge-connected
     # sub-group of the selection is expanded independently — same fix
     # as remove_gaps's per-side expansion — so the resulting rims
-    # converge to matching sizes (`_zipper_stitch` only welds
+    # converge to matching sizes (the zipper stitch only welds
     # manifoldly when both rims have similar vertex counts).
     sel, loops = _expand_selection_per_group(
         sel_input, edge_to_faces, face_adj, faces=np.asarray(mesh.faces)
@@ -2029,37 +1393,7 @@ def find_fragments(
     return fragment
 
 
-def _otsu_threshold(values: np.ndarray) -> tuple[float, float]:
-    """Otsu's method on continuous 1-D data.
-
-    Returns ``(threshold, separability)`` where *separability* is the
-    ratio of between-class variance to total variance (0 = no split,
-    1 = perfect bimodal separation).
-    """
-    x = np.sort(values)
-    n = len(x)
-    if n < 2:
-        return float(x[0]), 0.0
-
-    total_var = float(np.var(x))
-    if total_var < 1e-12:
-        return float(x[0]), 0.0
-
-    best_thresh = float(x[0])
-    best_between = 0.0
-
-    # Scan every midpoint between consecutive unique values
-    for i in range(1, n):
-        if x[i] == x[i - 1]:
-            continue
-        left, right = x[:i], x[i:]
-        w0, w1 = i / n, (n - i) / n
-        between = w0 * w1 * (left.mean() - right.mean()) ** 2
-        if between > best_between:
-            best_between = between
-            best_thresh = float(x[i - 1] + x[i]) / 2.0
-
-    return best_thresh, best_between / total_var
+_otsu_threshold = _py_pre.otsu_threshold
 
 
 def find_soma_via_ring_cutoff(
@@ -2171,7 +1505,7 @@ def _ring_cutoff_soma(
         fits.append(soma)
         return soma.center, soma._W, float(soma.axes.min())
 
-    k, soma_verts, cutoff, max_ring = _rs.find_soma_ring_cutoff(
+    k, soma_verts, cutoff, max_ring = kernels.pre.find_soma_ring_cutoff(
         np.asarray(mesh.faces, dtype=np.int64),
         verts,
         np.asarray(labels, dtype=np.int64),
@@ -2188,19 +1522,7 @@ def _ring_cutoff_soma(
     return soma, cutoff, max_ring
 
 
-def _build_edge_to_faces(faces, mask):
-    """Edge→face map for faces where *mask* is True."""
-    fi_idx = np.where(mask)[0]
-    gf = faces[fi_idx]
-    result: dict[tuple[int, int], list[int]] = defaultdict(list)
-    for col_a, col_b in ((0, 1), (1, 2), (0, 2)):
-        va = gf[:, col_a].astype(np.intp)
-        vb = gf[:, col_b].astype(np.intp)
-        lo = np.minimum(va, vb)
-        hi = np.maximum(va, vb)
-        for k in range(len(fi_idx)):
-            result[(int(lo[k]), int(hi[k]))].append(int(fi_idx[k]))
-    return result
+_build_edge_to_faces = _py_pre.build_edge_to_faces
 
 
 def _face_components_fast(faces, face_indices) -> list[np.ndarray]:
@@ -2216,7 +1538,7 @@ def _face_components_fast(faces, face_indices) -> list[np.ndarray]:
     equal-sized ones in that order.  Sorting on ``(-size, min face id)``
     reproduces it without relying on the labeller's numbering.
     """
-    return _rs.face_components(
+    return kernels.pre.face_components(
         np.asarray(faces, dtype=np.int64), np.asarray(face_indices, dtype=np.int64)
     )
 
@@ -2528,7 +1850,9 @@ break_at_soma = break_up_mesh
 
 
 # What :func:`_break_up_pieces` makes of a piece.
-_PIECE_CANDIDATE, _PIECE_TRAPPED, _PIECE_SOMA = 0, 1, 2
+_PIECE_CANDIDATE = _py_pre.PIECE_CANDIDATE
+_PIECE_TRAPPED = _py_pre.PIECE_TRAPPED
+_PIECE_SOMA = _py_pre.PIECE_SOMA
 
 
 def _break_up_pieces(
@@ -2541,7 +1865,7 @@ def _break_up_pieces(
     outer edges meet soma faces (only with a soma), else
     :data:`_PIECE_CANDIDATE`.  Claimed pieces are never trapped or soma.
     """
-    return _rs.break_up_classify(
+    return kernels.pre.break_up_classify(
         np.asarray(faces, dtype=np.int64),
         int(n_vertices),
         np.asarray(usable, dtype=bool),
@@ -3738,7 +3062,7 @@ def _refine_components_with_fusions(
     """
     labels = np.asarray(labels)
     fusion = np.fromiter((int(f) for c in fusions for f in c), dtype=np.int64)
-    new_labels, new_main = _rs.refine_components_with_fusions(
+    new_labels, new_main = kernels.pre.refine_components_with_fusions(
         np.asarray(mesh.faces, dtype=np.int64),
         labels.astype(np.int64, copy=False),
         int(main),
@@ -3810,7 +3134,7 @@ def find_disconnected(
             mesh_stats=mesh_stats,
         )
 
-    found = _rs.find_disconnected(
+    found = kernels.pre.find_disconnected(
         np.asarray(mesh.faces, dtype=np.int64),
         np.asarray(mesh.vertices, dtype=np.float64),
         np.asarray(mesh.triangles_center, dtype=np.float64),
@@ -4008,7 +3332,7 @@ def find_gaps(
 
     median_edge = float(np.median(mesh.edges_unique_length))
     fusion_faces = list(dict.fromkeys(int(f) for c in fusions or () for f in c))
-    gaps, n_capped, n_repaired = _rs.find_gaps(
+    gaps, n_capped, n_repaired = kernels.pre.find_gaps(
         np.asarray(mesh.faces, dtype=np.int64),
         np.asarray(mesh.vertices, dtype=np.float64),
         np.asarray(mesh.triangles_center, dtype=np.float64),
@@ -4158,7 +3482,7 @@ def _bridge_gaps(mesh, gaps, labels):
         center, radius, normal = _fit_loop_circle(verts[ids])
         return center, radius, normal
 
-    new_verts, faces, n_bridged, n_removed, n_skipped = _rs.remove_gaps(
+    new_verts, faces, n_bridged, n_removed, n_skipped = kernels.pre.remove_gaps(
         np.asarray(mesh.faces, dtype=np.int64),
         verts,
         np.asarray(mesh.face_normals, dtype=np.float64),
@@ -4330,7 +3654,7 @@ def _outward_dot(
     np.ndarray
         (nFaces,) float64 array of outward dot products.
     """
-    return _rs.outward_dots(
+    return kernels.pre.outward_dots(
         np.asarray(mesh.vertices, dtype=np.float64),
         np.asarray(mesh.faces, dtype=np.int64),
         np.asarray(mesh.triangles_center, dtype=np.float64),
@@ -4363,7 +3687,7 @@ def _filter_small_clusters(
     """
     if not np.any(face_mask):
         return face_mask
-    return _rs.filter_small_clusters(
+    return kernels.pre.filter_small_clusters(
         np.asarray(mesh.faces, dtype=np.int64),
         np.asarray(face_mask, dtype=bool),
         int(min_cluster_size),
@@ -4388,7 +3712,7 @@ def compute_mesh_stats(
         median_edge = float(np.median(mesh.edges_unique_length))
         radius = radius_multiplier * median_edge
 
-    outward_dots, face_comp, main_ci = _rs.mesh_stats(
+    outward_dots, face_comp, main_ci = kernels.pre.mesh_stats(
         np.asarray(mesh.vertices, dtype=np.float64),
         np.asarray(mesh.faces, dtype=np.int64),
         np.asarray(mesh.triangles_center, dtype=np.float64),
@@ -4413,88 +3737,6 @@ def _report_mesh_stats(face_comp, outward_dots, radius, n_faces, t0) -> None:
         f"raw internal={raw_neg:,} ({pct:.1f}%) "
         f"({dt:.1f}s)"
     )
-
-
-def _rim_enclosed_area(
-    boundary_edges: list[tuple[int, int]],
-    vertices: np.ndarray,
-) -> float:
-    """Compute total enclosed planar area of closed loops in boundary edges.
-
-    For each closed loop: project vertices onto a best-fit plane, then
-    compute polygon area via the shoelace formula.
-    """
-
-    if not boundary_edges:
-        return 0.0
-
-    vert_to_be: dict[int, list[int]] = defaultdict(list)
-    for i, e in enumerate(boundary_edges):
-        vert_to_be[e[0]].append(i)
-        vert_to_be[e[1]].append(i)
-
-    visited: set[int] = set()
-    total_area = 0.0
-
-    for start in range(len(boundary_edges)):
-        if start in visited:
-            continue
-        comp: list[int] = []
-        queue = deque([start])
-        while queue:
-            ei = queue.popleft()
-            if ei in visited:
-                continue
-            visited.add(ei)
-            comp.append(ei)
-            for v in boundary_edges[ei]:
-                for nei in vert_to_be[v]:
-                    if nei not in visited:
-                        queue.append(nei)
-
-        # Check closed ring
-        vcount: dict[int, int] = defaultdict(int)
-        for ei in comp:
-            for v in boundary_edges[ei]:
-                vcount[v] += 1
-        if not all(c == 2 for c in vcount.values()):
-            continue
-
-        # Order vertices into a loop
-        edge_list = [boundary_edges[ei] for ei in comp]
-        adj_v: dict[int, list[int]] = defaultdict(list)
-        for a, b in edge_list:
-            adj_v[a].append(b)
-            adj_v[b].append(a)
-
-        ordered = [edge_list[0][0]]
-        while len(ordered) < len(edge_list):
-            curr = ordered[-1]
-            prev = ordered[-2] if len(ordered) > 1 else -1
-            for nb in adj_v[curr]:
-                if nb != prev:
-                    ordered.append(nb)
-                    break
-            else:
-                break
-
-        if len(ordered) < 3:
-            continue
-
-        # Project onto best-fit plane and compute area
-        pts = vertices[ordered]
-        centroid = pts.mean(axis=0)
-        centered = pts - centroid
-        _, _, vh = np.linalg.svd(centered)
-        u_ax, v_ax = vh[0], vh[1]
-        pts_2d = np.column_stack([centered @ u_ax, centered @ v_ax])
-        x, y = pts_2d[:, 0], pts_2d[:, 1]
-        area = 0.5 * abs(
-            np.sum(x[:-1] * y[1:] - x[1:] * y[:-1]) + x[-1] * y[0] - x[0] * y[-1]
-        )
-        total_area += area
-
-    return total_area
 
 
 def find_pocket_mouths(
@@ -4544,91 +3786,20 @@ def find_pocket_mouths(
     edge_to_face = _edge_to_face if _edge_to_face is not None else _edge_to_faces(mesh)
     adj = _adj if _adj is not None else _face_adjacency(mesh, edge_to_face)
 
-    # Connected components of negative-dot faces on main component
-    neg_idx = set(np.where((outward_dots < 0) & main_face_mask)[0].tolist())
-    visited: set[int] = set()
-    clusters: list[list[int]] = []
-    for fi in neg_idx:
-        if fi in visited:
-            continue
-        cluster: list[int] = []
-        queue = deque([fi])
-        while queue:
-            curr = queue.popleft()
-            if curr in visited:
-                continue
-            visited.add(curr)
-            cluster.append(curr)
-            for nfi in adj.get(curr, set()):
-                if nfi in neg_idx and nfi not in visited:
-                    queue.append(nfi)
-        clusters.append(cluster)
-
-    # For each cluster, collect boundary edges and count boundary loops.
-    # A real pocket has multiple boundary loops (multiple openings).
-    # A flat concave patch has exactly one boundary loop — not a pocket.
-    faces_arr = np.asarray(mesh.faces)  # snapshot — avoids trimesh caching
-    area_arr = np.asarray(mesh.area_faces)
-    verts_arr = np.asarray(mesh.vertices)
-    mouths: list[list[tuple[int, int]]] = []
-    for cluster in clusters:
-        if len(cluster) < min_pocket_size:
-            continue
-        cset = set(cluster)
-        boundary_edges: list[tuple[int, int]] = []
-        seen_edges: set[tuple[int, int]] = set()
-        for fi in cluster:
-            f = faces_arr[fi]
-            for i in range(3):
-                e = (
-                    min(int(f[i]), int(f[(i + 1) % 3])),
-                    max(int(f[i]), int(f[(i + 1) % 3])),
-                )
-                if e in seen_edges:
-                    continue
-                seen_edges.add(e)
-                faces_on_edge = edge_to_face[e]
-                if len(faces_on_edge) == 2:
-                    other = (
-                        faces_on_edge[1]
-                        if faces_on_edge[0] in cset
-                        else faces_on_edge[0]
-                    )
-                    if other not in cset:
-                        boundary_edges.append(e)
-        if not boundary_edges:
-            continue
-
-        # Fold ratio: pocket surface area / mouth enclosed planar area.
-        # A real pocket folds inward through a small opening (high ratio).
-        # A flat patch has ratio near 1.
-        pocket_area = float(area_arr[np.sort(cluster)].sum())
-        opening_area = _rim_enclosed_area(boundary_edges, verts_arr)
-        if opening_area <= 0:
-            # Boundary loops with non-manifold junctions (vertex
-            # shared by 4+ boundary edges) get discarded by
-            # _rim_enclosed_area.  Fall back to the convex hull of
-            # boundary vertices: hull_area >= true opening area, so
-            # pocket_area / hull_area is a *lower bound* on the true
-            # fold ratio — this can only recover missed mouths, never
-            # reject valid ones.
-            # Only apply on the main component — small disconnected
-            # components have degenerate boundary topology that
-            # produces false positives.
-            on_non_main = _non_main_mask is not None and _non_main_mask[cluster[0]]
-            if not on_non_main:
-                bverts = sorted({v for e in boundary_edges for v in e})
-                if len(bverts) >= 3:
-                    opening_area = _mouth_hull_area(verts_arr[bverts])
-            if opening_area <= 0:
-                continue
-        fold_ratio = pocket_area / opening_area
-        if fold_ratio < min_fold_ratio:
-            continue
-
-        mouths.append(boundary_edges)
-
-    return mouths
+    return kernels.pre.pocket_mouths(
+        np.asarray(mesh.faces),
+        np.asarray(mesh.vertices),
+        np.asarray(mesh.area_faces),
+        outward_dots,
+        main_face_mask,
+        edge_to_face,
+        adj,
+        _svd_rows,
+        _mouth_hull_area,
+        min_pocket_size=min_pocket_size,
+        min_fold_ratio=min_fold_ratio,
+        non_main_mask=_non_main_mask,
+    )
 
 
 def _face_adjacency(
@@ -4638,14 +3809,7 @@ def _face_adjacency(
     """Build face adjacency map (edge-connected neighbors)."""
     if edge_to_face is None:
         edge_to_face = _edge_to_faces(mesh)
-
-    adj: dict[int, set[int]] = defaultdict(set)
-    for faces in edge_to_face.values():
-        for i in range(len(faces)):
-            for j in range(i + 1, len(faces)):
-                adj[faces[i]].add(faces[j])
-                adj[faces[j]].add(faces[i])
-    return adj
+    return _py_mesh.face_adjacency(edge_to_face)
 
 
 def find_pocket_organelles(
@@ -4730,200 +3894,43 @@ def find_pocket_organelles(
         )
         outward_dots = mesh_stats.outward_dots
         main_face_mask = mesh_stats.main_face_mask
-    n_faces = len(mesh.faces)
     # Compute shared structures once
     edge_to_face = _edge_to_faces(mesh)
     adj = _face_adjacency(mesh, edge_to_face)
 
-    # Use find_pocket_mouths to get mouth edges for each pocket
-    mouths = find_pocket_mouths(
-        mesh,
-        radius=radius,
-        radius_multiplier=radius_multiplier,
+    pocket, counts = kernels.pre.pocket_organelles(
+        np.asarray(mesh.faces),
+        np.asarray(mesh.vertices),
+        np.asarray(mesh.area_faces),
+        outward_dots,
+        main_face_mask,
+        edge_to_face,
+        adj,
+        _svd_rows,
+        _mouth_hull_area,
+        grow_threshold=grow_threshold,
+        bridge_threshold=bridge_threshold,
+        max_hole_size=max_hole_size,
+        hole_enclosure_ratio=hole_enclosure_ratio,
         min_pocket_size=min_pocket_size,
         min_fold_ratio=min_fold_ratio,
-        verbose=verbose,
-        mesh_stats=mesh_stats,
-        _adj=adj,
-        _edge_to_face=edge_to_face,
-        _non_main_mask=_non_main_mask,
+        min_cluster_size=min_cluster_size,
+        non_main_mask=_non_main_mask,
     )
-
-    if not mouths:
-        if verbose:
-            dt = time.perf_counter() - _t0
-            print(f"[skeliner.pre] Pocket organelles: 0 faces (no mouths) ({dt:.1f}s)")
-        return np.zeros(n_faces, dtype=bool)
-
-    # Collect all mouth edges and seed faces
-    # Seeds = negative-dot faces adjacent to mouth edges (inward side)
-    mouth_edge_set: set[tuple[int, int]] = set()
-    for mouth in mouths:
-        mouth_edge_set.update(mouth)
-
-    # Seeds: negative-dot faces touching mouth edges
-    seeds: set[int] = set()
-    for e in mouth_edge_set:
-        for fi in edge_to_face.get(e, []):
-            if main_face_mask[fi] and outward_dots[fi] < 0:
-                seeds.add(fi)
-
-    # Mouth faces: positive-dot faces touching mouth edges (block flood-fill)
-    mouth_faces: set[int] = set()
-    for e in mouth_edge_set:
-        for fi in edge_to_face.get(e, []):
-            if fi not in seeds:
-                mouth_faces.add(fi)
-
-    n_mouths = len(mouths)
-
-    # Flood-fill from seeds, blocked by mouth faces and grow_threshold
-    pocket = np.zeros(n_faces, dtype=bool)
-    visited = np.zeros(n_faces, dtype=bool)
-    queue = deque(seeds)
-
-    while queue:
-        fi = queue.popleft()
-        if visited[fi]:
-            continue
-        visited[fi] = True
-        if fi in mouth_faces:
-            continue
-        if not main_face_mask[fi]:
-            continue
-        if outward_dots[fi] > grow_threshold:
-            continue
-        pocket[fi] = True
-        for nfi in adj.get(fi, set()):
-            if not visited[nfi]:
-                queue.append(nfi)
-
-    initial_count = int(pocket.sum())
-
-    # Phase 1 — Bridging: flood-fill from pocket boundary using the
-    # relaxed bridge_threshold to cross positive-dot barriers.
-    bridge_queue = deque()
-    for fi in np.where(pocket)[0]:
-        for nfi in adj.get(int(fi), set()):
-            if not pocket[nfi]:
-                bridge_queue.append(nfi)
-
-    while bridge_queue:
-        fi = bridge_queue.popleft()
-        if pocket[fi]:
-            continue
-        if fi in mouth_faces or not main_face_mask[fi]:
-            continue
-        if outward_dots[fi] > bridge_threshold:
-            continue
-        pocket[fi] = True
-        for nfi in adj.get(fi, set()):
-            if not pocket[nfi]:
-                bridge_queue.append(nfi)
-
-    bridge_count = int(pocket.sum()) - initial_count
-
-    # Phase 2 — Hole filling: small non-pocket clusters mostly enclosed
-    # by pocket faces are filled in.  Sub-folds inside pockets can have
-    # positive outward_dot, so we use enclosure ratio only.
-    non_pocket_main = main_face_mask & ~pocket
-    non_pocket_idx = set(np.where(non_pocket_main)[0].tolist())
-    np_visited: set[int] = set()
-    hole_count = 0
-
-    for fi in non_pocket_idx:
-        if fi in np_visited:
-            continue
-        cluster: list[int] = []
-        n_pocket_boundary = 0
-        n_total_boundary = 0
-        adj_pocket_faces: set[int] = set()
-        bfs_queue = deque([fi])
-        while bfs_queue:
-            curr = bfs_queue.popleft()
-            if curr in np_visited:
-                continue
-            np_visited.add(curr)
-            cluster.append(curr)
-            for nfi in adj.get(curr, set()):
-                if nfi in non_pocket_idx and nfi not in np_visited:
-                    bfs_queue.append(nfi)
-                elif nfi not in non_pocket_idx:
-                    n_total_boundary += 1
-                    if pocket[nfi]:
-                        n_pocket_boundary += 1
-                        adj_pocket_faces.add(nfi)
-        if len(cluster) == 0:
-            continue
-        enclosure = n_pocket_boundary / n_total_boundary if n_total_boundary else 0
-        # Small holes: fill if enclosure meets threshold.
-        # Large holes: only fill if fully entrapped (enclosure ~1.0)
-        #   and not the main mesh body (< 5% of faces).
-        # On non-main structural components, a hole can't be bigger
-        # than the pocket membrane enclosing it — prevents swallowing
-        # entire small disconnected components.
-        n_faces = len(pocket)
-        is_small = len(cluster) <= max_hole_size
-        is_entrapped = enclosure >= 0.99 and len(cluster) < n_faces * 0.05
-        if (
-            _non_main_mask is not None
-            and _non_main_mask[cluster[0]]
-            and len(cluster) > len(adj_pocket_faces)
-        ):
-            continue
-        if (is_small and enclosure >= hole_enclosure_ratio) or is_entrapped:
-            for c in cluster:
-                pocket[c] = True
-            hole_count += len(cluster)
-
-    # Cluster filter to remove noise
-    pocket = _filter_small_clusters(mesh, pocket, min_cluster_size)
-
-    # Post-validate: reject pocket components that are just surface dips.
-    # A real pocket has much more surface area than its adjacent non-pocket
-    # faces (the "cap").  A shallow dip has pocket_area ≈ cap_area.
-    pocket_idx = set(np.where(pocket)[0].tolist())
-    pocket_visited: set[int] = set()
-    n_rejected = 0
-    for start in list(pocket_idx):
-        if start in pocket_visited:
-            continue
-        comp: list[int] = []
-        pq = deque([start])
-        while pq:
-            fi = pq.popleft()
-            if fi in pocket_visited:
-                continue
-            pocket_visited.add(fi)
-            comp.append(fi)
-            for nfi in adj.get(fi, set()):
-                if nfi in pocket_idx and nfi not in pocket_visited:
-                    pq.append(nfi)
-
-        comp_set = set(comp)
-        cap_faces: set[int] = set()
-        for fi in comp:
-            for nfi in adj.get(fi, set()):
-                if nfi not in comp_set:
-                    cap_faces.add(nfi)
-
-        pocket_area = float(mesh.area_faces[np.sort(comp)].sum())
-        cap_area = float(mesh.area_faces[sorted(cap_faces)].sum()) if cap_faces else 0.0
-        if cap_area <= 0 or pocket_area / cap_area < min_fold_ratio:
-            for fi in comp:
-                pocket[fi] = False
-            n_rejected += 1
 
     if verbose:
         dt = time.perf_counter() - _t0
-        print(
-            f"[skeliner.pre] Pocket organelles: "
-            f"{pocket.sum():,} faces from {n_mouths} mouths "
-            f"(fill {initial_count:,}, "
-            f"bridge +{bridge_count:,}, "
-            f"holes +{hole_count:,}, "
-            f"rejected {n_rejected}) ({dt:.1f}s)"
-        )
+        if not counts["n_mouths"]:
+            print(f"[skeliner.pre] Pocket organelles: 0 faces (no mouths) ({dt:.1f}s)")
+        else:
+            print(
+                f"[skeliner.pre] Pocket organelles: "
+                f"{pocket.sum():,} faces from {counts['n_mouths']} mouths "
+                f"(fill {counts['n_initial']:,}, "
+                f"bridge +{counts['n_bridged']:,}, "
+                f"holes +{counts['n_holes']:,}, "
+                f"rejected {counts['n_rejected']}) ({dt:.1f}s)"
+            )
     return pocket
 
 
@@ -4961,66 +3968,25 @@ def find_isolated_organelles(
         main_ci = mesh_stats.main_ci
     else:
         face_comp, main_ci = _face_edge_components(mesh)
-    n_comps = face_comp.max() + 1
-    isolated = np.zeros(len(mesh.faces), dtype=bool)
-    n_internal_frags = 0
-    n_internal_frag_faces = 0
-    n_kept_frags = 0
-    n_via_dots = 0
-    n_via_geo = 0
-
-    # Classify each non-main component using outward_dots.
-    # Organelle membranes have predominantly negative outward_dots
-    # (faces point inward); structural components have positive.
-    # For tiny components where outward_dots are all zero (too few
-    # neighbours for valid local COM), fall back to the geometric
-    # inside/outside test against the main component.
-    main_face_idx = np.where(face_comp == main_ci)[0]
-    main_centroids = mesh.triangles_center[main_face_idx]
-    main_normals = mesh.face_normals[main_face_idx]
-    main_tree = None  # built lazily for fallback
-
-    for ci in range(n_comps):
-        if ci == main_ci:
-            continue
-        comp_face_idx = np.where(face_comp == ci)[0]
-        if len(comp_face_idx) == 0:
-            continue
-
-        comp_dots = outward_dots[comp_face_idx]
-        n_valid = np.count_nonzero(comp_dots)
-
-        if n_valid > 0:
-            # Use outward_dots: majority negative → isolated organelle
-            is_internal = (comp_dots < 0).sum() > n_valid / 2
-            n_via_dots += 1
-        else:
-            # Fallback: geometric test against main surface
-            if main_tree is None:
-                main_tree = KDTree(main_centroids)
-            comp_verts = np.unique(mesh.faces[comp_face_idx])
-            coords = mesh.vertices[comp_verts]
-            _, nn_idx = _nearest(main_tree, coords)
-            vecs = coords - main_centroids[nn_idx]
-            dots = _row_dot(vecs, main_normals[nn_idx])
-            is_internal = (dots < 0).sum() > len(dots) / 2
-            n_via_geo += 1
-
-        if is_internal:
-            isolated[comp_face_idx] = True
-            n_internal_frags += 1
-            n_internal_frag_faces += len(comp_face_idx)
-        else:
-            n_kept_frags += 1
+    isolated, counts = kernels.pre.isolated_organelles(
+        np.asarray(mesh.faces),
+        np.asarray(mesh.vertices),
+        np.asarray(mesh.triangles_center),
+        np.asarray(mesh.face_normals),
+        outward_dots,
+        face_comp,
+        main_ci,
+    )
 
     if verbose:
         dt = time.perf_counter() - _t0
         print(
             f"[skeliner.pre] Isolated organelles: "
-            f"{n_internal_frags:,} fragments, "
-            f"{n_internal_frag_faces:,} faces "
-            f"({n_kept_frags:,} external kept; "
-            f"{n_via_dots:,} by dots, {n_via_geo:,} by geometry) "
+            f"{counts['n_internal']:,} fragments, "
+            f"{counts['n_internal_faces']:,} faces "
+            f"({counts['n_kept']:,} external kept; "
+            f"{counts['n_via_dots']:,} by dots, "
+            f"{counts['n_via_geometry']:,} by geometry) "
             f"({dt:.1f}s)"
         )
     return isolated
@@ -5095,7 +4061,7 @@ def find_organelles(
 
     if verbose:
         print("[skeliner.pre] Finding isolated organelles and pockets …")
-    pocket, isolated, rep = _rs.find_organelles(
+    pocket, isolated, rep = kernels.pre.find_organelles(
         np.asarray(mesh.vertices, dtype=np.float64),
         np.asarray(mesh.faces, dtype=np.int64),
         np.asarray(mesh.triangles_center, dtype=np.float64),
@@ -5161,7 +4127,7 @@ def _find_nonmanifold_fusions(
     mesh_stats: MeshStats | None = None,
 ) -> list[list[int]]:
     """Detect non-manifold fusions (shared edges, duplicate faces, pinch vertices)."""
-    return _rs.find_nonmanifold_fusions(
+    return kernels.pre.find_nonmanifold_fusions(
         np.asarray(mesh.faces, dtype=np.int64),
         len(mesh.vertices),
         np.asarray(mesh.area_faces, dtype=np.float64),
@@ -5236,7 +4202,7 @@ def find_fusions(
         print("[skeliner.pre] Finding fusions …")
         _t0 = time.perf_counter()
 
-    clusters = _rs.find_nonmanifold_fusions(
+    clusters = kernels.pre.find_nonmanifold_fusions(
         np.asarray(mesh.faces, dtype=np.int64),
         len(mesh.vertices),
         np.asarray(mesh.area_faces, dtype=np.float64),
@@ -5275,7 +4241,7 @@ def _split_fan_vertices(
         if candidate_verts is None
         else np.fromiter(sorted(candidate_verts), dtype=np.int64)
     )
-    faces, sources = _rs.split_fan_vertices(
+    faces, sources = kernels.pre.split_fan_vertices(
         np.asarray(mesh.faces, dtype=np.int64), len(mesh.vertices), candidates
     )
     if len(sources) == 0:
@@ -5348,7 +4314,7 @@ def remove_fusions(
 
     n_verts_before = len(mesh.vertices)
     if all_fusions:
-        faces, sources = _rs.remove_fusions(
+        faces, sources = kernels.pre.remove_fusions(
             np.asarray(mesh.faces, dtype=np.int64),
             len(mesh.vertices),
             [list(map(int, c)) for c in fusions],
@@ -5654,7 +4620,7 @@ def find_parallel_patches(
     if boundaries is None:
         boundaries = find_chunk_boundaries(mesh)
 
-    found = _rs.find_parallel_patches(
+    found = kernels.pre.find_parallel_patches(
         np.asarray(mesh.faces, dtype=np.int64),
         np.asarray(mesh.vertices, dtype=np.float64),
         np.asarray(mesh.face_normals, dtype=np.float64),
@@ -5944,14 +4910,16 @@ def remove_parallel_patches(
     if not patches:
         return mesh
 
-    faces_out, n_removed, n_a, n_b, n_orphan, n_stitched = _rs.remove_parallel_patches(
-        np.asarray(mesh.faces, dtype=np.int64),
-        np.asarray(mesh.vertices, dtype=np.float64),
-        np.asarray(mesh.face_normals, dtype=np.float64),
-        [
-            (p["axis"], p["bval"], p["faces"], p["up_faces"], p["down_faces"])
-            for p in patches
-        ],
+    faces_out, n_removed, n_a, n_b, n_orphan, n_stitched = (
+        kernels.pre.remove_parallel_patches(
+            np.asarray(mesh.faces, dtype=np.int64),
+            np.asarray(mesh.vertices, dtype=np.float64),
+            np.asarray(mesh.face_normals, dtype=np.float64),
+            [
+                (p["axis"], p["bval"], p["faces"], p["up_faces"], p["down_faces"])
+                for p in patches
+            ],
+        )
     )
     result = trimesh.Trimesh(vertices=mesh.vertices, faces=faces_out, process=False)
     n_trimmed = n_faces_before_trim - n_faces_after_trim
@@ -6405,7 +5373,7 @@ def _z_scan(
     from scipy.spatial import ConvexHull
 
     verts = np.asarray(verts, dtype=np.float64)
-    scan = _rs.ZScan(verts, grid_res, z_tol, min_void_r, max_shift)
+    scan = kernels.pre.ZScan(verts, grid_res, z_tol, min_void_r, max_shift)
     if scan.best is not None and retry_broken:
         # Pass 2 needs the convex hull of each chain end's soma cluster.
         hulls = []

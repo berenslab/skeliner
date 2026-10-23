@@ -22,7 +22,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import ConvexHull, KDTree
 
-from . import _rs
+from ._backend import kernels
 from .dataclass import ContactSeeds, ContactSites, ProxySites, Skeleton
 
 ####################
@@ -1436,7 +1436,7 @@ def scan_contacts(
     tol = float(tol)
 
     def touching(src, dst):
-        return _rs.contact_faces(
+        return kernels.pair.contact_faces(
             np.asarray(src.triangles_center, np.float64),
             np.asarray(src.face_normals, np.float64),
             np.asarray(dst.triangles, np.float64).reshape(-1, 9),
@@ -1546,8 +1546,8 @@ class _Branches:
         self.centers = np.asarray(mesh.triangles_center, np.float64)
         self.normals = np.asarray(mesh.face_normals, np.float64)
         self.tree = KDTree(self.centers)
-        self.topology = _rs.Topology(self.faces, len(self.vertices))
-        self.bvh = _rs.TriangleBvh(
+        self.topology = kernels.mesh.Topology(self.faces, len(self.vertices))
+        self.bvh = kernels.pair.TriangleBvh(
             np.asarray(mesh.triangles, np.float64).reshape(-1, 9), self.normals
         )
         self._thickness = np.full(len(self.faces), np.nan)

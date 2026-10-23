@@ -37,17 +37,19 @@ dev = [
 skeliner = "skeliner.__main__:main"
 
 [tool.maturin]
-# The Rust core is the `skeliner._rs` extension module, built from the
-# workspace under rust/ and installed inside the `skeliner` package.
-manifest-path = "rust/skeliner-py/Cargo.toml"
+# The Rust path is the `skeliner._rs` extension module, built from the
+# workspace in skeliner/rust/ (one crate per Python module) and installed
+# inside the `skeliner` package. Wheels carry the module, not its sources.
+manifest-path = "skeliner/rust/_rs/Cargo.toml"
 module-name = "skeliner._rs"
+exclude = [{ path = "skeliner/rust/**/*", format = "wheel" }]
 
 [tool.uv]
 # Rebuild the extension on `uv sync` when the Rust sources change.
 cache-keys = [
     { file = "pyproject.toml" },
-    { file = "rust/**/Cargo.toml" },
-    { file = "rust/**/*.rs" },
+    { file = "skeliner/rust/**/Cargo.toml" },
+    { file = "skeliner/rust/**/*.rs" },
 ]
 
 [tool.ruff]

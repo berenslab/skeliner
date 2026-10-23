@@ -30,15 +30,15 @@ class threads:
             if isinstance(n, bool) or not isinstance(n, Integral) or n < 1:
                 raise ValueError(f"threads takes a positive integer or None, not {n!r}")
             n = int(n)
-        self._previous = _rs.thread_override()
-        _rs.set_threads(n)
+        self._previous = _rs.threads.thread_override()
+        _rs.threads.set_threads(n)
         self.n = n
 
     def __enter__(self) -> threads:
         return self
 
     def __exit__(self, *_exc) -> None:
-        _rs.set_threads(self._previous)
+        _rs.threads.set_threads(self._previous)
 
     def __repr__(self) -> str:
         return f"skeliner.threads({self.n!r})"
@@ -46,4 +46,4 @@ class threads:
     @staticmethod
     def get() -> int:
         """How many threads the next parallel loop runs on."""
-        return _rs.current_threads()
+        return _rs.threads.current_threads()

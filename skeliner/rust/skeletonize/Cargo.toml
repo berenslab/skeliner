@@ -1,0 +1,13 @@
+[package]
+name = "skeletonize"
+version = "0.1.0"
+description = "Skeletonizing a mesh (`sk.skeletonize`)."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mesh.workspace = true
+
+[lints]
+workspace = true

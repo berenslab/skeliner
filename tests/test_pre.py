@@ -21,6 +21,8 @@ from skeliner.dataclass import (
 )
 from skeliner.pre import _non_degenerate
 
+from ._parity import assert_parity, both
+
 
 def _live_faces(mesh):
     """Count non-degenerate faces (degenerate = removed by _rebuild_mesh)."""
@@ -441,6 +443,33 @@ PINNED_CAP = dict(min_bridge_gap=0.0, max_bridge_dist=5000.0)
 
 
 class TestFindGaps:
+    def test_is_the_same_on_both_paths(self):
+        from pathlib import Path
+
+        from skeliner.io import load_mesh
+
+        reference = load_mesh(Path(__file__).parent / "data" / "60427.obj")
+        cyl = _two_cylinders(separation=300.0)
+        first = np.arange(len(cyl.faces) // 2)
+        # the first cylinder's faces nearest the gap, posing as a fusion
+        near = first[np.argsort(-cyl.triangles_center[first, 0])[:6]].tolist()
+        cases = [
+            (reference, {}),
+            (_two_cylinders(separation=1500.0), NO_CAP),
+            (cyl, NO_CAP),
+            (cyl, {"fusions": [near], **NO_CAP}),
+            (cyl, {"fusions": [near], "fusion_clearance": 1e4, **NO_CAP}),
+            (_main_debris_piece(), PINNED_CAP),
+            (_main_relay_piece(), {"relay_min_faces": 0, **PINNED_CAP}),
+            (_main_relay_piece(), PINNED_CAP),
+        ]
+        n_gaps = 0
+        for mesh, kwargs in cases:
+            rust, python = both(pre.find_gaps, mesh, **kwargs)
+            assert_parity(rust, python)
+            n_gaps += len(rust)
+        assert n_gaps > 10
+
     def test_single_component_no_gaps(self):
         mesh = _icosphere()
         gaps = pre.find_gaps(mesh)
@@ -554,6 +583,22 @@ class TestFindGaps:
 
 
 class TestRemoveGaps:
+    def test_is_the_same_on_both_paths(self):
+        added = 0
+        cases = [
+            (_two_cylinders(separation=1500.0), NO_CAP),
+            (_two_cylinders(separation=300.0), NO_CAP),
+            (_main_debris_piece(), PINNED_CAP),
+            (_main_relay_piece(), {"relay_min_faces": 0, **PINNED_CAP}),
+        ]
+        for mesh, kwargs in cases:
+            gaps = pre.find_gaps(mesh, **kwargs)
+            rust, python = both(pre.remove_gaps, mesh, gaps=gaps)
+            assert_parity(np.asarray(rust.vertices), np.asarray(python.vertices))
+            assert_parity(np.asarray(rust.faces), np.asarray(python.faces))
+            added += len(rust.faces) - len(mesh.faces)
+        assert added > 0
+
     def test_noop_single_component(self):
         mesh = _icosphere()
         result = pre.remove_gaps(mesh)
@@ -586,7 +631,7 @@ class TestRemoveGaps:
         # pieces glued at the rim share a few vertices; that alone is fine
         assert pre._validate_loop_pair([1, 2, 3, 4, 5], [4, 5, 6, 7, 8]) is None
 
-    def test_tips_side_by_side_are_filled_not_tubed(self):
+    def test_tips_side_by_side_are_filled_not_tubed_on_both_paths(self):
         # Two tips on one surface whose rims share vertices: they are glued
         # along those vertices (a fusion join).  A tube from rim to rim
         # would fold over the glue; removing both and closing the one hole
@@ -594,7 +639,7 @@ class TestRemoveGaps:
         from skeliner import _rs
 
         mesh = _subdivided_tube()
-        topo = _rs.Topology(np.asarray(mesh.faces, np.int64), len(mesh.vertices))
+        topo = _rs.mesh.Topology(np.asarray(mesh.faces, np.int64), len(mesh.vertices))
         centre_z = mesh.vertices[mesh.faces].mean(axis=1)[:, 2]
         fa = [int(np.argmin(np.abs(centre_z)))]
         sel_a, rim_a = pre._expand_tip_to_good_rim(fa, topo, None)
@@ -611,7 +656,9 @@ class TestRemoveGaps:
                 break
         else:
             pytest.fail("no side-by-side tip on the fixture")
-        out = pre.remove_gaps(mesh, gaps=[(fa, fb, 1.0, -1, 0)])
+        out, python = both(pre.remove_gaps, mesh, gaps=[(fa, fb, 1.0, -1, 0)])
+        assert_parity(np.asarray(out.vertices), np.asarray(python.vertices))
+        assert_parity(np.asarray(out.faces), np.asarray(python.faces))
 
         def edge_uses(m):
             f = np.asarray(m.faces)

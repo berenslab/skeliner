@@ -10,7 +10,8 @@ import numpy as np
 import trimesh
 from numpy.typing import ArrayLike
 
-from . import _rs, dx
+from . import dx
+from ._backend import kernels
 from ._core import (
     _bridge_gaps,
     _build_mst,
@@ -28,6 +29,7 @@ from ._state import (
     swap_nodes,
 )
 from .dataclass import Skeleton, Soma
+from .python import post as _python_post
 
 __skeleton__ = [
     # editing bins
@@ -96,23 +98,6 @@ def _refresh_igraph(skel) -> ig.Graph:  # type: ignore[valid-type]
     )
 
 
-_NTYPE_PRIORITY = (1, -1, 2, 3, 4, 5, 6, 0)
-
-
-def _build_adjacency(n: int, edges: np.ndarray) -> list[list[int]]:
-    adj = [[] for _ in range(n)]
-    if edges.size == 0:
-        return adj
-    for a, b in edges:
-        a = int(a)
-        b = int(b)
-        if a == b:
-            continue
-        adj[a].append(b)
-        adj[b].append(a)
-    return adj
-
-
 def _fill_ntype_gaps(ntype: np.ndarray, edges: np.ndarray) -> np.ndarray:
     """
     Fill zero-labeled gaps by propagating neighboring non-zero (non-root/soma) labels.
@@ -120,28 +105,11 @@ def _fill_ntype_gaps(ntype: np.ndarray, edges: np.ndarray) -> np.ndarray:
     """
     if ntype is None or ntype.size == 0 or edges is None or edges.size == 0:
         return ntype
-    filled = ntype.copy()
-    adj = _build_adjacency(len(filled), edges)
-    for _ in range(len(filled)):
-        changed = False
-        zeros = np.where(filled == 0)[0]
-        if not len(zeros):
-            break
-        for z in zeros:
-            nbr = adj[z]
-            if not nbr:
-                continue
-            lbls = filled[nbr]
-            nz = lbls[(lbls != 0) & (lbls != -1) & (lbls != 1)]
-            if nz.size == 0:
-                continue
-            candidate = _mode_int(nz, default=0)
-            if candidate != 0:
-                filled[z] = candidate
-                changed = True
-        if not changed:
-            break
-    return filled
+    filled = kernels.post.fill_ntype_gaps(
+        np.asarray(ntype, dtype=np.int64),
+        np.asarray(edges, dtype=np.int64).reshape(-1, 2),
+    )
+    return filled.astype(ntype.dtype, copy=False)
 
 
 def _derive_root_label(ntype: np.ndarray) -> int:
@@ -153,36 +121,7 @@ def _derive_root_label(ntype: np.ndarray) -> int:
     return -1
 
 
-def _choose_label(labels: list[int]) -> int:
-    """
-    Aggregate labels for a merged node.
-
-    Non-zero labels are preferred over zeros. Ties are broken by `_NTYPE_PRIORITY`.
-    """
-    if not labels:
-        return 0
-    vals = np.asarray(labels, dtype=int)
-    nonzero = vals[vals != 0]
-    use = nonzero if nonzero.size else vals
-    uniq, counts = np.unique(use, return_counts=True)
-    max_count = counts.max()
-    candidates = {int(u) for u, c in zip(uniq, counts) if c == max_count}
-    for p in _NTYPE_PRIORITY:
-        if p in candidates:
-            return p
-    return int(next(iter(candidates)))
-
-
-def _ensure_root_label(arr: np.ndarray, root_label: int) -> np.ndarray:
-    if arr.size == 0:
-        return arr
-    lbl = 1 if root_label == 1 else -1
-    arr[0] = lbl
-    dupes = (arr == 1) | (arr == -1)
-    dupes[0] = False
-    if np.any(dupes):
-        arr[dupes] = 0
-    return arr
+_ensure_root_label = _python_post.ensure_root_label
 
 
 def _remap_ntype(
@@ -196,24 +135,18 @@ def _remap_ntype(
 ) -> np.ndarray | None:
     if ntype is None:
         return None
-
-    buckets: list[list[int]] = [[] for _ in range(new_len)]
-    for old_idx, new_idx in enumerate(old2new):
-        if new_idx >= 0:
-            buckets[int(new_idx)].append(int(ntype[old_idx]))
-
-    mapped = np.empty(new_len, dtype=ntype.dtype)
-    for idx, vals in enumerate(buckets):
-        mapped[idx] = _choose_label(vals)
-
     root_label = int(root_hint) if root_hint in (-1, 1) else _derive_root_label(ntype)
-    mapped = _ensure_root_label(mapped, root_label)
-    if fill_gaps:
-        mapped = _fill_ntype_gaps(
-            mapped, edges if edges is not None else np.empty((0, 2), dtype=np.int64)
-        )
-        mapped = _ensure_root_label(mapped, root_label)
-    return mapped
+    mapped = kernels.post.remap_ntype(
+        np.asarray(ntype, dtype=np.int64),
+        np.asarray(old2new, dtype=np.int64),
+        int(new_len),
+        root_label,
+        np.empty((0, 2), dtype=np.int64)
+        if edges is None
+        else np.asarray(edges, dtype=np.int64).reshape(-1, 2),
+        bool(fill_gaps),
+    )
+    return mapped.astype(ntype.dtype, copy=False)
 
 
 # -----------------------------------------------------------------------------
@@ -1324,17 +1257,6 @@ def detect_soma(
 # -----------------------------------------------------------------------------
 
 
-def _mode_int(vals: np.ndarray, default: int = 0) -> int:
-    """Fast integer mode with a sane default when empty."""
-    vals = np.asarray(vals, dtype=np.int64)
-    if vals.size == 0:
-        return int(default)
-    mx = int(vals.max(initial=0))
-    if mx < 0:
-        return int(default)
-    return int(np.bincount(np.clip(vals, 0, mx)).argmax())
-
-
 def _adjacency_from_edges(n: int, edges: np.ndarray) -> list[list[int]]:
     """Build simple adjacency lists."""
     adj = [set() for _ in range(n)]
@@ -1745,7 +1667,7 @@ def submesh_by_vertices(
     """
     Reduce mesh to a subset of vertices and corresponding faces.
 
-    *vertex_faces*, a :class:`skeliner._rs.VertexFaces` of *mesh*, finds the
+    *vertex_faces*, a ``VertexFaces`` of *mesh* (either path's), finds the
     faces from the vertices' own instead of testing every face of the mesh.
     """
     vertex_indices = np.asarray(vertex_indices, dtype=np.int64)
@@ -1794,13 +1716,7 @@ def filter_inner_surfaces_raycast(mesh, num_rays=20, thresh=0.2, sample=True):
             [np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi), np.cos(theta)]
         )
     else:
-        golden_ratio = (1 + np.sqrt(5)) / 2
-        idx = np.arange(num_rays)
-        theta = 2 * np.pi * idx / golden_ratio
-        phi = np.arccos(1 - 2 * (idx + 0.5) / num_rays)
-        directions = np.column_stack(
-            [np.sin(phi) * np.cos(theta), np.sin(phi) * np.sin(theta), np.cos(phi)]
-        )
+        directions = _golden_spiral(num_rays)
 
     # ---- Precompute centroids & normals ----
     C = mesh.triangles_center
@@ -1827,7 +1743,7 @@ def filter_inner_surfaces_raycast(mesh, num_rays=20, thresh=0.2, sample=True):
     embree = _embree_intersector()
     if embree is None:
         # trimesh's own `ray_triangle` test, on the Rust core
-        hit_mask = _rs.ray_hits(
+        hit_mask = kernels.post.ray_hits(
             np.asarray(mesh.triangles, dtype=np.float64).reshape(-1, 9),
             np.asarray(N, dtype=np.float64),
             np.ascontiguousarray(origins_flat, dtype=np.float64),
@@ -1848,6 +1764,100 @@ def filter_inner_surfaces_raycast(mesh, num_rays=20, thresh=0.2, sample=True):
     # ---- Return vertex indices from these faces ----
     outer_vertices = mesh.faces[outer_faces].reshape(-1)
     return np.unique(outer_vertices)
+
+
+#: :func:`calibrate_radii`'s methods, by the kernels' kind codes.
+_RADIUS_KINDS = ("fallback", "full_centerline", "outer_centerline")
+
+
+def _golden_spiral(n: int) -> np.ndarray:
+    """*n* unit directions spread evenly over the sphere."""
+    golden_ratio = (1 + np.sqrt(5)) / 2
+    idx = np.arange(n)
+    theta = 2 * np.pi * idx / golden_ratio
+    phi = np.arccos(1 - 2 * (idx + 0.5) / n)
+    return np.column_stack(
+        [np.sin(phi) * np.cos(theta), np.sin(phi) * np.sin(theta), np.cos(phi)]
+    )
+
+
+def _calibrate_node_by_node(
+    skel: Skeleton,
+    mesh: trimesh.Trimesh,
+    r_new: np.ndarray,
+    r_kind: np.ndarray,
+    *,
+    radius_metric: str,
+    aggregate: str,
+    min_n_outer: int,
+    min_frac_outer: float,
+    min_verts_q_outer: float,
+    min_n_verts_bulb: int,
+    rays_num_outer: int,
+    rays_thresh_outer: float,
+    rays_sample: bool,
+) -> None:
+    """:func:`calibrate_radii`'s nodes one at a time, a trimesh submesh each,
+    for the ray casts the kernels do not make: embree's, and fresh random
+    rays per node.  Fills *r_new* and *r_kind* in place."""
+    mesh_vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    n_verts = np.array([len(i) for i in skel.node2verts])
+    vertex_faces = kernels.post.VertexFaces(
+        np.asarray(mesh.faces, dtype=np.int64), len(mesh_vertices)
+    )
+    for i in range(len(r_new)):
+        if skel.ntype[i] == 1 and skel.soma is not None:  # Ignore soma
+            continue
+
+        vids = (
+            np.asarray(skel.node2verts[i], dtype=np.int64)
+            if i < len(skel.node2verts)
+            else np.empty(0, dtype=np.int64)
+        )
+        if vids.size == 0:
+            continue
+
+        outer_success = False
+        if n_verts[i] >= min_n_verts_bulb and min_verts_q_outer < 100.0:
+            n_inner = len(vids)
+            mesh_i = submesh_by_vertices(mesh, vids, vertex_faces=vertex_faces)
+            assert len(mesh_i.vertices) == len(vids)
+            outer_vids = filter_inner_surfaces_raycast(
+                mesh_i,
+                num_rays=rays_num_outer,
+                thresh=rays_thresh_outer,
+                sample=rays_sample,
+            )
+            n_outer = len(outer_vids)
+
+            if (
+                (n_outer >= min_n_outer)
+                and (n_outer >= min_frac_outer * n_inner)
+                and (n_outer < n_inner)
+            ):
+                d_local = dx.distance(
+                    skel,
+                    mesh_vertices[vids[outer_vids]],
+                    mode="centerline",
+                    radius_metric=radius_metric,
+                    allowed_nodes=[int(i)],
+                )
+                r_new[i] = _estimate_radius(d_local, method=aggregate)
+                r_kind[i] = "outer_centerline"
+                outer_success = True
+
+        if not outer_success:
+            d_local = dx.distance(
+                skel,
+                mesh_vertices[vids],
+                mode="centerline",
+                radius_metric=radius_metric,
+                allowed_nodes=[int(i)],
+            )
+            r_new_i = _estimate_radius(d_local, method=aggregate)
+            if r_new_i < r_new[i]:  # Update only if smaller
+                r_new[i] = r_new_i
+                r_kind[i] = "full_centerline"
 
 
 def calibrate_radii(
@@ -1927,76 +1937,57 @@ def calibrate_radii(
     n_verts = np.array([len(i) for i in skel.node2verts])
     min_n_verts_bulb = int(np.percentile(n_verts, q=min_verts_q_outer))
 
-    log_steps = (np.array([0, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0]) * n_total).astype(int)
-    log_steps[-1] = n_total - 1
-    vertex_faces = _rs.VertexFaces(
-        np.asarray(mesh.faces, dtype=np.int64), len(mesh_vertices)
-    )
-
     with _post_stage("calibrate_radii", verbose=verbose) as log:
         log(
             f"Check for inner meshes in all nodes with min_n_verts_bulb>={min_n_verts_bulb};"
         )
         log(f"This is {np.mean(n_verts > min_n_verts_bulb):.0%} of all nodes")
 
-    for i in range(n_total):
-        if i in log_steps:
-            _post_stage(
-                f"calibrate_radii - {i / n_total:.0%} calibrated", verbose=verbose
-            )
-
-        if skel.ntype[i] == 1 and skel.soma is not None:  # Ignore soma
-            continue
-
-        vids = (
-            np.asarray(skel.node2verts[i], dtype=np.int64)
-            if i < len(skel.node2verts)
-            else np.empty(0, dtype=np.int64)
+    if not rays_sample and _embree_intersector() is None:
+        # every node in one call on the active path, with the golden-spiral
+        # rays and trimesh's own ray test the node-by-node loop uses then
+        empty = np.empty(0, dtype=np.int64)
+        radii, kinds = kernels.post.calibrate_radii(
+            mesh_vertices,
+            np.asarray(mesh.faces, dtype=np.int64),
+            np.asarray(mesh.triangles_center, dtype=np.float64),
+            np.asarray(mesh.face_normals, dtype=np.float64),
+            np.asarray(skel.nodes, dtype=np.float64),
+            np.asarray(skel.edges, dtype=np.int64).reshape(-1, 2),
+            [
+                np.asarray(skel.node2verts[i], dtype=np.int64)
+                if i < len(skel.node2verts)
+                else empty
+                for i in range(n_total)
+            ],
+            (np.asarray(skel.ntype) == 1) & (skel.soma is not None),
+            r_new,
+            _golden_spiral(rays_num_outer),
+            min_n_verts_bulb,
+            min_verts_q_outer < 100.0,
+            min_n_outer,
+            min_frac_outer,
+            int(rays_num_outer * rays_thresh_outer),
+            aggregate,
         )
-        if vids.size == 0:
-            continue
-
-        outer_success = False
-        if n_verts[i] >= min_n_verts_bulb and min_verts_q_outer < 100.0:
-            n_inner = len(vids)
-            mesh_i = submesh_by_vertices(mesh, vids, vertex_faces=vertex_faces)
-            assert len(mesh_i.vertices) == len(vids)
-            outer_vids = filter_inner_surfaces_raycast(
-                mesh_i,
-                num_rays=rays_num_outer,
-                thresh=rays_thresh_outer,
-                sample=rays_sample,
-            )
-            n_outer = len(outer_vids)
-
-            if (
-                (n_outer >= min_n_outer)
-                and (n_outer >= min_frac_outer * n_inner)
-                and (n_outer < n_inner)
-            ):
-                d_local = dx.distance(
-                    skel,
-                    mesh_vertices[vids[outer_vids]],
-                    mode="centerline",
-                    radius_metric=radius_metric,
-                    allowed_nodes=[int(i)],
-                )
-                r_new[i] = _estimate_radius(d_local, method=aggregate)
-                r_kind[i] = "outer_centerline"
-                outer_success = True
-
-        if not outer_success:
-            d_local = dx.distance(
-                skel,
-                mesh_vertices[vids],
-                mode="centerline",
-                radius_metric=radius_metric,
-                allowed_nodes=[int(i)],
-            )
-            r_new_i = _estimate_radius(d_local, method=aggregate)
-            if r_new_i < r_new[i]:  # Update only if smaller
-                r_new[i] = r_new_i
-                r_kind[i] = "full_centerline"
+        r_new = np.asarray(radii, dtype=np.float64)
+        r_kind = np.array(_RADIUS_KINDS, dtype="object")[np.asarray(kinds)]
+    else:
+        _calibrate_node_by_node(
+            skel,
+            mesh,
+            r_new,
+            r_kind,
+            radius_metric=radius_metric,
+            aggregate=aggregate,
+            min_n_outer=min_n_outer,
+            min_frac_outer=min_frac_outer,
+            min_verts_q_outer=min_verts_q_outer,
+            min_n_verts_bulb=min_n_verts_bulb,
+            rays_num_outer=rays_num_outer,
+            rays_thresh_outer=rays_thresh_outer,
+            rays_sample=rays_sample,
+        )
 
     skel.radii[store_key] = r_new
     n_fallback = int(np.sum(r_kind == "fallback"))

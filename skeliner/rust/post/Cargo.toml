@@ -1,0 +1,17 @@
+[package]
+name = "post"
+version = "0.1.0"
+description = "Post-processing a skeleton (`sk.post`)."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mesh.workspace = true
+threads.workspace = true
+skeletonize.workspace = true
+dx.workspace = true
+rayon.workspace = true
+
+[lints]
+workspace = true

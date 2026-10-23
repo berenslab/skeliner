@@ -5,7 +5,7 @@ Runs `skeletonize()` on the reference mesh and checks a handful of
 topological / numerical invariants so that regressions blow up early.
 """
 
-import importlib
+import re
 from pathlib import Path
 
 import igraph as ig
@@ -13,7 +13,10 @@ import numpy as np
 import pytest
 import trimesh
 
+import skeliner as sk
 from skeliner import _rs, skeletonize
+from skeliner._backend import PATHS
+from skeliner._core import _build_mst
 from skeliner.dataclass import (
     Discarded,
     MeshComponents,
@@ -22,20 +25,21 @@ from skeliner.dataclass import (
     Soma,
 )
 from skeliner.io import load_mesh
+from skeliner.python import skeletonize as python_skel
 from skeliner.skeletonize import (
     _bin_geodesic_shells,
-    _direct_on_rust,
     _edges_from_mesh,
     _extreme_vertex,
     _make_nodes,
-    _make_nodes_direct_rs,
-    _merge_nested_nodes,
     _neighbour_groups,
+    _perpendicular_rebin,
+    _pick_neurite_seed,
     _split_branch_band,
     _surface_graph,
-    _surface_graph_rs,
+    _surface_graph_of,
 )
 
+from ._parity import assert_parity, both
 from .test_rust_core import _dirty_mesh
 
 
@@ -94,8 +98,25 @@ def _shells_equal(a, b) -> bool:
     )
 
 
-def _direct_bins_both_ways(mesh, seed, step=None):
-    py = _bin_geodesic_shells(
+def _skeleton_fields(skel) -> dict:
+    """What a skeleton holds, but its provenance record, for comparing two."""
+    soma = skel.soma
+    return {
+        "nodes": skel.nodes,
+        "edges": skel.edges,
+        "ntype": skel.ntype,
+        "radii": dict(skel.radii),
+        "node2verts": list(skel.node2verts),
+        "vert2node": dict(skel.vert2node),
+        "soma": None if soma is None else [soma.center, soma.axes, soma.R],
+        "extra": dict(skel.extra),
+    }
+
+
+def _direct_bins(mesh, seed, step=None):
+    """The direct track's shells three ways: the legacy igraph binning with
+    its split off, and ``bin_mesh`` on the Rust path and on the Python path."""
+    legacy = _bin_geodesic_shells(
         mesh,
         _surface_graph(mesh),
         seed_vid=seed,
@@ -106,24 +127,29 @@ def _direct_bins_both_ways(mesh, seed, step=None):
         split_elongated_shells=False,
     )
     e_m = float(mesh.edges_unique_length.mean())
-    rs = _surface_graph_rs(mesh).bin_mesh(seed, e_m, step, 1000, 6, 50)
-    return py, rs
+    rust, python = both(
+        lambda: _surface_graph_of(mesh).bin_mesh(seed, e_m, step, 1000, 6, 50)
+    )
+    return legacy, rust, python
 
 
 def test_direct_components_come_in_igraphs_order(reference_mesh):
-    py = [list(c) for c in _surface_graph(reference_mesh).components()]
-    rs = [c.tolist() for c in _surface_graph_rs(reference_mesh).components()]
-    assert len(rs) == 7 and rs == py
+    legacy = [list(c) for c in _surface_graph(reference_mesh).components()]
+    rust, python = both(lambda: _surface_graph_of(reference_mesh).components())
+    assert len(rust) == 7 and [c.tolist() for c in rust] == legacy
+    assert_parity(rust, python)
 
 
-def test_surface_graph_has_trimeshs_unique_edges_and_lengths(reference_mesh):
+@pytest.mark.parametrize("path", PATHS)
+def test_surface_graph_has_trimeshs_unique_edges_and_lengths(reference_mesh, path):
     """Built from the faces, value for value what trimesh computes, so the
     mean edge and the edge mapping see the same numbers either way."""
-    for mesh in [reference_mesh, _dirty_mesh()]:
-        g = _surface_graph_rs(mesh)
-        assert np.array_equal(g.edges, mesh.edges_unique)
-        assert np.array_equal(g.lengths, mesh.edges_unique_length)
-        assert g.lengths.mean() == mesh.edges_unique_length.mean()
+    with sk.backend(path):
+        for mesh in [reference_mesh, _dirty_mesh()]:
+            g = _surface_graph_of(mesh)
+            assert np.array_equal(g.edges, mesh.edges_unique)
+            assert np.array_equal(g.lengths, mesh.edges_unique_length)
+            assert g.lengths.mean() == mesh.edges_unique_length.mean()
     # the dirty mesh's degenerate faces keep their [v, v] edges
     assert (g.edges[:, 0] == g.edges[:, 1]).any()
 
@@ -146,86 +172,94 @@ def test_edges_from_mesh_are_the_distinct_node_pairs_in_row_order():
 
 
 @pytest.mark.parametrize("step_edges", [None, 3.0])
-def test_direct_binning_on_the_rust_core_matches_the_python(reference_mesh, step_edges):
+def test_direct_binning_is_the_same_on_both_paths(reference_mesh, step_edges):
     """Auto shell width, and a fixed one of three mean edges; the seed in
-    the main component, and in a small one so the main falls back."""
+    the main component, and in a small one so the main falls back.  The
+    legacy igraph binning, its split off, gives the same shells."""
     mesh = reference_mesh
     step = None
     if step_edges is not None:
         step = step_edges * float(mesh.edges_unique_length.mean())
-    small = min(_surface_graph_rs(mesh).components(), key=len)
+    small = min(_surface_graph(mesh).components(), key=len)
     for seed in [_extreme_vertex(mesh), _extreme_vertex(mesh, "x", "max"), small[0]]:
-        py, rs = _direct_bins_both_ways(mesh, int(seed), step)
-        assert sum(len(band) for band in rs) > 20
-        assert _shells_equal(py, rs), seed
+        legacy, rust, python = _direct_bins(mesh, int(seed), step)
+        assert sum(len(band) for band in rust) > 20
+        assert_parity(rust, python, f"seed {seed}")
+        assert _shells_equal(legacy, rust), seed
 
 
-def test_direct_binning_matches_the_python_on_a_dirty_mesh():
+def test_direct_binning_is_the_same_on_both_paths_on_a_dirty_mesh():
     mesh = _dirty_mesh()
-    py, rs = _direct_bins_both_ways(mesh, _extreme_vertex(mesh))
-    assert _shells_equal(py, rs)
+    legacy, rust, python = _direct_bins(mesh, _extreme_vertex(mesh))
+    assert_parity(rust, python)
+    assert _shells_equal(legacy, rust)
 
 
-def test_direct_nodes_and_nested_merge_match_the_python(reference_mesh):
+def test_direct_nodes_and_nested_merge_are_the_same_on_both_paths(reference_mesh):
     mesh = reference_mesh
     e_m = float(mesh.edges_unique_length.mean())
-    shells = _surface_graph_rs(mesh).bin_mesh(
+    shells = _surface_graph_of(mesh).bin_mesh(
         _extreme_vertex(mesh), e_m, None, 1000, 6, 50
     )
-    v = mesh.vertices.view(np.ndarray)
-    est = ["median", "mean", "trim"]
-    py = _make_nodes(
-        [list(band) for band in shells],
-        v,
-        radius_estimators=est,
+    rust, python = both(
+        _make_nodes,
+        shells,
+        mesh.vertices.view(np.ndarray),
+        radius_estimators=["median", "mean", "trim"],
         merge_nested=True,
         merge_kwargs={"inside_frac": 0.8},
     )
-    rs = _make_nodes_direct_rs(shells, v, est, 0.8)
-    assert len(rs[0]) < sum(len(band) for band in shells), "nothing merged"
-    assert np.array_equal(py[0], rs[0])
-    assert all(np.array_equal(py[1][k], rs[1][k]) for k in est)
-    assert len(py[2]) == len(rs[2])
-    assert all(np.array_equal(a, b) for a, b in zip(py[2], rs[2]))
-    assert py[3] == rs[3]
+    assert len(rust[0]) < sum(len(band) for band in shells), "nothing merged"
+    assert_parity(rust, python)
 
 
-def test_nested_merge_on_the_rust_core_matches_on_crowded_nodes():
+def test_nested_merge_is_the_same_on_both_paths_on_crowded_nodes():
     rng = np.random.default_rng(3)
     nodes = rng.random((400, 3)) * 50
     radii = rng.random(400) * 8
     radii[[5, 9, 40]] = radii[3]  # ties, visited by index
     n2v = [np.arange(3 * k, 3 * k + 3, dtype=np.int64) for k in range(400)]
-    keep_py, verts_py, old2new_py = _merge_nested_nodes(
-        nodes, radii, list(n2v), inside_frac=0.8
+    rust = _rs.skeletonize.merge_nested_nodes(nodes, radii, n2v, 0.8)
+    python = python_skel.merge_nested_nodes(nodes, radii, n2v, 0.8)
+    assert 50 < rust[0].sum() < 350
+    assert_parity(rust, python)
+    # the default fraction, with the root free to be absorbed and to absorb
+    rust = _rs.skeletonize.merge_nested_nodes(nodes, radii, n2v, keep_root=False)
+    python = python_skel.merge_nested_nodes(nodes, radii, n2v, keep_root=False)
+    assert not rust[0][0] or rust[2][0] == 0
+    assert_parity(rust, python)
+
+
+def test_nested_merge_refuses_the_same_input_on_both_paths():
+    nodes, radii = np.zeros((2, 3)), np.ones(2)
+    n2v = [np.arange(1), np.arange(1, 2)]
+    for merge in (_rs.skeletonize.merge_nested_nodes, python_skel.merge_nested_nodes):
+        with pytest.raises(ValueError, match=r"inside_frac must be in \(0, 1\]"):
+            merge(nodes, radii, n2v, 1.5)
+        with pytest.raises(ValueError, match="one radius and one vertex list"):
+            merge(nodes, radii[:1], n2v)
+        with pytest.raises(ValueError, match="vertex index -1 is out of range"):
+            merge(nodes, radii, [np.arange(1), np.array([-1])])
+    assert_parity(
+        _rs.skeletonize.merge_nested_nodes(np.empty((0, 3)), np.empty(0), []),
+        python_skel.merge_nested_nodes(np.empty((0, 3)), np.empty(0), []),
     )
-    keep_rs, verts_rs, old2new_rs = _rs.merge_nested_nodes(nodes, radii, n2v, 0.8)
-    assert 50 < keep_rs.sum() < 350
-    assert np.array_equal(keep_py, keep_rs)
-    assert np.array_equal(old2new_py, old2new_rs)
-    assert all(np.array_equal(a, b) for a, b in zip(verts_py, verts_rs))
 
 
-def test_direct_track_is_the_same_on_rust_and_in_python(reference_mesh, monkeypatch):
-    rs = skeletonize(reference_mesh)
-    module = importlib.import_module("skeliner.skeletonize")
-    monkeypatch.setattr(module, "_direct_on_rust", lambda _split: False)
-    py = skeletonize(reference_mesh)
-    _assert_skeleton_valid(rs)
-    assert len(rs.nodes) > 20
-    assert np.array_equal(rs.nodes, py.nodes)
-    assert np.array_equal(rs.edges, py.edges)
-    assert np.array_equal(rs.ntype, py.ntype)
-    assert rs.radii.keys() == py.radii.keys()
-    assert all(np.array_equal(rs.radii[k], py.radii[k]) for k in rs.radii)
-    assert len(rs.node2verts) == len(py.node2verts)
-    assert all(np.array_equal(a, b) for a, b in zip(rs.node2verts, py.node2verts))
-    for attr in ("center", "axes", "R"):
-        assert np.array_equal(getattr(rs.soma, attr), getattr(py.soma, attr))
+def test_direct_track_is_the_same_on_both_paths(reference_mesh):
+    rust, python = both(skeletonize, reference_mesh)
+    _assert_skeleton_valid(rust)
+    assert len(rust.nodes) > 20
+    assert_parity(_skeleton_fields(rust), _skeleton_fields(python))
 
 
-def test_only_the_legacy_split_keeps_the_direct_track_in_python():
-    assert _direct_on_rust(False) and not _direct_on_rust(True)
+def test_the_legacy_split_is_the_same_on_both_paths(reference_mesh):
+    """The elongated-shell split bins on the Python path's igraph graph
+    whichever path is active; the nodes it makes come from the active one."""
+    rust, python = both(skeletonize, reference_mesh, split_elongated_shells=True)
+    plain = skeletonize(reference_mesh)
+    assert not np.array_equal(rust.nodes, plain.nodes), "the split did nothing"
+    assert_parity(_skeleton_fields(rust), _skeleton_fields(python))
 
 
 # ----- preprocessing track ------------------------------------------------
@@ -289,6 +323,202 @@ def test_preproc_track_with_soma(reference_mesh):
     # soma center should be close to the mesh centroid
     mesh_center = reference_mesh.vertices.mean(axis=0)
     assert np.linalg.norm(skel.soma.center - mesh_center) < 1e3
+
+
+def test_preproc_track_is_the_same_on_both_paths(reference_mesh):
+    comp = _make_components(reference_mesh, with_soma=True)
+    rust, python = both(skeletonize, reference_mesh, components=comp)
+    assert "centerline" in rust.radii
+    assert_parity(_skeleton_fields(rust), _skeleton_fields(python))
+
+
+def _lists(shells):
+    return [[np.asarray(b).tolist() for b in band] for band in shells]
+
+
+def _preproc_steps(mesh, comp):
+    """The preprocessing track's steps on its first neurite, on the active
+    path: the shells, their nodes, the re-binned shells with their
+    centreline distances, and the three clean-ups in turn."""
+    sgraph = _surface_graph_of(mesh)
+    v = mesh.vertices.view(np.ndarray)
+    verts = np.unique(mesh.faces[comp.neurites[0]].ravel()).astype(np.int64)
+    seeds = np.atleast_1d(_pick_neurite_seed(verts, v, comp.soma))
+    est = ["median", "mean", "trim"]
+    e_m = float(sgraph.lengths.mean())
+    shells = sgraph.bin_component(verts, seeds, e_m, None, 500, 6, 50.0)
+    nodes, radii, node2verts, vert2node = _make_nodes(
+        shells, v, radius_estimators=est, merge_nested=False
+    )
+    mst = _build_mst(nodes, _edges_from_mesh(sgraph.edges, vert2node, len(v)))
+    rebinned, cl_dist = _perpendicular_rebin(nodes, mst, node2verts, v, est, radii)
+    rings = sgraph.recheck_rings(_lists(rebinned), verts)
+    united = sgraph.reunite_bins(_lists(rings))
+    return {
+        "shells": shells,
+        "nodes": (nodes, radii, node2verts, vert2node),
+        "branch nodes": int((np.bincount(mst.ravel()) >= 3).sum()),
+        "rebinned": (rebinned, cl_dist),
+        "rings": rings,
+        "united": united,
+        "split": sgraph.split_branch_bins(_lists(united)),
+    }
+
+
+def test_preproc_steps_are_the_same_on_both_paths(reference_mesh):
+    comp = _make_components(reference_mesh, with_soma=True)
+    rust, python = both(_preproc_steps, reference_mesh, comp)
+    assert_parity(rust, python)
+    # a branch node donates, and the ring check and the reunion have work
+    assert rust["branch nodes"] > 0
+    assert not _shells_equal(rust["rebinned"][0], rust["rings"])
+    assert not _shells_equal(rust["rings"], rust["united"])
+
+
+def test_binning_from_several_seeds_is_the_same_on_both_paths(reference_mesh):
+    mesh = reference_mesh
+    verts = np.asarray(max(_surface_graph(mesh).components(), key=len))
+    e_m = float(mesh.edges_unique_length.mean())
+
+    def bins(seeds):
+        return _surface_graph_of(mesh).bin_component(
+            verts, seeds, e_m, None, 500, 6, 50.0
+        )
+
+    rust, python = both(bins, verts[::97])
+    assert not _shells_equal(rust, bins(verts[:1])), "the seeds changed nothing"
+    assert_parity(rust, python)
+
+
+def _y_skeleton():
+    """A branch node with three arms, each node's vertices scattered around
+    it: ``(nodes, edges, node2verts, vertices)``."""
+    rng = np.random.default_rng(7)
+    unit = [[0, 0, 0], [1, 0, 0], [2, 0, 0], [0, 1, 0], [0, 2, 0], [0, 0, 1]]
+    nodes = np.asarray(unit, dtype=np.float64) * 10
+    edges = np.array([[0, 1], [1, 2], [0, 3], [3, 4], [0, 5]])
+    verts = np.repeat(nodes, 12, axis=0) + rng.normal(scale=2.0, size=(72, 3))
+    node2verts = [np.arange(12 * k, 12 * k + 12) for k in range(6)]
+    return nodes, edges, node2verts, verts
+
+
+@pytest.mark.parametrize("radius", [1.0, 0.0])
+def test_chains_rebin_the_same_on_both_paths(radius):
+    """The branch node's donations, and radii with no positive one to take
+    the floor from."""
+    nodes, edges, node2verts, verts = _y_skeleton()
+    radii = {"median": np.full(len(nodes), radius)}
+    rust, python = both(
+        _perpendicular_rebin, nodes, edges, node2verts, verts, ["median"], radii
+    )
+    assert sorted(v for band in rust[0] for v in band[0]) == list(range(len(verts)))
+    assert_parity(rust, python)
+
+
+@pytest.mark.parametrize(
+    "rebin_chains",
+    [_rs.skeletonize.rebin_chains, python_skel.rebin_chains],
+    ids=PATHS,
+)
+def test_chains_refuse_the_same_input_on_both_paths(rebin_chains):
+    nodes, _, node2verts, verts = _y_skeleton()
+    node2verts = [v.tolist() for v in node2verts]
+    radii = np.ones(len(nodes))
+    edge = np.array([[0, 1]])
+    with pytest.raises(ValueError, match="node 9 is out of range"):
+        rebin_chains(nodes, np.array([[0, 9]]), node2verts, verts, radii, [])
+    with pytest.raises(ValueError, match="vertex 99 is out of range"):
+        rebin_chains(nodes, edge, [[99], *node2verts[1:]], verts, radii, [])
+    with pytest.raises(ValueError, match="vertex 99 is out of range"):
+        rebin_chains(nodes, edge, node2verts, verts, radii, [(0, 1, [99])])
+    with pytest.raises(ValueError, match="one radius and one vertex list"):
+        rebin_chains(nodes, edge, node2verts, verts, radii[:2], [])
+    with pytest.raises(ValueError, match="edges must be"):
+        rebin_chains(nodes, np.zeros((1, 3), np.int64), node2verts, verts, radii, [])
+
+
+def _two_boxes():
+    """Two unit cubes apart: vertices and faces of a two-component mesh."""
+    a, b = trimesh.creation.box(), trimesh.creation.box()
+    b.apply_translation([5.0, 0.0, 0.0])
+    faces = np.vstack([a.faces, b.faces + len(a.vertices)])
+    return np.vstack([a.vertices, b.vertices]), faces
+
+
+@pytest.mark.parametrize(
+    "SurfaceGraph",
+    [_rs.skeletonize.SurfaceGraph, python_skel.SurfaceGraph],
+    ids=PATHS,
+)
+def test_the_surface_graph_refuses_the_same_input_on_both_paths(SurfaceGraph):
+    vertices, faces = _two_boxes()
+    with pytest.raises(ValueError, match="edges must be"):
+        SurfaceGraph(3, np.zeros((2, 3), np.int64), np.zeros(2))
+    with pytest.raises(ValueError, match="one weight per edge"):
+        SurfaceGraph(3, np.zeros((2, 2), np.int64), np.zeros(1))
+    with pytest.raises(ValueError, match="vertex index 5 is out of range"):
+        SurfaceGraph(3, np.array([[0, 5]]), np.ones(1))
+    with pytest.raises(ValueError, match="names vertex 99"):
+        SurfaceGraph.from_mesh(vertices, np.array([[0, 1, 99]]))
+
+    g = SurfaceGraph.from_mesh(vertices, faces)
+    first, second = g.components()
+    with pytest.raises(ValueError, match="no seed vertex lies in this component"):
+        g.bin_component(first, second[:1], 1.0, None, 500, 6, 50.0)
+    # a fixed shell width, and vertices no seed reaches
+    with pytest.raises(ValueError, match="arange: cannot compute length"):
+        g.bin_component(np.arange(len(vertices)), first[:1], 1.0, 0.5, 500, 6, 50.0)
+    with pytest.raises(ValueError, match="vertex index -1 is out of range"):
+        g.bin_mesh(-1, 1.0, None, 500, 6, 50.0)
+    with pytest.raises(ValueError, match="vertex index 99 is out of range"):
+        g.reunite_bins([[[0, 99]]])
+
+
+@pytest.mark.parametrize(
+    "skeleton_nodes",
+    [_rs.skeletonize.skeleton_nodes, python_skel.skeleton_nodes],
+    ids=PATHS,
+)
+def test_skeleton_nodes_refuse_the_same_input_on_both_paths(skeleton_nodes):
+    v = np.random.default_rng(0).random((10, 3))
+    with pytest.raises(ValueError, match="a bin has no vertices"):
+        skeleton_nodes([[[0, 1], []]], v, ["median"])
+    unknown = re.escape('Unknown radius estimator in ["median", "nope"].')
+    with pytest.raises(ValueError, match=unknown):
+        skeleton_nodes([[[0, 1]]], v, ["median", "nope"])
+    # no bin, so no estimator to know
+    nodes, radii = skeleton_nodes([], v, ["nope"])
+    assert nodes.shape == (0, 3) and len(radii) == 1 and radii[0].shape == (0,)
+
+
+def test_every_radius_estimator_is_the_same_on_both_paths(reference_mesh):
+    from skeliner._core import RECOMPUTABLE_RADII
+
+    mesh = reference_mesh
+    e_m = float(mesh.edges_unique_length.mean())
+    shells = _lists(
+        _surface_graph_of(mesh).bin_mesh(_extreme_vertex(mesh), e_m, None, 1000, 6, 50)
+    )
+    v = mesh.vertices.view(np.ndarray)
+    est = sorted(RECOMPUTABLE_RADII)
+    assert_parity(
+        _rs.skeletonize.skeleton_nodes(shells, v, est),
+        python_skel.skeleton_nodes(shells, v, est),
+    )
+
+
+def test_branch_bins_split_the_same_on_both_paths():
+    g, _, owner = _pants()
+    edges = np.sort(np.asarray(g.get_edgelist(), dtype=np.int64), axis=1)
+    shells: list[list[list[int]]] = [[[]] for _ in range(4)]
+    for v, (bi, _) in sorted(owner.items()):
+        shells[bi][0].append(v)
+    split = [
+        SurfaceGraph(g.vcount(), edges, np.ones(len(edges))).split_branch_bins(shells)
+        for SurfaceGraph in (_rs.skeletonize.SurfaceGraph, python_skel.SurfaceGraph)
+    ]
+    assert [len(band) for band in split[0]] == [1, 3, 1, 1]
+    assert_parity(*split)
 
 
 def _barbell_surface():
@@ -916,3 +1146,171 @@ def test_dx_neurite_nodes_refuses_an_unknown_name():
     skel = skeletonize(mesh, components=comp, verbose=False)
     with pytest.raises(KeyError, match="no neurite called"):
         skel.dx.neurite_nodes("apical")
+
+
+# ---------------------------------------------------------------------
+# _core's stages on both paths
+# ---------------------------------------------------------------------
+def _stable_kruskal(nodes, edges) -> list[tuple[int, int]]:
+    """Kruskal's forest with ties in input order: not igraph's."""
+    w = [float(np.linalg.norm(nodes[a] - nodes[b])) for a, b in edges]
+    comp = list(range(len(nodes)))
+
+    def root(x):
+        while comp[x] != x:
+            x = comp[x]
+        return x
+
+    tree = []
+    for i in np.argsort(w, kind="stable"):
+        a, b = (root(int(v)) for v in edges[i])
+        if a != b:
+            comp[a] = b
+            tree.append(tuple(sorted(map(int, edges[i]))))
+    return sorted(tree)
+
+
+def test_bfs_parents_and_spanning_forest_on_both_paths():
+    rng = np.random.default_rng(3)
+    ties_matter = 0
+    for _ in range(300):
+        n = int(rng.integers(2, 60))
+        edges = rng.integers(0, n, size=(int(rng.integers(0, 4 * n)), 2))
+        # nodes on a small grid, so many edge lengths tie exactly
+        nodes = rng.integers(0, 3, size=(n, 3)).astype(np.float64)
+        root = int(rng.integers(0, n))
+        assert_parity(
+            _rs.skeletonize.bfs_parents(edges, n, root),
+            python_skel.bfs_parents(edges, n, root),
+        )
+        mst = _rs.skeletonize.build_mst(nodes, edges)
+        assert_parity(mst, python_skel.build_mst(nodes, edges))
+        assert mst.shape[1] == 2
+        ties_matter += [tuple(e) for e in mst.tolist()] != _stable_kruskal(nodes, edges)
+    # the forests above differ from a stable sort's: igraph's tie order is
+    # what they test
+    assert ties_matter > 10
+    # no edges: an empty (0, 2) forest, every node its own root
+    assert _rs.skeletonize.build_mst(np.zeros((3, 3)), np.empty((0, 2), int)).shape == (
+        0,
+        2,
+    )
+    assert _rs.skeletonize.bfs_parents(np.empty((0, 2), int), 3, 0).tolist() == [-1] * 3
+
+
+@pytest.mark.parametrize(
+    "call, message",
+    [
+        (
+            lambda m: m.build_mst(np.full((2, 3), np.nan), np.array([[0, 1]])),
+            "must not be NaN",
+        ),
+        (
+            lambda m: m.build_mst(np.zeros((2, 3)), np.array([[0, 2]])),
+            "edge names node 2, not",
+        ),
+        (
+            lambda m: m.build_mst(np.zeros((2, 3)), np.array([[0, 1, 1]])),
+            r"got shape \[1, 3\]",
+        ),
+        (lambda m: m.bfs_parents(np.empty((0, 2), int), 3, 3), "root 3 is not one"),
+        (lambda m: m.bfs_parents(np.array([[0, -1]]), 3, 0), "edge names node -1, not"),
+    ],
+)
+def test_core_stage_errors_alike_on_both_paths(call, message):
+    for module in (_rs.skeletonize, python_skel):
+        with pytest.raises(ValueError, match=message):
+            call(module)
+
+
+def test_single_node_branches_apart_from_the_root_stay():
+    from skeliner._core import _merge_single_node_branches
+
+    # 0-6, 1-6, 4-6: node 6, the last, has three edges; 2-3 and 2-5 hang
+    # apart from the root, where a BFS from it gives 3 and 5 no parent
+    nodes = np.arange(21, dtype=float).reshape(7, 3)
+    edges = np.array([[0, 6], [1, 6], [4, 6], [2, 3], [2, 5]])
+    n2v = [np.array([i]) for i in range(7)]
+    out = _merge_single_node_branches(
+        nodes,
+        {"median": np.ones(7)},
+        n2v,
+        edges,
+        mesh_vertices=None,
+        return_mapping=True,
+    )
+    assert out[5].tolist() == [0, 2, 3, 5, 6]
+    assert [v.tolist() for v in out[2]] == [[0], [2], [3], [5], [6, 1, 4]]
+
+
+def _random_skeleton(rng, n: int, n_mesh: int = 400):
+    """A random tree of *n* nodes with a few extra edges, radii under keys
+    the stages re-estimate and keys they leave, and vertex lists (some
+    empty) into a random mesh: the arrays ``_core``'s stages take."""
+    edges = [[int(rng.integers(0, i)), i] for i in range(1, n)]
+    edges += rng.integers(0, n, size=(int(rng.integers(0, 3)), 2)).tolist()
+    keys = ["median", "mean", "trim", "centerline", "calibrated"]
+    lens = rng.integers(0, 6, size=n)
+    ptr = np.r_[0, np.cumsum(lens)].astype(np.int64)
+    idx = rng.integers(0, n_mesh, size=int(ptr[-1])).astype(np.int64)
+    return dict(
+        nodes=rng.normal(size=(n, 3)) * 10,
+        keys=keys,
+        radii=rng.random((len(keys), n)),
+        ptr=ptr,
+        idx=idx,
+        edges=np.asarray(edges, dtype=np.int64).reshape(-1, 2),
+        mesh_vertices=rng.normal(size=(n_mesh, 3)) * 10,
+    )
+
+
+def test_single_node_merge_and_pruning_on_both_paths():
+    rng = np.random.default_rng(11)
+    merged = pruned = 0
+    for trial in range(150):
+        s = _random_skeleton(rng, int(rng.integers(2, 50)))
+        mesh = s["mesh_vertices"] if trial % 3 else None
+        args = [s[k] for k in ("nodes", "keys", "radii", "ptr", "idx", "edges")]
+        for degree in (1, 2, 3):
+            rust = _rs.skeletonize.merge_single_node_branches(*args, mesh, degree)
+            assert_parity(
+                rust, python_skel.merge_single_node_branches(*args, mesh, degree)
+            )
+            merged += len(rust[1]) < len(s["nodes"])
+        center = s["nodes"][0] + rng.normal(size=3)
+        r_soma = float(rng.uniform(1, 15))
+        for drop in (True, False):
+            rest = (center, r_soma, mesh, 1.2, float(rng.uniform(1, 3)), drop)
+            rust = _rs.skeletonize.prune_neurites(*args, *rest)
+            assert_parity(rust, python_skel.prune_neurites(*args, *rest))
+            pruned += rust[3] > 0
+    assert merged > 50 and pruned > 20
+    s = _random_skeleton(rng, 5)
+    args = [s[k] for k in ("nodes", "keys", "radii", "ptr", "idx", "edges")]
+    out_of_mesh = np.full_like(s["idx"], 400)
+    for module in (_rs.skeletonize, python_skel):
+        if out_of_mesh.size:
+            with pytest.raises(ValueError, match="vertex index 400 is out of range"):
+                module.merge_single_node_branches(
+                    *args[:4], out_of_mesh, args[5], s["mesh_vertices"], 3
+                )
+        with pytest.raises(ValueError, match="CSR over the nodes"):
+            module.merge_single_node_branches(
+                *args[:3], args[3][:-1], *args[4:], None, 3
+            )
+
+
+def test_pruning_ends_alike_on_both_paths(reference_mesh):
+    skel = sk.skeletonize(reference_mesh, verbose=False)
+    for kwargs in (
+        dict(stem_extent_factor=3.0),
+        dict(stem_extent_factor=6.0, drop_single_node_branches=False),
+    ):
+        rust, python = both(
+            sk.post.prune_neurites,
+            skel,
+            mesh_vertices=reference_mesh.vertices,
+            verbose=False,
+            **kwargs,
+        )
+        assert_parity(_skeleton_fields(rust), _skeleton_fields(python))

@@ -228,3 +228,61 @@ def test_kinds_survive_a_round_trip_and_old_files_load(tube_z, tmp_path):
     plain.to_npz(tmp_path / "plain.npz")
     back = load_contact_sites_npz(tmp_path / "plain.npz")
     assert back.kind is None and back.geometry is None
+
+
+# ---------------------------------------------------------------------
+# the Python path computes what the Rust path does
+# ---------------------------------------------------------------------
+def test_contact_faces_on_both_paths_agree(tube_z):
+    from skeliner import _rs
+    from skeliner.python import pair as python_pair
+
+    from ._parity import assert_parity
+
+    other = _tube([1, 0, 0], [0.0, 405.0, 0.0])  # crosses tube_z, touching it
+    near = np.flatnonzero(
+        np.linalg.norm(tube_z.triangles_center - [0.0, 200.0, 0.0], axis=1) < 300.0
+    )
+    assert len(near) > 100
+    args = (
+        np.asarray(tube_z.triangles_center[near], np.float64),
+        np.asarray(tube_z.face_normals[near], np.float64),
+        np.asarray(other.triangles, np.float64).reshape(-1, 9),
+        np.asarray(other.face_normals, np.float64),
+    )
+    for tol, max_dot in ((20.0, -0.2), (60.0, 1.0)):
+        rust = _rs.pair.contact_faces(*args, tol, max_dot)
+        assert len(rust[0]) > 0
+        assert_parity(rust, python_pair.contact_faces(*args, tol, max_dot))
+
+
+def test_first_hits_on_both_paths_agree(tube_z):
+    from skeliner import _rs
+    from skeliner.python import pair as python_pair
+
+    from ._parity import assert_parity
+
+    tris = np.asarray(tube_z.triangles, np.float64).reshape(-1, 9)
+    normals = np.asarray(tube_z.face_normals, np.float64)
+    faces = np.arange(0, len(tris), 37)
+    rays = (tube_z.triangles_center[faces], -normals[faces], faces, 1e-6)
+    rust = _rs.pair.TriangleBvh(tris, normals).first_hits(*rays)
+    assert np.isfinite(rust).sum() > len(faces) // 2  # inward rays cross the tube
+    assert_parity(rust, python_pair.TriangleBvh(tris, normals).first_hits(*rays))
+
+
+def test_contact_sites_on_both_paths_agree():
+    from ._parity import assert_parity, both
+
+    # small and coarse, for the Python path: still ~7 nm apart where they cross
+    small = dict(length=1200.0, step=40.0, around=32)
+    along_z = _tube([0, 0, 1], [0.0, 0.0, 0.0], **small)
+    crossing = _tube([1, 0, 0], [0.0, 405.0, 0.0], **small)
+
+    def sites():
+        s = pair.scan_contacts(along_z, crossing, tol=20.0)
+        return [np.concatenate(f) for f in (s.faces_A, s.faces_B)], list(s.kind)
+
+    rust, python = both(sites)
+    assert len(rust[0][0])
+    assert_parity(rust, python)

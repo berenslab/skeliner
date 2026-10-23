@@ -1,0 +1,43 @@
+[workspace]
+members = [
+    "mesh",
+    "threads",
+    "pre",
+    "skeletonize",
+    "post",
+    "dx",
+    "pair",
+    "io",
+    "_rs",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-or-later"
+rust-version = "1.88"
+
+[workspace.dependencies]
+# one crate per Python module of skeliner, named after it; `mesh` has
+# none (it does what trimesh and scipy do for the Python path), and `_rs`
+# builds the extension module `skeliner._rs`
+mesh = { path = "mesh" }
+threads = { path = "threads" }
+pre = { path = "pre" }
+skeletonize = { path = "skeletonize" }
+post = { path = "post" }
+dx = { path = "dx" }
+pair = { path = "pair" }
+io = { path = "io" }
+rayon = "1"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+# Cargo's default debuginfo strip runs the system `strip`; on macOS 27 with the
+# current Command Line Tools its output is refused by dyld ("mis-aligned
+# LINKEDIT string pool"), so release builds keep their symbols.
+strip = "none"

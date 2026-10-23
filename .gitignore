@@ -45,7 +45,8 @@ dev/
 *.obj
 
 .claude
-# Rust build output, and the extension module editable installs build in place
-rust/target/
+# Rust build output (.cargo/config.toml puts it here), and the extension module
+# editable installs build in place
+/target/
 skeliner/_rs*.so
 skeliner/_rs*.pyd

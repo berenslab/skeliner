@@ -449,6 +449,61 @@ def _junction_skeleton(arm_lengths, *, unit="nm"):
     )
 
 
+def _fork_skeleton():
+    """Soma 0; arm 0-1-2-3 along +x with a twig 2-4; arm 0-5-6 along -x."""
+    from skeliner.dataclass import Skeleton, Soma
+
+    nodes = np.asarray(
+        [[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0], [2, 1, 0], [-1, 0, 0], [-2, 0, 0]],
+        dtype=np.float64,
+    )
+    edges = np.asarray([[0, 1], [1, 2], [2, 3], [2, 4], [0, 5], [5, 6]], dtype=np.int64)
+    return Skeleton(
+        soma=Soma.from_sphere(center=np.zeros(3), radius=0.5, verts=None),
+        nodes=nodes,
+        radii={"median": np.full(len(nodes), 0.1)},
+        edges=edges,
+        ntype=None,
+    )
+
+
+def test_extract_neurites_is_the_distal_subtree():
+    s = _fork_skeleton()
+    assert dx.extract_neurites(s, 1) == [1, 2, 3, 4]
+    assert dx.extract_neurites(s, 2, include_root=False) == [3, 4]
+    assert dx.extract_neurites(s, 0, include_root=False) == [1, 2, 3, 4, 5, 6]
+
+
+def test_neurites_out_of_bounds_cut_at_the_first_node_outside():
+    s = _fork_skeleton()
+    box = ([-1.5, -1.0, -1.0], [1.5, 2.0, 1.0])  # nodes 2, 3, 4 and 6 outside
+    assert dx.neurites_out_of_bounds(s, box) == [2, 3, 4, 6]
+    assert dx.neurites_out_of_bounds(s, box, include_root=False) == [3, 4]
+    assert dx.neurites_out_of_bounds(s, ([-5.0] * 3, [5.0] * 3)) == []
+
+
+def test_neurite_walks_on_a_forest_keep_to_the_somas_tree():
+    """A tree the soma does not reach has no distal direction: its nodes have
+    no subtree, and each one outside the box starts its own.  The hop count
+    to them is infinite, which used to fail as an integer."""
+    from skeliner.dataclass import Skeleton
+
+    s = _fork_skeleton()
+    s = Skeleton(
+        soma=s.soma,
+        nodes=np.vstack([s.nodes, [[10.0, 0.0, 0.0], [11.0, 0.0, 0.0]]]),
+        radii={"median": np.full(len(s.nodes) + 2, 0.1)},
+        edges=np.vstack([s.edges, [[7, 8]]]),
+        ntype=None,
+    )
+    assert dx.extract_neurites(s, 1) == [1, 2, 3, 4]
+    assert dx.extract_neurites(s, 7) == [7]
+    assert dx.extract_neurites(s, 0, include_root=False) == [1, 2, 3, 4, 5, 6]
+    box = ([-1.5, -1.0, -1.0], [1.5, 2.0, 1.0])  # nodes 2, 3, 4, 6, 7, 8 outside
+    assert dx.neurites_out_of_bounds(s, box) == [2, 3, 4, 6, 7, 8]
+    assert dx.neurites_out_of_bounds(s, box, include_root=False) == [3, 4]
+
+
 def test_the_arms_of_a_junction_partition_all_the_cable(skel):
     """Every measurement is one arm's share of a total that stays whole.
 
@@ -756,3 +811,19 @@ def test_check_bins_cannot_see_a_wrong_mesh(skel, bigger_mesh):
     consistent with each other whatever mesh is loaded."""
     assert dx.check_bins(skel) is True
     assert dx.check_bins(skel, mesh=bigger_mesh) is True
+
+
+def test_segment_distances_on_both_paths_agree():
+    from skeliner import _rs
+    from skeliner.python import dx as python_dx
+
+    from ._parity import assert_parity
+
+    rng = np.random.default_rng(1)
+    nodes = rng.normal(size=(50, 3)) * 100
+    points = rng.normal(size=(500, 3)) * 100
+    centres, segments = [3, 7, 11], [(0, 1), (1, 2), (5, 9), (20, 21), (4, 4)]
+    assert_parity(
+        _rs.dx.segment_distances(points, nodes, centres, segments),
+        python_dx.segment_distances(points, nodes, centres, segments),
+    )

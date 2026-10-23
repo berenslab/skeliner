@@ -23,15 +23,15 @@ jobs:
               with:
                   components: clippy, rustfmt
             - name: rustfmt
-              working-directory: rust
+              working-directory: skeliner/rust
               run: cargo fmt --all --check
             - name: clippy
-              working-directory: rust
+              working-directory: skeliner/rust
               run: cargo clippy --workspace --all-targets -- -D warnings
             - name: cargo test
-              working-directory: rust
-              # skeliner-py is the extension module; pytest covers it.
-              run: cargo test --workspace --exclude skeliner-py
+              working-directory: skeliner/rust
+              # _rs is the extension module; pytest covers it.
+              run: cargo test --workspace --exclude _rs
 
     build:
         runs-on: ubuntu-latest
@@ -65,6 +65,26 @@ jobs:
                   flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
                   # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
                   flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+            - name: Test with pytest
+              run: |
+                  pytest
+
+    macos:
+        # Apple silicon: the platform the Python and Rust paths were checked
+        # on, where tests/_parity.py compares them exactly.
+        runs-on: macos-latest
+        steps:
+            - uses: actions/checkout@v4
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.13"
+            - name: Set up Rust
+              uses: dtolnay/rust-toolchain@stable
+            - name: Install dependencies
+              run: |
+                  python -m pip install --upgrade pip
+                  python -m pip install -e .[dev]
             - name: Test with pytest
               run: |
                   pytest

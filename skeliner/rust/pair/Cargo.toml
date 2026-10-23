@@ -1,0 +1,15 @@
+[package]
+name = "pair"
+version = "0.1.0"
+description = "Contact sites between two meshes (`sk.pair`)."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mesh.workspace = true
+threads.workspace = true
+rayon.workspace = true
+
+[lints]
+workspace = true

@@ -670,3 +670,200 @@ def test_splitting_off_the_whole_bin_is_refused(bin_skel, bin_mesh):
 def test_splitting_vertices_from_elsewhere_only_is_refused(bin_skel, bin_mesh):
     with pytest.raises(ValueError, match="belong to node 3"):
         post.split_node(bin_skel, 3, bin_skel.node2verts[5], mesh=bin_mesh)
+
+
+# ---------------------------------------------------------------------
+# the Python path computes what the Rust path does
+# ---------------------------------------------------------------------
+def test_ray_hits_and_vertex_faces_on_both_paths_agree():
+    from skeliner import _rs
+    from skeliner.python import post as python_post
+
+    from ._parity import assert_parity
+
+    mesh = load_mesh(Path(__file__).parent / "data" / "60427.obj")
+    tris = np.asarray(mesh.triangles, np.float64).reshape(-1, 9)
+    normals = np.asarray(mesh.face_normals, np.float64)
+    centres = np.asarray(mesh.triangles_center, np.float64)
+    golden = (1 + np.sqrt(5)) / 2  # calibrate_radii's ray directions
+    k = np.arange(30)
+    theta, phi = 2 * np.pi * k / golden, np.arccos(1 - 2 * (k + 0.5) / 30)
+    dirs = np.column_stack(
+        [np.sin(phi) * np.cos(theta), np.sin(phi) * np.sin(theta), np.cos(phi)]
+    )
+    rng = np.random.default_rng(0)
+    f = rng.choice(len(tris), 300, replace=False)
+    origins = np.repeat(centres[f] + 0.001 * normals[f], len(dirs), axis=0)
+    directions = np.tile(dirs, (len(f), 1))
+    rust = _rs.post.ray_hits(tris[f], normals[f], origins, directions)
+    assert 0 < rust.sum() < len(rust)
+    assert_parity(rust, python_post.ray_hits(tris[f], normals[f], origins, directions))
+
+    faces = np.asarray(mesh.faces, np.int64)
+    rs = _rs.post.VertexFaces(faces, len(mesh.vertices))
+    py = python_post.VertexFaces(faces, len(mesh.vertices))
+    for size in (1, 10, 300, 1500):
+        vids = rng.choice(len(mesh.vertices), size, replace=False)
+        assert_parity(rs.faces_within(vids), py.faces_within(vids))
+
+
+def _calibrated_node_by_node(skel, mesh, **kwargs):
+    """``calibrate_radii``'s per-node loop, the route embree's and sampled
+    rays take, on *skel*: ``(radii, methods)``."""
+    params = dict(
+        aggregate="trim",
+        min_n_outer=20,
+        min_frac_outer=0.33,
+        min_verts_q_outer=80.0,
+        rays_num_outer=30,
+        rays_thresh_outer=0.2,
+        rays_sample=False,
+    )
+    params.update(kwargs)
+    metric = skel.recommend_radius()[0]
+    r_new = np.array(skel.radii[metric], dtype=np.float64)
+    r_kind = np.full(len(skel.nodes), "fallback", dtype=object)
+    n_verts = np.array([len(v) for v in skel.node2verts])
+    post._calibrate_node_by_node(
+        skel,
+        mesh,
+        r_new,
+        r_kind,
+        radius_metric=metric,
+        min_n_verts_bulb=int(np.percentile(n_verts, q=params["min_verts_q_outer"])),
+        **params,
+    )
+    return r_new, r_kind.tolist()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"min_verts_q_outer": 0.0},
+        {"aggregate": "median"},
+        {"aggregate": "mean", "min_verts_q_outer": 50.0, "min_frac_outer": 0.0},
+    ],
+)
+def test_calibrate_radii_in_one_call_is_the_node_by_node_loop(template_skel, kwargs):
+    from .test_core import _ball_with_two_processes
+
+    mesh = load_mesh(Path(__file__).parent / "data" / "60427.obj")
+    ball, comps = _ball_with_two_processes()
+    kinds = set()
+    for skel, m in [(template_skel, mesh), (skeletonize(ball, components=comps), ball)]:
+        one_call = copy.deepcopy(skel)
+        post.calibrate_radii(one_call, m, **kwargs)
+        radii, methods = _calibrated_node_by_node(copy.deepcopy(skel), m, **kwargs)
+        assert np.array_equal(one_call.radii["calibrated"], radii)
+        assert one_call.extra["calibration"]["radius_method"] == methods
+        kinds |= set(methods)
+    if kwargs.get("min_verts_q_outer") == 0.0:
+        assert kinds == {"fallback", "full_centerline", "outer_centerline"}
+
+
+def test_calibrate_radii_with_sampled_rays_runs_node_by_node(template_skel):
+    mesh = load_mesh(Path(__file__).parent / "data" / "60427.obj")
+    skel = copy.deepcopy(template_skel)
+    post.calibrate_radii(skel, mesh, rays_sample=True)
+    methods = set(skel.extra["calibration"]["radius_method"])
+    assert methods <= {"fallback", "full_centerline", "outer_centerline"}
+    assert np.isfinite(skel.radii["calibrated"]).all()
+
+
+def test_calibrate_radii_on_both_paths_agree(template_skel):
+    from ._parity import assert_parity, both
+    from .test_core import _ball_with_two_processes
+
+    mesh = load_mesh(Path(__file__).parent / "data" / "60427.obj")
+    ball, comps = _ball_with_two_processes()
+    cases = [
+        (template_skel, mesh, {}),
+        (template_skel, mesh, {"min_verts_q_outer": 0.0, "aggregate": "median"}),
+        (skeletonize(ball, components=comps), ball, {"min_verts_q_outer": 0.0}),
+    ]
+    for skel, m, kwargs in cases:
+
+        def calibrated():
+            s = copy.deepcopy(skel)
+            post.calibrate_radii(s, m, **kwargs)
+            return s.radii["calibrated"], s.extra["calibration"]["radius_method"]
+
+        rust, python = both(calibrated)
+        assert_parity(rust, python)
+
+
+def test_remap_ntype_and_gap_fill_on_both_paths():
+    from skeliner import _rs
+    from skeliner.python import post as python_post
+
+    from ._parity import assert_parity
+
+    rng = np.random.default_rng(5)
+    labels = np.array([0, 0, 0, 1, -1, 2, 3, 4, 5, 6, 7, 9, -2])
+    filled = 0
+    for _ in range(400):
+        n = int(rng.integers(1, 40))
+        ntype = rng.choice(labels, size=n)
+        new_len = int(rng.integers(1, n + 1))
+        old2new = rng.integers(-1, new_len, size=n)
+        edges = rng.integers(0, new_len, size=(int(rng.integers(0, 3 * new_len)), 2))
+        root = int(rng.choice([1, -1]))
+        for fill in (True, False):
+            got = _rs.post.remap_ntype(ntype, old2new, new_len, root, edges, fill)
+            assert_parity(
+                got,
+                python_post.remap_ntype(ntype, old2new, new_len, root, edges, fill),
+            )
+        edges = rng.integers(0, n, size=(int(rng.integers(0, 3 * n)), 2))
+        gaps = _rs.post.fill_ntype_gaps(ntype, edges)
+        assert_parity(gaps, python_post.fill_ntype_gaps(ntype, edges))
+        filled += int(((ntype == 0) & (gaps != 0)).sum())
+    assert filled > 100
+    # errors alike
+    for call, message in [
+        (
+            lambda m: m.remap_ntype(
+                np.array([1, 2]), np.array([0]), 1, 1, np.empty((0, 2), int), True
+            ),
+            "one entry per node",
+        ),
+        (
+            lambda m: m.remap_ntype(
+                np.array([1, 2]), np.array([0, 4]), 2, 1, np.empty((0, 2), int), True
+            ),
+            "names node 4, past",
+        ),
+        (
+            lambda m: m.fill_ntype_gaps(np.array([0, 2]), np.array([[0, 2]])),
+            "edge names node 2, not",
+        ),
+    ]:
+        for module in (_rs.post, python_post):
+            with pytest.raises(ValueError, match=message):
+                call(module)
+
+
+def test_remap_ntype_ties_beyond_the_known_types_go_to_the_smallest():
+    mapped = post._remap_ntype(
+        np.array([-1, 9, 7, 0], np.int8), np.array([0, 1, 1, 1]), 2
+    )
+    assert mapped.tolist() == [-1, 7]
+    assert mapped.dtype == np.int8
+
+
+def test_merge_near_soma_nodes_leaves_the_input_skeleton_alone():
+    mesh = load_mesh(Path(__file__).parent / "data" / "60427.obj")
+    skel = skeletonize(mesh, verbose=False)
+    before = copy.deepcopy(skel.soma)
+    out = post.merge_near_soma_nodes(
+        skel,
+        mesh_vertices=mesh.vertices,
+        near_factor=3.0,
+        fat_factor=0.05,
+        verbose=False,
+    )
+    assert len(out.nodes) < len(skel.nodes)  # it merged something
+    assert len(out.soma.verts) > len(before.verts)
+    assert np.array_equal(skel.soma.verts, before.verts)
+    assert np.array_equal(skel.soma.center, before.center)

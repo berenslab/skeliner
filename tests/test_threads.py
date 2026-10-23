@@ -20,7 +20,7 @@ from skeliner import _rs
 
 _m = trimesh.creation.icosphere(subdivisions=2)
 _n = np.asarray(_m.face_normals, np.float64)
-_bvh = _rs.TriangleBvh(np.asarray(_m.triangles, np.float64).reshape(-1, 9), _n)
+_bvh = _rs.pair.TriangleBvh(np.asarray(_m.triangles, np.float64).reshape(-1, 9), _n)
 
 
 def loop():
@@ -55,9 +55,9 @@ def test_set_report_and_reset():
     default = sk.threads.get()
     assert default >= 1
     sk.threads(3)
-    assert sk.threads.get() == 3 and _rs.thread_override() == 3
+    assert sk.threads.get() == 3 and _rs.threads.thread_override() == 3
     sk.threads(None)
-    assert sk.threads.get() == default and _rs.thread_override() is None
+    assert sk.threads.get() == default and _rs.threads.thread_override() is None
 
 
 def test_a_block_puts_back_what_was_set_before():
@@ -77,14 +77,14 @@ def test_a_block_puts_back_what_was_set_before():
 def test_a_block_puts_it_back_after_an_error():
     with pytest.raises(KeyError), sk.threads(2):
         raise KeyError
-    assert _rs.thread_override() is None
+    assert _rs.threads.thread_override() is None
 
 
 @pytest.mark.parametrize("bad", [0, -1, 1.5, True, "4"])
 def test_refuses_what_is_not_a_positive_integer(bad):
     with pytest.raises(ValueError):
         sk.threads(bad)
-    assert _rs.thread_override() is None
+    assert _rs.threads.thread_override() is None
 
 
 def test_results_do_not_depend_on_the_thread_count():
@@ -94,7 +94,7 @@ def test_results_do_not_depend_on_the_thread_count():
     faces = np.arange(len(nrm), dtype=np.int64)
 
     def run():
-        hits = _rs.TriangleBvh(tri, nrm).first_hits(
+        hits = _rs.pair.TriangleBvh(tri, nrm).first_hits(
             np.asarray(mesh.triangles_center), -nrm, faces, 1e-6
         )
         return hits, sk.pre.compute_mesh_stats(mesh).outward_dots

@@ -6,6 +6,7 @@ from .plot import view3d
 from .plot.vis2d import projection as plot2d
 from .plot.vis2d import threeviews as plot3v
 from .pre import preprocess
+from ._backend import backend
 from ._threads import threads
 from .skeletonize import skeletonize
 
@@ -33,4 +34,5 @@ __all__ = [
     "plot",
     "preprocess",
     "threads",
+    "backend",
 ]
