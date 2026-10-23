@@ -52,17 +52,27 @@ fn read_ctm<'py>(py: Python<'py>, path: &str) -> PyResult<Option<MeshOut<'py>>> 
         .detach(|| std::fs::read(path))
         .map_err(|e| os_error(path, e))?;
     let lzma = py.import("lzma")?;
+    let lzma_error = lzma.getattr("LZMAError")?;
     let kwargs = PyDict::new(py);
     kwargs.set_item("format", lzma.getattr("FORMAT_ALONE")?)?;
-    // an LZMA "alone" stream: the five property bytes, the unpacked size,
-    // then the packed data
-    let mut unlzma = |props: &[u8], packed: &[u8], size: usize| -> PyResult<Vec<u8>> {
+    // an LZMA "alone" stream: the five property bytes, the unpacked size
+    // (all ones for unknown), then the packed data
+    let decompress = |props: &[u8], size: [u8; 8], packed: &[u8]| -> PyResult<Vec<u8>> {
         let mut alone = Vec::with_capacity(13 + packed.len());
         alone.extend_from_slice(props);
-        alone.extend_from_slice(&(size as u64).to_le_bytes());
+        alone.extend_from_slice(&size);
         alone.extend_from_slice(packed);
         let out = lzma.call_method("decompress", (PyBytes::new(py, &alone),), Some(&kwargs))?;
         Ok(out.extract::<PyBackedBytes>()?.to_vec())
+    };
+    // read as the reference library reads a block, up to its size whatever
+    // follows: with the size known, and where the data ends in an end
+    // marker, which liblzma before 5.4 refuses then, with it unknown
+    let mut unlzma = |props: &[u8], packed: &[u8], size: usize| -> PyResult<Vec<u8>> {
+        match decompress(props, (size as u64).to_le_bytes(), packed) {
+            Err(e) if e.is_instance(py, &lzma_error) => decompress(props, [0xff; 8], packed),
+            found => found,
+        }
     };
     match ::io::read_ctm(&data, &mut unlzma) {
         Ok(found) => Ok(found.map(|m| mesh_out(py, m))),

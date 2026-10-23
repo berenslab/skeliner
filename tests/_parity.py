@@ -6,6 +6,7 @@ differently, so floats there are compared within a tolerance; integers,
 booleans, shapes and dtypes always exactly.
 """
 
+import os
 import platform
 
 import numpy as np
@@ -15,6 +16,25 @@ import skeliner as sk
 EXACT = platform.system() == "Darwin" and platform.machine() == "arm64"
 # floats off the reference platform; set from CI's first measured differences
 RTOL, ATOL = 1e-9, 1e-12
+
+#: Off the reference platform, the largest float difference each test saw
+#: between the two paths, ``{test: [max |a - b|, max |a - b| / |b|]}``,
+#: which ``conftest.py`` prints at the end of the session.
+DIFFERENCES: dict[str, list[float]] = {}
+
+
+def _record(a, b) -> None:
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    both_finite = np.isfinite(a) & np.isfinite(b)
+    if not both_finite.any():
+        return
+    d = np.abs(a - b)[both_finite]
+    rel = d / np.maximum(np.abs(b[both_finite]), np.finfo(np.float64).tiny)
+    test = os.environ.get("PYTEST_CURRENT_TEST", "?").split(" ")[0]
+    worst = DIFFERENCES.setdefault(test, [0.0, 0.0])
+    worst[0] = max(worst[0], float(d.max()))
+    worst[1] = max(worst[1], float(rel.max()))
 
 
 def both(fn, *args, **kwargs):
@@ -33,6 +53,8 @@ def assert_parity(a, b, path="result", *, rtol=RTOL, atol=ATOL):
     if isinstance(a, float) and isinstance(b, float):
         if a != a and b != b:
             return
+        if not EXACT:
+            _record(a, b)
         assert a == b or (not EXACT and np.isclose(a, b, rtol, atol)), (
             f"{path}: {a!r} != {b!r}"
         )
@@ -40,6 +62,8 @@ def assert_parity(a, b, path="result", *, rtol=RTOL, atol=ATOL):
         a, b = np.asarray(a), np.asarray(b)
         assert a.shape == b.shape, f"{path}: shape {a.shape} != {b.shape}"
         assert a.dtype.kind == b.dtype.kind, f"{path}: dtype {a.dtype} != {b.dtype}"
+        if a.dtype.kind == "f" and not EXACT:
+            _record(a, b)
         if a.dtype.kind in "fc" and not EXACT:
             assert np.allclose(a, b, rtol, atol, equal_nan=True), f"{path}: values"
         else:

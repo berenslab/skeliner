@@ -210,8 +210,8 @@ impl<'a> Ctm<'a> {
 /// in the reference library's `u32` arithmetic.
 fn restore_indices(words: &[u32]) -> Vec<[u32; 3]> {
     let mut out: Vec<[u32; 3]> = Vec::with_capacity(words.len() / 3);
-    for w in words.chunks_exact(3) {
-        let mut t = [w[0], w[1], w[2]];
+    for w in words.as_chunks::<3>().0 {
+        let mut t = *w;
         let prev = out.last().copied();
         if let Some(p) = prev {
             t[0] = t[0].wrapping_add(p[0]);
@@ -271,8 +271,10 @@ pub fn read_ctm<E>(
             f.section(b"VERT")?;
             let words = f.packed(n_vertices, 3, unlzma)?;
             let vertices = words
-                .chunks_exact(3)
-                .map(|w| [w[0], w[1], w[2]].map(f32::from_bits))
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|w| w.map(f32::from_bits))
                 .collect();
             (vertices, triangles)
         }

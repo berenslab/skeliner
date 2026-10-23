@@ -105,6 +105,21 @@ def read_obj(path) -> tuple[np.ndarray, np.ndarray] | None:
     return v, f
 
 
+def _unlzma(props: bytes, packed: bytes, size: int) -> bytes:
+    """An LZMA1 block of *size* bytes from its five property bytes and data,
+    read as the reference library reads it: up to *size* bytes, whatever
+    follows. As an LZMA "alone" stream (the property bytes, the unpacked
+    size, the data) with the size known; where the data ends in an end
+    marker, which liblzma before 5.4 refuses with the size known, again with
+    the size unknown."""
+    try:
+        return lzma.decompress(
+            props + struct.pack("<Q", size) + packed, format=lzma.FORMAT_ALONE
+        )
+    except lzma.LZMAError:
+        return lzma.decompress(props + b"\xff" * 8 + packed, format=lzma.FORMAT_ALONE)
+
+
 class _Ctm:
     """An OpenCTM file, read front to back."""
 
@@ -143,11 +158,7 @@ class _Ctm:
         props = self.take(5)
         packed = self.take(n)
         total = count * size
-        # an LZMA "alone" stream: the property bytes, the unpacked size, the
-        # packed data
-        raw = lzma.decompress(
-            props + struct.pack("<Q", 4 * total) + packed, format=lzma.FORMAT_ALONE
-        )
+        raw = _unlzma(props, packed, 4 * total)
         if len(raw) != 4 * total:
             raise ValueError("a CTM block unpacks to the wrong size")
         planes = np.frombuffer(raw, dtype=np.uint8).reshape(4, size, count)

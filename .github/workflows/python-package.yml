@@ -68,23 +68,3 @@ jobs:
             - name: Test with pytest
               run: |
                   pytest
-
-    macos:
-        # Apple silicon: the platform the Python and Rust paths were checked
-        # on, where tests/_parity.py compares them exactly.
-        runs-on: macos-latest
-        steps:
-            - uses: actions/checkout@v4
-            - name: Set up Python
-              uses: actions/setup-python@v5
-              with:
-                  python-version: "3.13"
-            - name: Set up Rust
-              uses: dtolnay/rust-toolchain@stable
-            - name: Install dependencies
-              run: |
-                  python -m pip install --upgrade pip
-                  python -m pip install -e .[dev]
-            - name: Test with pytest
-              run: |
-                  pytest

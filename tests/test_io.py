@@ -684,6 +684,7 @@ def test_eyewire_ctm_reads_on_both_paths(tmp_path, method):
 
 def test_eyewire_ctm_refuses_the_same_broken_files_on_both_paths(tmp_path):
     import lzma
+    import struct
 
     import trimesh
 
@@ -694,7 +695,13 @@ def test_eyewire_ctm_refuses_the_same_broken_files_on_both_paths(tmp_path):
     data, _, _ = _ctm_file("MG2", sphere.vertices, sphere.faces)
     gidx = data.index(b"GIDX")
     vert = data.index(b"VERT")
+    # one vertex more in the header than in the packed block: the block's
+    # end marker comes before the size, so the size-known read fails and
+    # the size-unknown one gives too few bytes
+    mg1, _, _ = _ctm_file("MG1", sphere.vertices, sphere.faces)
+    counted = mg1[:12] + struct.pack("<I", len(sphere.vertices) + 1) + mg1[16:]
     cases = {
+        "counted.ctm": (counted, ValueError, "unpacks to the wrong size"),
         "short.ctm": (data[:-7], ValueError, "ends early"),
         "unordered.ctm": (
             data[:gidx] + b"XXXX" + data[gidx + 4 :],
