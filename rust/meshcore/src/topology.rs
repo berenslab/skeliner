@@ -198,6 +198,46 @@ fn edge_key(a: u32, b: u32) -> u64 {
     (u64::from(lo) << 32) | u64::from(hi)
 }
 
+/// Every distinct edge of `faces` as `[low, high]`, ordered by `high` and
+/// then `low`: trimesh's `edges_unique`, which keeps a degenerate face's
+/// edges too — `[v, v]` for its repeated vertex.
+///
+/// Every index in `faces` must be below `n_vertices`.
+pub fn unique_edges(faces: &[[u32; 3]], n_vertices: usize) -> Vec<[u32; 2]> {
+    // Bucket each face edge's low end by its high end, then sort and
+    // deduplicate each bucket: a few entries each, so no global sort.
+    let ends = |f: &[u32; 3]| [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])];
+    let mut start = vec![0usize; n_vertices + 1];
+    for f in faces {
+        for (a, b) in ends(f) {
+            start[a.max(b) as usize + 1] += 1;
+        }
+    }
+    for v in 0..n_vertices {
+        start[v + 1] += start[v];
+    }
+    let mut fill = start.clone();
+    let mut low = vec![0u32; start[n_vertices]];
+    for f in faces {
+        for (a, b) in ends(f) {
+            let hi = a.max(b) as usize;
+            low[fill[hi]] = a.min(b);
+            fill[hi] += 1;
+        }
+    }
+    let mut edges = Vec::with_capacity(low.len() / 2);
+    for hi in 0..n_vertices {
+        let bucket = &mut low[start[hi]..start[hi + 1]];
+        bucket.sort_unstable();
+        for (i, &lo) in bucket.iter().enumerate() {
+            if i == 0 || bucket[i - 1] != lo {
+                edges.push([lo, hi as u32]);
+            }
+        }
+    }
+    edges
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +253,27 @@ mod tests {
             [5, 5, 2], // 4: degenerate
         ];
         (faces, 6)
+    }
+
+    #[test]
+    fn unique_edges_come_by_high_end_then_low_with_degenerate_ones_kept() {
+        let (faces, n) = fan();
+        assert_eq!(
+            unique_edges(&faces, n),
+            [
+                [0, 1],
+                [0, 2],
+                [1, 2],
+                [0, 3],
+                [1, 3],
+                [0, 4],
+                [1, 4],
+                [1, 5],
+                [2, 5],
+                [5, 5],
+            ]
+        );
+        assert!(unique_edges(&[], 3).is_empty());
     }
 
     #[test]

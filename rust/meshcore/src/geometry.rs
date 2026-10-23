@@ -56,6 +56,20 @@ pub fn numpy_sum(a: &[f64]) -> f64 {
     }
 }
 
+/// Length of each edge, `sqrt((dx² + dy²) + dz²)`: trimesh's
+/// `edges_unique_length`, whose BLAS dot of the squares with ones adds
+/// them in that order (multiplying by one rounds nothing, fused or not).
+pub fn edge_lengths(vertices: &[[f64; 3]], edges: &[[u32; 2]]) -> Vec<f64> {
+    edges
+        .iter()
+        .map(|&[a, b]| {
+            let (p, q) = (&vertices[a as usize], &vertices[b as usize]);
+            let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        })
+        .collect()
+}
+
 /// Orders floats as numpy's sort does: `-0.0` equal to `0.0`, and every NaN,
 /// whatever its sign bit, after every number.  `f64::total_cmp` puts `-0.0`
 /// first and a NaN with its sign bit set — what x86 makes of `0.0 / 0.0` —
@@ -228,6 +242,20 @@ mod tests {
         assert!((numpy_sum(&a) - 49950.0).abs() < 1e-9);
         assert_eq!(numpy_sum(&[1.0, 2.0, 3.0]), 6.0);
         assert_eq!(numpy_sum(&[]), 0.0);
+    }
+
+    #[test]
+    fn edge_lengths_add_the_squares_in_axis_order() {
+        let v = [
+            [0.0, 0.0, 0.0],
+            [3.0, 4.0, 12.0],
+            [1.0, 1.2247e-8, 1.2247e-8],
+        ];
+        let l = edge_lengths(&v, &[[0, 1], [1, 0], [2, 2], [0, 2]]);
+        assert_eq!(l[..3], [13.0, 13.0, 0.0]);
+        // each small square rounds the sum up a step; added to each other
+        // first they would round it up once, and the root would come out 1
+        assert_eq!(l[3], 1.0000000000000002);
     }
 
     #[test]

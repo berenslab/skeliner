@@ -5,6 +5,7 @@ Runs `skeletonize()` on the reference mesh and checks a handful of
 topological / numerical invariants so that regressions blow up early.
 """
 
+import importlib
 from pathlib import Path
 
 import igraph as ig
@@ -12,7 +13,7 @@ import numpy as np
 import pytest
 import trimesh
 
-from skeliner import skeletonize
+from skeliner import _rs, skeletonize
 from skeliner.dataclass import (
     Discarded,
     MeshComponents,
@@ -22,10 +23,20 @@ from skeliner.dataclass import (
 )
 from skeliner.io import load_mesh
 from skeliner.skeletonize import (
+    _bin_geodesic_shells,
+    _direct_on_rust,
+    _edges_from_mesh,
+    _extreme_vertex,
+    _make_nodes,
+    _make_nodes_direct_rs,
+    _merge_nested_nodes,
     _neighbour_groups,
     _split_branch_band,
     _surface_graph,
+    _surface_graph_rs,
 )
+
+from .test_rust_core import _dirty_mesh
 
 
 def _assert_skeleton_valid(skel, *, expect_soma: bool = False):
@@ -74,6 +85,147 @@ def test_skeletonize_soma_init_guess_axis_mode(reference_mesh):
         verbose=False,
     )
     _assert_skeleton_valid(skel)
+
+
+def _shells_equal(a, b) -> bool:
+    return len(a) == len(b) and all(
+        len(x) == len(y) and all(np.array_equal(u, v) for u, v in zip(x, y))
+        for x, y in zip(a, b)
+    )
+
+
+def _direct_bins_both_ways(mesh, seed, step=None):
+    py = _bin_geodesic_shells(
+        mesh,
+        _surface_graph(mesh),
+        seed_vid=seed,
+        step_size=step,
+        target_shell_count=1000,
+        min_shell_vertices=6,
+        max_shell_width_factor=50,
+        split_elongated_shells=False,
+    )
+    e_m = float(mesh.edges_unique_length.mean())
+    rs = _surface_graph_rs(mesh).bin_mesh(seed, e_m, step, 1000, 6, 50)
+    return py, rs
+
+
+def test_direct_components_come_in_igraphs_order(reference_mesh):
+    py = [list(c) for c in _surface_graph(reference_mesh).components()]
+    rs = [c.tolist() for c in _surface_graph_rs(reference_mesh).components()]
+    assert len(rs) == 7 and rs == py
+
+
+def test_surface_graph_has_trimeshs_unique_edges_and_lengths(reference_mesh):
+    """Built from the faces, value for value what trimesh computes, so the
+    mean edge and the edge mapping see the same numbers either way."""
+    for mesh in [reference_mesh, _dirty_mesh()]:
+        g = _surface_graph_rs(mesh)
+        assert np.array_equal(g.edges, mesh.edges_unique)
+        assert np.array_equal(g.lengths, mesh.edges_unique_length)
+        assert g.lengths.mean() == mesh.edges_unique_length.mean()
+    # the dirty mesh's degenerate faces keep their [v, v] edges
+    assert (g.edges[:, 0] == g.edges[:, 1]).any()
+
+
+def test_edges_from_mesh_are_the_distinct_node_pairs_in_row_order():
+    rng = np.random.default_rng(0)
+    edges = np.sort(rng.integers(0, 300, (2000, 2)), axis=1)
+    owned = rng.permutation(300)[:250]
+    v2n = {int(v): int(n) for v, n in zip(owned, rng.integers(0, 40, 250))}
+    out = _edges_from_mesh(edges, v2n, 300)
+
+    lut = np.full(300, -1)
+    lut[list(v2n)] = list(v2n.values())
+    pairs = lut[edges]
+    pairs = pairs[(pairs >= 0).all(axis=1) & (pairs[:, 0] != pairs[:, 1])]
+    assert len(out) > 100
+    assert np.array_equal(out, np.unique(np.sort(pairs, axis=1), axis=0))
+    assert out.dtype == np.int64 and out.flags.c_contiguous
+    assert _edges_from_mesh(edges, {}, 300).shape == (0, 2)
+
+
+@pytest.mark.parametrize("step_edges", [None, 3.0])
+def test_direct_binning_on_the_rust_core_matches_the_python(reference_mesh, step_edges):
+    """Auto shell width, and a fixed one of three mean edges; the seed in
+    the main component, and in a small one so the main falls back."""
+    mesh = reference_mesh
+    step = None
+    if step_edges is not None:
+        step = step_edges * float(mesh.edges_unique_length.mean())
+    small = min(_surface_graph_rs(mesh).components(), key=len)
+    for seed in [_extreme_vertex(mesh), _extreme_vertex(mesh, "x", "max"), small[0]]:
+        py, rs = _direct_bins_both_ways(mesh, int(seed), step)
+        assert sum(len(band) for band in rs) > 20
+        assert _shells_equal(py, rs), seed
+
+
+def test_direct_binning_matches_the_python_on_a_dirty_mesh():
+    mesh = _dirty_mesh()
+    py, rs = _direct_bins_both_ways(mesh, _extreme_vertex(mesh))
+    assert _shells_equal(py, rs)
+
+
+def test_direct_nodes_and_nested_merge_match_the_python(reference_mesh):
+    mesh = reference_mesh
+    e_m = float(mesh.edges_unique_length.mean())
+    shells = _surface_graph_rs(mesh).bin_mesh(
+        _extreme_vertex(mesh), e_m, None, 1000, 6, 50
+    )
+    v = mesh.vertices.view(np.ndarray)
+    est = ["median", "mean", "trim"]
+    py = _make_nodes(
+        [list(band) for band in shells],
+        v,
+        radius_estimators=est,
+        merge_nested=True,
+        merge_kwargs={"inside_frac": 0.8},
+    )
+    rs = _make_nodes_direct_rs(shells, v, est, 0.8)
+    assert len(rs[0]) < sum(len(band) for band in shells), "nothing merged"
+    assert np.array_equal(py[0], rs[0])
+    assert all(np.array_equal(py[1][k], rs[1][k]) for k in est)
+    assert len(py[2]) == len(rs[2])
+    assert all(np.array_equal(a, b) for a, b in zip(py[2], rs[2]))
+    assert py[3] == rs[3]
+
+
+def test_nested_merge_on_the_rust_core_matches_on_crowded_nodes():
+    rng = np.random.default_rng(3)
+    nodes = rng.random((400, 3)) * 50
+    radii = rng.random(400) * 8
+    radii[[5, 9, 40]] = radii[3]  # ties, visited by index
+    n2v = [np.arange(3 * k, 3 * k + 3, dtype=np.int64) for k in range(400)]
+    keep_py, verts_py, old2new_py = _merge_nested_nodes(
+        nodes, radii, list(n2v), inside_frac=0.8
+    )
+    keep_rs, verts_rs, old2new_rs = _rs.merge_nested_nodes(nodes, radii, n2v, 0.8)
+    assert 50 < keep_rs.sum() < 350
+    assert np.array_equal(keep_py, keep_rs)
+    assert np.array_equal(old2new_py, old2new_rs)
+    assert all(np.array_equal(a, b) for a, b in zip(verts_py, verts_rs))
+
+
+def test_direct_track_is_the_same_on_rust_and_in_python(reference_mesh, monkeypatch):
+    rs = skeletonize(reference_mesh)
+    module = importlib.import_module("skeliner.skeletonize")
+    monkeypatch.setattr(module, "_direct_on_rust", lambda _split: False)
+    py = skeletonize(reference_mesh)
+    _assert_skeleton_valid(rs)
+    assert len(rs.nodes) > 20
+    assert np.array_equal(rs.nodes, py.nodes)
+    assert np.array_equal(rs.edges, py.edges)
+    assert np.array_equal(rs.ntype, py.ntype)
+    assert rs.radii.keys() == py.radii.keys()
+    assert all(np.array_equal(rs.radii[k], py.radii[k]) for k in rs.radii)
+    assert len(rs.node2verts) == len(py.node2verts)
+    assert all(np.array_equal(a, b) for a, b in zip(rs.node2verts, py.node2verts))
+    for attr in ("center", "axes", "R"):
+        assert np.array_equal(getattr(rs.soma, attr), getattr(py.soma, attr))
+
+
+def test_only_the_legacy_split_keeps_the_direct_track_in_python():
+    assert _direct_on_rust(False) and not _direct_on_rust(True)
 
 
 # ----- preprocessing track ------------------------------------------------

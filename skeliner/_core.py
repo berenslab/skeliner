@@ -263,7 +263,9 @@ def _merge_near_soma_nodes(
         node2verts=node2verts,
         vert2node=None,
     )
-    state_out, old2new = compact_state(state_in, keep_mask, return_old2new=True)
+    state_out, old2new = compact_state(
+        state_in, keep_mask, rebuild_map=False, return_old2new=True
+    )
 
     nodes_keep = state_out.nodes
     radii_keep = state_out.radii
@@ -448,15 +450,12 @@ def _prune_neurites(
         node2verts=node2verts,
         vert2node=None,
     )
-    state, _ = compact_state(state, keep)
+    state, _ = compact_state(state, keep, rebuild_map=False)
 
     nodes_new = state.nodes
     node2verts_new = state.node2verts
     radii_new = state.radii
     edges_new = state.edges
-    vert2node = (
-        rebuild_vert2node(node2verts_new) if node2verts_new is not None else None
-    )
 
     soma_verts = np.unique(node2verts_new[0]).astype(np.int64)
     if mesh_vertices is not None and soma_verts.size:
@@ -506,6 +505,10 @@ def _prune_neurites(
         )
         if extra_indices is not None:
             orig_indices = orig_indices[extra_indices]
+    else:
+        vert2node = (
+            rebuild_vert2node(node2verts_new) if node2verts_new is not None else None
+        )
 
     old2new = -np.ones(N, dtype=np.int64)
     old2new[orig_indices] = np.arange(len(nodes_new))
@@ -633,7 +636,9 @@ def _bridge_gaps(
     # helper to compute the *current* closest gap of a component
     def closest_pair(cid: int) -> tuple[float, int, int]:
         pts = nodes[comp_idx[cid]]
-        dists, idx_is = island_tree.query(pts, k=1, workers=-1)
+        # One thread: the foreign components are a few nodes each, and
+        # starting a thread per core costs 10-30x such a query.
+        dists, idx_is = island_tree.query(pts, k=1, workers=1)
         best = int(np.argmin(dists))
         return float(dists[best]), best, np.asarray(idx_is, dtype=np.int64)[best]
 
@@ -775,7 +780,7 @@ def _merge_single_node_branches(
 
         keep = np.ones(len(state.nodes), bool)
         keep[list(to_drop)] = False
-        state, _ = compact_state(state, keep)
+        state, _ = compact_state(state, keep, rebuild_map=False)
         if return_mapping and orig_indices is not None:
             orig_indices = orig_indices[keep]
 

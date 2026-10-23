@@ -1,7 +1,9 @@
-//! `skeliner.skeletonize`'s mesh side on the preprocessing track: geodesic
-//! shells over one neurite, the ring tests that keep cross-sections apart
-//! from fragments, the second pass's clean-up of the re-binned shells, and
-//! the nodes (centroid and radii) each bin becomes.
+//! `skeliner.skeletonize`'s mesh side: geodesic shells over one neurite
+//! (the preprocessing track) or over every component of a raw mesh (the
+//! direct track), the ring tests that keep cross-sections apart from
+//! fragments, the second pass's clean-up of the re-binned shells, the nodes
+//! (centroid and radii) each bin becomes, and the direct track's merge of
+//! nodes nested inside bigger ones.
 //!
 //! The surface is the reference's igraph graph: one vertex per mesh
 //! vertex, one edge per unique mesh edge weighted by its length, every
@@ -11,6 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use meshcore::geometry::{arange, numpy_order, numpy_sum};
 use meshcore::graph::WeightedGraph;
+use meshcore::spatial::{KdTree, Sum};
 
 /// A bin: vertex ids in the reference's order.
 pub type Bin = Vec<u32>;
@@ -213,6 +216,27 @@ pub enum BinError {
     Unreachable,
 }
 
+/// Per-vertex work arrays over the whole graph, reused from one component to
+/// the next; each use leaves them as it found them (all `false`, all
+/// infinite).
+pub struct Scratch {
+    inside: Vec<bool>,
+    mark: Vec<bool>,
+    seen: Vec<bool>,
+    dist: Vec<f64>,
+}
+
+impl Scratch {
+    pub fn new(n: usize) -> Scratch {
+        Scratch {
+            inside: vec![false; n],
+            mark: vec![false; n],
+            seen: vec![false; n],
+            dist: vec![f64::INFINITY; n],
+        }
+    }
+}
+
 /// `_bin_one_component` without soma exclusion or elongated-shell
 /// splitting: geodesic shells from the nearest of `seeds` over `verts`
 /// (ascending), each split into connected bins; rings stay, fragments and
@@ -224,11 +248,46 @@ pub fn bin_one_component(
     mean_edge: f64,
     p: &BinParams,
 ) -> Result<Vec<Vec<Bin>>, BinError> {
-    let n = g.n_vertices();
-    let mut inside = vec![false; n];
+    bin_one_component_in(
+        g,
+        verts,
+        seeds,
+        mean_edge,
+        p,
+        &mut Scratch::new(g.n_vertices()),
+    )
+}
+
+/// [`bin_one_component`] with `scratch` sized to the graph.
+fn bin_one_component_in(
+    g: &WeightedGraph,
+    verts: &[u32],
+    seeds: &[u32],
+    mean_edge: f64,
+    p: &BinParams,
+    scratch: &mut Scratch,
+) -> Result<Vec<Vec<Bin>>, BinError> {
     for &v in verts {
-        inside[v as usize] = true;
+        scratch.inside[v as usize] = true;
     }
+    let out = bin_marked(g, verts, seeds, mean_edge, p, scratch);
+    for &v in verts {
+        scratch.inside[v as usize] = false;
+        scratch.dist[v as usize] = f64::INFINITY;
+    }
+    out
+}
+
+/// The body of [`bin_one_component`], `verts` marked in `scratch.inside`.
+fn bin_marked(
+    g: &WeightedGraph,
+    verts: &[u32],
+    seeds: &[u32],
+    mean_edge: f64,
+    p: &BinParams,
+    scratch: &mut Scratch,
+) -> Result<Vec<Vec<Bin>>, BinError> {
+    let inside = &scratch.inside;
     let roots: Vec<u32> = seeds
         .iter()
         .copied()
@@ -240,8 +299,8 @@ pub fn bin_one_component(
     if verts.is_empty() {
         return Ok(Vec::new());
     }
-    let all = g.distances_within(&inside, &roots);
-    let dists: Vec<f64> = verts.iter().map(|&v| all[v as usize]).collect();
+    g.distances_within_into(inside, &roots, &mut scratch.dist);
+    let dists: Vec<f64> = verts.iter().map(|&v| scratch.dist[v as usize]).collect();
     let mut step = match p.step_size {
         Some(s) => s,
         None => {
@@ -258,8 +317,6 @@ pub fn bin_one_component(
         step *= 1.5;
     }
 
-    let mut mark = vec![false; n];
-    let mut seen = vec![false; n];
     let mut out: Vec<Vec<Bin>> = Vec::new();
     let mut pending: Vec<Bin> = Vec::new();
     for shell in shells {
@@ -267,15 +324,16 @@ pub fn bin_one_component(
             continue;
         }
         let mut comps = Vec::new();
-        for comp in induced_components(g, &shell, &mut mark, &mut seen) {
+        for comp in induced_components(g, &shell, &mut scratch.mark, &mut scratch.seen) {
             if comp.len() < p.min_shell_vertices {
                 pending.push(comp);
             } else {
                 comps.push(comp);
             }
         }
-        let (rings, frags): (Vec<Bin>, Vec<Bin>) =
-            comps.into_iter().partition(|c| is_ring(g, c, &inside));
+        let (rings, frags): (Vec<Bin>, Vec<Bin>) = comps
+            .into_iter()
+            .partition(|c| is_ring(g, c, &scratch.inside));
         pending.extend(frags);
         if !rings.is_empty() {
             out.push(rings);
@@ -283,6 +341,98 @@ pub fn bin_one_component(
     }
     merge_fragments(g, &mut out, pending);
     Ok(out)
+}
+
+/// `_bin_geodesic_shells` on the direct track's settings (no soma
+/// exclusion, no elongated-shell split): every connected component of the
+/// graph binned on its own, in igraph's component order, from `seed` in
+/// the component that holds it and from the vertex at the component's
+/// index modulo its size in the others (the reference's `hash(cid) %
+/// len(verts)`); the shells of all components, in that order.
+pub fn bin_mesh(
+    g: &WeightedGraph,
+    seed: u32,
+    mean_edge: f64,
+    p: &BinParams,
+) -> Result<Vec<Vec<Bin>>, BinError> {
+    let mut scratch = Scratch::new(g.n_vertices());
+    let mut out = Vec::new();
+    for (cid, verts) in g.components().into_iter().enumerate() {
+        let start = if verts.binary_search(&seed).is_ok() {
+            seed
+        } else {
+            verts[cid % verts.len()]
+        };
+        out.extend(bin_one_component_in(
+            g,
+            &verts,
+            &[start],
+            mean_edge,
+            p,
+            &mut scratch,
+        )?);
+    }
+    Ok(out)
+}
+
+/// `_merge_nested_nodes`: node `j` collapses into node `i` when
+/// `|c_i - c_j| + inside_frac * r_j <= r_i + tol`, and `i` takes `j`'s
+/// vertices.  Nodes are visited biggest first, ties by index, node 0 never
+/// when `keep_root`; each one's candidates are the nodes within
+/// `r_i + max(r)`, by index.  Returns the kept mask, the kept nodes'
+/// vertices in order, and each old node's new id (dropped ones take their
+/// keeper's).
+pub fn merge_nested_nodes(
+    nodes: &[[f64; 3]],
+    radii: &[f64],
+    mut node2verts: Vec<Vec<u32>>,
+    inside_frac: f64,
+    keep_root: bool,
+    tol: f64,
+) -> (Vec<bool>, Vec<Vec<u32>>, Vec<i64>) {
+    let n = nodes.len();
+    let neg: Vec<f64> = radii.iter().map(|r| -r).collect();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| numpy_order(&neg[a], &neg[b]));
+    let biggest = radii.iter().copied().fold(f64::NEG_INFINITY, |m, r| {
+        if m.is_nan() || r.is_nan() {
+            f64::NAN
+        } else {
+            m.max(r)
+        }
+    });
+    let tree = KdTree::new(nodes.to_vec(), Sum::Plain);
+    let mut keep = vec![true; n];
+    let mut old2new: Vec<i64> = (0..n as i64).collect();
+    for i in order {
+        if (keep_root && i == 0) || !keep[i] {
+            continue;
+        }
+        for j in tree.within(&nodes[i], radii[i] + biggest) {
+            let j = j as usize;
+            if j == i || !keep[j] || radii[j] > radii[i] {
+                continue;
+            }
+            let d = [
+                nodes[i][0] - nodes[j][0],
+                nodes[i][1] - nodes[j][1],
+                nodes[i][2] - nodes[j][2],
+            ];
+            let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            if dist + inside_frac * radii[j] <= radii[i] + tol {
+                let taken = std::mem::take(&mut node2verts[j]);
+                node2verts[i].extend(taken);
+                keep[j] = false;
+                old2new[j] = old2new[i];
+            }
+        }
+    }
+    let kept = node2verts
+        .into_iter()
+        .zip(&keep)
+        .filter_map(|(v, &k)| k.then_some(v))
+        .collect();
+    (keep, kept, old2new)
 }
 
 /// `_pieces`: connected pieces of `comp`, each in breadth-first order from
@@ -888,5 +1038,66 @@ mod tests {
             bin_one_component(&g, &half, &[150], 1.0, &p).err(),
             Some(BinError::NoSeed)
         );
+    }
+
+    #[test]
+    fn a_mesh_bins_each_component_from_its_own_seed() {
+        // two tubes (0..160, 160..320), a lone vertex (320), a triangle
+        let one = tube(20, 8);
+        let mut edges = Vec::new();
+        for v in 0..160u32 {
+            for &u in one.neighbors(v) {
+                if v < u {
+                    edges.push([v, u]);
+                    edges.push([v + 160, u + 160]);
+                }
+            }
+        }
+        edges.extend([[321, 322], [322, 323], [321, 323]]);
+        let w = vec![1.0; edges.len()];
+        let g = WeightedGraph::new(324, &edges, &w);
+        let p = BinParams {
+            step_size: Some(2.0),
+            target_shell_count: 500,
+            min_shell_vertices: 6,
+            max_shell_width_factor: 50.0,
+        };
+        // the seed is in the second tube; the others start at the vertex
+        // at their component index modulo their size
+        let got = bin_mesh(&g, 170, 1.0, &p).unwrap();
+        let tube_a: Vec<u32> = (0..160).collect();
+        let tube_b: Vec<u32> = (160..320).collect();
+        let mut want = bin_one_component(&g, &tube_a, &[0], 1.0, &p).unwrap();
+        want.extend(bin_one_component(&g, &tube_b, &[170], 1.0, &p).unwrap());
+        want.extend(bin_one_component(&g, &[320], &[320], 1.0, &p).unwrap());
+        want.extend(bin_one_component(&g, &[321, 322, 323], &[321], 1.0, &p).unwrap());
+        assert!(want.len() >= 16, "{}", want.len());
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn nested_nodes_fold_into_the_bigger_one_biggest_first() {
+        let nodes = [
+            [0.0, 0.0, 0.0],   // 0: the root
+            [100.0, 0.0, 0.0], // 1
+            [102.0, 0.0, 0.0], // 2: inside 1
+            [200.0, 0.0, 0.0], // 3
+            [200.0, 0.0, 0.0], // 4: the same as 3; 3 comes first
+            [0.5, 0.0, 0.0],   // 5: near the root, which never absorbs
+            [0.0, 0.0, 0.0],   // 6: bigger than the root, so it takes it
+        ];
+        let radii = [1.0, 10.0, 1.0, 5.0, 5.0, 0.5, 3.0];
+        let verts: Vec<Vec<u32>> = (0..7).map(|k| vec![10 * k, 10 * k + 1]).collect();
+        let (keep, kept, old2new) = merge_nested_nodes(&nodes, &radii, verts, 0.8, true, 1e-6);
+        assert_eq!(keep, vec![false, true, false, true, false, false, true]);
+        assert_eq!(
+            kept,
+            vec![
+                vec![10, 11, 20, 21],
+                vec![30, 31, 40, 41],
+                vec![60, 61, 0, 1, 50, 51],
+            ]
+        );
+        assert_eq!(old2new, vec![6, 1, 1, 3, 3, 6, 6]);
     }
 }

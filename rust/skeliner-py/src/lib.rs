@@ -1365,6 +1365,8 @@ fn vertex_ids(ids: &numpy::PyReadonlyArray1<'_, i64>, n: usize) -> PyResult<Vec<
 #[pyclass(name = "SurfaceGraph", module = "skeliner._rs", frozen)]
 struct PySurfaceGraph {
     inner: meshcore::graph::WeightedGraph,
+    edges: Py<PyArray2<i64>>,
+    lengths: Py<PyArray1<f64>>,
 }
 
 #[pymethods]
@@ -1399,9 +1401,49 @@ impl PySurfaceGraph {
                 Ok([id(r[0])?, id(r[1])?])
             })
             .collect::<PyResult<_>>()?;
+        let inner = py.detach(|| meshcore::graph::WeightedGraph::new(n_vertices, &pairs, &w));
         Ok(Self {
-            inner: py.detach(|| meshcore::graph::WeightedGraph::new(n_vertices, &pairs, &w)),
+            inner,
+            edges: e.to_owned().into_pyarray(py).unbind(),
+            lengths: Array1::from(w).into_pyarray(py).unbind(),
         })
+    }
+
+    /// The surface graph of a mesh, from its faces: `edges` and `lengths`
+    /// are trimesh's `edges_unique` and `edges_unique_length`, the same
+    /// values in the same order, without trimesh's sort of every face edge.
+    #[staticmethod]
+    fn from_mesh(
+        py: Python<'_>,
+        vertices: PyReadonlyArray2<'_, f64>,
+        faces: PyReadonlyArray2<'_, i64>,
+    ) -> PyResult<Self> {
+        let verts = points3(&vertices)?;
+        let (tris, n) = checked_faces(&faces, Some(verts.len()))?;
+        let (inner, edges, lengths) = py.detach(|| {
+            let edges = meshcore::topology::unique_edges(&tris, n);
+            let lengths = meshcore::geometry::edge_lengths(&verts, &edges);
+            let graph = meshcore::graph::WeightedGraph::new(n, &edges, &lengths);
+            (graph, edges, lengths)
+        });
+        let edges = Array2::from_shape_fn((edges.len(), 2), |(i, j)| i64::from(edges[i][j]));
+        Ok(Self {
+            inner,
+            edges: edges.into_pyarray(py).unbind(),
+            lengths: Array1::from(lengths).into_pyarray(py).unbind(),
+        })
+    }
+
+    /// The edges, `(E, 2)`.
+    #[getter]
+    fn edges<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<i64>> {
+        self.edges.bind(py).clone()
+    }
+
+    /// The edge weights, `(E,)`: their lengths.
+    #[getter]
+    fn lengths<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        self.lengths.bind(py).clone()
     }
 
     /// `_bin_one_component` on the preprocessing track: shells of bins
@@ -1430,6 +1472,57 @@ impl PySurfaceGraph {
         let g = &self.inner;
         let shells = py
             .detach(|| skeliner_pre::skeleton::bin_one_component(g, &verts, &seeds, mean_edge, &p))
+            .map_err(|e| match e {
+                skeliner_pre::skeleton::BinError::NoSeed => {
+                    PyValueError::new_err("no seed vertex lies in this component")
+                }
+                skeliner_pre::skeleton::BinError::Unreachable => {
+                    PyValueError::new_err("arange: cannot compute length")
+                }
+            })?;
+        Ok(shells_to_py(py, shells))
+    }
+
+    /// Connected components, each ascending, in order of their smallest
+    /// vertex — igraph's `components()`.
+    fn components<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyArray1<i64>>> {
+        let comps = py.detach(|| self.inner.components());
+        comps
+            .into_iter()
+            .map(|c| Array1::from_iter(c.into_iter().map(i64::from)).into_pyarray(py))
+            .collect()
+    }
+
+    /// `_bin_geodesic_shells` on the direct track's settings: every
+    /// connected component binned on its own, in `components()` order, from
+    /// `seed` where it lies and otherwise from the component's vertex at its
+    /// index modulo its size; the shells of all components in that order.
+    #[pyo3(signature = (seed, mean_edge, step_size, target_shell_count, min_shell_vertices, max_shell_width_factor))]
+    #[allow(clippy::too_many_arguments)]
+    fn bin_mesh<'py>(
+        &self,
+        py: Python<'py>,
+        seed: i64,
+        mean_edge: f64,
+        step_size: Option<f64>,
+        target_shell_count: usize,
+        min_shell_vertices: usize,
+        max_shell_width_factor: f64,
+    ) -> PyResult<ShellsOut<'py>> {
+        let n = self.inner.n_vertices();
+        let seed = u32::try_from(seed)
+            .ok()
+            .filter(|&v| (v as usize) < n)
+            .ok_or_else(|| PyValueError::new_err(format!("vertex index {seed} is out of range")))?;
+        let p = skeliner_pre::skeleton::BinParams {
+            step_size,
+            target_shell_count,
+            min_shell_vertices,
+            max_shell_width_factor,
+        };
+        let g = &self.inner;
+        let shells = py
+            .detach(|| skeliner_pre::skeleton::bin_mesh(g, seed, mean_edge, &p))
             .map_err(|e| match e {
                 skeliner_pre::skeleton::BinError::NoSeed => {
                     PyValueError::new_err("no seed vertex lies in this component")
@@ -2104,6 +2197,56 @@ impl PyZScan {
     }
 }
 
+/// Kept mask, kept nodes' vertices and old → new ids from
+/// `merge_nested_nodes`.
+type MergedOut<'py> = (
+    Bound<'py, PyArray1<bool>>,
+    Vec<Bound<'py, PyArray1<i64>>>,
+    Bound<'py, PyArray1<i64>>,
+);
+
+/// `_merge_nested_nodes`: node `j` folds into node `i` when
+/// `|c_i - c_j| + inside_frac * r_j <= r_i + tol`; nodes visited biggest
+/// first (ties by index), node 0 never absorbing when `keep_root`, each
+/// one's candidates within `r_i + max(r)` by index.  Returns the kept mask,
+/// the kept nodes' vertex ids and each node's new id.
+#[pyfunction]
+#[pyo3(signature = (nodes, radii, node2verts, inside_frac, keep_root=true, tol=1e-6))]
+fn merge_nested_nodes<'py>(
+    py: Python<'py>,
+    nodes: PyReadonlyArray2<'py, f64>,
+    radii: numpy::PyReadonlyArray1<'py, f64>,
+    node2verts: Vec<numpy::PyReadonlyArray1<'py, i64>>,
+    inside_frac: f64,
+    keep_root: bool,
+    tol: f64,
+) -> PyResult<MergedOut<'py>> {
+    if !(inside_frac > 0.0 && inside_frac <= 1.0) {
+        return Err(PyValueError::new_err("inside_frac must be in (0, 1]."));
+    }
+    let pts = rows3("N", &nodes)?;
+    let r = radii.as_array().to_vec();
+    if r.len() != pts.len() || node2verts.len() != pts.len() {
+        return Err(PyValueError::new_err(
+            "one radius and one vertex list per node",
+        ));
+    }
+    let lists: Vec<Vec<u32>> = node2verts
+        .iter()
+        .map(|a| vertex_ids(a, u32::MAX as usize))
+        .collect::<PyResult<_>>()?;
+    let (keep, kept, old2new) = py.detach(|| {
+        skeliner_pre::skeleton::merge_nested_nodes(&pts, &r, lists, inside_frac, keep_root, tol)
+    });
+    Ok((
+        Array1::from(keep).into_pyarray(py),
+        kept.into_iter()
+            .map(|v| Array1::from_iter(v.into_iter().map(i64::from)).into_pyarray(py))
+            .collect(),
+        Array1::from(old2new).into_pyarray(py),
+    ))
+}
+
 /// Run skeliner's parallel loops on a pool of `n` threads from now on, or
 /// on rayon's global pool again with `None` (all cores, or
 /// `RAYON_NUM_THREADS`).
@@ -2160,6 +2303,7 @@ fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ray_hits, m)?)?;
     m.add_function(wrap_pyfunction!(contact_faces, m)?)?;
     m.add_function(wrap_pyfunction!(segment_distances, m)?)?;
+    m.add_function(wrap_pyfunction!(merge_nested_nodes, m)?)?;
     m.add_function(wrap_pyfunction!(set_threads, m)?)?;
     m.add_function(wrap_pyfunction!(thread_override, m)?)?;
     m.add_function(wrap_pyfunction!(current_threads, m)?)?;

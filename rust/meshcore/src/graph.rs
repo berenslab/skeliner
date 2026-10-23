@@ -57,12 +57,49 @@ impl WeightedGraph {
             .zip(self.weight[r].iter().copied())
     }
 
+    /// Connected components, each ascending, in order of their smallest
+    /// vertex — igraph's `components()`.
+    pub fn components(&self) -> Vec<Vec<u32>> {
+        let n = self.n_vertices();
+        let mut label = vec![usize::MAX; n];
+        let mut count = 0;
+        let mut stack = Vec::new();
+        for s in 0..n {
+            if label[s] != usize::MAX {
+                continue;
+            }
+            label[s] = count;
+            stack.push(s as u32);
+            while let Some(v) = stack.pop() {
+                for &u in self.neighbors(v) {
+                    if label[u as usize] == usize::MAX {
+                        label[u as usize] = count;
+                        stack.push(u);
+                    }
+                }
+            }
+            count += 1;
+        }
+        let mut out = vec![Vec::new(); count];
+        for (v, &c) in label.iter().enumerate() {
+            out[c].push(v as u32);
+        }
+        out
+    }
+
     /// Shortest-path distance to each vertex marked `inside` from the
     /// nearest of `seeds`, travelling only through `inside` vertices;
     /// infinity where none reaches.  Each distance is the path's weights
     /// added in order from the seed, as igraph's Dijkstra adds them.
     pub fn distances_within(&self, inside: &[bool], seeds: &[u32]) -> Vec<f64> {
         let mut dist = vec![f64::INFINITY; self.n_vertices()];
+        self.distances_within_into(inside, seeds, &mut dist);
+        dist
+    }
+
+    /// [`Self::distances_within`] into `dist`, which must hold infinity at
+    /// every `inside` vertex; only those entries are written.
+    pub fn distances_within_into(&self, inside: &[bool], seeds: &[u32], dist: &mut [f64]) {
         let mut heap = BinaryHeap::new();
         for &s in seeds {
             if inside[s as usize] && dist[s as usize] > 0.0 {
@@ -85,7 +122,6 @@ impl WeightedGraph {
                 }
             }
         }
-        dist
     }
 }
 
@@ -132,5 +168,28 @@ mod tests {
         assert!(d[1].is_infinite());
         // two seeds: the nearer wins
         assert_eq!(g.distances_within(&all, &[0, 2]), vec![0.0, 1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn components_come_by_their_smallest_vertex_each_ascending() {
+        // 5-0-3 and 4-1, with 2 and 6 alone
+        let g = WeightedGraph::new(7, &[[5, 0], [0, 3], [4, 1]], &[1.0, 1.0, 1.0]);
+        let comps = g.components();
+        assert_eq!(comps, vec![vec![0, 3, 5], vec![1, 4], vec![2], vec![6]]);
+    }
+
+    #[test]
+    fn distances_into_a_buffer_touch_only_the_inside_vertices() {
+        let g = WeightedGraph::new(
+            4,
+            &[[0, 1], [1, 2], [2, 3], [3, 0], [2, 0]],
+            &[1.0, 1.0, 1.0, 1.0, 5.0],
+        );
+        let some = vec![true, false, true, false];
+        let mut dist = vec![f64::INFINITY; 4];
+        dist[1] = -7.0; // outside: left alone
+        g.distances_within_into(&some, &[0], &mut dist);
+        assert_eq!((dist[0], dist[1], dist[2]), (0.0, -7.0, 5.0));
+        assert!(dist[3].is_infinite());
     }
 }

@@ -114,3 +114,25 @@ def test_swap_nodes_updates_all_linked_structures():
     assert np.array_equal(state.node2verts[2], np.array([0], dtype=np.int64))
     assert state.vert2node[3] == 0
     assert state.vert2node[0] == 2
+
+
+def test_rebuild_vert2node_lists_keys_by_node_and_lets_the_last_node_win():
+    # vertex 7 is in nodes 0 and 2: it keeps its first place and maps to 2
+    mapping = rebuild_vert2node(
+        [
+            np.array([7, 3], dtype=np.int64),
+            np.array([], dtype=np.int64),
+            np.array([1, 7], dtype=np.int32),
+        ]
+    )
+
+    assert list(mapping.items()) == [(7, 2), (3, 0), (1, 2)]
+    assert all(type(k) is int and type(v) is int for k, v in mapping.items())
+    assert rebuild_vert2node([]) == {}
+
+
+def test_swap_nodes_keeps_the_vertex_order():
+    state = _make_state()
+    swap_nodes(state, 1, 2)
+
+    assert list(state.vert2node.items()) == [(0, 0), (1, 2), (2, 2), (3, 1)]

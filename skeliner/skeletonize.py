@@ -144,11 +144,13 @@ def _surface_graph(mesh: trimesh.Trimesh) -> ig.Graph:
 
 
 def _surface_graph_rs(mesh: trimesh.Trimesh):
-    """:func:`_surface_graph` as a :class:`skeliner._rs.SurfaceGraph`."""
-    return _rs.SurfaceGraph(
-        len(mesh.vertices),
-        np.asarray(mesh.edges_unique, dtype=np.int64),
-        np.asarray(mesh.edges_unique_length, dtype=np.float64),
+    """:func:`_surface_graph` as a :class:`skeliner._rs.SurfaceGraph`, built
+    from the faces.  Its ``edges`` and ``lengths`` are the mesh's
+    ``edges_unique`` and ``edges_unique_length``, value for value, without
+    trimesh computing them."""
+    return _rs.SurfaceGraph.from_mesh(
+        np.asarray(mesh.vertices, dtype=np.float64),
+        np.asarray(mesh.faces, dtype=np.int64),
     )
 
 
@@ -690,7 +692,8 @@ def _edges_from_mesh(
     """
     # 1. build an int64 lookup table  mesh_vid -> node_id  (-1 if absent)
     lut = np.full(n_mesh_verts, -1, dtype=np.int64)
-    lut[list(v2n.keys())] = list(v2n.values())
+    n = len(v2n)
+    lut[np.fromiter(v2n.keys(), np.int64, n)] = np.fromiter(v2n.values(), np.int64, n)
 
     # 2. map both columns in one shot
     a, b = edges_unique.T  # views, no copy
@@ -699,11 +702,13 @@ def _edges_from_mesh(
     # 3. keep edges whose *both* endpoints exist and are different
     mask = (na >= 0) & (nb >= 0) & (na != nb)
     na, nb = na[mask], nb[mask]
+    lo, hi = np.minimum(na, nb), np.maximum(na, nb)  # canonical order
 
-    edges = np.vstack([na, nb]).T
-    edges = np.sort(edges, axis=1)  # canonical order
-    edges = np.unique(edges, axis=0)  # drop duplicates
-    return edges.astype(np.int64)  # copy to new array
+    # 4. drop duplicates.  One key per edge sorts as the (lo, hi) rows do,
+    #    and np.unique on it is far faster than on the rows (axis=0).
+    width = int(hi.max()) + 1 if hi.size else 1
+    key = np.unique(lo * width + hi)
+    return np.stack([key // width, key % width], axis=1)
 
 
 def _extreme_vertex(mesh: trimesh.Trimesh, axis: str = "z", mode: str = "min") -> int:
@@ -748,7 +753,7 @@ def _merge_nested_nodes(
         raise ValueError("inside_frac must be in (0, 1].")
 
     N = len(nodes)
-    order = np.argsort(-radii)  # big → small
+    order = np.argsort(-radii, kind="stable")  # big → small, ties by index
     tree = KDTree(nodes)
 
     keep_mask = np.ones(N, bool)
@@ -761,7 +766,9 @@ def _merge_nested_nodes(
             continue  # already swallowed
 
         # neighbours that *might* fit: distance ≤ rᵢ + r_max
-        cand_idx = tree.query_ball_point(nodes[i], radii[i] + radii.max())
+        cand_idx = tree.query_ball_point(
+            nodes[i], radii[i] + radii.max(), return_sorted=True
+        )
         for j in cand_idx:
             if j == i or not keep_mask[j] or radii[j] > radii[i]:
                 continue  # j is larger or gone; skip
@@ -1434,6 +1441,34 @@ def _make_nodes_rs(shells, vertices, radius_estimators):
     return nodes, dict(zip(radius_estimators, radii)), node2verts, vert2node
 
 
+def _direct_on_rust(split_elongated_shells: bool) -> bool:
+    """Whether the direct track's surface graph, binning and nodes run on
+    the Rust core: always, but for the legacy elongated-shell split."""
+    return not split_elongated_shells
+
+
+def _make_nodes_direct_rs(shells, vertices, radius_estimators, inside_frac):
+    """:func:`_make_nodes` with the nested merge, as the direct track runs
+    it, on the Rust core."""
+    if not any(len(band) for band in shells):
+        empty = {k: np.asarray(np.array([])) for k in radius_estimators}
+        return np.asarray([], dtype=np.float64), empty, [], {}
+    nodes, radii = _rs.skeleton_nodes(
+        [[b.tolist() for b in band] for band in shells],
+        vertices,
+        list(radius_estimators),
+    )
+    radii_dict = dict(zip(radius_estimators, radii))
+    node2verts = [np.asarray(b, dtype=np.int64) for band in shells for b in band]
+    keep, node2verts, _ = _rs.merge_nested_nodes(
+        nodes, radii_dict[radius_estimators[0]], node2verts, inside_frac
+    )
+    nodes = nodes[keep]
+    radii_dict = {k: np.asanyarray(v[keep]) for k, v in radii_dict.items()}
+    vert2node = rebuild_vert2node(node2verts) or {}
+    return nodes, radii_dict, node2verts, vert2node
+
+
 def _skeletonize_component_rs(
     mesh: trimesh.Trimesh,
     sgraph,
@@ -1452,7 +1487,7 @@ def _skeletonize_component_rs(
     binning, the bin clean-up and the nodes in the Rust core; the spanning
     tree, the perpendicular re-binning and the edges stay as they are."""
     mesh_vertices = mesh.vertices.view(np.ndarray)
-    e_m = float(mesh.edges_unique_length.mean())
+    e_m = float(sgraph.lengths.mean())
     vid_cl_dist: dict[int, float] = {}
     verts = np.asarray(vert_ids, dtype=np.int64)
 
@@ -1474,7 +1509,7 @@ def _skeletonize_component_rs(
 
     with stage("derive edges from mesh edges"):
         edges_arr = _edges_from_mesh(
-            mesh.edges_unique, vert2node, n_mesh_verts=len(mesh.vertices)
+            sgraph.edges, vert2node, n_mesh_verts=len(mesh.vertices)
         )
 
     if second_pass and len(nodes_arr) > 1 and edges_arr.size:
@@ -1518,7 +1553,7 @@ def _skeletonize_component_rs(
 
         with stage("re-derive edges from mesh edges"):
             edges_arr = _edges_from_mesh(
-                mesh.edges_unique, vert2node, n_mesh_verts=len(mesh.vertices)
+                sgraph.edges, vert2node, n_mesh_verts=len(mesh.vertices)
             )
 
     return nodes_arr, radii_dict, node2verts, vert2node, edges_arr, vid_cl_dist
@@ -2050,7 +2085,9 @@ def _skeletonize_direct(
 
     Stages: surface graph, geodesic binning, node creation,
     soma detection, edge mapping, near-soma collapse, gap
-    bridging, MST, neurite pruning.
+    bridging, MST, neurite pruning.  The graph, the binning and the nodes
+    run on the Rust core, but with ``split_elongated_shells``, which keeps
+    them in Python.
     """
     # See _skeletonize_preproc: snapshot the arguments before anything else
     # is bound, so the record cannot drift from the signature.
@@ -2082,9 +2119,11 @@ def _skeletonize_direct(
         prune_tiny_neurites = False
         run_mst = False
 
+    on_rust = _direct_on_rust(split_elongated_shells)
+
     # 0. build surface graph -----------------------------------------------
     with _timed("↳  build surface graph", verbose=verbose):
-        gsurf = _surface_graph(mesh)
+        gsurf = _surface_graph_rs(mesh) if on_rust else _surface_graph(mesh)
 
     # 1. binning surface vertices by geodesic distance ----------------------------------
     with _timed("↳  bin surface vertices by geodesic distance", verbose=verbose):
@@ -2120,31 +2159,49 @@ def _skeletonize_direct(
                 mode=soma_init_guess_mode,
             )
 
-        all_shells = _bin_geodesic_shells(
-            mesh,
-            gsurf,
-            seed_vid=seed_vid,
-            step_size=geodesic_step_size,
-            target_shell_count=geodesic_shell_count,
-            min_shell_vertices=min_shell_vertices,
-            max_shell_width_factor=max_shell_width_factor,
-            split_elongated_shells=split_elongated_shells,
-            split_aspect_thr=split_aspect_thr,
-            split_min_shell_vertices=split_min_shell_vertices,
-            split_max_vertices_per_slice=split_max_vertices_per_slice,
-        )
+        if on_rust:
+            all_shells = gsurf.bin_mesh(
+                seed_vid,
+                float(gsurf.lengths.mean()),
+                geodesic_step_size,
+                geodesic_shell_count,
+                min_shell_vertices,
+                max_shell_width_factor,
+            )
+        else:
+            all_shells = _bin_geodesic_shells(
+                mesh,
+                gsurf,
+                seed_vid=seed_vid,
+                step_size=geodesic_step_size,
+                target_shell_count=geodesic_shell_count,
+                min_shell_vertices=min_shell_vertices,
+                max_shell_width_factor=max_shell_width_factor,
+                split_elongated_shells=split_elongated_shells,
+                split_aspect_thr=split_aspect_thr,
+                split_min_shell_vertices=split_min_shell_vertices,
+                split_max_vertices_per_slice=split_max_vertices_per_slice,
+            )
 
     # 2. create skeleton nodes ------------------------------------------
     with _timed("↳  compute bin centroids and radii", verbose=verbose):
-        (nodes_arr, radii_dict, node2verts, vert2node) = _make_nodes(
-            all_shells,
-            mesh_vertices,
-            radius_estimators=radius_estimators,
-            merge_nested=True,
-            merge_kwargs={
-                "inside_frac": merge_nodes_overlap_fraction
-            },  # tune `inside_frac`/`keep_root` here if needed
-        )
+        if on_rust:
+            (nodes_arr, radii_dict, node2verts, vert2node) = _make_nodes_direct_rs(
+                all_shells,
+                mesh_vertices,
+                radius_estimators,
+                merge_nodes_overlap_fraction,
+            )
+        else:
+            (nodes_arr, radii_dict, node2verts, vert2node) = _make_nodes(
+                all_shells,
+                mesh_vertices,
+                radius_estimators=radius_estimators,
+                merge_nested=True,
+                merge_kwargs={
+                    "inside_frac": merge_nodes_overlap_fraction
+                },  # tune `inside_frac`/`keep_root` here if needed
+            )
 
     # 3. soma detection (optional) -----------------------------------
     _t0 = time.perf_counter()
@@ -2175,7 +2232,7 @@ def _skeletonize_direct(
     # 4. edges from mesh connectivity -----------------------------------
     with _timed("↳  map mesh faces to skeleton edges", verbose=verbose):
         edges_arr = _edges_from_mesh(
-            mesh.edges_unique,
+            gsurf.edges if on_rust else mesh.edges_unique,
             vert2node,
             n_mesh_verts=len(mesh.vertices),
         )

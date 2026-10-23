@@ -83,16 +83,18 @@ def remap_edges(edges: np.ndarray, old2new: np.ndarray) -> np.ndarray:
 
 
 def rebuild_vert2node(node2verts: list[np.ndarray] | None) -> dict[int, int] | None:
-    """Invert node2verts (if present) into a vertex→node dictionary."""
+    """Invert node2verts (if present) into a vertex→node dictionary.
+
+    Keys come in node order, each node's vertices in the order it lists
+    them; a vertex listed by several nodes maps to the last of them.
+    """
     if node2verts is None:
         return None
-    mapping: dict[int, int] = {}
-    for nid, verts in enumerate(node2verts):
-        if verts.size == 0:
-            continue
-        for vid in np.asarray(verts, dtype=np.int64):
-            mapping[int(vid)] = nid
-    return mapping
+    verts = [np.asarray(v, dtype=np.int64).ravel() for v in node2verts]
+    if not verts:
+        return {}
+    nids = np.repeat(np.arange(len(verts)), [v.size for v in verts])
+    return dict(zip(np.concatenate(verts).tolist(), nids.tolist()))
 
 
 def compact_state(
@@ -151,13 +153,18 @@ def swap_nodes(
             state.node2verts[a],
         )
     if update_vert2node and state.vert2node is not None:
+        v2n = state.vert2node
         if touched_vertices is None:
-            touched = list(state.vert2node.keys())
-        else:
-            touched = touched_vertices
-        for vid in touched:
-            nid = state.vert2node.get(int(vid))
+            # values only, so the keys keep their order
+            for vid, nid in v2n.items():
+                if nid == a:
+                    v2n[vid] = b
+                elif nid == b:
+                    v2n[vid] = a
+            return
+        for vid in touched_vertices:
+            nid = v2n.get(int(vid))
             if nid == a:
-                state.vert2node[int(vid)] = b
+                v2n[int(vid)] = b
             elif nid == b:
-                state.vert2node[int(vid)] = a
+                v2n[int(vid)] = a
