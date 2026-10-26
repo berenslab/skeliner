@@ -170,9 +170,16 @@ fn outer_vertices(
             .collect();
         let normals = sub.iter().map(|&f| m.normals[f as usize]).collect();
         let bvh = TriangleBvh::new(tris, normals);
+        // a big node's rays at once, so it does not hold the others up
+        let hit = |(&o, &d): (&[f64; 3], &[f64; 3])| bvh.any_hit(o, d);
+        let hit: Vec<bool> = if origins.len() >= 1 << 14 {
+            threads::install(|| origins.par_iter().zip(&rays).map(hit).collect())
+        } else {
+            origins.iter().zip(&rays).map(hit).collect()
+        };
         let mut hits = vec![0i64; sub.len()];
-        for ((&o, &d), &k) in origins.iter().zip(&rays).zip(&owner) {
-            hits[k] += i64::from(bvh.any_hit(o, d));
+        for (&h, &k) in hit.iter().zip(&owner) {
+            hits[k] += i64::from(h);
         }
         sub.iter()
             .zip(&hits)

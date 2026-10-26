@@ -1,11 +1,12 @@
 //! `skeliner._rs.pre`: the `pre` crate's stages for `skeliner.pre`.
 
-use numpy::ndarray::{Array1, Array2};
+use numpy::ndarray::{Array1, Array2, Array3};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::{Mutex, MutexGuard};
 
@@ -373,11 +374,61 @@ impl PySvd {
             Ok([rows[0], rows[1], rows[2]])
         })
     }
+
+    /// The callback on the matrices `xs`, all of `rows` rows, stacked into
+    /// one `(len, rows, 3)` array.
+    fn call_stacked(
+        &self,
+        xs: &[&[[f64; 3]]],
+        rows: usize,
+        full_matrices: bool,
+    ) -> PyResult<Vec<[[f64; 3]; 3]>> {
+        let flat: Vec<f64> = xs
+            .iter()
+            .flat_map(|x| x.iter().flatten())
+            .copied()
+            .collect();
+        let stack = Array3::from_shape_vec((xs.len(), rows, 3), flat).expect("rows of three");
+        Python::attach(|py| {
+            let out = self
+                .rows
+                .call1(py, (stack.into_pyarray(py), full_matrices))?;
+            let m: numpy::PyReadonlyArray3<'_, f64> = out.extract(py)?;
+            let m = m.as_array();
+            if m.shape() != [xs.len(), 3, 3] {
+                return Err(PyValueError::new_err("svd callback must return (k, 3, 3)"));
+            }
+            Ok((0..xs.len())
+                .map(|k| [0, 1, 2].map(|i| [0, 1, 2].map(|j| m[[k, i, j]])))
+                .collect())
+        })
+    }
 }
 
 impl ::pre::fits::Svd for PySvd {
     fn right_singular(&self, x: &[[f64; 3]], full_matrices: bool) -> [[f64; 3]; 3] {
         self.checked([[f64::NAN; 3]; 3], || self.call_rows(x, full_matrices))
+    }
+
+    /// One callback per row count, its matrices stacked: numpy's SVD of a
+    /// stack is each matrix's alone, bit for bit (the same LAPACK call on
+    /// each).
+    fn right_singular_each(&self, xs: &[&[[f64; 3]]], full_matrices: bool) -> Vec<[[f64; 3]; 3]> {
+        let mut by_rows: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (i, x) in xs.iter().enumerate() {
+            by_rows.entry(x.len()).or_default().push(i);
+        }
+        let mut out = vec![[[f64::NAN; 3]; 3]; xs.len()];
+        for (rows, at) in by_rows {
+            let group: Vec<&[[f64; 3]]> = at.iter().map(|&i| xs[i]).collect();
+            let vts = self.checked(Vec::new(), || {
+                self.call_stacked(&group, rows, full_matrices)
+            });
+            for (&i, vt) in at.iter().zip(vts) {
+                out[i] = vt;
+            }
+        }
+        out
     }
 }
 
@@ -663,6 +714,38 @@ fn usable_faces<'py>(
     Ok(Array1::from(mask).into_pyarray(py))
 }
 
+/// `compact_mesh`'s arrays: the kept faces, the vertex and face maps (−1
+/// for what goes), and the compacted vertices and faces.
+type CompactOut<'py> = (
+    Bound<'py, PyArray1<bool>>,
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray2<f64>>,
+    Bound<'py, PyArray2<i64>>,
+);
+
+/// `skeliner.pre.compact_mesh`'s arrays: the mesh without its collapsed
+/// faces (`[v, v, v]`) and the vertices no face left names, ids renumbered
+/// in order.
+#[pyfunction]
+fn compact_mesh<'py>(
+    py: Python<'py>,
+    vertices: PyReadonlyArray2<'py, f64>,
+    faces: PyReadonlyArray2<'py, i64>,
+) -> PyResult<CompactOut<'py>> {
+    let verts = rows3("V", &vertices)?;
+    let (tris, _) = checked_faces(&faces, Some(verts.len()))?;
+    let c = py.detach(|| ::pre::compact::compact(&verts, &tris));
+    let faces: Vec<[i64; 3]> = threads::map(&c.faces, |f| f.map(i64::from));
+    Ok((
+        Array1::from(c.good).into_pyarray(py),
+        Array1::from(c.vert_map).into_pyarray(py),
+        Array1::from(c.face_map).into_pyarray(py),
+        rows_to_array(&c.vertices).into_pyarray(py),
+        rows_to_array(&faces).into_pyarray(py),
+    ))
+}
+
 /// Pocket and isolated masks, and the report.
 type OrganelleOut<'py> = (
     Bound<'py, PyArray1<bool>>,
@@ -717,17 +800,23 @@ fn find_organelles<'py>(
         ));
     }
     let pairs = adjacency.as_array();
-    let adjacency: Vec<[u32; 2]> = pairs
-        .rows()
-        .into_iter()
-        .map(|r| {
-            let ok = |v: i64| u32::try_from(v).ok().filter(|&v| (v as usize) < nf);
-            match (ok(r[0]), ok(r[1])) {
-                (Some(a), Some(b)) => Ok([a, b]),
-                _ => Err(PyValueError::new_err("adjacency names a face out of range")),
-            }
-        })
-        .collect::<PyResult<_>>()?;
+    let ok = |v: i64| u32::try_from(v).ok().filter(|&v| (v as usize) < nf);
+    let pair = |a: i64, b: i64| match (ok(a), ok(b)) {
+        (Some(a), Some(b)) => Ok([a, b]),
+        _ => Err(PyValueError::new_err("adjacency names a face out of range")),
+    };
+    let adjacency: Vec<[u32; 2]> = match pairs.as_slice() {
+        Some(flat) if pairs.ncols() == 2 => {
+            threads::map(flat.as_chunks::<2>().0, |r| pair(r[0], r[1]))
+                .into_iter()
+                .collect::<PyResult<_>>()?
+        }
+        _ => pairs
+            .rows()
+            .into_iter()
+            .map(|r| pair(r[0], r[1]))
+            .collect::<PyResult<_>>()?,
+    };
     let found = svd.run(py, || {
         let topo = ::mesh::Topology::new(&tris, n);
         let surface = ::pre::organelles::Surface {
@@ -1448,6 +1537,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(find_organelles, m)?)?;
     m.add_function(wrap_pyfunction!(find_chunk_boundaries, m)?)?;
     m.add_function(wrap_pyfunction!(usable_faces, m)?)?;
+    m.add_function(wrap_pyfunction!(compact_mesh, m)?)?;
     m.add_function(wrap_pyfunction!(isolated_organelles, m)?)?;
     m.add_function(wrap_pyfunction!(pocket_mouths, m)?)?;
     m.add_function(wrap_pyfunction!(pocket_organelles, m)?)?;

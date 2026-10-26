@@ -20,9 +20,9 @@ fn vertex_map<'py>(
     idx: numpy::PyReadonlyArray1<'py, i64>,
     n_vertices: Option<usize>,
 ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)> {
-    let bins = csr_lists(&ptr, &idx, n_vertices, "the bins")?;
-    let n = n_vertices.unwrap_or_else(|| bins.iter().flatten().max().map_or(0, |&v| v + 1));
-    let bins: Vec<&[usize]> = bins.iter().map(Vec::as_slice).collect();
+    let (ptr, idx) = csr_flat(&ptr, &idx, n_vertices, "the bins")?;
+    let n = n_vertices.unwrap_or_else(|| idx.iter().max().map_or(0, |&v| v + 1));
+    let bins: Vec<&[usize]> = ptr.windows(2).map(|w| &idx[w[0]..w[1]]).collect();
     let (keys, node) = py.detach(|| ::dataclass::state::vertex_map(&bins, n));
     let keys = Array1::from_iter(keys.into_iter().map(|v| v as i64));
     Ok((keys.into_pyarray(py), Array1::from(node).into_pyarray(py)))

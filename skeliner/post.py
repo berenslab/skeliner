@@ -1415,7 +1415,13 @@ def _embree_intersector():
     """trimesh's embree ``RayMeshIntersector``, or None without embree.
 
     Asked once: a failing import is slow, and calibration asks per node.
+    Without ``embreex`` or ``pyembree``, which trimesh's wrapper needs, the
+    answer is None without importing trimesh (and with it scipy).
     """
+    from importlib.util import find_spec
+
+    if find_spec("embreex") is None and find_spec("pyembree") is None:
+        return None
     try:
         from trimesh.ray.ray_pyembree import RayMeshIntersector
     except ImportError:

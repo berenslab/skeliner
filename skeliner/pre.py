@@ -138,6 +138,14 @@ def _svd_rows(x: np.ndarray, full_matrices: bool) -> np.ndarray:
 _nearest = _py_mesh.nearest
 
 
+def _median_edge(mesh) -> float:
+    """``np.median(mesh.edges_unique_length)``, kept on a :class:`Mesh` once
+    taken."""
+    if not isinstance(mesh, Mesh):
+        return float(np.median(mesh.edges_unique_length))
+    return float(mesh._get("median_edge", lambda: np.median(mesh.edges_unique_length)))
+
+
 def _face_edge_components(mesh: Mesh) -> tuple[np.ndarray, int]:
     """Connected components of faces using edge adjacency.
 
@@ -806,7 +814,7 @@ def fill_holes(
     if not loops:
         return mesh
 
-    target_edge = float(np.median(mesh.edges_unique_length))
+    target_edge = _median_edge(mesh)
 
     # Default max_perimeter depends on method
     if max_perimeter_mult is None:
@@ -1105,7 +1113,7 @@ def _stitch_and_rebuild(
         np.asarray(mesh.faces, dtype=np.int64),
         verts,
         np.asarray(mesh.face_normals, dtype=np.float64),
-        float(np.median(mesh.edges_unique_length)),
+        _median_edge(mesh),
         sel,
         loop_pairs,
         [],
@@ -3170,7 +3178,7 @@ def find_disconnected(
         np.asarray(mesh.vertices, dtype=np.float64),
         np.asarray(mesh.triangles_center, dtype=np.float64),
         np.asarray(mesh.face_normals, dtype=np.float64),
-        float(np.median(mesh.edges_unique_length)),
+        _median_edge(mesh),
         np.asarray(labels, dtype=np.int64),
         int(main),
         None if organelles is None else np.asarray(organelles.mask, dtype=bool),
@@ -3362,7 +3370,7 @@ def find_gaps(
             )
         return []
 
-    median_edge = float(np.median(mesh.edges_unique_length))
+    median_edge = _median_edge(mesh)
     fusion_faces = list(dict.fromkeys(int(f) for c in fusions or () for f in c))
     gaps, n_capped, n_repaired = kernels.pre.find_gaps(
         np.asarray(mesh.faces, dtype=np.int64),
@@ -3519,7 +3527,7 @@ def _bridge_gaps(mesh, gaps, labels):
         np.asarray(mesh.faces, dtype=np.int64),
         verts,
         np.asarray(mesh.face_normals, dtype=np.float64),
-        float(np.median(mesh.edges_unique_length)),
+        _median_edge(mesh),
         None if labels is None else np.asarray(labels, dtype=np.int64),
         [
             (list(map(int, faces_a)), list(map(int, faces_b)))
@@ -3758,7 +3766,7 @@ def compute_mesh_stats(
         _t0 = time.perf_counter()
 
     if radius is None:
-        median_edge = float(np.median(mesh.edges_unique_length))
+        median_edge = _median_edge(mesh)
         radius = radius_multiplier * median_edge
 
     outward_dots, face_comp, main_ci = kernels.pre.mesh_stats(
@@ -4190,9 +4198,7 @@ def _outward_dots_for(mesh, radius, radius_multiplier, mesh_stats) -> np.ndarray
     else:
         dots = _outward_dot(
             mesh,
-            radius
-            if radius is not None
-            else radius_multiplier * float(np.median(mesh.edges_unique_length)),
+            radius if radius is not None else radius_multiplier * _median_edge(mesh),
         )
     return np.asarray(dots, dtype=np.float64)
 
@@ -4974,18 +4980,13 @@ def compact_mesh(
     face_map : np.ndarray *(only when return_maps=True)*
         ``(nOldFaces,)`` int64 — ``face_map[old]`` → new index, or -1.
     """
-    # Strip degenerate faces (from _rebuild_mesh) and compact vertices
-    good = ~np.all(mesh.faces == mesh.faces[:, :1], axis=1)
-    live_faces = mesh.faces[good]
-
+    # Strip the collapsed faces (from _rebuild_mesh) and compact vertices
+    good, vert_map, face_map, verts, faces = kernels.pre.compact_mesh(
+        np.asarray(mesh.vertices, dtype=np.float64),
+        np.asarray(mesh.faces, dtype=np.int64),
+    )
     n_old = len(mesh.vertices)
-    used = np.zeros(n_old, dtype=bool)
-    used[live_faces.ravel()] = True
-    referenced = np.flatnonzero(used)
-    vert_map = np.full(n_old, -1, dtype=np.int64)
-    vert_map[referenced] = np.arange(len(referenced), dtype=np.int64)
-
-    clean = Mesh(mesh.vertices[referenced], vert_map[live_faces])
+    clean = Mesh._adopt(verts, faces)
 
     if verbose:
         n_removed_v = n_old - len(clean.vertices)
@@ -5010,10 +5011,6 @@ def compact_mesh(
                 f"[skeliner.pre] Soma remap: {n_before:,} → {n_after:,} verts "
                 f"({n_before - n_after:,} dropped)"
             )
-
-    # Build face index map: old_fi → new_fi (or -1 if removed)
-    face_map = np.full(len(mesh.faces), -1, dtype=np.int64)
-    face_map[good] = np.arange(int(good.sum()), dtype=np.int64)
 
     def _remap_face_list(arrays):
         out = []

@@ -22,24 +22,26 @@ fn shells_to_py<'py>(py: Python<'py>, shells: Vec<Vec<Vec<u32>>>) -> ShellsOut<'
         .collect()
 }
 
-fn shells_from_py(shells: Vec<Vec<Vec<i64>>>, n: usize) -> PyResult<Vec<Vec<Vec<u32>>>> {
+/// Shells from Python: per shell its bins, each an int64 array (read in
+/// place) or any sequence of ints, every vertex checked against `n`.
+fn shells_from_py(shells: &Bound<'_, PyAny>, n: usize) -> PyResult<Vec<Vec<Vec<u32>>>> {
+    let id = |v: i64| {
+        u32::try_from(v)
+            .ok()
+            .filter(|&v| (v as usize) < n)
+            .ok_or_else(|| PyValueError::new_err(format!("vertex index {v} is out of range")))
+    };
     shells
-        .into_iter()
+        .try_iter()?
         .map(|band| {
-            band.into_iter()
+            band?
+                .try_iter()?
                 .map(|bin| {
-                    bin.into_iter()
-                        .map(|v| {
-                            u32::try_from(v)
-                                .ok()
-                                .filter(|&v| (v as usize) < n)
-                                .ok_or_else(|| {
-                                    PyValueError::new_err(format!(
-                                        "vertex index {v} is out of range"
-                                    ))
-                                })
-                        })
-                        .collect()
+                    let bin = bin?;
+                    match bin.extract::<numpy::PyReadonlyArray1<'_, i64>>() {
+                        Ok(a) => a.as_array().iter().map(|&v| id(v)).collect(),
+                        Err(_) => bin.extract::<Vec<i64>>()?.into_iter().map(id).collect(),
+                    }
                 })
                 .collect()
         })
@@ -224,11 +226,11 @@ impl PySurfaceGraph {
     fn recheck_rings<'py>(
         &self,
         py: Python<'py>,
-        rebinned: Vec<Vec<Vec<i64>>>,
+        rebinned: Bound<'py, PyAny>,
         verts: numpy::PyReadonlyArray1<'py, i64>,
     ) -> PyResult<ShellsOut<'py>> {
         let n = self.inner.n_vertices();
-        let (rebinned, verts) = (shells_from_py(rebinned, n)?, vertex_ids(&verts, n)?);
+        let (rebinned, verts) = (shells_from_py(&rebinned, n)?, vertex_ids(&verts, n)?);
         let g = &self.inner;
         let shells = py.detach(|| ::skeletonize::skeleton::recheck_rings(g, rebinned, &verts));
         Ok(shells_to_py(py, shells))
@@ -238,9 +240,9 @@ impl PySurfaceGraph {
     fn reunite_bins<'py>(
         &self,
         py: Python<'py>,
-        shells: Vec<Vec<Vec<i64>>>,
+        shells: Bound<'py, PyAny>,
     ) -> PyResult<ShellsOut<'py>> {
-        let shells = shells_from_py(shells, self.inner.n_vertices())?;
+        let shells = shells_from_py(&shells, self.inner.n_vertices())?;
         let g = &self.inner;
         Ok(shells_to_py(
             py,
@@ -252,9 +254,9 @@ impl PySurfaceGraph {
     fn split_branch_bins<'py>(
         &self,
         py: Python<'py>,
-        shells: Vec<Vec<Vec<i64>>>,
+        shells: Bound<'py, PyAny>,
     ) -> PyResult<ShellsOut<'py>> {
-        let shells = shells_from_py(shells, self.inner.n_vertices())?;
+        let shells = shells_from_py(&shells, self.inner.n_vertices())?;
         let g = &self.inner;
         Ok(shells_to_py(
             py,
@@ -349,12 +351,12 @@ type NodesOut<'py> = (Bound<'py, PyArray2<f64>>, Vec<Bound<'py, PyArray1<f64>>>)
 #[pyfunction]
 fn skeleton_nodes<'py>(
     py: Python<'py>,
-    shells: Vec<Vec<Vec<i64>>>,
+    shells: Bound<'py, PyAny>,
     vertices: PyReadonlyArray2<'py, f64>,
     estimators: Vec<String>,
 ) -> PyResult<NodesOut<'py>> {
     let verts = rows3("V", &vertices)?;
-    let shells = shells_from_py(shells, verts.len())?;
+    let shells = shells_from_py(&shells, verts.len())?;
     if shells.iter().flatten().any(|b| b.is_empty()) {
         return Err(PyValueError::new_err("a bin has no vertices"));
     }

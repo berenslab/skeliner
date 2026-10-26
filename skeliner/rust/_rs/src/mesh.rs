@@ -356,7 +356,7 @@ fn mesh_in(
 }
 
 fn pairs_out<'py>(py: Python<'py>, pairs: &[[u32; 2]]) -> Bound<'py, PyArray2<i64>> {
-    let flat: Vec<i64> = pairs.iter().flatten().map(|&v| v as i64).collect();
+    let flat: Vec<i64> = threads::map(pairs.as_flattened(), |&v| i64::from(v));
     Array2::from_shape_vec((pairs.len(), 2), flat)
         .expect("two per row")
         .into_pyarray(py)
@@ -445,7 +445,7 @@ fn edge_lengths<'py>(
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let verts = rows3("V", &vertices)?;
     let pairs = node_pairs(&edges, verts.len())?;
-    let pairs: Vec<[u32; 2]> = pairs.iter().map(|&[a, b]| [a as u32, b as u32]).collect();
+    let pairs: Vec<[u32; 2]> = threads::map(&pairs, |&[a, b]| [a as u32, b as u32]);
     let out = py.detach(|| ::mesh::geometry::edge_lengths(&verts, &pairs));
     Ok(Array1::from(out).into_pyarray(py))
 }

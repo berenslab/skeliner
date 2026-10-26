@@ -14,6 +14,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 
 /// The chosen pool's size; 0 for rayon's global pool.
@@ -84,10 +85,23 @@ pub fn install<R: Send>(op: impl FnOnce() -> R + Send) -> R {
     }
 }
 
+/// Below this many items [`map`] runs on the calling thread: spreading so
+/// little costs more than it saves, and it leaves the pool unstarted.
+pub const MIN_PARALLEL: usize = 1 << 13;
+
+/// `f` of each of `xs`, in order: on the chosen pool for [`MIN_PARALLEL`]
+/// items or more, else on the calling thread.
+pub fn map<T: Sync, U: Send>(xs: &[T], f: impl Fn(&T) -> U + Sync + Send) -> Vec<U> {
+    if xs.len() < MIN_PARALLEL {
+        xs.iter().map(f).collect()
+    } else {
+        install(|| xs.par_iter().map(f).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rayon::prelude::*;
 
     fn worker_names() -> Vec<String> {
         install(|| {

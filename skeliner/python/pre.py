@@ -4908,6 +4908,25 @@ def find_chunk_boundaries(
     return out
 
 
+def compact_mesh(vertices, faces):
+    """The mesh without its collapsed faces (``[v, v, v]``) and the
+    vertices no face left names: ``(good, vert_map, face_map, vertices,
+    faces)`` — the faces kept, each vertex's and face's new id (-1 for what
+    goes), and the kept vertices and faces, renumbered in order."""
+    verts = rows3("V", vertices)
+    faces, _ = checked_faces(faces, len(verts))
+    good = ~np.all(faces == faces[:, :1], axis=1)
+    live = faces[good]
+    used = np.zeros(len(verts), dtype=bool)
+    used[live.ravel()] = True
+    referenced = np.flatnonzero(used)
+    vert_map = np.full(len(verts), -1, dtype=np.int64)
+    vert_map[referenced] = np.arange(len(referenced), dtype=np.int64)
+    face_map = np.full(len(faces), -1, dtype=np.int64)
+    face_map[good] = np.arange(int(good.sum()), dtype=np.int64)
+    return good, vert_map, face_map, verts[referenced], vert_map[live]
+
+
 def usable_faces(vertices, faces) -> np.ndarray:
     """Faces ``break_up_mesh`` will consider: three distinct vertices and a
     cross product ``(v1 - v0) x (v2 - v0)`` with a norm above zero."""

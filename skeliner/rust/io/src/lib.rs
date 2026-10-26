@@ -9,6 +9,8 @@
 
 #![forbid(unsafe_code)]
 
+use rayon::prelude::*;
+
 /// A triangle mesh: its vertices, and faces naming them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Mesh {
@@ -72,24 +74,77 @@ fn referenced_only(vertices: Vec<[f64; 3]>, faces: Vec<[u32; 3]>) -> Mesh {
 /// texture coordinates, more objects, groups, materials, polygons, slashes,
 /// relative or out-of-range indices, extra vertex values, no faces at all.
 pub fn read_obj(text: &[u8]) -> Option<Mesh> {
+    // stretches of whole lines, read at once
+    let mut parts = Vec::new();
+    let mut at = 0;
+    while at < text.len() {
+        let want = (at + OBJ_PART).min(text.len());
+        let end = text[want..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(text.len(), |i| want + i + 1);
+        parts.push(&text[at..end]);
+        at = end;
+    }
+    let read: Vec<Option<ObjPart>> = if parts.len() < 2 {
+        parts.iter().map(|p| read_obj_part(p)).collect()
+    } else {
+        threads::install(|| parts.par_iter().map(|p| read_obj_part(p)).collect())
+    };
+    let mut vertices = Vec::new();
+    let mut faces = Vec::new();
+    let mut named = false;
+    for part in read {
+        let part = part?;
+        if let Some(before) = part.named_after {
+            // one object for every face, or trimesh splits the mesh
+            if named || !faces.is_empty() || before > 0 {
+                return None;
+            }
+            named = true;
+        }
+        vertices.extend(part.vertices);
+        faces.extend(part.faces);
+    }
+    let n = vertices.len();
+    let out_of_range = |f: &[u32; 3]| f.iter().any(|&v| v as usize >= n);
+    if faces.is_empty() || threads::map(&faces, out_of_range).contains(&true) {
+        return None;
+    }
+    Some(referenced_only(vertices, faces))
+}
+
+/// Bytes of OBJ text [`read_obj`] reads as one stretch.
+const OBJ_PART: usize = 1 << 20;
+
+/// What a stretch of whole lines of an OBJ holds.
+struct ObjPart {
+    vertices: Vec<[f64; 3]>,
+    faces: Vec<[u32; 3]>,
+    /// How many of its faces come before its `o` line, if it has one.
+    named_after: Option<usize>,
+}
+
+/// A stretch of [`read_obj`]'s lines, or `None` for anything it does not
+/// read.
+fn read_obj_part(text: &[u8]) -> Option<ObjPart> {
     if !text.is_ascii() || text.contains(&b'\\') {
         return None;
     }
     let text = std::str::from_utf8(text).ok()?;
     let mut vertices = Vec::new();
     let mut faces = Vec::new();
-    let mut named = false;
+    let mut named_after = None;
     for line in text.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
         if line.split_ascii_whitespace().next().is_none() || line.starts_with('#') {
             continue;
         }
         if line.starts_with("o ") {
-            // one object for every face, or trimesh splits the mesh
-            if named || !faces.is_empty() {
+            if named_after.is_some() {
                 return None;
             }
-            named = true;
+            named_after = Some(faces.len());
         } else if let Some(rest) = line.strip_prefix("v ") {
             let mut it = rest.split_ascii_whitespace();
             let v = [
@@ -116,11 +171,11 @@ pub fn read_obj(text: &[u8]) -> Option<Mesh> {
             faces.push(f);
         }
     }
-    let n = vertices.len();
-    if faces.is_empty() || faces.iter().flatten().any(|&v| v as usize >= n) {
-        return None;
-    }
-    Some(referenced_only(vertices, faces))
+    Some(ObjPart {
+        vertices,
+        faces,
+        named_after,
+    })
 }
 
 /// Why an OpenCTM file could not be read: it is malformed, or a packed
@@ -567,6 +622,35 @@ mod tests {
                 "a CTM triangle names a vertex past the last"
             ))
         );
+    }
+
+    #[test]
+    fn an_obj_of_many_stretches_reads_as_one() {
+        // past several stretches, an object name first and a face that names
+        // a vertex from the first stretch at the end
+        let mut text = String::from("# made\no cell.obj\n");
+        let n = 120_000;
+        for i in 0..n {
+            text.push_str(&format!("v {i}.5 {} -{i}e-3\n", 2 * i));
+        }
+        for i in 1..n - 1 {
+            text.push_str(&format!("f {i} {} {}\r\n", i + 1, i + 2));
+        }
+        text.push_str(&format!("f 1 {} {n}\n", n / 2));
+        assert!(text.len() > 3 * OBJ_PART);
+        let m = read_obj(text.as_bytes()).expect("plain");
+        assert_eq!(m.vertices.len(), n as usize);
+        assert_eq!(m.vertices[7], [7.5, 14.0, -7e-3]);
+        assert_eq!(m.faces.len(), n as usize - 1);
+        assert_eq!(m.faces[0], [0, 1, 2]);
+        assert_eq!(*m.faces.last().unwrap(), [0, n / 2 - 1, n - 1]);
+        // an object name after faces of earlier stretches splits the mesh,
+        // as does a second name
+        let unnamed = text.replacen("o cell.obj\n", "", 1);
+        let late = format!("{unnamed}o other\nf 1 2 3\n");
+        assert_eq!(read_obj(late.as_bytes()), None);
+        assert!(read_obj(format!("o first\n{unnamed}").as_bytes()).is_some());
+        assert_eq!(read_obj(format!("{text}o other\n").as_bytes()), None);
     }
 
     #[test]

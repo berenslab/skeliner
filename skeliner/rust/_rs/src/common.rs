@@ -6,7 +6,8 @@ use numpy::{PyArray2, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-/// Rows of an `(N, 3)` array, refusing any other shape.
+/// Rows of an `(N, 3)` array, refusing any other shape; one copy when the
+/// array is C-contiguous.
 pub(crate) fn rows3<T: Copy + numpy::Element>(
     name: &str,
     a: &PyReadonlyArray2<'_, T>,
@@ -18,7 +19,10 @@ pub(crate) fn rows3<T: Copy + numpy::Element>(
             v.shape()
         )));
     }
-    Ok(v.rows().into_iter().map(|r| [r[0], r[1], r[2]]).collect())
+    Ok(match v.as_slice() {
+        Some(flat) => flat.as_chunks::<3>().0.to_vec(),
+        None => v.rows().into_iter().map(|r| [r[0], r[1], r[2]]).collect(),
+    })
 }
 
 /// Faces narrowed to `u32` and checked against the vertex count, which
@@ -30,11 +34,10 @@ pub(crate) fn checked_faces(
     let rows = rows3("F", faces)?;
     let n = match n_vertices {
         Some(n) => n,
-        None => rows
-            .iter()
-            .flatten()
+        None => threads::map(&rows, |r| r[0].max(r[1]).max(r[2]))
+            .into_iter()
             .max()
-            .map_or(0, |&m| usize::try_from(m).map_or(0, |m| m + 1)),
+            .map_or(0, |m| usize::try_from(m).map_or(0, |m| m + 1)),
     };
     let checked =
         ::mesh::checked_faces(&rows, n).map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -89,7 +92,7 @@ pub(crate) fn selection(sel: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
 pub(crate) type MeshArrays<'py> = (Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<i64>>);
 
 pub(crate) fn rows_to_array<T: Copy>(rows: &[[T; 3]]) -> Array2<T> {
-    let flat: Vec<T> = rows.iter().flatten().copied().collect();
+    let flat: Vec<T> = rows.as_flattened().to_vec();
     Array2::from_shape_vec((rows.len(), 3), flat).expect("three columns per row")
 }
 
@@ -146,10 +149,23 @@ pub(crate) fn node_pairs(edges: &PyReadonlyArray2<'_, i64>, n: usize) -> PyResul
             .filter(|&v| v < n)
             .ok_or_else(|| PyValueError::new_err(format!("edge names node {v}, not one of {n}")))
     };
-    e.rows()
-        .into_iter()
-        .map(|r| Ok([node(r[0])?, node(r[1])?]))
-        .collect()
+    match e.as_slice() {
+        // the error naming the first bad id in row order
+        Some(flat) => {
+            let ok = threads::map(flat, |&v| node(v).is_ok());
+            if let Some(i) = ok.iter().position(|&ok| !ok) {
+                return Err(node(flat[i]).expect_err("a bad id"));
+            }
+            Ok(threads::map(flat.as_chunks::<2>().0, |r| {
+                [r[0] as usize, r[1] as usize]
+            }))
+        }
+        None => e
+            .rows()
+            .into_iter()
+            .map(|r| Ok([node(r[0])?, node(r[1])?]))
+            .collect(),
+    }
 }
 
 /// A CSR (`ptr` `(K + 1,)` from 0, never decreasing, `idx`) as `K` lists of
@@ -161,6 +177,17 @@ pub(crate) fn csr_lists(
     bound: Option<usize>,
     what: &str,
 ) -> PyResult<Vec<Vec<usize>>> {
+    let (ptr, idx) = csr_flat(ptr, idx, bound, what)?;
+    Ok(ptr.windows(2).map(|w| idx[w[0]..w[1]].to_vec()).collect())
+}
+
+/// [`csr_lists`] left as one CSR, `ptr` and the checked `idx`.
+pub(crate) fn csr_flat(
+    ptr: &numpy::PyReadonlyArray1<'_, i64>,
+    idx: &numpy::PyReadonlyArray1<'_, i64>,
+    bound: Option<usize>,
+    what: &str,
+) -> PyResult<(Vec<usize>, Vec<usize>)> {
     let (ptr, idx) = (ptr.as_array(), idx.as_array());
     let well_formed = !ptr.is_empty()
         && ptr[0] == 0
@@ -182,8 +209,12 @@ pub(crate) fn csr_lists(
                 None => PyValueError::new_err("vertex ids must not be negative"),
             })
     };
-    ptr.iter()
-        .zip(ptr.iter().skip(1))
-        .map(|(&a, &b)| (a as usize..b as usize).map(|i| id(idx[i])).collect())
-        .collect()
+    let ptr: Vec<usize> = ptr.iter().map(|&p| p as usize).collect();
+    let idx: Vec<i64> = idx.to_vec();
+    // the error naming the first bad id
+    let ok = threads::map(&idx, |&v| id(v).is_ok());
+    if let Some(i) = ok.iter().position(|&ok| !ok) {
+        return Err(id(idx[i]).expect_err("a bad id"));
+    }
+    Ok((ptr, threads::map(&idx, |&v| v as usize)))
 }

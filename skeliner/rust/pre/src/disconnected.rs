@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use mesh::geometry::numpy_order;
 use mesh::spatial::{KdTree, Sum};
+use rayon::prelude::*;
 
 pub use crate::soma::Ellipsoid;
 
@@ -52,53 +53,89 @@ pub fn find_disconnected(
         }
         entry.push(fi as u32);
     }
-    let main_faces: Vec<usize> = (0..labels.len()).filter(|&f| labels[f] == main).collect();
-    let tree = KdTree::new(
-        main_faces.iter().map(|&f| s.centers[f]).collect(),
-        Sum::Plain,
-    );
+    let (main_faces, tree) = threads::install(|| {
+        let main_faces: Vec<usize> = (0..labels.len())
+            .into_par_iter()
+            .filter(|&f| labels[f] == main)
+            .collect();
+        let centers = main_faces.par_iter().map(|&f| s.centers[f]).collect();
+        (main_faces, KdTree::new(centers, Sum::Plain))
+    });
 
     let mut out = Disconnected {
         n_non_main: comps.len(),
         ..Default::default()
     };
+    // each component's fate at once, kept in the order first seen
+    let listed: Vec<Vec<u32>> = first_seen
+        .iter()
+        .map(|c| comps.remove(c).expect("seen"))
+        .collect();
+    let fates: Vec<Fate> = threads::install(|| {
+        listed
+            .par_iter()
+            .map(|fis| fate(s, fis, organelle, soma, &tree, &main_faces))
+            .collect()
+    });
     let mut kept: Vec<Vec<u32>> = Vec::new();
-    for c in first_seen {
-        let fis = comps.remove(&c).expect("seen");
-        if fis.len() < 7 {
-            continue;
+    for (fis, fate) in listed.into_iter().zip(fates) {
+        match fate {
+            Fate::Small => {}
+            Fate::Organelle => out.n_organelle += 1,
+            Fate::Soma => out.n_soma += 1,
+            Fate::Enclosed => out.n_enclosed += 1,
+            Fate::Kept => kept.push(fis),
         }
-        if let Some(mask) = organelle
-            && fis.iter().all(|&f| mask[f as usize])
-        {
-            out.n_organelle += 1;
-            continue;
-        }
-        let mut vids: Vec<u32> = fis.iter().flat_map(|&f| s.faces[f as usize]).collect();
-        vids.sort_unstable();
-        vids.dedup();
-        let coords: Vec<[f64; 3]> = vids.iter().map(|&v| s.verts[v as usize]).collect();
-        let mut sum = [0.0f64; 3];
-        for p in &coords {
-            for k in 0..3 {
-                sum[k] += p[k];
-            }
-        }
-        let n = coords.len() as f64;
-        let centroid = [sum[0] / n, sum[1] / n, sum[2] / n];
-        if soma.is_some_and(|e| e.contains(&centroid)) {
-            out.n_soma += 1;
-            continue;
-        }
-        if !tree.is_empty() && is_enclosed(s, &tree, &main_faces, &coords) {
-            out.n_enclosed += 1;
-            continue;
-        }
-        kept.push(fis);
     }
     kept.sort_by_key(|c| std::cmp::Reverse(c.len()));
     out.components = kept;
     out
+}
+
+/// What [`find_disconnected`] makes of one component.
+enum Fate {
+    Small,
+    Organelle,
+    Soma,
+    Enclosed,
+    Kept,
+}
+
+fn fate(
+    s: &Surface<'_>,
+    fis: &[u32],
+    organelle: Option<&[bool]>,
+    soma: Option<&Ellipsoid>,
+    tree: &KdTree,
+    main_faces: &[usize],
+) -> Fate {
+    if fis.len() < 7 {
+        return Fate::Small;
+    }
+    if let Some(mask) = organelle
+        && fis.iter().all(|&f| mask[f as usize])
+    {
+        return Fate::Organelle;
+    }
+    let mut vids: Vec<u32> = fis.iter().flat_map(|&f| s.faces[f as usize]).collect();
+    vids.sort_unstable();
+    vids.dedup();
+    let coords: Vec<[f64; 3]> = vids.iter().map(|&v| s.verts[v as usize]).collect();
+    let mut sum = [0.0f64; 3];
+    for p in &coords {
+        for k in 0..3 {
+            sum[k] += p[k];
+        }
+    }
+    let n = coords.len() as f64;
+    let centroid = [sum[0] / n, sum[1] / n, sum[2] / n];
+    if soma.is_some_and(|e| e.contains(&centroid)) {
+        return Fate::Soma;
+    }
+    if !tree.is_empty() && is_enclosed(s, tree, main_faces, &coords) {
+        return Fate::Enclosed;
+    }
+    Fate::Kept
 }
 
 /// Whether a component near the main surface (median vertex distance at

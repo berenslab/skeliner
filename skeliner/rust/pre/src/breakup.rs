@@ -138,23 +138,20 @@ pub fn classify(m: &BreakUpMesh<'_>, has_soma: bool) -> (Vec<Vec<u32>>, Vec<Piec
 /// product `(v1 − v0) × (v2 − v0)`, computed as numpy computes it, has a
 /// norm above zero.
 pub fn usable_faces(verts: &[[f64; 3]], faces: &[[u32; 3]]) -> Vec<bool> {
-    faces
-        .iter()
-        .map(|&[a, b, c]| {
-            if a == b || b == c || a == c {
-                return false;
-            }
-            let (p, q, r) = (verts[a as usize], verts[b as usize], verts[c as usize]);
-            let u = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
-            let w = [r[0] - p[0], r[1] - p[1], r[2] - p[2]];
-            let x = [
-                u[1] * w[2] - u[2] * w[1],
-                u[2] * w[0] - u[0] * w[2],
-                u[0] * w[1] - u[1] * w[0],
-            ];
-            (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt() > 0.0
-        })
-        .collect()
+    threads::map(faces, |&[a, b, c]| {
+        if a == b || b == c || a == c {
+            return false;
+        }
+        let (p, q, r) = (verts[a as usize], verts[b as usize], verts[c as usize]);
+        let u = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
+        let w = [r[0] - p[0], r[1] - p[1], r[2] - p[2]];
+        let x = [
+            u[1] * w[2] - u[2] * w[1],
+            u[2] * w[0] - u[0] * w[2],
+            u[0] * w[1] - u[1] * w[0],
+        ];
+        (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt() > 0.0
+    })
 }
 
 #[cfg(test)]

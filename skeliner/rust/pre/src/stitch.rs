@@ -12,6 +12,7 @@ use mesh::Topology;
 use mesh::components::face_edge_components;
 use mesh::geometry::{HAS_FMA, numpy_order};
 use mesh::loops::border_loops;
+use rayon::prelude::*;
 
 use crate::gaps::{expand_tip_to_good_rim, rescue_size, sever_cost};
 
@@ -235,7 +236,7 @@ fn zipper_stitch<E>(
     m: &StitchMesh<'_>,
     la: &[u32],
     lb: &[u32],
-    vert_to_faces: &[Vec<u32>],
+    kept: &KeptFaces,
     new_verts: &mut Vec<V3>,
     fit: &mut impl FnMut(&[u32]) -> Result<LoopFit, E>,
 ) -> Result<Vec<[u32; 3]>, E> {
@@ -394,7 +395,7 @@ fn zipper_stitch<E>(
     // orient the tube like the faces around the first loop
     let mut ref_fis: Vec<u32> = Vec::new();
     for &vi in la.iter().take(5) {
-        ref_fis.extend(vert_to_faces[vi as usize].iter().take(5));
+        ref_fis.extend(kept.at(vi).take(5));
     }
     if !ref_fis.is_empty() {
         let mean = |vs: &mut dyn Iterator<Item = V3>, k: usize| {
@@ -436,29 +437,19 @@ pub fn stitch_and_rebuild<E>(
     fills: &[Vec<u32>],
     fit: &mut impl FnMut(&[u32]) -> Result<LoopFit, E>,
 ) -> Result<(Vec<V3>, Vec<[u32; 3]>), E> {
-    let mut vert_to_faces: Vec<Vec<u32>> = vec![Vec::new(); m.verts.len()];
-    for (fi, f) in m.faces.iter().enumerate() {
-        let degenerate = f[0] == f[1] || f[1] == f[2] || f[0] == f[2];
-        if !degenerate && !sel.contains(&(fi as u32)) {
-            for &v in f {
-                vert_to_faces[v as usize].push(fi as u32);
-            }
-        }
-    }
+    let loops = pairs
+        .iter()
+        .flat_map(|(la, lb)| [la, lb])
+        .chain(fills)
+        .map(Vec::as_slice);
+    let kept = KeptFaces::around(m, sel, loops);
     let mut new_verts: Vec<V3> = Vec::new();
     let mut stitched: Vec<[u32; 3]> = Vec::new();
     for (la, lb) in pairs {
-        stitched.extend(zipper_stitch(
-            m,
-            la,
-            lb,
-            &vert_to_faces,
-            &mut new_verts,
-            fit,
-        )?);
+        stitched.extend(zipper_stitch(m, la, lb, &kept, &mut new_verts, fit)?);
     }
     for lp in fills {
-        stitched.extend(fan_fill(m, lp, &vert_to_faces, &mut new_verts));
+        stitched.extend(fan_fill(m, lp, &kept, &mut new_verts));
     }
     let mut faces = m.faces.to_vec();
     for &f in sel {
@@ -468,20 +459,67 @@ pub fn stitch_and_rebuild<E>(
     Ok((new_verts, faces))
 }
 
+/// The faces a stitch keeps (not degenerate, not removed) around the
+/// vertices of its loops, each vertex's in ascending order.
+struct KeptFaces(Vec<(u32, u32)>);
+
+impl KeptFaces {
+    /// One scan of the faces, in parallel, for those at a vertex of `loops`.
+    fn around<'l>(
+        m: &StitchMesh<'_>,
+        sel: &BTreeSet<u32>,
+        loops: impl Iterator<Item = &'l [u32]>,
+    ) -> Self {
+        let mut wanted = vec![false; m.verts.len()];
+        for v in loops.flatten() {
+            wanted[*v as usize] = true;
+        }
+        Self(threads::install(|| {
+            let mut at: Vec<(u32, u32)> = m
+                .faces
+                .par_iter()
+                .enumerate()
+                .filter(|&(fi, f)| {
+                    let degenerate = f[0] == f[1] || f[1] == f[2] || f[0] == f[2];
+                    f.iter().any(|&v| wanted[v as usize])
+                        && !degenerate
+                        && !sel.contains(&(fi as u32))
+                })
+                .flat_map_iter(|(fi, f)| {
+                    f.iter()
+                        .filter(|&&v| wanted[v as usize])
+                        .map(move |&v| (v, fi as u32))
+                })
+                .collect();
+            // a face has each of its vertices once, so the pairs are distinct
+            at.par_sort_unstable();
+            at
+        }))
+    }
+
+    /// The kept faces at `v`, ascending.
+    fn at(&self, v: u32) -> impl Iterator<Item = u32> + '_ {
+        let from = self.0.partition_point(|&(u, _)| u < v);
+        self.0[from..]
+            .iter()
+            .take_while(move |&&(u, _)| u == v)
+            .map(|&(_, f)| f)
+    }
+}
+
 /// Close the hole bounded by `lp` with a fan from its centroid, wound so
 /// that every border edge runs against the kept face beside it.
-/// `vert_to_faces` lists the kept faces at each vertex.
 fn fan_fill(
     m: &StitchMesh<'_>,
     lp: &[u32],
-    vert_to_faces: &[Vec<u32>],
+    kept: &KeptFaces,
     new_verts: &mut Vec<V3>,
 ) -> Vec<[u32; 3]> {
     let n = lp.len();
     let (mut along, mut against) = (0usize, 0usize);
     for i in 0..n {
         let (u, v) = (lp[i], lp[(i + 1) % n]);
-        for &f in &vert_to_faces[u as usize] {
+        for f in kept.at(u) {
             let t = m.faces[f as usize];
             for k in 0..3 {
                 let e = (t[k], t[(k + 1) % 3]);
@@ -669,6 +707,51 @@ mod tests {
     }
 
     #[test]
+    fn the_kept_faces_at_a_loop_vertex_are_its_faces_in_order() {
+        // random faces on 3,000 vertices, some degenerate, some removed
+        let mut state = 0x3c6e_f372_fe94_f82bu64;
+        let mut next = |n: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) % n) as u32
+        };
+        let faces: Vec<[u32; 3]> = (0..60_000)
+            .map(|_| {
+                let a = next(3000);
+                let b = if next(30) == 0 { a } else { next(3000) };
+                [a, b, next(3000)]
+            })
+            .collect();
+        let verts = vec![[0.0; 3]; 3000];
+        let normals = vec![[0.0, 0.0, 1.0]; faces.len()];
+        let m = StitchMesh {
+            faces: &faces,
+            verts: &verts,
+            face_normals: &normals,
+            median_edge: 1.0,
+        };
+        let sel: BTreeSet<u32> = (0..faces.len() as u32).filter(|_| next(10) == 0).collect();
+        let loops: Vec<Vec<u32>> = (0..40)
+            .map(|_| (0..next(12) + 3).map(|_| next(3000)).collect())
+            .collect();
+        let kept = KeptFaces::around(&m, &sel, loops.iter().map(Vec::as_slice));
+        let mut by_vertex = vec![Vec::new(); verts.len()];
+        for (fi, f) in faces.iter().enumerate() {
+            let degenerate = f[0] == f[1] || f[1] == f[2] || f[0] == f[2];
+            if !degenerate && !sel.contains(&(fi as u32)) {
+                for &v in f {
+                    by_vertex[v as usize].push(fi as u32);
+                }
+            }
+        }
+        for &v in loops.iter().flatten() {
+            assert_eq!(kept.at(v).collect::<Vec<_>>(), by_vertex[v as usize]);
+            assert!(by_vertex[v as usize].len() > 10);
+        }
+    }
+
+    #[test]
     fn a_fan_closes_a_hole_against_the_faces_around_it() {
         // a 3 x 3 grid of squares in z = 0, wound counter-clockwise, its
         // middle square removed
@@ -692,22 +775,15 @@ mod tests {
             median_edge: 1.0,
         };
         let removed: BTreeSet<u32> = [8, 9].into_iter().collect();
-        let mut vert_to_faces = vec![Vec::new(); verts.len()];
-        for (fi, f) in faces.iter().enumerate() {
-            if !removed.contains(&(fi as u32)) {
-                for &v in f {
-                    vert_to_faces[v as usize].push(fi as u32);
-                }
-            }
-        }
         // the hole's border, walked either way round
         let hole = [vid(1, 1), vid(1, 2), vid(2, 2), vid(2, 1)];
         let mut reversed = hole;
         reversed.reverse();
+        let kept = KeptFaces::around(&m, &removed, [hole.as_slice()].into_iter());
         let mut other = Vec::new();
-        let flipped = fan_fill(&m, &reversed, &vert_to_faces, &mut other);
+        let flipped = fan_fill(&m, &reversed, &kept, &mut other);
         let mut new_verts = Vec::new();
-        let fan = fan_fill(&m, &hole, &vert_to_faces, &mut new_verts);
+        let fan = fan_fill(&m, &hole, &kept, &mut new_verts);
         let directed = |f: &[[u32; 3]]| -> BTreeSet<(u32, u32)> {
             f.iter()
                 .flat_map(|t| (0..3).map(move |k| (t[k], t[(k + 1) % 3])))

@@ -59,16 +59,20 @@ pub fn enclosure_pass(
         fill[s as usize] += 1;
     }
 
-    // Iterative Tarjan with subtree accumulation.
+    // Iterative Tarjan with subtree accumulation, in 32-bit words (a face's
+    // discovery time, subtree size and boundary counts are under 3n) to
+    // keep the walk's arrays small.
     let pocket_n = pocket.iter().filter(|&&p| p).count() as i64;
-    let mut disc = vec![-1i64; n];
-    let mut low = vec![-1i64; n];
-    let mut sub_sz = vec![1i64; n];
-    let mut sub_pb = pbnd;
-    let mut sub_tb = tbnd;
-    let mut children = vec![0usize; n];
-    let mut tmr = 0i64;
-    let mut claims: Vec<(usize, i64)> = Vec::new();
+    let narrow = |x: Vec<i64>| -> Vec<i32> { x.into_iter().map(|v| v as i32).collect() };
+    let mut disc = vec![-1i32; n];
+    let mut low = vec![-1i32; n];
+    let mut sub_sz = vec![1i32; n];
+    let mut sub_pb = narrow(pbnd);
+    let mut sub_tb = narrow(tbnd);
+    let mut children = vec![0u32; n];
+    let mut tmr = 0i32;
+    let mut claims: Vec<(usize, i32)> = Vec::new();
+    const NO_PARENT: u32 = u32::MAX;
     for root in (0..n).filter(|&f| np_mask[f]) {
         if disc[root] >= 0 {
             continue;
@@ -77,17 +81,18 @@ pub fn enclosure_pass(
         low[root] = tmr;
         tmr += 1;
         // (node, parent, next edge)
-        let mut stack: Vec<(usize, Option<usize>, usize)> = vec![(root, None, off[root])];
+        let mut stack: Vec<(u32, u32, u32)> = vec![(root as u32, NO_PARENT, off[root] as u32)];
         while let Some(&(u, pu, ei)) = stack.last() {
+            let (u, ei) = (u as usize, ei as usize);
             if ei < off[u + 1] {
-                stack.last_mut().expect("non-empty").2 = ei + 1;
+                stack.last_mut().expect("non-empty").2 = ei as u32 + 1;
                 let v = dst[ei] as usize;
                 if disc[v] < 0 {
                     disc[v] = tmr;
                     low[v] = tmr;
                     tmr += 1;
-                    stack.push((v, Some(u), off[v]));
-                } else if Some(v) != pu && low[u] > disc[v] {
+                    stack.push((v as u32, u as u32, off[v] as u32));
+                } else if v as u32 != pu && low[u] > disc[v] {
                     low[u] = disc[v];
                 }
                 continue;
@@ -96,18 +101,19 @@ pub fn enclosure_pass(
             let Some(&(p, pp, _)) = stack.last() else {
                 break;
             };
+            let p = p as usize;
             low[p] = low[p].min(low[u]);
             sub_sz[p] += sub_sz[u];
             sub_pb[p] += sub_pb[u];
             sub_tb[p] += sub_tb[u];
             children[p] += 1;
-            let is_root = pp.is_none();
+            let is_root = pp == NO_PARENT;
             if low[u] >= disc[p] && (!is_root || children[p] > 1) {
                 let (sz, tb, pb) = (sub_sz[u], sub_tb[u], sub_pb[u]);
                 if tb > 0
-                    && pb as f64 >= tb as f64 * 0.9
-                    && sz >= min_cluster_size as i64
-                    && sz <= pocket_n
+                    && f64::from(pb) >= f64::from(tb) * 0.9
+                    && sz as usize >= min_cluster_size
+                    && i64::from(sz) <= pocket_n
                 {
                     claims.push((u, disc[u]));
                 }
@@ -211,7 +217,8 @@ mod tests {
     }
 }
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use mesh::Topology;
 use mesh::components::LowestRootSets;
@@ -219,7 +226,7 @@ use mesh::geometry::numpy_sum;
 use mesh::spatial::{KdTree, Sum};
 use rayon::prelude::*;
 
-use crate::fits::Svd;
+use crate::fits::{Svd, centred, hull_area_on};
 
 /// The arrays organelle detection reads about a mesh.
 pub struct Surface<'a> {
@@ -253,42 +260,47 @@ fn area_of(s: &Surface<'_>, faces: &BTreeSet<u32>) -> f64 {
     numpy_sum(&a)
 }
 
-/// Edge-connected components of the faces where `inside`, found from the
-/// lowest face up.
-fn components_where(s: &Surface<'_>, inside: impl Fn(usize) -> bool) -> Vec<Vec<u32>> {
-    let n = s.faces.len();
-    let mut seen = vec![false; n];
-    let mut comps = Vec::new();
-    for seed in 0..n {
-        if seen[seed] || !inside(seed) {
-            continue;
-        }
-        let mut comp = Vec::new();
-        let mut queue = VecDeque::from([seed as u32]);
-        seen[seed] = true;
-        while let Some(f) = queue.pop_front() {
-            comp.push(f);
-            for g in s.topo.face_neighbors(f as usize) {
-                if !seen[g as usize] && inside(g as usize) {
-                    seen[g as usize] = true;
-                    queue.push_back(g);
-                }
-            }
-        }
-        comps.push(comp);
-    }
-    comps
-}
-
-/// [`components_where`]'s components with each one's faces ascending: the
-/// same faces, the components in the same order (by lowest face), for the
-/// passes that read no order inside one.
-fn components_where_unordered(
+/// Edge-connected components of the faces where `inside`, by lowest face,
+/// each listing its faces in the order a breadth-first search from its
+/// lowest face meets them; with each face's component (its lowest face,
+/// `u32::MAX` outside).  The components are searched at once.
+fn components_where(
     s: &Surface<'_>,
     inside: impl Fn(usize) -> bool + Sync,
-) -> Vec<Vec<u32>> {
+) -> (Vec<Vec<u32>>, Vec<u32>) {
+    threads::install(|| {
+        let n = s.faces.len();
+        let is_in: Vec<bool> = (0..n).into_par_iter().map(&inside).collect();
+        let roots = lowest_faces(s, &is_in);
+        let lowest: Vec<u32> = (0..n as u32).filter(|&f| roots[f as usize] == f).collect();
+        // a face lies in one component, so only that one's search marks it
+        let seen: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
+        let comps = lowest
+            .par_iter()
+            .map(|&seed| {
+                let mut comp = Vec::new();
+                let mut queue = VecDeque::from([seed]);
+                seen[seed as usize].store(true, Ordering::Relaxed);
+                while let Some(f) = queue.pop_front() {
+                    comp.push(f);
+                    for g in s.topo.face_neighbors(f as usize) {
+                        if is_in[g as usize] && !seen[g as usize].load(Ordering::Relaxed) {
+                            seen[g as usize].store(true, Ordering::Relaxed);
+                            queue.push_back(g);
+                        }
+                    }
+                }
+                comp
+            })
+            .collect();
+        (comps, roots)
+    })
+}
+
+/// Each face's edge-connected component among those `is_in` marks, as the
+/// component's lowest face; `u32::MAX` outside.
+fn lowest_faces(s: &Surface<'_>, is_in: &[bool]) -> Vec<u32> {
     let n = s.faces.len();
-    let is_in: Vec<bool> = (0..n).into_par_iter().map(&inside).collect();
     let sets = LowestRootSets::new(n);
     (0..s.topo.n_edges()).into_par_iter().for_each(|e| {
         let mut on = s
@@ -303,7 +315,28 @@ fn components_where_unordered(
             }
         }
     });
-    let roots = sets.roots();
+    (0..n as u32)
+        .into_par_iter()
+        .map(|f| {
+            if is_in[f as usize] {
+                sets.root(f)
+            } else {
+                u32::MAX
+            }
+        })
+        .collect()
+}
+
+/// [`components_where`]'s components with each one's faces ascending: the
+/// same faces, the components in the same order (by lowest face), for the
+/// passes that read no order inside one.
+fn components_where_unordered(
+    s: &Surface<'_>,
+    inside: impl Fn(usize) -> bool + Sync,
+) -> Vec<Vec<u32>> {
+    let n = s.faces.len();
+    let is_in: Vec<bool> = (0..n).into_par_iter().map(&inside).collect();
+    let roots = lowest_faces(s, &is_in);
     let mut slot = vec![usize::MAX; n];
     let mut comps: Vec<Vec<u32>> = Vec::new();
     for f in (0..n).filter(|&f| is_in[f]) {
@@ -348,13 +381,19 @@ pub fn isolated_organelles(s: &Fragments<'_>, face_comp: &[i64], main: i64) -> I
         .copied()
         .max()
         .map_or(0, |m| (m + 1).max(0) as usize);
+    // the other components' faces; main's are only searched
     let mut by_comp: Vec<Vec<usize>> = vec![Vec::new(); n_comps];
     for (fi, &c) in face_comp.iter().enumerate() {
-        if c >= 0 {
+        if c >= 0 && c != main {
             by_comp[c as usize].push(fi);
         }
     }
-    let main_faces: Vec<usize> = (0..n).filter(|&f| face_comp[f] == main).collect();
+    let main_faces: Vec<usize> = threads::install(|| {
+        (0..n)
+            .into_par_iter()
+            .filter(|&f| face_comp[f] == main)
+            .collect()
+    });
     let others: Vec<&Vec<usize>> = by_comp
         .iter()
         .enumerate()
@@ -364,10 +403,8 @@ pub fn isolated_organelles(s: &Fragments<'_>, face_comp: &[i64], main: i64) -> I
     let by_dots = |fis: &[usize]| fis.iter().any(|&f| s.dots[f] != 0.0);
     // the main faces' tree, for components whose outward dots are all zero
     let tree = others.iter().any(|fis| !by_dots(fis)).then(|| {
-        KdTree::new(
-            main_faces.iter().map(|&f| s.centers[f]).collect(),
-            Sum::Plain,
-        )
+        let centers = threads::install(|| main_faces.par_iter().map(|&f| s.centers[f]).collect());
+        KdTree::new(centers, Sum::Plain)
     });
     // each component: whether it points inward, and whether by its dots
     let decided: Vec<(bool, bool)> = threads::install(|| {
@@ -454,17 +491,17 @@ pub fn structural_masks(
     (mask, non_main, n_structural)
 }
 
-/// `skeliner.pre._rim_enclosed_area`: total planar area enclosed by the
-/// simple closed loops among `edges`, each projected onto its best-fit
-/// plane.
-pub fn rim_enclosed_area(edges: &[[u32; 2]], verts: &[[f64; 3]], svd: &dyn Svd) -> f64 {
+/// The simple closed loops among `edges`, each loop's points in order
+/// round it and centred on their mean: what `skeliner.pre._rim_enclosed_area`
+/// fits a plane to.
+pub fn rim_loops(edges: &[[u32; 2]], verts: &[[f64; 3]]) -> Vec<Vec<[f64; 3]>> {
     let mut edges_at: HashMap<u32, Vec<usize>> = HashMap::new();
     for (i, e) in edges.iter().enumerate() {
         edges_at.entry(e[0]).or_default().push(i);
         edges_at.entry(e[1]).or_default().push(i);
     }
     let mut visited = vec![false; edges.len()];
-    let mut total = 0.0;
+    let mut loops = Vec::new();
     for start in 0..edges.len() {
         if visited[start] {
             continue;
@@ -521,11 +558,21 @@ pub fn rim_enclosed_area(edges: &[[u32; 2]], verts: &[[f64; 3]], svd: &dyn Svd) 
             }
         }
         let mean = mean.map(|m| m / n_pts);
-        let centred: Vec<[f64; 3]> = pts
-            .iter()
-            .map(|p| [p[0] - mean[0], p[1] - mean[1], p[2] - mean[2]])
-            .collect();
-        let vh = svd.right_singular(&centred, true);
+        loops.push(
+            pts.iter()
+                .map(|p| [p[0] - mean[0], p[1] - mean[1], p[2] - mean[2]])
+                .collect(),
+        );
+    }
+    loops
+}
+
+/// `skeliner.pre._rim_enclosed_area`: the planar area enclosed by the
+/// [`rim_loops`], each projected onto the plane of the first two of its
+/// right-singular vectors `vts`.
+pub fn rim_area(loops: &[Vec<[f64; 3]>], vts: &[[[f64; 3]; 3]]) -> f64 {
+    let mut total = 0.0;
+    for (centred, vh) in loops.iter().zip(vts) {
         let dot = |a: &[f64; 3], b: &[f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
         let p2: Vec<[f64; 2]> = centred
             .iter()
@@ -579,50 +626,94 @@ pub fn pocket_mouths(
     svd: &dyn Svd,
 ) -> Vec<Vec<[u32; 2]>> {
     let neg = |f: usize| s.dots[f] < 0.0 && main_mask[f];
-    let mut mouths = Vec::new();
-    for cluster in components_where(s, neg) {
-        if cluster.len() < params.min_pocket_size {
-            continue;
-        }
-        let members: BTreeSet<u32> = cluster.iter().copied().collect();
-        let mut boundary: Vec<[u32; 2]> = Vec::new();
-        let mut seen: BTreeSet<[u32; 2]> = BTreeSet::new();
-        for &f in &cluster {
-            for e in face_edge_keys(&s.faces[f as usize]) {
-                if !seen.insert(e) {
-                    continue;
-                }
-                let on = faces_on(s, e);
-                if on.len() == 2 {
-                    let other = if members.contains(&on[0]) {
-                        on[1]
-                    } else {
-                        on[0]
-                    };
-                    if !members.contains(&other) {
-                        boundary.push(e);
+    let (clusters, of) = components_where(s, neg);
+    // each cluster big enough: its boundary edges (each where first met in
+    // the cluster's order), its area and its rim's loops, all at once
+    struct Rim {
+        first: u32,
+        boundary: Vec<[u32; 2]>,
+        area: f64,
+        loops: Vec<Vec<[f64; 3]>>,
+    }
+    let rims: Vec<Rim> = threads::install(|| {
+        clusters
+            .par_iter()
+            .filter(|c| c.len() >= params.min_pocket_size)
+            .filter_map(|cluster| {
+                let first = cluster[0];
+                let member = |f: u32| of[f as usize] == first;
+                let mut boundary: Vec<[u32; 2]> = Vec::new();
+                for &f in cluster {
+                    let ids = s.topo.face_edges(f as usize);
+                    for (k, e) in face_edge_keys(&s.faces[f as usize]).into_iter().enumerate() {
+                        let on = match ids {
+                            // the keys' column pairs are the topology's
+                            Some(ids) => s.topo.edge_faces(ids[k] as usize),
+                            None => faces_on(s, e),
+                        };
+                        if on.len() == 2 {
+                            let other = if member(on[0]) { on[1] } else { on[0] };
+                            if !member(other) {
+                                boundary.push(e);
+                            }
+                        }
                     }
                 }
-            }
-        }
-        if boundary.is_empty() {
-            continue;
-        }
-        let pocket_area = area_of(s, &members);
-        let mut opening = rim_enclosed_area(&boundary, s.verts, svd);
-        if opening <= 0.0 && !non_main.is_some_and(|m| m[cluster[0] as usize]) {
-            let bverts: BTreeSet<u32> = boundary.iter().flatten().copied().collect();
-            if bverts.len() >= 3 {
+                // an edge met twice is a face's repeated vertex pair
+                let mut met = HashSet::with_capacity(boundary.len());
+                boundary.retain(|e| met.insert(*e));
+                if boundary.is_empty() {
+                    return None;
+                }
+                let mut members = cluster.clone();
+                members.sort_unstable();
+                let areas: Vec<f64> = members.iter().map(|&f| s.areas[f as usize]).collect();
+                Some(Rim {
+                    first,
+                    area: numpy_sum(&areas),
+                    loops: rim_loops(&boundary, s.verts),
+                    boundary,
+                })
+            })
+            .collect()
+    });
+
+    // the rims' planes, every loop's at once
+    let loops: Vec<&[[f64; 3]]> = rims
+        .iter()
+        .flat_map(|r| r.loops.iter().map(Vec::as_slice))
+        .collect();
+    let vts = svd.right_singular_each(&loops, true);
+    let mut at = 0;
+    let mut openings: Vec<f64> = rims
+        .iter()
+        .map(|r| {
+            at += r.loops.len();
+            rim_area(&r.loops, &vts[at - r.loops.len()..at])
+        })
+        .collect();
+    // no rim encloses anything: the boundary's hull instead
+    let hulls: Vec<(usize, Vec<[f64; 3]>)> = rims
+        .iter()
+        .enumerate()
+        .filter(|&(i, r)| openings[i] <= 0.0 && !non_main.is_some_and(|m| m[r.first as usize]))
+        .filter_map(|(i, r)| {
+            let bverts: BTreeSet<u32> = r.boundary.iter().flatten().copied().collect();
+            (bverts.len() >= 3).then(|| {
                 let pts: Vec<[f64; 3]> = bverts.iter().map(|&v| s.verts[v as usize]).collect();
-                opening = svd.hull_area(&pts);
-            }
-        }
-        if opening <= 0.0 || pocket_area / opening < params.min_fold_ratio {
-            continue;
-        }
-        mouths.push(boundary);
+                (i, centred(&pts))
+            })
+        })
+        .collect();
+    let pts: Vec<&[[f64; 3]]> = hulls.iter().map(|(_, c)| c.as_slice()).collect();
+    for ((i, c), vt) in hulls.iter().zip(svd.right_singular_each(&pts, true)) {
+        openings[*i] = hull_area_on(c, vt);
     }
-    mouths
+    rims.into_iter()
+        .zip(openings)
+        .filter(|(r, opening)| !(*opening <= 0.0 || r.area / opening < params.min_fold_ratio))
+        .map(|(r, _)| r.boundary)
+        .collect()
 }
 
 /// What [`pocket_organelles`] found, with the tallies the verbose report
@@ -656,107 +747,125 @@ pub fn pocket_organelles(
     if mouths.is_empty() {
         return out;
     }
-    let mouth_edges: BTreeSet<[u32; 2]> = mouths.iter().flatten().copied().collect();
-    let mut seeds: BTreeSet<u32> = BTreeSet::new();
-    for &e in &mouth_edges {
-        for &f in faces_on(s, e) {
-            if main_mask[f as usize] && s.dots[f as usize] < 0.0 {
-                seeds.insert(f);
-            }
-        }
-    }
+    // the faces on the mouths' edges: seeds where they dip inward, else
+    // walls
+    let mut mouth_edges: Vec<[u32; 2]> = mouths.concat();
+    let on_mouths: Vec<u32> = threads::install(|| {
+        mouth_edges.par_sort_unstable();
+        mouth_edges.dedup();
+        mouth_edges
+            .par_iter()
+            .flat_map_iter(|&e| faces_on(s, e).iter().copied())
+            .collect()
+    });
+    let seed = |f: u32| main_mask[f as usize] && s.dots[f as usize] < 0.0;
     let mut mouth_face = vec![false; n];
-    for &e in &mouth_edges {
-        for &f in faces_on(s, e) {
-            if !seeds.contains(&f) {
-                mouth_face[f as usize] = true;
-            }
+    for &f in &on_mouths {
+        if !seed(f) {
+            mouth_face[f as usize] = true;
         }
     }
     let pocket = &mut out.mask;
 
     // Phase 0: flood from the seeds, stopped by mouth faces and the grow
-    // threshold.
-    let mut visited = vec![false; n];
-    let mut queue: VecDeque<u32> = seeds.iter().copied().collect();
-    while let Some(f) = queue.pop_front() {
-        let fu = f as usize;
-        if visited[fu] {
-            continue;
+    // threshold — the pieces of the faces under it that hold a seed.
+    // a NaN dot is not over the threshold
+    let grows = |f: usize, threshold: f64| {
+        !mouth_face[f]
+            && main_mask[f]
+            && s.dots[f].partial_cmp(&threshold) != Some(std::cmp::Ordering::Greater)
+    };
+    threads::install(|| {
+        let ok: Vec<bool> = (0..n)
+            .into_par_iter()
+            .map(|f| grows(f, params.grow_threshold))
+            .collect();
+        let roots = lowest_faces(s, &ok);
+        let mut held = vec![false; n];
+        for &f in on_mouths.iter().filter(|&&f| seed(f) && ok[f as usize]) {
+            held[roots[f as usize] as usize] = true;
         }
-        visited[fu] = true;
-        if mouth_face[fu] || !main_mask[fu] || s.dots[fu] > params.grow_threshold {
-            continue;
-        }
-        pocket[fu] = true;
-        for g in s.topo.face_neighbors(fu) {
-            if !visited[g as usize] {
-                queue.push_back(g);
-            }
-        }
-    }
+        pocket
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(f, p)| *p = ok[f] && held[roots[f] as usize]);
+    });
     out.n_initial = pocket.iter().filter(|&&p| p).count();
 
-    // Phase 1: bridge out from the pocket under the relaxed threshold.
-    let mut queue: VecDeque<u32> = VecDeque::new();
-    for f in (0..n).filter(|&f| pocket[f]) {
-        for g in s.topo.face_neighbors(f) {
-            if !pocket[g as usize] {
-                queue.push_back(g);
-            }
+    // Phase 1: bridge out from the pocket under the relaxed threshold —
+    // the pieces of the other faces under it that touch the pocket.
+    threads::install(|| {
+        let ok: Vec<bool> = (0..n)
+            .into_par_iter()
+            .map(|f| !pocket[f] && grows(f, params.bridge_threshold))
+            .collect();
+        let roots = lowest_faces(s, &ok);
+        let touched: Vec<u32> = (0..n)
+            .into_par_iter()
+            .filter(|&f| pocket[f])
+            .flat_map_iter(|f| s.topo.face_neighbors(f))
+            .filter(|&g| ok[g as usize])
+            .map(|g| roots[g as usize])
+            .collect();
+        let mut held = vec![false; n];
+        for r in touched {
+            held[r as usize] = true;
         }
-    }
-    while let Some(f) = queue.pop_front() {
-        let fu = f as usize;
-        if pocket[fu] || mouth_face[fu] || !main_mask[fu] || s.dots[fu] > params.bridge_threshold {
-            continue;
-        }
-        pocket[fu] = true;
-        for g in s.topo.face_neighbors(fu) {
-            if !pocket[g as usize] {
-                queue.push_back(g);
-            }
-        }
-    }
+        pocket
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(f, p)| *p = *p || (ok[f] && held[roots[f] as usize]));
+    });
     out.n_bridged = pocket.iter().filter(|&&p| p).count() - out.n_initial;
 
     // Phase 2: fill holes — non-pocket clusters mostly enclosed by pocket.
+    // A hole's neighbours are pocket or off the main mask, never another
+    // hole, so filling one leaves the others as they were.
     let open: Vec<bool> = (0..n).map(|f| main_mask[f] && !pocket[f]).collect();
     let holes = components_where_unordered(s, |f| open[f]);
-    for cluster in holes {
-        // neither small nor under 5% of the mesh: never filled
-        if cluster.len() > params.max_hole_size && cluster.len() as f64 >= n as f64 * 0.05 {
-            continue;
-        }
-        let (mut total, mut walled) = (0usize, 0usize);
-        let mut walls: BTreeSet<u32> = BTreeSet::new();
-        for &f in &cluster {
-            for g in s.topo.face_neighbors(f as usize) {
-                if !open[g as usize] {
-                    total += 1;
-                    if pocket[g as usize] {
-                        walled += 1;
-                        walls.insert(g);
+    let walled_in: &[bool] = pocket;
+    let filled: Vec<bool> = threads::install(|| {
+        holes
+            .par_iter()
+            .map(|cluster| {
+                // neither small nor under 5% of the mesh: never filled
+                if cluster.len() > params.max_hole_size && cluster.len() as f64 >= n as f64 * 0.05 {
+                    return false;
+                }
+                let (mut total, mut walled) = (0usize, 0usize);
+                let mut walls: Vec<u32> = Vec::new();
+                for &f in cluster {
+                    for g in s.topo.face_neighbors(f as usize) {
+                        if !open[g as usize] {
+                            total += 1;
+                            if walled_in[g as usize] {
+                                walled += 1;
+                                walls.push(g);
+                            }
+                        }
                     }
                 }
-            }
+                walls.sort_unstable();
+                walls.dedup();
+                let enclosure = if total > 0 {
+                    walled as f64 / total as f64
+                } else {
+                    0.0
+                };
+                let small = cluster.len() <= params.max_hole_size;
+                let entrapped = enclosure >= 0.99 && (cluster.len() as f64) < n as f64 * 0.05;
+                if non_main.is_some_and(|m| m[cluster[0] as usize]) && cluster.len() > walls.len() {
+                    return false;
+                }
+                (small && enclosure >= params.hole_enclosure_ratio) || entrapped
+            })
+            .collect()
+    });
+    for (cluster, _) in holes.iter().zip(&filled).filter(|(_, f)| **f) {
+        for &f in cluster {
+            pocket[f as usize] = true;
         }
-        let enclosure = if total > 0 {
-            walled as f64 / total as f64
-        } else {
-            0.0
-        };
-        let small = cluster.len() <= params.max_hole_size;
-        let entrapped = enclosure >= 0.99 && (cluster.len() as f64) < n as f64 * 0.05;
-        if non_main.is_some_and(|m| m[cluster[0] as usize]) && cluster.len() > walls.len() {
-            continue;
-        }
-        if (small && enclosure >= params.hole_enclosure_ratio) || entrapped {
-            for &f in &cluster {
-                pocket[f as usize] = true;
-            }
-            out.n_holes += cluster.len();
-        }
+        out.n_holes += cluster.len();
     }
 
     // Drop small clusters, then reject shallow dips: a pocket must have

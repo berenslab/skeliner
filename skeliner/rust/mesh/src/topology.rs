@@ -329,38 +329,23 @@ fn edge_key(a: u32, b: u32) -> u64 {
 ///
 /// Every index in `faces` must be below `n_vertices`.
 pub fn unique_edges(faces: &[[u32; 3]], n_vertices: usize) -> Vec<[u32; 2]> {
-    // Bucket each face edge's low end by its high end, then sort and
-    // deduplicate each bucket: a few entries each, so no global sort.
-    let ends = |f: &[u32; 3]| [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])];
-    let mut start = vec![0usize; n_vertices + 1];
-    for f in faces {
-        for (a, b) in ends(f) {
-            start[a.max(b) as usize + 1] += 1;
-        }
-    }
-    for v in 0..n_vertices {
-        start[v + 1] += start[v];
-    }
-    let mut fill = start.clone();
-    let mut low = vec![0u32; start[n_vertices]];
-    for f in faces {
-        for (a, b) in ends(f) {
-            let hi = a.max(b) as usize;
-            low[fill[hi]] = a.min(b);
-            fill[hi] += 1;
-        }
-    }
-    let mut edges = Vec::with_capacity(low.len() / 2);
-    for hi in 0..n_vertices {
-        let bucket = &mut low[start[hi]..start[hi + 1]];
-        bucket.sort_unstable();
-        for (i, &lo) in bucket.iter().enumerate() {
-            if i == 0 || bucket[i - 1] != lo {
-                edges.push([lo, hi as u32]);
-            }
-        }
-    }
-    edges
+    debug_assert!(faces.iter().flatten().all(|&v| (v as usize) < n_vertices));
+    threads::install(|| {
+        // each face edge as (high, low), sorted: equal keys are equal
+        // values, so the order is the same however it is sorted
+        let mut keys: Vec<u64> = faces
+            .par_iter()
+            .flat_map_iter(|f| {
+                [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])]
+                    .map(|(a, b)| (u64::from(a.max(b)) << 32) | u64::from(a.min(b)))
+            })
+            .collect();
+        keys.par_sort_unstable();
+        keys.dedup();
+        keys.par_iter()
+            .map(|&k| [k as u32, (k >> 32) as u32])
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -399,6 +384,39 @@ mod tests {
             ]
         );
         assert!(unique_edges(&[], 3).is_empty());
+    }
+
+    #[test]
+    fn many_unique_edges_are_what_bucketing_by_high_end_gives() {
+        // random faces on 5,000 vertices, some with a repeated vertex
+        let mut state = 0xa54f_f53a_5f1d_36f1u64;
+        let mut next = |n: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) % n) as u32
+        };
+        let n = 5000;
+        let faces: Vec<[u32; 3]> = (0..80_000)
+            .map(|_| {
+                let a = next(n);
+                [a, if next(40) == 0 { a } else { next(n) }, next(n)]
+            })
+            .collect();
+        let mut buckets = vec![Vec::new(); n as usize];
+        for f in &faces {
+            for (a, b) in [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])] {
+                buckets[a.max(b) as usize].push(a.min(b));
+            }
+        }
+        let mut bucketed = Vec::new();
+        for (hi, lows) in buckets.iter_mut().enumerate() {
+            lows.sort_unstable();
+            lows.dedup();
+            bucketed.extend(lows.iter().map(|&lo| [lo, hi as u32]));
+        }
+        assert_eq!(unique_edges(&faces, n as usize), bucketed);
+        assert!(bucketed.iter().any(|e| e[0] == e[1]));
     }
 
     #[test]

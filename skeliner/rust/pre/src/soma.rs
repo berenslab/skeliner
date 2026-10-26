@@ -10,8 +10,11 @@
 //! eigen-solver), so the ellipsoids are bit-identical to the reference's.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU8, Ordering};
 
-use mesh::geometry::{numpy_order, numpy_sum, row_times_matrix};
+use mesh::components::LowestRootSets;
+use mesh::geometry::{numpy_argmin, numpy_order, numpy_sum, row_times_matrix};
+use rayon::prelude::*;
 
 /// An ellipsoid as `skeliner.dataclass.Soma` tests it: a point is inside
 /// when `|(x - center) @ w|^2 <= 1`, where `w = R / axes`.
@@ -187,6 +190,72 @@ impl Graph {
         }
         out
     }
+
+    /// The connected pieces of the vertices `inside` marks, neighbours in
+    /// one piece where `joins(v, u)`; found in parallel, the same pieces
+    /// whatever the order.
+    fn pieces_of(&self, inside: &[bool], joins: impl Fn(u32, u32) -> bool + Sync) -> Pieces {
+        let roots: Vec<u32> = threads::install(|| {
+            let sets = LowestRootSets::new(inside.len());
+            (0..inside.len() as u32).into_par_iter().for_each(|v| {
+                if inside[v as usize] {
+                    for &u in self.nbrs(v) {
+                        if u > v && inside[u as usize] && joins(v, u) {
+                            sets.join(v, u);
+                        }
+                    }
+                }
+            });
+            (0..inside.len() as u32)
+                .into_par_iter()
+                .map(|v| {
+                    if inside[v as usize] {
+                        sets.root(v)
+                    } else {
+                        NONE
+                    }
+                })
+                .collect()
+        });
+        let mut size = vec![0usize; roots.len()];
+        for &r in &roots {
+            if r != NONE {
+                size[r as usize] += 1;
+            }
+        }
+        let list = (0..roots.len() as u32)
+            .filter(|&v| roots[v as usize] == v)
+            .collect();
+        Pieces { roots, size, list }
+    }
+}
+
+/// Outside every piece.
+const NONE: u32 = u32::MAX;
+
+/// Connected pieces, each named by its lowest vertex.
+struct Pieces {
+    /// Each vertex's piece, [`NONE`] outside them.
+    roots: Vec<u32>,
+    /// Each piece's size, at its name.
+    size: Vec<usize>,
+    /// The pieces, ascending: in the order a search from the lowest
+    /// vertex up meets them.
+    list: Vec<u32>,
+}
+
+impl Pieces {
+    fn size(&self, piece: u32) -> usize {
+        self.size[piece as usize]
+    }
+
+    /// The vertices of the pieces `chosen` marks (by name), ascending.
+    fn members<'a>(&'a self, chosen: &'a [bool]) -> impl Iterator<Item = u32> + 'a {
+        (0..self.roots.len() as u32).filter(move |&v| {
+            let r = self.roots[v as usize];
+            r != NONE && chosen[r as usize]
+        })
+    }
 }
 
 /// A vertex set kept as a mask plus its size.
@@ -353,99 +422,84 @@ fn assign_soma_verts<E>(
     let nv = m.verts.len();
     let soma = cur.fit;
     let e = &soma.ellipsoid;
-    let mut main_verts = g.keys.clone();
-    main_verts.sort_unstable();
-    let mut soma_set = Set::from(
-        nv,
-        main_verts
-            .iter()
-            .copied()
-            .filter(|&v| e.contains(&m.verts[v as usize])),
-    );
+    let inside = |on_component: bool| -> Vec<u32> {
+        threads::install(|| {
+            (0..nv as u32)
+                .into_par_iter()
+                .filter(|&v| {
+                    g.is_key[v as usize] == on_component && e.contains(&m.verts[v as usize])
+                })
+                .collect()
+        })
+    };
+    let contained = inside(true);
+    let mut soma_set = Set::from(nv, contained.iter().copied());
 
+    // dilation along edges, a ring a round until a round adds nothing:
+    // everything reached from the contained vertices through vertices
+    // under the limit
     let edge_in_body = m.avg_edge / soma.axes_min;
     let dilation_limit = 1.0 + 3.0 * edge_in_body;
-    if soma_set.len > 0 {
-        let mut in_frontier = vec![false; nv];
-        loop {
-            let mut frontier = Vec::new();
-            for v in soma_set.sorted() {
-                for &nv in g.nbrs(v) {
-                    if !soma_set.has(nv) && !in_frontier[nv as usize] {
-                        in_frontier[nv as usize] = true;
-                        frontier.push(nv);
-                    }
-                }
-            }
-            for &u in &frontier {
-                in_frontier[u as usize] = false;
-            }
-            if frontier.is_empty() {
-                break;
-            }
-            let accept: Vec<u32> = frontier
-                .into_iter()
-                .filter(|&u| e.rho2(&m.verts[u as usize]).sqrt() < dilation_limit)
-                .collect();
-            if accept.is_empty() {
-                break;
-            }
-            for u in accept {
+    let mut stack = contained;
+    while let Some(v) = stack.pop() {
+        for &u in g.nbrs(v) {
+            if !soma_set.has(u) && e.rho2(&m.verts[u as usize]).sqrt() < dilation_limit {
                 soma_set.insert(u);
+                stack.push(u);
             }
         }
     }
 
     // pockets: pieces of the component outside the soma, absorbed unless
-    // Otsu on their sizes calls them neurites
-    for _ in 0..10 {
-        let outside: Vec<bool> = (0..nv as u32)
+    // Otsu on their sizes calls them neurites.  Every piece is bounded by
+    // the soma alone (a vertex's neighbours are on the component: in the
+    // soma or in its piece), and absorbing pieces leaves the others as
+    // they were, so the pieces are found once for every round.
+    let outside: Vec<bool> = threads::install(|| {
+        (0..nv as u32)
+            .into_par_iter()
             .map(|v| g.is_key[v as usize] && !soma_set.has(v))
-            .collect();
-        let starts: Vec<u32> = main_verts
+            .collect()
+    });
+    let pieces = g.pieces_of(&outside, |_, _| true);
+    let mut left = pieces.list.clone();
+    let mut absorb = vec![false; nv];
+    let mut soma_len = soma_set.len;
+    for _ in 0..10 {
+        let trapped: Vec<u32> = left
             .iter()
             .copied()
-            .filter(|&v| outside[v as usize])
+            .filter(|&p| pieces.size(p) < soma_len)
             .collect();
-        let mut seen = vec![false; nv];
-        let mut trapped: Vec<Vec<u32>> = Vec::new();
-        for comp in g.pieces(&starts, &outside, &mut seen) {
-            let in_comp = |v: u32| outside[v as usize];
-            let closed = comp
-                .iter()
-                .all(|&v| g.nbrs(v).iter().all(|&nv| soma_set.has(nv) || in_comp(nv)));
-            if closed && comp.len() < soma_set.len {
-                trapped.push(comp);
-            }
-        }
         if trapped.is_empty() {
             break;
         }
         let size_thresh = if trapped.len() >= 2 {
-            let sizes: Vec<f64> = trapped.iter().map(|c| c.len() as f64).collect();
+            let sizes: Vec<f64> = trapped.iter().map(|&p| pieces.size(p) as f64).collect();
             otsu_threshold(&sizes).0
         } else {
             0.0
         };
         let mut absorbed = 0;
-        for comp in trapped {
-            if comp.len() as f64 <= size_thresh {
-                absorbed += comp.len();
-                for v in comp {
-                    soma_set.insert(v);
-                }
+        for &p in &trapped {
+            if pieces.size(p) as f64 <= size_thresh {
+                absorbed += pieces.size(p);
+                absorb[p as usize] = true;
             }
         }
         if absorbed == 0 {
             break;
         }
+        soma_len += absorbed;
+        left.retain(|&p| !absorb[p as usize]);
+    }
+    for v in pieces.members(&absorb) {
+        soma_set.insert(v);
     }
 
     // vertices of other components inside the ellipsoid
-    for v in 0..nv as u32 {
-        if !g.is_key[v as usize] && e.contains(&m.verts[v as usize]) {
-            soma_set.insert(v);
-        }
+    for v in inside(false) {
+        soma_set.insert(v);
     }
     cur.refit(soma_set.sorted(), fit)
 }
@@ -488,9 +542,12 @@ pub fn ring_cutoff<E>(
             soma_ci = c;
         }
     }
-    let soma_fi: Vec<u32> = (0..nf as u32)
-        .filter(|&f| m.labels[f as usize] == soma_ci)
-        .collect();
+    let soma_fi: Vec<u32> = threads::install(|| {
+        (0..nf as u32)
+            .into_par_iter()
+            .filter(|&f| m.labels[f as usize] == soma_ci)
+            .collect()
+    });
     let g = Graph::new(m.faces, &soma_fi, nv);
 
     // BFS rings from the seeds on the component, or from the component's
@@ -511,60 +568,40 @@ pub fn ring_cutoff<E>(
             ];
             (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
         };
-        let mut best: Option<(u32, f64)> = None;
-        for &v in &g.keys {
-            let d = dist(v);
-            if best.is_none_or(|(_, b)| d < b) {
-                best = Some((v, d));
-            }
+        if !g.keys.is_empty() {
+            let d: Vec<f64> = g.keys.iter().map(|&v| dist(v)).collect();
+            seeds.push(g.keys[numpy_argmin(&d)]);
         }
-        seeds.extend(best.map(|(v, _)| v));
     }
-    let mut level = vec![usize::MAX; nv];
-    let mut rings: Vec<Vec<u32>> = vec![Vec::new()];
-    let mut queue = VecDeque::new();
+    // the search's order is ring after ring, ring 0 the seeds as listed
+    let mut level = vec![u32::MAX; nv];
+    let mut order: Vec<u32> = Vec::new();
     for &s in &seeds {
         level[s as usize] = 0;
-        queue.push_back(s);
-        rings[0].push(s);
+        order.push(s);
     }
-    while let Some(v) = queue.pop_front() {
+    let mut next = 0;
+    while next < order.len() {
+        let v = order[next];
+        next += 1;
         let lv = level[v as usize];
-        for &nv in g.nbrs(v) {
-            if level[nv as usize] == usize::MAX {
-                level[nv as usize] = lv + 1;
-                queue.push_back(nv);
-                if rings.len() <= lv + 1 {
-                    rings.push(Vec::new());
-                }
-                rings[lv + 1].push(nv);
+        for &u in g.nbrs(v) {
+            if level[u as usize] == u32::MAX {
+                level[u as usize] = lv + 1;
+                order.push(u);
             }
         }
     }
-    let max_ring = rings.len() - 1;
+    let max_ring = order.last().map_or(0, |&v| level[v as usize] as usize);
 
-    // largest connected piece of each ring
-    let mut in_ring = vec![false; nv];
-    let mut seen = vec![false; nv];
-    let largest: Vec<f64> = rings
-        .iter()
-        .map(|ring| {
-            for &v in ring {
-                in_ring[v as usize] = true;
-            }
-            let size = g
-                .pieces(ring, &in_ring, &mut seen)
-                .iter()
-                .map(Vec::len)
-                .max()
-                .unwrap_or(0);
-            for &v in ring {
-                in_ring[v as usize] = false;
-                seen[v as usize] = false;
-            }
-            size as f64
-        })
-        .collect();
+    // largest connected piece of each ring, all rings at once
+    let reached: Vec<bool> = level.iter().map(|&l| l != u32::MAX).collect();
+    let ring_pieces = g.pieces_of(&reached, |v, u| level[v as usize] == level[u as usize]);
+    let mut largest = vec![0.0f64; max_ring + 1];
+    for &p in &ring_pieces.list {
+        let l = &mut largest[level[p as usize] as usize];
+        *l = l.max(ring_pieces.size(p) as f64);
+    }
 
     // the cutoff: past the peak (searched within three nucleus heights),
     // the first ring whose largest piece falls under Otsu's threshold
@@ -591,7 +628,9 @@ pub fn ring_cutoff<E>(
     let min_cutoff = ((nuc.z_span / m.avg_edge) as i64).max(1) as usize;
     cutoff = cutoff.max(min_cutoff);
 
-    let mut bfs: Vec<u32> = rings[..=cutoff.min(max_ring)].concat();
+    let last = cutoff.min(max_ring);
+    let mut bfs: Vec<u32> =
+        order[..order.partition_point(|&v| level[v as usize] as usize <= last)].to_vec();
     bfs.sort_unstable();
     let initial = fit(&bfs, FitKind::Initial)
         .map_err(SomaError::Fit)?
@@ -607,23 +646,24 @@ pub fn ring_cutoff<E>(
 
     // organelle-only vertices leave the soma
     if m.organelle.iter().any(|&o| o) {
-        let mut on_org = vec![false; nv];
-        let mut on_other = vec![false; nv];
-        for (f, face) in m.faces.iter().enumerate() {
-            let side = if m.organelle[f] {
-                &mut on_org
-            } else {
-                &mut on_other
-            };
-            for &v in face {
-                side[v as usize] = true;
-            }
-        }
+        // which faces each vertex is on: bit 1 organelle, bit 2 other
+        let (org, other) = (1u8, 2u8);
+        let sides: Vec<AtomicU8> = (0..nv).map(|_| AtomicU8::new(0)).collect();
+        threads::install(|| {
+            m.faces
+                .par_iter()
+                .zip(m.organelle.par_iter())
+                .for_each(|(face, &o)| {
+                    for &v in face {
+                        sides[v as usize].fetch_or(if o { org } else { other }, Ordering::Relaxed);
+                    }
+                });
+        });
         let kept: Vec<u32> = cur
             .verts
             .iter()
             .copied()
-            .filter(|&v| !(on_org[v as usize] && !on_other[v as usize]))
+            .filter(|&v| sides[v as usize].load(Ordering::Relaxed) != org)
             .collect();
         if kept.len() < cur.verts.len() {
             cur.refit(kept, &mut fit)?;
@@ -663,47 +703,54 @@ fn prune<E>(
     // 6a: tubes reaching far past the ellipsoid, on the side of a neurite
     let mut pruned = false;
     if !outside_soma.is_empty() {
-        let non_soma: Vec<bool> = (0..nv as u32)
-            .map(|v| g.is_key[v as usize] && !soma_set.has(v))
-            .collect();
-        let starts: Vec<u32> = (0..nv as u32).filter(|&v| non_soma[v as usize]).collect();
-        let mut seen = vec![false; nv];
-        let ns = g.pieces(&starts, &non_soma, &mut seen);
-        let mut neurite_tree = Set::empty(nv);
-        if ns.len() >= 2 {
-            let sizes: Vec<f64> = ns.iter().map(|c| c.len() as f64).collect();
-            let thresh = otsu_threshold(&sizes).0;
-            for c in ns.iter().filter(|c| c.len() as f64 > thresh) {
-                for &v in c {
-                    neurite_tree.insert(v);
-                }
+        let non_soma: Vec<bool> = threads::install(|| {
+            (0..nv as u32)
+                .into_par_iter()
+                .map(|v| g.is_key[v as usize] && !soma_set.has(v))
+                .collect()
+        });
+        let ns = g.pieces_of(&non_soma, |_, _| true);
+        // a neurite tree: the pieces Otsu calls large, or the only piece
+        let neurite_tree = match ns.list.len() {
+            0 => false,
+            1 => true,
+            _ => {
+                let sizes: Vec<f64> = ns.list.iter().map(|&p| ns.size(p) as f64).collect();
+                let thresh = otsu_threshold(&sizes).0;
+                sizes.iter().any(|&s| s > thresh)
             }
-        } else if let Some(c) = ns.first() {
-            for &v in c {
-                neurite_tree.insert(v);
-            }
-        }
-        if neurite_tree.len > 0 {
+        };
+        if neurite_tree {
             let mut in_out = vec![false; nv];
             for &v in &outside_soma {
                 in_out[v as usize] = true;
             }
-            let mut seen = vec![false; nv];
-            let comps: Vec<(Vec<u32>, f64)> = g
-                .pieces(&outside_soma, &in_out, &mut seen)
-                .into_iter()
-                .filter(|c| c.len() >= 20)
-                .map(|c| {
-                    let ext = nan_max(c.iter().map(|&v| initial.rho2(&m.verts[v as usize]).sqrt()));
-                    (c, ext)
-                })
+            let out = g.pieces_of(&in_out, |_, _| true);
+            // each piece's farthest reach past the ellipsoid
+            let mut reach = vec![f64::NEG_INFINITY; nv];
+            for &v in &outside_soma {
+                let p = out.roots[v as usize] as usize;
+                let x = initial.rho2(&m.verts[v as usize]).sqrt();
+                reach[p] = nan_max([reach[p], x].into_iter());
+            }
+            let comps: Vec<u32> = out
+                .list
+                .iter()
+                .copied()
+                .filter(|&p| out.size(p) >= 20)
                 .collect();
-            let mut ext: Vec<f64> = comps.iter().map(|(_, e)| *e).collect();
+            let mut ext: Vec<f64> = comps.iter().map(|&p| reach[p as usize]).collect();
             let ext_thresh = 2.0 * percentile25(&mut ext).ok_or(SomaError::NoExtents)?;
-            for (c, e) in &comps {
-                if *e > ext_thresh {
+            let mut far = vec![false; nv];
+            for &p in &comps {
+                if reach[p as usize] > ext_thresh {
                     pruned = true;
-                    for &v in c {
+                    far[p as usize] = true;
+                }
+            }
+            if pruned {
+                for &v in &outside_soma {
+                    if far[out.roots[v as usize] as usize] {
                         soma_set.remove(v);
                     }
                 }
@@ -808,16 +855,24 @@ fn prune<E>(
     let main_final: Vec<bool> = (0..nv as u32)
         .map(|v| soma_set.has(v) && g.is_key[v as usize])
         .collect();
-    let starts: Vec<u32> = (0..nv as u32).filter(|&v| main_final[v as usize]).collect();
-    let mut seen = vec![false; nv];
-    let mut largest: Vec<u32> = Vec::new();
-    for c in g.pieces(&starts, &main_final, &mut seen) {
-        if c.len() > largest.len() {
-            largest = c;
+    let fin = g.pieces_of(&main_final, |_, _| true);
+    // the first largest, as a search from the lowest vertex meets them
+    let mut largest: Option<u32> = None;
+    for &p in &fin.list {
+        if largest.is_none_or(|b| fin.size(p) > fin.size(b)) {
+            largest = Some(p);
         }
     }
-    if starts.len() > largest.len() {
-        soma_set = Set::from(nv, largest.into_iter().chain(non_comp_soma.iter().copied()));
+    let n_main = main_final.iter().filter(|&&b| b).count();
+    if let Some(p) = largest
+        && n_main > fin.size(p)
+    {
+        let mut chosen = vec![false; nv];
+        chosen[p as usize] = true;
+        soma_set = Set::from(
+            nv,
+            fin.members(&chosen).chain(non_comp_soma.iter().copied()),
+        );
     }
 
     if soma_set.len != cur.verts.len() {
@@ -829,6 +884,52 @@ fn prune<E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pieces_found_at_once_are_the_pieces_a_search_finds() {
+        // random faces in clusters of 30 vertices, half the vertices inside
+        let mut state = 0xbb67_ae85_84ca_a73bu64;
+        let mut next = |n: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) % n) as u32
+        };
+        let nv = 30_000;
+        let faces: Vec<[u32; 3]> = (0..40_000)
+            .map(|_| {
+                let base = 30 * next(1000);
+                [base + next(30), base + next(30), base + next(30)]
+            })
+            .collect();
+        let soma_fi: Vec<u32> = (0..faces.len() as u32).filter(|_| next(4) > 0).collect();
+        let g = Graph::new(&faces, &soma_fi, nv);
+        let inside: Vec<bool> = (0..nv).map(|v| g.is_key[v] && next(2) == 0).collect();
+        let starts: Vec<u32> = (0..nv as u32).filter(|&v| inside[v as usize]).collect();
+        let searched: Vec<Vec<u32>> = g
+            .pieces(&starts, &inside, &mut vec![false; nv])
+            .into_iter()
+            .map(|mut c| {
+                c.sort_unstable();
+                c
+            })
+            .collect();
+        let found = g.pieces_of(&inside, |_, _| true);
+        let listed: Vec<Vec<u32>> = found
+            .list
+            .iter()
+            .map(|&p| {
+                (0..nv as u32)
+                    .filter(|&v| found.roots[v as usize] == p)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(listed, searched);
+        assert!(searched.len() > 1000 && searched.iter().any(|c| c.len() > 5));
+        for (&p, c) in found.list.iter().zip(&listed) {
+            assert_eq!(found.size(p), c.len());
+        }
+    }
 
     #[test]
     fn otsu_splits_two_clusters() {

@@ -4,10 +4,11 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
 
-use mesh::geometry::{numpy_order, numpy_sum, row_times_matrix};
+use mesh::geometry::{numpy_argmin, numpy_order, numpy_sum, row_times_matrix};
 use mesh::spatial::{KdTree, Sum};
+use rayon::prelude::*;
 
-use crate::skeleton::{estimate_radius, quantile_sorted};
+use crate::skeleton::{estimate_radius_sorted, quantile_sorted};
 
 /// A skeleton's node-aligned arrays, as `_state.SkeletonState` holds them.
 #[derive(Debug, Clone, PartialEq)]
@@ -46,8 +47,10 @@ impl Arrays {
     /// `d`: every radius a plain aggregate of them (`estimate_radius`)
     /// re-estimated; `centerline` and any other left as they are.
     fn reestimate(&mut self, keys: &[String], nid: usize, d: &[f64]) {
+        let mut sorted = d.to_vec();
+        sorted.sort_by(numpy_order);
         for (key, r) in keys.iter().zip(&mut self.radii) {
-            if let Some(v) = estimate_radius(d, key) {
+            if let Some(v) = estimate_radius_sorted(d, &sorted, key) {
                 r[nid] = v;
             }
         }
@@ -129,18 +132,20 @@ impl Ellipsoid {
             .collect();
         let out: Vec<usize> = (0..p.len()).filter(|&i| r2[i] > 1.0 + 1e-12).collect();
         let mut t = vec![0.0f64; out.len()];
+        let step = |(&i, &ti): (&usize, &f64)| {
+            let q = p[i];
+            let den = [ti + a2[0], ti + a2[1], ti + a2[2]];
+            let f = [0, 1, 2].map(|k| a2[k] * (q[k] * q[k]) / (den[k] * den[k]));
+            let fp = [0, 1, 2].map(|k| (-2.0 * a2[k]) * (q[k] * q[k]) / den[k].powf(3.0));
+            -((f[0] + f[1]) + f[2] - 1.0) / ((fp[0] + fp[1]) + fp[2])
+        };
         for _ in 0..64 {
-            let dts: Vec<f64> = out
-                .iter()
-                .zip(&t)
-                .map(|(&i, &ti)| {
-                    let q = p[i];
-                    let den = [ti + a2[0], ti + a2[1], ti + a2[2]];
-                    let f = [0, 1, 2].map(|k| a2[k] * (q[k] * q[k]) / (den[k] * den[k]));
-                    let fp = [0, 1, 2].map(|k| (-2.0 * a2[k]) * (q[k] * q[k]) / den[k].powf(3.0));
-                    -((f[0] + f[1]) + f[2] - 1.0) / ((fp[0] + fp[1]) + fp[2])
-                })
-                .collect();
+            // every point's step at once when there are enough of them
+            let dts: Vec<f64> = if out.len() >= 1024 {
+                threads::install(|| out.par_iter().zip(&t).map(step).collect())
+            } else {
+                out.iter().zip(&t).map(step).collect()
+            };
             let mut converged = true;
             for (ti, dt) in t.iter_mut().zip(&dts) {
                 *ti += dt;
@@ -660,19 +665,25 @@ pub fn merge_near_soma_nodes(
 
     let mut verts: Option<Vec<i64>> = soma_verts.map(<[i64]>::to_vec);
     let limit = near_factor * r_soma;
-    for vidx in &merged_verts {
-        let contrib: Vec<usize> = match mesh_vertices {
-            Some(mv) => {
-                let pts: Vec<[f64; 3]> = vidx.iter().map(|&v| mv[v]).collect();
-                let d = soma.distance_to_surface(&pts);
-                vidx.iter()
-                    .zip(&d)
-                    .filter(|&(_, &d)| d < limit)
-                    .map(|(&v, _)| v)
-                    .collect()
-            }
-            None => vidx.clone(),
-        };
+    // each merged node's vertices near the soma, the nodes at once
+    let contribs: Vec<Vec<usize>> = threads::install(|| {
+        merged_verts
+            .par_iter()
+            .map(|vidx| match mesh_vertices {
+                Some(mv) => {
+                    let pts: Vec<[f64; 3]> = vidx.iter().map(|&v| mv[v]).collect();
+                    let d = soma.distance_to_surface(&pts);
+                    vidx.iter()
+                        .zip(&d)
+                        .filter(|&(_, &d)| d < limit)
+                        .map(|(&v, _)| v)
+                        .collect()
+                }
+                None => vidx.clone(),
+            })
+            .collect()
+    });
+    for contrib in contribs {
         if !contrib.is_empty() {
             verts
                 .get_or_insert_with(Vec::new)
@@ -828,18 +839,63 @@ impl PartialOrd for Gap {
     }
 }
 
-/// numpy's `argmin`: the first smallest value, or the first NaN.
-fn numpy_argmin(v: &[f64]) -> usize {
-    let mut best = 0;
-    for (i, &x) in v.iter().enumerate() {
-        if x.is_nan() {
-            return i;
-        }
-        if x < v[best] {
-            best = i;
+/// The nodes tied so far, for [`bridge_gaps`]' nearest searches: a tree
+/// over those tied at the last rebuild and one over each component tied
+/// since, rebuilt as one past eight.  Each tree's nearest is its least by
+/// squared distance, then index, whatever its shape, so the least of theirs
+/// is what one tree over every tied node finds.
+struct Tied<'a> {
+    nodes: &'a [[f64; 3]],
+    /// The tied nodes, in the order they were tied.
+    island: Vec<usize>,
+    /// Each tree, and the island index of its first node.
+    trees: Vec<(KdTree, u32)>,
+}
+
+impl<'a> Tied<'a> {
+    fn new(nodes: &'a [[f64; 3]], island: Vec<usize>) -> Self {
+        let mut tied = Tied {
+            nodes,
+            island,
+            trees: Vec::new(),
+        };
+        tied.rebuild();
+        tied
+    }
+
+    fn rebuild(&mut self) {
+        let points = self.island.iter().map(|&v| self.nodes[v]).collect();
+        self.trees = vec![(KdTree::new(points, Sum::Plain), 0)];
+    }
+
+    fn tie(&mut self, comp: &[usize]) {
+        let at = self.island.len() as u32;
+        self.island.extend_from_slice(comp);
+        if self.trees.len() > 8 {
+            self.rebuild();
+        } else {
+            let points = comp.iter().map(|&v| self.nodes[v]).collect();
+            self.trees.push((KdTree::new(points, Sum::Plain), at));
         }
     }
-    best
+
+    /// `KdTree::nearest` over the tied nodes: an island index and distance.
+    fn nearest(&self, q: &[f64; 3]) -> (u32, f64) {
+        let mut best = (u32::MAX, f64::INFINITY);
+        for (tree, at) in &self.trees {
+            match tree.nearest_sq(q) {
+                // no point nearer than infinity, as with NaN distances
+                Some((u32::MAX, _)) | None => {}
+                Some((i, d)) => {
+                    let i = i + at;
+                    if d < best.1 || (d == best.1 && i < best.0) {
+                        best = (i, d);
+                    }
+                }
+            }
+        }
+        (best.0, best.1.sqrt())
+    }
 }
 
 /// `_bridge_gaps`: every connected component of `edges` tied to the
@@ -902,27 +958,32 @@ pub fn bridge_gaps(
         .collect();
     let edge_len_mean = numpy_sum(&lengths) / lengths.len() as f64;
 
-    let mut island: Vec<usize> = comps[soma_cid].clone();
-    let points = |island: &[usize]| island.iter().map(|&v| nodes[v]).collect::<Vec<_>>();
-    let mut tree = KdTree::new(points(&island), Sum::Plain);
-    let closest = |tree: &KdTree, cid: usize| -> (f64, usize, usize) {
-        let found: Vec<(u32, f64)> = comps[cid]
-            .iter()
-            .map(|&v| tree.nearest(&nodes[v]).expect("the tied part has nodes"))
-            .collect();
+    let mut tree = Tied::new(nodes, comps[soma_cid].clone());
+    let closest = |tree: &Tied, cid: usize| -> (f64, usize, usize) {
+        let near = |&v: &usize| tree.nearest(&nodes[v]);
+        let found: Vec<(u32, f64)> = if comps[cid].len() >= 1024 {
+            threads::install(|| comps[cid].par_iter().map(near).collect())
+        } else {
+            comps[cid].iter().map(near).collect()
+        };
         let dists: Vec<f64> = found.iter().map(|f| f.1).collect();
         let best = numpy_argmin(&dists);
         (dists[best], best, found[best].0 as usize)
     };
-    let measured = |tree: &KdTree, cids: &mut dyn Iterator<Item = usize>| {
-        cids.map(|c| {
-            let (g, bc, bi) = closest(tree, c);
-            Gap(g, c, bc, bi)
-        })
-        .collect::<BinaryHeap<Gap>>()
+    let measured = |tree: &Tied, cids: Vec<usize>| {
+        let gaps: Vec<Gap> = threads::install(|| {
+            cids.into_par_iter()
+                .map(|c| {
+                    let (g, bc, bi) = closest(tree, c);
+                    Gap(g, c, bc, bi)
+                })
+                .collect()
+        });
+        // the gaps are all different, so the heap pops them in one order
+        BinaryHeap::from(gaps)
     };
 
-    let mut pq = measured(&tree, &mut (0..n_comp).filter(|&c| c != soma_cid));
+    let mut pq = measured(&tree, (0..n_comp).filter(|&c| c != soma_cid).collect());
     let factor = bridge_max_factor.unwrap_or_else(|| {
         let mut gaps: Vec<f64> = pq.iter().map(|g| g.0).collect();
         let raw = if gaps.iter().any(|g| g.is_nan()) {
@@ -952,20 +1013,19 @@ pub fn bridge_gaps(
             stall += 1;
             if stall >= 2 * max_stall {
                 let cids: Vec<usize> = pq.iter().map(|g| g.1).collect();
-                pq = measured(&tree, &mut cids.into_iter());
+                pq = measured(&tree, cids);
                 current_max *= 1.5;
                 stall = 0;
             }
             continue;
         }
         stall = 0;
-        bridges.push([comps[cid][best_c], island[best_i]]);
-        island.extend_from_slice(&comps[cid]);
-        tree = KdTree::new(points(&island), Sum::Plain);
+        bridges.push([comps[cid][best_c], tree.island[best_i]]);
+        tree.tie(&comps[cid]);
         since_recalc += 1;
         if since_recalc >= recalc_after {
             let cids: Vec<usize> = pq.iter().map(|g| g.1).collect();
-            pq = measured(&tree, &mut cids.into_iter());
+            pq = measured(&tree, cids);
             since_recalc = 0;
         }
     }

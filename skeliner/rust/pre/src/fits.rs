@@ -8,26 +8,43 @@ pub trait Svd {
     /// or more rows: right-singular vectors as rows, largest first.
     fn right_singular(&self, x: &[[f64; 3]], full_matrices: bool) -> [[f64; 3]; 3];
 
+    /// [`Svd::right_singular`] of each of `xs`, in order: one call each,
+    /// unless the caller makes them at once.
+    fn right_singular_each(&self, xs: &[&[[f64; 3]]], full_matrices: bool) -> Vec<[[f64; 3]; 3]> {
+        xs.iter()
+            .map(|x| self.right_singular(x, full_matrices))
+            .collect()
+    }
+
     /// `find_pocket_mouths`' opening when no rim loop closes: the convex-hull
     /// area of `pts` centred on their mean, on the plane of their first two
     /// right-singular vectors — 0 where qhull, which scipy's `ConvexHull`
     /// ran, refuses them as flat ([`mesh::geometry::hull_measures`]).
     fn hull_area(&self, pts: &[[f64; 3]]) -> f64 {
-        let n = pts.len() as f64;
-        let mut sum = [0.0f64; 3];
-        for p in pts {
-            for k in 0..3 {
-                sum[k] += p[k];
-            }
-        }
-        let centred: Vec<[f64; 3]> = pts
-            .iter()
-            .map(|p| [0, 1, 2].map(|k| p[k] - sum[k] / n))
-            .collect();
-        let vt = self.right_singular(&centred, true);
-        let plane = mesh::geometry::project(&centred, [0.0; 3], vt[0], vt[1]);
-        mesh::geometry::hull_measures(&plane).0
+        let centred = centred(pts);
+        hull_area_on(&centred, self.right_singular(&centred, true))
     }
+}
+
+/// `pts` less their mean, as [`Svd::hull_area`] takes them.
+pub fn centred(pts: &[[f64; 3]]) -> Vec<[f64; 3]> {
+    let n = pts.len() as f64;
+    let mut sum = [0.0f64; 3];
+    for p in pts {
+        for k in 0..3 {
+            sum[k] += p[k];
+        }
+    }
+    pts.iter()
+        .map(|p| [0, 1, 2].map(|k| p[k] - sum[k] / n))
+        .collect()
+}
+
+/// [`Svd::hull_area`] of [`centred`] points whose right-singular vectors
+/// are `vt`.
+pub fn hull_area_on(centred: &[[f64; 3]], vt: [[f64; 3]; 3]) -> f64 {
+    let plane = mesh::geometry::project(centred, [0.0; 3], vt[0], vt[1]);
+    mesh::geometry::hull_measures(&plane).0
 }
 
 /// A pure-Rust stand-in: Jacobi eigenvectors of the scatter matrix for the

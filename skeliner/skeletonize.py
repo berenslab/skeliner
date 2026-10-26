@@ -473,17 +473,14 @@ def _skeletonize_component(
                 radii_dict,
             )
 
-        def _lists(shells):
-            return [[b.tolist() for b in band] for band in shells]
-
         with stage("re-check rings, merge non-rings"):
-            final_shells = sgraph.recheck_rings(_lists(rebin_shells), verts)
+            final_shells = sgraph.recheck_rings(rebin_shells, verts)
 
         with stage("reunite bins split across the surface"):
-            final_shells = sgraph.reunite_bins(_lists(final_shells))
+            final_shells = sgraph.reunite_bins(final_shells)
 
         with stage("split bins that wrap a branch point"):
-            final_shells = sgraph.split_branch_bins(_lists(final_shells))
+            final_shells = sgraph.split_branch_bins(final_shells)
 
         with stage("recompute centroids and centerline radii"):
             nodes_arr, radii_dict, node2verts, _ = _make_nodes(

@@ -58,22 +58,26 @@ pub struct Mesh {
 
 /// Narrow face indices to `u32`, checking each names one of `n_vertices`.
 pub fn checked_faces(faces: &[[i64; 3]], n_vertices: usize) -> Result<Vec<[u32; 3]>, MeshError> {
-    let mut checked = Vec::with_capacity(faces.len());
-    for (face, f) in faces.iter().enumerate() {
-        let mut g = [0u32; 3];
-        for (slot, &vertex) in g.iter_mut().zip(f) {
-            *slot = u32::try_from(vertex)
-                .ok()
-                .filter(|&v| (v as usize) < n_vertices)
-                .ok_or(MeshError::VertexOutOfRange {
-                    face,
-                    vertex,
-                    n_vertices,
-                })?;
-        }
-        checked.push(g);
+    let out_of_range = |v: i64| {
+        u32::try_from(v)
+            .ok()
+            .filter(|&v| (v as usize) < n_vertices)
+            .is_none()
+    };
+    let bad = threads::map(faces, |f| f.iter().any(|&v| out_of_range(v)));
+    if let Some(face) = bad.iter().position(|&b| b) {
+        let vertex = faces[face]
+            .into_iter()
+            .find(|&v| out_of_range(v))
+            .expect("the face has one");
+        return Err(MeshError::VertexOutOfRange {
+            face,
+            vertex,
+            n_vertices,
+        });
     }
-    Ok(checked)
+    // every index fits a u32
+    Ok(threads::map(faces, |f| f.map(|v| v as u32)))
 }
 
 impl Mesh {

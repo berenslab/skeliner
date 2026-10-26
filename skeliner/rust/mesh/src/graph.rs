@@ -1,8 +1,5 @@
 //! An undirected, edge-weighted vertex graph and shortest paths over it.
 
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
-
 use rayon::prelude::*;
 
 use crate::components::LowestRootSets;
@@ -102,15 +99,20 @@ impl WeightedGraph {
 
     /// [`Self::distances_within`] into `dist`, which must hold infinity at
     /// every `inside` vertex; only those entries are written.
+    ///
+    /// The weights must not be negative.  Which of equally near vertices is
+    /// settled first changes no distance: each is the least, over the paths
+    /// to its vertex, of the sum along it (adding a weight never lowers a
+    /// sum), so any order of ties ends the same.
     pub fn distances_within_into(&self, inside: &[bool], seeds: &[u32], dist: &mut [f64]) {
-        let mut heap = BinaryHeap::new();
+        let mut heap = RadixHeap::new();
         for &s in seeds {
             if inside[s as usize] && dist[s as usize] > 0.0 {
                 dist[s as usize] = 0.0;
-                heap.push(Entry(0.0, s));
+                heap.push(0.0, s);
             }
         }
-        while let Some(Entry(d, v)) = heap.pop() {
+        while let Some((d, v)) = heap.pop() {
             if d > dist[v as usize] {
                 continue;
             }
@@ -121,36 +123,76 @@ impl WeightedGraph {
                 let nd = d + w;
                 if nd < dist[u as usize] {
                     dist[u as usize] = nd;
-                    heap.push(Entry(nd, u));
+                    heap.push(nd, u);
                 }
             }
         }
     }
 }
 
-/// A heap entry ordered so the smallest distance pops first.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Entry(f64, u32);
-
-impl Eq for Entry {}
-
-impl PartialOrd for Entry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
+/// A queue of distances that never fall below the last one taken, as
+/// Dijkstra's do, nearest first: each non-negative distance kept by its
+/// bits (which order as the distances do), in the bucket of the highest
+/// bit where it differs from the last taken.
+struct RadixHeap {
+    last: u64,
+    len: usize,
+    buckets: [Vec<(u64, u32)>; 65],
+    spare: Vec<(u64, u32)>,
 }
 
-impl Ord for Entry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .0
-            .total_cmp(&self.0)
-            .then_with(|| other.1.cmp(&self.1))
+impl RadixHeap {
+    fn new() -> Self {
+        RadixHeap {
+            last: 0,
+            len: 0,
+            buckets: std::array::from_fn(|_| Vec::new()),
+            spare: Vec::new(),
+        }
+    }
+
+    fn bucket(&self, key: u64) -> usize {
+        (64 - (key ^ self.last).leading_zeros()) as usize
+    }
+
+    fn push(&mut self, d: f64, v: u32) {
+        let key = d.to_bits();
+        debug_assert!(d >= 0.0 && key >= self.last, "a distance below the last");
+        let b = self.bucket(key);
+        self.buckets[b].push((key, v));
+        self.len += 1;
+    }
+
+    fn pop(&mut self) -> Option<(f64, u32)> {
+        if self.len == 0 {
+            return None;
+        }
+        if self.buckets[0].is_empty() {
+            // the lowest filled bucket's least key is the next to go; the
+            // rest of that bucket all move to lower ones
+            let i = (1..65)
+                .find(|&i| !self.buckets[i].is_empty())
+                .expect("a filled bucket");
+            std::mem::swap(&mut self.spare, &mut self.buckets[i]);
+            self.last = self.spare.iter().map(|e| e.0).min().expect("filled");
+            for k in 0..self.spare.len() {
+                let e = self.spare[k];
+                let b = self.bucket(e.0);
+                self.buckets[b].push(e);
+            }
+            self.spare.clear();
+        }
+        self.len -= 1;
+        let (key, v) = self.buckets[0].pop().expect("bucket 0 filled");
+        Some((f64::from_bits(key), v))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
+
     use super::*;
 
     #[test]
@@ -194,5 +236,81 @@ mod tests {
         g.distances_within_into(&some, &[0], &mut dist);
         assert_eq!((dist[0], dist[1], dist[2]), (0.0, -7.0, 5.0));
         assert!(dist[3].is_infinite());
+    }
+
+    /// Dijkstra on a binary heap ordered by (distance, vertex).
+    fn by_binary_heap(g: &WeightedGraph, inside: &[bool], seeds: &[u32]) -> Vec<f64> {
+        #[derive(PartialEq)]
+        struct Entry(f64, u32);
+        impl Eq for Entry {}
+        impl PartialOrd for Entry {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Entry {
+            fn cmp(&self, other: &Self) -> Ordering {
+                other
+                    .0
+                    .total_cmp(&self.0)
+                    .then_with(|| other.1.cmp(&self.1))
+            }
+        }
+        let mut dist = vec![f64::INFINITY; g.n_vertices()];
+        let mut heap = BinaryHeap::new();
+        for &s in seeds {
+            if inside[s as usize] && dist[s as usize] > 0.0 {
+                dist[s as usize] = 0.0;
+                heap.push(Entry(0.0, s));
+            }
+        }
+        while let Some(Entry(d, v)) = heap.pop() {
+            if d > dist[v as usize] {
+                continue;
+            }
+            for (u, w) in g.weighted(v) {
+                let nd = d + w;
+                if inside[u as usize] && nd < dist[u as usize] {
+                    dist[u as usize] = nd;
+                    heap.push(Entry(nd, u));
+                }
+            }
+        }
+        dist
+    }
+
+    #[test]
+    fn distances_are_what_a_binary_heap_finds() {
+        // random edges, some of zero length, some of equal ones, over 20,000
+        // vertices; a few seeds; a tenth of the vertices left out
+        let mut state = 0x9b05_688c_2b3e_6c1fu64;
+        let mut next = |n: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % n
+        };
+        let n = 20_000u32;
+        let mut edges = Vec::new();
+        let mut weights = Vec::new();
+        for v in 1..n {
+            for _ in 0..3 {
+                let u = (v + n - 1 - next(40) as u32) % n;
+                if u != v {
+                    edges.push([u.min(v), u.max(v)]);
+                    weights.push(match next(10) {
+                        0 => 0.0,
+                        1 => 1.0,
+                        _ => next(1000) as f64 * 0.37 + 0.01,
+                    });
+                }
+            }
+        }
+        let g = WeightedGraph::new(n as usize, &edges, &weights);
+        let inside: Vec<bool> = (0..n).map(|_| next(10) > 0).collect();
+        let seeds = [0, 7, 9_999, 19_000];
+        let got = g.distances_within(&inside, &seeds);
+        assert_eq!(got, by_binary_heap(&g, &inside, &seeds));
+        assert!(got.iter().filter(|d| d.is_finite()).count() > 15_000);
     }
 }

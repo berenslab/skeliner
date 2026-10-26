@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod breakup;
+pub mod compact;
 pub mod components;
 pub mod disconnected;
 pub mod find_gaps;

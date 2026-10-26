@@ -128,56 +128,68 @@ fn induced_components(
 
 /// `_is_ring`: do the outside neighbours of `comp` (vertices marked in
 /// `neurite` but not in it) fall into two or more connected groups?
-fn is_ring(g: &WeightedGraph, comp: &[u32], neurite: &[bool]) -> bool {
-    let inside: HashSet<u32> = comp.iter().copied().collect();
-    let mut ext: HashSet<u32> = HashSet::new();
+/// `state`, zero everywhere, is left so.
+fn is_ring(g: &WeightedGraph, comp: &[u32], neurite: &[bool], state: &mut [u8]) -> bool {
+    const IN: u8 = 1;
+    const OUTSIDE: u8 = 2;
+    const REACHED: u8 = 3;
+    for &v in comp {
+        state[v as usize] = IN;
+    }
+    let mut ext = Vec::new();
     for &v in comp {
         for &u in g.neighbors(v) {
-            if !inside.contains(&u) && neurite[u as usize] {
-                ext.insert(u);
+            if state[u as usize] == 0 && neurite[u as usize] {
+                state[u as usize] = OUTSIDE;
+                ext.push(u);
             }
         }
     }
-    if ext.len() < 2 {
-        return false;
-    }
-    let mut visited: HashSet<u32> = HashSet::new();
     let mut groups = 0;
-    let mut queue = VecDeque::new();
-    for &start in &ext {
-        if visited.contains(&start) {
-            continue;
-        }
-        groups += 1;
-        if groups >= 2 {
-            return true;
-        }
-        queue.push_back(start);
-        while let Some(u) = queue.pop_front() {
-            if !visited.insert(u) {
+    if ext.len() >= 2 {
+        let mut stack = Vec::new();
+        for &start in &ext {
+            if state[start as usize] == REACHED {
                 continue;
             }
-            for &w in g.neighbors(u) {
-                if ext.contains(&w) && !visited.contains(&w) {
-                    queue.push_back(w);
+            groups += 1;
+            if groups >= 2 {
+                break;
+            }
+            state[start as usize] = REACHED;
+            stack.push(start);
+            while let Some(u) = stack.pop() {
+                for &w in g.neighbors(u) {
+                    if state[w as usize] == OUTSIDE {
+                        state[w as usize] = REACHED;
+                        stack.push(w);
+                    }
                 }
             }
         }
+    }
+    for &v in comp.iter().chain(&ext) {
+        state[v as usize] = 0;
     }
     groups >= 2
 }
 
 /// Merge each fragment into the ring its vertices touch most (first among
-/// equals), in order; fragments touching no ring are dropped.
-fn merge_fragments(g: &WeightedGraph, shells: &mut [Vec<Bin>], pending: Vec<Bin>) {
+/// equals), in order; fragments touching no ring are dropped.  `owner`
+/// (no owner anywhere) is left as it was.
+fn merge_fragments(
+    g: &WeightedGraph,
+    shells: &mut [Vec<Bin>],
+    pending: Vec<Bin>,
+    owner: &mut [Option<Key>],
+) {
     if pending.is_empty() {
         return;
     }
-    let mut owner: HashMap<u32, Key> = HashMap::new();
     for (bi, band) in shells.iter().enumerate() {
         for (ci, ring) in band.iter().enumerate() {
             for &v in ring {
-                owner.insert(v, (bi, ci));
+                owner[v as usize] = Some((bi, ci));
             }
         }
     }
@@ -185,7 +197,7 @@ fn merge_fragments(g: &WeightedGraph, shells: &mut [Vec<Bin>], pending: Vec<Bin>
         let mut votes = Votes::default();
         for &v in &frag {
             for &u in g.neighbors(v) {
-                if let Some(&k) = owner.get(&u) {
+                if let Some(k) = owner[u as usize] {
                     votes.add(k);
                 }
             }
@@ -193,9 +205,12 @@ fn merge_fragments(g: &WeightedGraph, shells: &mut [Vec<Bin>], pending: Vec<Bin>
         if let Some((bi, ci)) = votes.winner() {
             shells[bi][ci].extend_from_slice(&frag);
             for &v in &frag {
-                owner.insert(v, (bi, ci));
+                owner[v as usize] = Some((bi, ci));
             }
         }
+    }
+    for &v in shells.iter().flatten().flatten() {
+        owner[v as usize] = None;
     }
 }
 
@@ -219,10 +234,14 @@ pub enum BinError {
 
 /// Per-vertex work arrays over the whole graph, reused from one component to
 /// the next; each use leaves them as it found them (all `false`, all
-/// infinite).
+/// infinite, no owner).
 pub struct Scratch {
     inside: Vec<bool>,
     dist: Vec<f64>,
+    mark: Vec<bool>,
+    seen: Vec<bool>,
+    state: Vec<u8>,
+    owner: Vec<Option<Key>>,
 }
 
 impl Scratch {
@@ -230,9 +249,18 @@ impl Scratch {
         Scratch {
             inside: vec![false; n],
             dist: vec![f64::INFINITY; n],
+            mark: vec![false; n],
+            seen: vec![false; n],
+            state: vec![0; n],
+            owner: vec![None; n],
         }
     }
 }
+
+/// Components with fewer vertices have their shells' pieces found one shell
+/// after another, in the scratch's arrays: for them a parallel pass costs
+/// more in work arrays than it saves.
+const PARALLEL_SHELLS: usize = 1 << 14;
 
 /// `_bin_one_component` without soma exclusion or elongated-shell
 /// splitting: geodesic shells from the nearest of `seeds` over `verts`
@@ -317,30 +345,41 @@ fn bin_marked(
     // each shell's rings, and its pieces left to merge (too small, then not
     // rings), the shells at once; gathered in shell order
     let n = g.n_vertices();
-    let per_shell: Vec<(Vec<Bin>, Vec<Bin>)> = threads::install(|| {
+    let pieces = |mark: &mut [bool], seen: &mut [bool], state: &mut [u8], shell: &[u32]| {
+        let mut left = Vec::new();
+        let mut comps = Vec::new();
+        for comp in induced_components(g, shell, mark, seen) {
+            if comp.len() < p.min_shell_vertices {
+                left.push(comp);
+            } else {
+                comps.push(comp);
+            }
+        }
+        let (rings, frags): (Vec<Bin>, Vec<Bin>) = comps
+            .into_iter()
+            .partition(|c| is_ring(g, c, inside, state));
+        left.extend(frags);
+        (rings, left)
+    };
+    let per_shell: Vec<(Vec<Bin>, Vec<Bin>)> = if verts.len() < PARALLEL_SHELLS {
+        let (mark, seen, state) = (&mut scratch.mark, &mut scratch.seen, &mut scratch.state);
         shells
-            .par_iter()
+            .iter()
             .filter(|shell| !shell.is_empty())
-            .map_init(
-                || (vec![false; n], vec![false; n]),
-                |(mark, seen), shell| {
-                    let mut left = Vec::new();
-                    let mut comps = Vec::new();
-                    for comp in induced_components(g, shell, mark, seen) {
-                        if comp.len() < p.min_shell_vertices {
-                            left.push(comp);
-                        } else {
-                            comps.push(comp);
-                        }
-                    }
-                    let (rings, frags): (Vec<Bin>, Vec<Bin>) =
-                        comps.into_iter().partition(|c| is_ring(g, c, inside));
-                    left.extend(frags);
-                    (rings, left)
-                },
-            )
+            .map(|shell| pieces(mark, seen, state, shell))
             .collect()
-    });
+    } else {
+        threads::install(|| {
+            shells
+                .par_iter()
+                .filter(|shell| !shell.is_empty())
+                .map_init(
+                    || (vec![false; n], vec![false; n], vec![0; n]),
+                    |(mark, seen, state), shell| pieces(mark, seen, state, shell),
+                )
+                .collect()
+        })
+    };
     let mut out: Vec<Vec<Bin>> = Vec::new();
     let mut pending: Vec<Bin> = Vec::new();
     for (rings, left) in per_shell {
@@ -349,7 +388,7 @@ fn bin_marked(
             out.push(rings);
         }
     }
-    merge_fragments(g, &mut out, pending);
+    merge_fragments(g, &mut out, pending, &mut scratch.owner);
     Ok(out)
 }
 
@@ -365,22 +404,37 @@ pub fn bin_mesh(
     mean_edge: f64,
     p: &BinParams,
 ) -> Result<Vec<Vec<Bin>>, BinError> {
-    let mut scratch = Scratch::new(g.n_vertices());
+    let comps = g.components();
+    let bin = |cids: Vec<usize>| {
+        let mut scratch = Scratch::new(g.n_vertices());
+        cids.into_iter()
+            .map(|cid| {
+                let verts = &comps[cid];
+                let start = if verts.binary_search(&seed).is_ok() {
+                    seed
+                } else {
+                    verts[cid % verts.len()]
+                };
+                (
+                    cid,
+                    bin_one_component_in(g, verts, &[start], mean_edge, p, &mut scratch),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    // the big components, their shells in parallel, beside the small ones
+    // one after another (which never wait on the pool)
+    let (big, small): (Vec<usize>, Vec<usize>) =
+        (0..comps.len()).partition(|&cid| comps[cid].len() >= PARALLEL_SHELLS);
+    let (big, small) = threads::install(|| rayon::join(|| bin(big), || bin(small)));
+    let mut binned: Vec<Option<Result<Vec<Vec<Bin>>, BinError>>> = Vec::new();
+    binned.resize_with(comps.len(), || None);
+    for (cid, shells) in big.into_iter().chain(small) {
+        binned[cid] = Some(shells);
+    }
     let mut out = Vec::new();
-    for (cid, verts) in g.components().into_iter().enumerate() {
-        let start = if verts.binary_search(&seed).is_ok() {
-            seed
-        } else {
-            verts[cid % verts.len()]
-        };
-        out.extend(bin_one_component_in(
-            g,
-            &verts,
-            &[start],
-            mean_edge,
-            p,
-            &mut scratch,
-        )?);
+    for shells in binned.into_iter().flatten() {
+        out.extend(shells?);
     }
     Ok(out)
 }
@@ -412,13 +466,20 @@ pub fn merge_nested_nodes(
         }
     });
     let tree = KdTree::new(nodes.to_vec(), Sum::Plain);
+    // every node's candidates at once: they depend on nothing the merge moves
+    let near: Vec<Vec<u32>> = threads::install(|| {
+        (0..n)
+            .into_par_iter()
+            .map(|i| tree.within(&nodes[i], radii[i] + biggest))
+            .collect()
+    });
     let mut keep = vec![true; n];
     let mut old2new: Vec<i64> = (0..n as i64).collect();
     for i in order {
         if (keep_root && i == 0) || !keep[i] {
             continue;
         }
-        for j in tree.within(&nodes[i], radii[i] + biggest) {
+        for &j in &near[i] {
             let j = j as usize;
             if j == i || !keep[j] || radii[j] > radii[i] {
                 continue;
@@ -448,21 +509,23 @@ pub fn merge_nested_nodes(
 /// `_pieces`: connected pieces of `comp`, each in breadth-first order from
 /// its lowest vertex, largest first (stable).
 fn pieces(g: &WeightedGraph, comp: &[u32]) -> Vec<Vec<u32>> {
-    let vset: HashSet<u32> = comp.iter().copied().collect();
-    let mut starts: Vec<u32> = vset.iter().copied().collect();
-    starts.sort_unstable();
-    let mut seen: HashSet<u32> = HashSet::new();
+    let members = sorted_set(comp);
+    let mut seen = vec![false; members.len()];
     let mut out: Vec<Vec<u32>> = Vec::new();
     let mut queue = VecDeque::new();
-    for s in starts {
-        if !seen.insert(s) {
+    for (i, &s) in members.iter().enumerate() {
+        if seen[i] {
             continue;
         }
+        seen[i] = true;
         let mut grp = vec![s];
         queue.push_back(s);
         while let Some(u) = queue.pop_front() {
             for &w in g.neighbors(u) {
-                if vset.contains(&w) && seen.insert(w) {
+                if let Ok(j) = members.binary_search(&w)
+                    && !seen[j]
+                {
+                    seen[j] = true;
                     queue.push_back(w);
                     grp.push(w);
                 }
@@ -474,36 +537,45 @@ fn pieces(g: &WeightedGraph, comp: &[u32]) -> Vec<Vec<u32>> {
     out
 }
 
+/// `v`'s values, ascending, once each: a set to search by bisection.
+fn sorted_set(v: &[u32]) -> Vec<u32> {
+    let mut s = v.to_vec();
+    s.sort_unstable();
+    s.dedup();
+    s
+}
+
 /// `_neighbour_groups`: the vertices of other bins touching `comp`,
 /// grouped by connectivity, groups touching a common bin merged.
 fn neighbour_groups(
     g: &WeightedGraph,
     comp: &[u32],
-    owner: &HashMap<u32, Key>,
+    owner: &[Option<Key>],
     own: Key,
 ) -> Vec<Vec<u32>> {
-    let mut ext: HashSet<u32> = HashSet::new();
-    for &v in comp {
-        for &u in g.neighbors(v) {
-            if owner.get(&u).is_some_and(|&k| k != own) {
-                ext.insert(u);
-            }
-        }
-    }
-    let mut starts: Vec<u32> = ext.iter().copied().collect();
-    starts.sort_unstable();
-    let mut seen: HashSet<u32> = HashSet::new();
+    let ext: Vec<u32> = sorted_set(
+        &comp
+            .iter()
+            .flat_map(|&v| g.neighbors(v).iter().copied())
+            .filter(|&u| owner[u as usize].is_some_and(|k| k != own))
+            .collect::<Vec<u32>>(),
+    );
+    let mut seen = vec![false; ext.len()];
     let mut patches: Vec<Vec<u32>> = Vec::new();
     let mut queue = VecDeque::new();
-    for s in starts {
-        if !seen.insert(s) {
+    for (i, &s) in ext.iter().enumerate() {
+        if seen[i] {
             continue;
         }
+        seen[i] = true;
         let mut grp = vec![s];
         queue.push_back(s);
         while let Some(u) = queue.pop_front() {
             for &w in g.neighbors(u) {
-                if ext.contains(&w) && seen.insert(w) {
+                if let Ok(j) = ext.binary_search(&w)
+                    && !seen[j]
+                {
+                    seen[j] = true;
                     queue.push_back(w);
                     grp.push(w);
                 }
@@ -521,8 +593,9 @@ fn neighbour_groups(
     }
     let mut first_seen: HashMap<Key, usize> = HashMap::new();
     for (pi, grp) in patches.iter().enumerate() {
-        for v in grp {
-            let other = *first_seen.entry(owner[v]).or_insert(pi);
+        for &v in grp {
+            let key = owner[v as usize].expect("an outside neighbour has a bin");
+            let other = *first_seen.entry(key).or_insert(pi);
             let (ra, rb) = (find(&mut parent, pi), find(&mut parent, other));
             if ra != rb {
                 parent[rb] = ra;
@@ -544,26 +617,31 @@ fn neighbour_groups(
 /// `_split_branch_band`: one piece per neighbouring group, grown from all
 /// groups at once; vertices no group reaches join the largest piece.
 fn split_branch_band(g: &WeightedGraph, comp: &[u32], groups: &[Vec<u32>]) -> Vec<Bin> {
-    let vset: HashSet<u32> = comp.iter().copied().collect();
-    let mut label: HashMap<u32, usize> = HashMap::new();
+    let members = sorted_set(comp);
+    let at = |v: u32| members.binary_search(&v).expect("a member");
+    let mut label: Vec<Option<usize>> = vec![None; members.len()];
     let mut queue = VecDeque::new();
     for (gi, grp) in groups.iter().enumerate() {
         let mut sorted = grp.clone();
         sorted.sort_unstable();
         for u in sorted {
             for &w in g.neighbors(u) {
-                if vset.contains(&w) && !label.contains_key(&w) {
-                    label.insert(w, gi);
+                if let Ok(j) = members.binary_search(&w)
+                    && label[j].is_none()
+                {
+                    label[j] = Some(gi);
                     queue.push_back(w);
                 }
             }
         }
     }
     while let Some(u) = queue.pop_front() {
-        let gi = label[&u];
+        let gi = label[at(u)];
         for &w in g.neighbors(u) {
-            if vset.contains(&w) && !label.contains_key(&w) {
-                label.insert(w, gi);
+            if let Ok(j) = members.binary_search(&w)
+                && label[j].is_none()
+            {
+                label[j] = gi;
                 queue.push_back(w);
             }
         }
@@ -571,8 +649,8 @@ fn split_branch_band(g: &WeightedGraph, comp: &[u32], groups: &[Vec<u32>]) -> Ve
     let mut parts: Vec<Vec<u32>> = vec![Vec::new(); groups.len()];
     let mut orphans = Vec::new();
     for &v in comp {
-        match label.get(&v) {
-            Some(&gi) => parts[gi].push(v),
+        match label[at(v)] {
+            Some(gi) => parts[gi].push(v),
             None => orphans.push(v),
         }
     }
@@ -592,13 +670,13 @@ fn split_branch_band(g: &WeightedGraph, comp: &[u32], groups: &[Vec<u32>]) -> Ve
     out
 }
 
-/// Each vertex's bin.
-fn owners(shells: &[Vec<Bin>]) -> HashMap<u32, Key> {
-    let mut owner = HashMap::new();
+/// Each of the `n` vertices' bin, the last listing it.
+fn owners(shells: &[Vec<Bin>], n: usize) -> Vec<Option<Key>> {
+    let mut owner = vec![None; n];
     for (bi, band) in shells.iter().enumerate() {
         for (ci, comp) in band.iter().enumerate() {
             for &v in comp {
-                owner.insert(v, (bi, ci));
+                owner[v as usize] = Some((bi, ci));
             }
         }
     }
@@ -615,44 +693,66 @@ pub fn recheck_rings(g: &WeightedGraph, rebinned: Vec<Vec<Bin>>, verts: &[u32]) 
     }
     let mut shells: Vec<Vec<Bin>> = Vec::new();
     let mut pending: Vec<Bin> = Vec::new();
+    let mut state = vec![0; g.n_vertices()];
     for band in rebinned {
-        let (rings, frags): (Vec<Bin>, Vec<Bin>) =
-            band.into_iter().partition(|c| is_ring(g, c, &inside));
+        let (rings, frags): (Vec<Bin>, Vec<Bin>) = band
+            .into_iter()
+            .partition(|c| is_ring(g, c, &inside, &mut state));
         pending.extend(frags);
         if !rings.is_empty() {
             shells.push(rings);
         }
     }
-    merge_fragments(g, &mut shells, pending);
+    merge_fragments(g, &mut shells, pending, &mut vec![None; g.n_vertices()]);
     shells
 }
 
 /// Make every bin one connected piece: its largest stays, strays go to the
 /// bin they touch most (or stay if they touch none), up to eight rounds.
 pub fn reunite_bins(g: &WeightedGraph, mut shells: Vec<Vec<Bin>>) -> Vec<Vec<Bin>> {
-    let mut owner = owners(&shells);
+    let mut owner = owners(&shells, g.n_vertices());
+    // Bins that may lie in pieces: every one at first, then those changed
+    // since they were last searched — a connected bin nobody touched stays
+    // so, and searching it again would find it whole.
+    let mut unsure: Vec<Vec<bool>> = shells.iter().map(|b| vec![true; b.len()]).collect();
     for _ in 0..8 {
         let mut changed = false;
+        // the round's searches at once; a bin that takes a stray before its
+        // turn is searched again then
+        let keys: Vec<Key> = (0..shells.len())
+            .flat_map(|bi| (0..shells[bi].len()).map(move |ci| (bi, ci)))
+            .filter(|&(bi, ci)| unsure[bi][ci] && shells[bi][ci].len() >= 2)
+            .collect();
+        let found: Vec<Vec<Vec<u32>>> = threads::install(|| {
+            keys.par_iter()
+                .map(|&(bi, ci)| pieces(g, &shells[bi][ci]))
+                .collect()
+        });
+        let mut found: HashMap<Key, Vec<Vec<u32>>> = keys.into_iter().zip(found).collect();
+        let mut stale: HashSet<Key> = HashSet::new();
         for bi in 0..shells.len() {
             for ci in 0..shells[bi].len() {
-                if shells[bi][ci].len() < 2 {
+                if !std::mem::take(&mut unsure[bi][ci]) || shells[bi][ci].len() < 2 {
                     continue;
                 }
-                let parts = pieces(g, &shells[bi][ci]);
+                let parts = match found.remove(&(bi, ci)) {
+                    Some(parts) if !stale.contains(&(bi, ci)) => parts,
+                    _ => pieces(g, &shells[bi][ci]),
+                };
                 if parts.len() < 2 {
                     continue;
                 }
                 let mut parts = parts.into_iter();
                 let first = parts.next().expect("two pieces");
                 for &v in &first {
-                    owner.insert(v, (bi, ci));
+                    owner[v as usize] = Some((bi, ci));
                 }
                 shells[bi][ci] = first;
                 for stray in parts {
                     let mut votes = Votes::default();
                     for &v in &stray {
                         for &u in g.neighbors(v) {
-                            if let Some(&k) = owner.get(&u)
+                            if let Some(k) = owner[u as usize]
                                 && k != (bi, ci)
                             {
                                 votes.add(k);
@@ -660,12 +760,18 @@ pub fn reunite_bins(g: &WeightedGraph, mut shells: Vec<Vec<Bin>>) -> Vec<Vec<Bin
                         }
                     }
                     match votes.winner() {
-                        None => shells[bi][ci].extend_from_slice(&stray),
+                        None => {
+                            // still in pieces: searched again next round
+                            shells[bi][ci].extend_from_slice(&stray);
+                            unsure[bi][ci] = true;
+                        }
                         Some((tb, tc)) => {
                             shells[tb][tc].extend_from_slice(&stray);
                             for &v in &stray {
-                                owner.insert(v, (tb, tc));
+                                owner[v as usize] = Some((tb, tc));
                             }
+                            unsure[tb][tc] = true;
+                            stale.insert((tb, tc));
                             changed = true;
                         }
                     }
@@ -682,23 +788,25 @@ pub fn reunite_bins(g: &WeightedGraph, mut shells: Vec<Vec<Bin>>) -> Vec<Vec<Bin
 /// Split each bin touching three or more neighbourhoods into one piece per
 /// tube, every decision against the ownership before any cut.
 pub fn split_branch_bins(g: &WeightedGraph, mut shells: Vec<Vec<Bin>>) -> Vec<Vec<Bin>> {
-    let snapshot = owners(&shells);
-    let mut planned: Vec<(usize, usize, Vec<Bin>)> = Vec::new();
-    for (bi, band) in shells.iter().enumerate() {
-        for (ci, comp) in band.iter().enumerate() {
-            if comp.len() < 3 {
-                continue;
-            }
-            let groups = neighbour_groups(g, comp, &snapshot, (bi, ci));
-            if groups.len() < 3 {
-                continue;
-            }
-            let parts = split_branch_band(g, comp, &groups);
-            if parts.len() > 1 {
-                planned.push((bi, ci, parts));
-            }
-        }
-    }
+    let snapshot = owners(&shells, g.n_vertices());
+    // each bin decided at once, all against the snapshot
+    let keys: Vec<Key> = (0..shells.len())
+        .flat_map(|bi| (0..shells[bi].len()).map(move |ci| (bi, ci)))
+        .filter(|&(bi, ci)| shells[bi][ci].len() >= 3)
+        .collect();
+    let planned: Vec<(usize, usize, Vec<Bin>)> = threads::install(|| {
+        keys.par_iter()
+            .filter_map(|&(bi, ci)| {
+                let comp = &shells[bi][ci];
+                let groups = neighbour_groups(g, comp, &snapshot, (bi, ci));
+                if groups.len() < 3 {
+                    return None;
+                }
+                let parts = split_branch_band(g, comp, &groups);
+                (parts.len() > 1).then_some((bi, ci, parts))
+            })
+            .collect()
+    });
     for (bi, ci, parts) in planned {
         let mut parts = parts.into_iter();
         shells[bi][ci] = parts.next().expect("two parts");
@@ -732,9 +840,14 @@ pub const TRIM_FRACTION: f64 = 0.05;
 
 /// `skeliner._core._estimate_radius` for one node's vertex distances.
 pub fn estimate_radius(d: &[f64], method: &str) -> Option<f64> {
-    let mean = |v: &[f64]| numpy_sum(v) / v.len() as f64;
     let mut sorted = d.to_vec();
     sorted.sort_by(numpy_order);
+    estimate_radius_sorted(d, &sorted, method)
+}
+
+/// [`estimate_radius`] with `d` sorted in numpy's order given as `sorted`.
+pub(crate) fn estimate_radius_sorted(d: &[f64], sorted: &[f64], method: &str) -> Option<f64> {
+    let mean = |v: &[f64]| numpy_sum(v) / v.len() as f64;
     let nan = d.iter().any(|v| v.is_nan());
     let n = d.len();
     let median = || {
@@ -750,7 +863,7 @@ pub fn estimate_radius(d: &[f64], method: &str) -> Option<f64> {
         if nan {
             f64::NAN
         } else {
-            quantile_sorted(&sorted, q)
+            quantile_sorted(sorted, q)
         }
     };
     let kept_mean = |keep: &dyn Fn(f64) -> bool| {
@@ -790,31 +903,47 @@ pub type Nodes = (Vec<[f64; 3]>, Vec<Vec<f64>>);
 /// estimator, the radius of its vertices' distances to it; `None` for an
 /// estimator name it does not know.
 pub fn make_nodes(shells: &[Vec<Bin>], verts: &[[f64; 3]], estimators: &[String]) -> Option<Nodes> {
-    let mut nodes = Vec::new();
-    let mut radii: Vec<Vec<f64>> = vec![Vec::new(); estimators.len()];
-    for bin in shells.iter().flatten() {
-        let mut s = [0.0f64; 3];
-        for &v in bin {
-            let p = verts[v as usize];
-            for k in 0..3 {
-                s[k] += p[k];
-            }
-        }
-        let n = bin.len() as f64;
-        let c = s.map(|x| x / n);
-        let d: Vec<f64> = bin
-            .iter()
-            .map(|&v| {
-                let p = verts[v as usize];
-                let e = [p[0] - c[0], p[1] - c[1], p[2] - c[2]];
-                (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt()
+    let bins: Vec<&Bin> = shells.iter().flatten().collect();
+    let per_bin: Option<Vec<([f64; 3], Vec<f64>)>> = threads::install(|| {
+        bins.par_iter()
+            .map(|bin| {
+                let mut s = [0.0f64; 3];
+                for &v in bin.iter() {
+                    let p = verts[v as usize];
+                    for k in 0..3 {
+                        s[k] += p[k];
+                    }
+                }
+                let n = bin.len() as f64;
+                let c = s.map(|x| x / n);
+                let d: Vec<f64> = bin
+                    .iter()
+                    .map(|&v| {
+                        let p = verts[v as usize];
+                        let e = [p[0] - c[0], p[1] - c[1], p[2] - c[2]];
+                        (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt()
+                    })
+                    .collect();
+                let mut sorted = d.clone();
+                sorted.sort_by(numpy_order);
+                let r = estimators
+                    .iter()
+                    .map(|est| estimate_radius_sorted(&d, &sorted, est))
+                    .collect::<Option<Vec<f64>>>()?;
+                Some((c, r))
             })
-            .collect();
-        for (est, r) in estimators.iter().zip(radii.iter_mut()) {
-            r.push(estimate_radius(&d, est)?);
-        }
-        nodes.push(c);
-    }
+            .collect()
+    });
+    let mut radii: Vec<Vec<f64>> = vec![Vec::with_capacity(bins.len()); estimators.len()];
+    let nodes = per_bin?
+        .into_iter()
+        .map(|(c, r)| {
+            for (all, x) in radii.iter_mut().zip(r) {
+                all.push(x);
+            }
+            c
+        })
+        .collect();
     Some((nodes, radii))
 }
 
@@ -897,26 +1026,42 @@ pub fn rebin_chains(
     let mut assigned = vec![false; verts.len()];
     let norm = |a: [f64; 3]| (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
     let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-    for chain in &chains {
-        let last = chain.len() - 1;
-        let mut ids: Vec<u32> = Vec::new();
-        for (pos, &ni) in chain.iter().enumerate() {
-            let k = if degree[ni as usize] >= 3 && (pos == 0 || pos == last) {
-                Some((ni, if pos == 0 { chain[1] } else { chain[last - 1] }))
-            } else {
-                None
-            };
-            match k.and_then(|k| donated.get(&k)) {
-                Some(d) => ids.extend_from_slice(d),
-                None => ids.extend_from_slice(&node2verts[ni as usize]),
-            }
-        }
-        ids.sort_unstable();
-        ids.dedup();
-        ids.retain(|&v| !assigned[v as usize]);
-        if ids.is_empty() {
-            continue;
-        }
+    // each chain's vertices: its nodes', a branch end's donation in place of
+    // its own; a vertex goes to the first chain listing it
+    let listed: Vec<Vec<u32>> = threads::install(|| {
+        chains
+            .par_iter()
+            .map(|chain| {
+                let last = chain.len() - 1;
+                let mut ids: Vec<u32> = Vec::new();
+                for (pos, &ni) in chain.iter().enumerate() {
+                    let k = if degree[ni as usize] >= 3 && (pos == 0 || pos == last) {
+                        Some((ni, if pos == 0 { chain[1] } else { chain[last - 1] }))
+                    } else {
+                        None
+                    };
+                    match k.and_then(|k| donated.get(&k)) {
+                        Some(d) => ids.extend_from_slice(d),
+                        None => ids.extend_from_slice(&node2verts[ni as usize]),
+                    }
+                }
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            })
+            .collect()
+    });
+    let mut claimed = vec![false; verts.len()];
+    let shares: Vec<Vec<u32>> = listed
+        .into_iter()
+        .map(|mut ids| {
+            ids.retain(|&v| !std::mem::replace(&mut claimed[v as usize], true));
+            ids
+        })
+        .collect();
+    // each vertex's node along its chain and distance to it, every chain at
+    // once (and a long chain's vertices at once); placed in chain order
+    let place = |chain: &[u32], ids: &[u32]| -> Vec<(u32, f64)> {
         let path: Vec<[f64; 3]> = chain.iter().map(|&c| nodes[c as usize]).collect();
         let seg_lens: Vec<f64> = path.windows(2).map(|w| norm(sub(w[1], w[0]))).collect();
         let mut arc_cum = vec![0.0f64];
@@ -925,28 +1070,6 @@ pub fn rebin_chains(
             acc += l;
             arc_cum.push(acc);
         }
-        let mut best_dist = vec![f64::INFINITY; ids.len()];
-        let mut best_t = vec![0.0f64; ids.len()];
-        for si in 0..chain.len() - 1 {
-            let (p0, p1, s) = (path[si], path[si + 1], seg_lens[si]);
-            if s < 1e-10 {
-                continue;
-            }
-            let sd = sub(p1, p0).map(|c| c / s);
-            for (k, &v) in ids.iter().enumerate() {
-                let p = verts[v as usize];
-                let df = sub(p, p0);
-                let t = df[0] * sd[0] + df[1] * sd[1] + df[2] * sd[2];
-                // np.clip(t, 0, s): maximum, then minimum, NaN kept
-                let t = if t.is_nan() { t } else { t.max(0.0).min(s) };
-                let q = [p0[0] + t * sd[0], p0[1] + t * sd[1], p0[2] + t * sd[2]];
-                let d = norm(sub(p, q));
-                if d < best_dist[k] {
-                    best_dist[k] = d;
-                    best_t[k] = arc_cum[si] + t;
-                }
-            }
-        }
         let node_radii: Vec<f64> = chain
             .iter()
             .map(|&c| {
@@ -954,19 +1077,54 @@ pub fn rebin_chains(
                 if r_floor > r { r_floor } else { r }
             })
             .collect();
-        for (k, &v) in ids.iter().enumerate() {
+        let one = |&v: &u32| {
+            let p = verts[v as usize];
+            let (mut best_dist, mut best_t) = (f64::INFINITY, 0.0f64);
+            for si in 0..chain.len() - 1 {
+                let (p0, p1, s) = (path[si], path[si + 1], seg_lens[si]);
+                if s < 1e-10 {
+                    continue;
+                }
+                let sd = sub(p1, p0).map(|c| c / s);
+                let df = sub(p, p0);
+                let t = df[0] * sd[0] + df[1] * sd[1] + df[2] * sd[2];
+                // np.clip(t, 0, s): maximum, then minimum, NaN kept
+                let t = if t.is_nan() { t } else { t.max(0.0).min(s) };
+                let q = [p0[0] + t * sd[0], p0[1] + t * sd[1], p0[2] + t * sd[2]];
+                let d = norm(sub(p, q));
+                if d < best_dist {
+                    best_dist = d;
+                    best_t = arc_cum[si] + t;
+                }
+            }
             let mut best = 0;
             let mut best_w = f64::NAN;
             for (ci, (&arc, &rad)) in arc_cum.iter().zip(&node_radii).enumerate() {
-                let w = (best_t[k] - arc).abs() / rad;
+                let w = (best_t - arc).abs() / rad;
                 if ci == 0 || w < best_w || (w.is_nan() && !best_w.is_nan()) {
                     best = ci;
                     best_w = w;
                 }
             }
-            let ni = chain[best] as usize;
-            out[ni].push(v);
-            cl[ni].push(best_dist[k]);
+            (chain[best], best_dist)
+        };
+        if ids.len() * chain.len() >= 1 << 16 {
+            ids.par_iter().map(one).collect()
+        } else {
+            ids.iter().map(one).collect()
+        }
+    };
+    let placed: Vec<Vec<(u32, f64)>> = threads::install(|| {
+        chains
+            .par_iter()
+            .zip(&shares)
+            .map(|(chain, ids)| place(chain, ids))
+            .collect()
+    });
+    for (ids, placed) in shares.iter().zip(placed) {
+        for (&v, (ni, d)) in ids.iter().zip(placed) {
+            out[ni as usize].push(v);
+            cl[ni as usize].push(d);
             assigned[v as usize] = true;
         }
     }
@@ -992,19 +1150,22 @@ pub fn rebin_chains(
 /// distinct owners once, smaller first, in order. `edges` must name
 /// vertices of `owner`.
 pub fn edges_between(edges: &[[usize; 2]], owner: &[i64]) -> Vec<[usize; 2]> {
-    let mut out: Vec<[usize; 2]> = edges
-        .iter()
-        .filter_map(|&[a, b]| {
-            let (na, nb) = (owner[a], owner[b]);
-            (na >= 0 && nb >= 0 && na != nb).then(|| {
-                let (na, nb) = (na as usize, nb as usize);
-                [na.min(nb), na.max(nb)]
+    threads::install(|| {
+        let mut out: Vec<[usize; 2]> = edges
+            .par_iter()
+            .filter_map(|&[a, b]| {
+                let (na, nb) = (owner[a], owner[b]);
+                (na >= 0 && nb >= 0 && na != nb).then(|| {
+                    let (na, nb) = (na as usize, nb as usize);
+                    [na.min(nb), na.max(nb)]
+                })
             })
-        })
-        .collect();
-    out.sort_unstable();
-    out.dedup();
-    out
+            .collect();
+        // equal pairs are equal values, so any sort leaves the same list
+        out.par_sort_unstable();
+        out.dedup();
+        out
+    })
 }
 
 /// The `centerline` radius of each node: the trimmed mean (`trim`) of its

@@ -1000,97 +1000,105 @@ pub struct Boundaries {
 /// the weaker of two spikes closer than a quarter of the median spacing.
 /// An axis with fewer than three coordinates or no spike has none.
 pub fn find_chunk_boundaries(verts: &[V3]) -> Vec<Boundaries> {
-    let mut out = Vec::new();
-    for axis in 0..3 {
-        let mut coords: Vec<i64> = verts
-            .iter()
-            .map(|v| v[axis].round_ties_even() as i64)
-            .collect();
-        coords.sort_unstable();
-        let mut unique: Vec<i64> = Vec::new();
-        let mut counts: Vec<i64> = Vec::new();
-        for c in coords {
-            if unique.last() == Some(&c) {
-                *counts.last_mut().expect("a count per value") += 1;
-            } else {
-                unique.push(c);
-                counts.push(1);
-            }
+    // the axes at once, each one's coordinates sorted in parallel (equal
+    // values are equal, so the order is the same however it is sorted)
+    threads::install(|| {
+        (0..3)
+            .into_par_iter()
+            .filter_map(|axis| axis_boundaries(verts, axis))
+            .collect()
+    })
+}
+
+/// [`find_chunk_boundaries`] on one axis.
+fn axis_boundaries(verts: &[V3], axis: usize) -> Option<Boundaries> {
+    let mut coords: Vec<i64> = verts
+        .par_iter()
+        .map(|v| v[axis].round_ties_even() as i64)
+        .collect();
+    coords.par_sort_unstable();
+    let mut unique: Vec<i64> = Vec::new();
+    let mut counts: Vec<i64> = Vec::new();
+    for c in coords {
+        if unique.last() == Some(&c) {
+            *counts.last_mut().expect("a count per value") += 1;
+        } else {
+            unique.push(c);
+            counts.push(1);
         }
-        let n = unique.len();
-        if n < 3 {
-            continue;
-        }
-        let spike: Vec<f64> = (0..n)
-            .map(|i| {
-                let (lo, hi) = (i.saturating_sub(5), (i + 6).min(n));
-                let around = (hi - lo - 1) as f64;
-                let sum: i64 = counts[lo..hi].iter().sum::<i64>() - counts[i];
-                let bg = if around > 0.0 {
-                    sum as f64 / around
-                } else {
-                    1.0
-                };
-                counts[i] as f64 / bg.max(1.0)
-            })
-            .collect();
-        let found: Vec<usize> = (0..n).filter(|&i| spike[i] > 5.0).collect();
-        if found.is_empty() {
-            continue;
-        }
-        let mut keep = vec![true; found.len()];
-        if found.len() >= 3 {
-            let spacings: Vec<i64> = found
-                .windows(2)
-                .map(|w| unique[w[1]] - unique[w[0]])
-                .collect();
-            let mut sorted = spacings.clone();
-            sorted.sort_unstable();
-            let m = sorted.len();
-            let median = if m % 2 == 1 {
-                sorted[m / 2] as f64
-            } else {
-                (sorted[m / 2 - 1] as f64 + sorted[m / 2] as f64) / 2.0
-            };
-            let close = median * 0.25;
-            for i in 0..found.len() {
-                let left = if i > 0 {
-                    spacings[i - 1] as f64
-                } else {
-                    median
-                };
-                let right = if i < spacings.len() {
-                    spacings[i] as f64
-                } else {
-                    median
-                };
-                if left.min(right) >= close {
-                    continue;
-                }
-                // of two spikes too close together, the weaker goes
-                let this = spike[found[i]];
-                if left < close && i > 0 && this < spike[found[i - 1]] {
-                    keep[i] = false;
-                }
-                if right < close && i < spacings.len() && this < spike[found[i + 1]] {
-                    keep[i] = false;
-                }
-            }
-        }
-        let kept: Vec<usize> = found
-            .iter()
-            .zip(&keep)
-            .filter(|(_, k)| **k)
-            .map(|(&i, _)| i)
-            .collect();
-        out.push(Boundaries {
-            axis,
-            values: kept.iter().map(|&i| unique[i]).collect(),
-            counts: kept.iter().map(|&i| counts[i]).collect(),
-            spikes: kept.iter().map(|&i| spike[i]).collect(),
-        });
     }
-    out
+    let n = unique.len();
+    if n < 3 {
+        return None;
+    }
+    let spike: Vec<f64> = (0..n)
+        .map(|i| {
+            let (lo, hi) = (i.saturating_sub(5), (i + 6).min(n));
+            let around = (hi - lo - 1) as f64;
+            let sum: i64 = counts[lo..hi].iter().sum::<i64>() - counts[i];
+            let bg = if around > 0.0 {
+                sum as f64 / around
+            } else {
+                1.0
+            };
+            counts[i] as f64 / bg.max(1.0)
+        })
+        .collect();
+    let found: Vec<usize> = (0..n).filter(|&i| spike[i] > 5.0).collect();
+    if found.is_empty() {
+        return None;
+    }
+    let mut keep = vec![true; found.len()];
+    if found.len() >= 3 {
+        let spacings: Vec<i64> = found
+            .windows(2)
+            .map(|w| unique[w[1]] - unique[w[0]])
+            .collect();
+        let mut sorted = spacings.clone();
+        sorted.sort_unstable();
+        let m = sorted.len();
+        let median = if m % 2 == 1 {
+            sorted[m / 2] as f64
+        } else {
+            (sorted[m / 2 - 1] as f64 + sorted[m / 2] as f64) / 2.0
+        };
+        let close = median * 0.25;
+        for i in 0..found.len() {
+            let left = if i > 0 {
+                spacings[i - 1] as f64
+            } else {
+                median
+            };
+            let right = if i < spacings.len() {
+                spacings[i] as f64
+            } else {
+                median
+            };
+            if left.min(right) >= close {
+                continue;
+            }
+            // of two spikes too close together, the weaker goes
+            let this = spike[found[i]];
+            if left < close && i > 0 && this < spike[found[i - 1]] {
+                keep[i] = false;
+            }
+            if right < close && i < spacings.len() && this < spike[found[i + 1]] {
+                keep[i] = false;
+            }
+        }
+    }
+    let kept: Vec<usize> = found
+        .iter()
+        .zip(&keep)
+        .filter(|(_, k)| **k)
+        .map(|(&i, _)| i)
+        .collect();
+    Some(Boundaries {
+        axis,
+        values: kept.iter().map(|&i| unique[i]).collect(),
+        counts: kept.iter().map(|&i| counts[i]).collect(),
+        spikes: kept.iter().map(|&i| spike[i]).collect(),
+    })
 }
 
 #[cfg(test)]

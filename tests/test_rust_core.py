@@ -1138,6 +1138,30 @@ def test_chunk_boundaries_and_usable_faces_are_the_same_on_both_paths(
         assert not rust[-4:].any() and rust[:-4].mean() > 0.9
 
 
+def test_compacting_is_the_same_on_both_paths(dirty_mesh, reference_mesh):
+    from skeliner.python import pre as python_pre
+
+    rng = np.random.default_rng(5)
+    for mesh in (dirty_mesh, reference_mesh):
+        v = np.asarray(mesh.vertices, dtype=np.float64)
+        f = np.asarray(mesh.faces, dtype=np.int64).copy()
+        # collapse a tenth of the faces as a stitch leaves them, one onto a
+        # vertex no other face names, and add a vertex nothing names
+        gone = rng.random(len(f)) < 0.1
+        f[gone] = f[gone][:, :1]
+        v = np.vstack([v, [[1e9, 0, 0]]])
+        f = np.vstack([f, [[len(v) - 1] * 3]])
+        rust = _rs.pre.compact_mesh(v, f)
+        assert_parity(rust, python_pre.compact_mesh(v, f))
+        good, vert_map, face_map, verts, faces = rust
+        assert good.sum() == len(faces) < len(f) and vert_map[-1] == -1
+        assert np.array_equal(verts[faces], v[f[good]])
+    empty = np.zeros((0, 3), dtype=np.int64)
+    rust = _rs.pre.compact_mesh(np.ones((4, 3)), empty)
+    assert_parity(rust, python_pre.compact_mesh(np.ones((4, 3)), empty))
+    assert rust[3].shape == (0, 3) and rust[4].shape == (0, 3)
+
+
 def test_the_derived_arrays_are_trimeshs_on_both_paths(dirty_mesh, reference_mesh):
     from skeliner.python import mesh as python_mesh
 

@@ -60,14 +60,11 @@ pub fn numpy_sum(a: &[f64]) -> f64 {
 /// `edges_unique_length`, whose BLAS dot of the squares with ones adds
 /// them in that order (multiplying by one rounds nothing, fused or not).
 pub fn edge_lengths(vertices: &[[f64; 3]], edges: &[[u32; 2]]) -> Vec<f64> {
-    edges
-        .iter()
-        .map(|&[a, b]| {
-            let (p, q) = (&vertices[a as usize], &vertices[b as usize]);
-            let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
-            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
-        })
-        .collect()
+    threads::map(edges, |&[a, b]| {
+        let (p, q) = (&vertices[a as usize], &vertices[b as usize]);
+        let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
+        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+    })
 }
 
 /// Orders floats as numpy's sort does: `-0.0` equal to `0.0`, and every NaN,
@@ -79,6 +76,21 @@ pub fn numpy_order(a: &f64, b: &f64) -> std::cmp::Ordering {
         (false, false) => a.partial_cmp(b).expect("neither is NaN"),
         (a_nan, b_nan) => a_nan.cmp(&b_nan),
     }
+}
+
+/// numpy's `argmin`: the first smallest value, or the first NaN; 0 when
+/// `v` is empty.
+pub fn numpy_argmin(v: &[f64]) -> usize {
+    let mut best = 0;
+    for (i, &x) in v.iter().enumerate() {
+        if x.is_nan() {
+            return i;
+        }
+        if x < v[best] {
+            best = i;
+        }
+    }
+    best
 }
 
 /// `numpy.arange(start, stop, step)` for floats: `ceil((stop - start) /

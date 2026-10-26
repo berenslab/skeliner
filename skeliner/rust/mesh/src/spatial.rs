@@ -229,6 +229,12 @@ impl KdTree {
     /// The nearest point to `q` and its distance; among exact ties, the
     /// lowest index.  `None` for an empty tree.
     pub fn nearest(&self, q: &[f64; 3]) -> Option<(u32, f64)> {
+        self.nearest_sq(q).map(|(i, d)| (i, d.sqrt()))
+    }
+
+    /// [`KdTree::nearest`] with the squared distance, which orders the
+    /// answers: two squares can round to one root.
+    pub fn nearest_sq(&self, q: &[f64; 3]) -> Option<(u32, f64)> {
         if self.nodes.is_empty() {
             return None;
         }
@@ -262,7 +268,7 @@ impl KdTree {
                 }
             }
         }
-        Some((best.0, best.1.sqrt()))
+        Some(best)
     }
 }
 
