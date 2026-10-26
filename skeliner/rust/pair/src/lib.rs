@@ -1,10 +1,53 @@
-//! `skeliner.pair`'s kernels: the faces of one mesh that touch another, and
-//! how far rays travel before they first hit a mesh.
+//! `skeliner.pair`'s kernels: the faces of one mesh that touch another, how
+//! far rays travel before they first hit a mesh, and the seeded path's
+//! nearest points on a mesh (trimesh's `ProximityQuery.on_surface`).
 
 #![forbid(unsafe_code)]
 
 use mesh::ray::TriangleBvh;
 use rayon::prelude::*;
+
+/// trimesh's `ProximityQuery.on_surface` over triangles `tris` with their
+/// face `normals`, for each of `points`: `(closest point, distance,
+/// triangle)` as [`TriangleBvh::nearest_trimesh`] finds it, `None` without
+/// triangles. Points in parallel.
+pub fn closest_points(
+    tris: Vec<[[f64; 3]; 3]>,
+    normals: Vec<[f64; 3]>,
+    points: &[[f64; 3]],
+) -> Vec<Option<([f64; 3], f64, usize)>> {
+    let bvh = TriangleBvh::new(tris, normals);
+    threads::install(|| points.par_iter().map(|&p| bvh.nearest_trimesh(p)).collect())
+}
+
+/// The farthest any face's corner lies from its centre (`(0 + a + b + c) /
+/// 3`, as trimesh places it): a face within `r` of a point has its centre
+/// within `r` plus this. 0 without faces, NaN when a coordinate is NaN.
+pub fn face_reach(verts: &[[f64; 3]], faces: &[[u32; 3]]) -> f64 {
+    fn max(a: f64, b: f64) -> f64 {
+        if a.is_nan() || b.is_nan() {
+            f64::NAN
+        } else {
+            a.max(b)
+        }
+    }
+    threads::install(|| {
+        faces
+            .par_iter()
+            .map(|f| {
+                let [p, q, r] = f.map(|v| verts[v as usize]);
+                let c: [f64; 3] = [0, 1, 2].map(|k| (0.0 + p[k] + q[k] + r[k]) / 3.0);
+                [p, q, r]
+                    .into_iter()
+                    .map(|v| {
+                        let d = [v[0] - c[0], v[1] - c[1], v[2] - c[2]];
+                        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+                    })
+                    .fold(0.0, max)
+            })
+            .reduce(|| 0.0, max)
+    })
+}
 
 /// Which faces of one mesh touch another: per face, the other mesh's
 /// triangle closest to its `center` — of several equally close (meeting at
@@ -65,4 +108,28 @@ pub fn first_hits(
             })
             .collect()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_faces_reach_is_its_farthest_corner() {
+        let s3 = 3f64.sqrt();
+        let verts = [
+            [0.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [1.5, 1.5 * s3, 0.0],
+            [9.0, 0.0, 0.0],
+        ];
+        // equilateral, side 3: each corner √3 from the centre
+        let reach = face_reach(&verts, &[[0, 1, 2]]);
+        assert!((reach - s3).abs() < 1e-12, "{reach}");
+        // a sliver along x: its far end 6 from its centre (3, 0, 0)
+        assert_eq!(face_reach(&verts, &[[0, 1, 2], [0, 0, 3]]), 6.0);
+        assert_eq!(face_reach(&verts, &[]), 0.0);
+        let nan = [[f64::NAN, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        assert!(face_reach(&nan, &[[0, 1, 2]]).is_nan());
+    }
 }

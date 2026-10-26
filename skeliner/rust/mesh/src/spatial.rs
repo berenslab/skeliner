@@ -206,9 +206,95 @@ impl KdTree {
     }
 }
 
+impl KdTree {
+    /// The `k` nearest points to `q`, nearest first, among equally near
+    /// points the lowest index first; each with its distance.
+    pub fn k_nearest(&self, q: &[f64; 3], k: usize) -> Vec<(u32, f64)> {
+        if self.nodes.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        // the best so far, ascending by (squared distance, index)
+        let mut best: Vec<(f64, u32)> = Vec::with_capacity(k + 1);
+        let mut stack = vec![0u32];
+        while let Some(id) = stack.pop() {
+            let node = &self.nodes[id as usize];
+            let bound = if best.len() == k {
+                best[k - 1].0 * (1.0 + 1e-12)
+            } else {
+                f64::INFINITY
+            };
+            if Self::box_sq_dist(node, q) > bound {
+                continue;
+            }
+            if node.left == NONE {
+                for &i in &self.order[node.lo..node.hi] {
+                    let d = self.sum.sq_dist(&self.points[i as usize], q);
+                    let full = best.len() == k;
+                    if full && (d, i) >= (best[k - 1].0, best[k - 1].1) {
+                        continue;
+                    }
+                    let at = best.partition_point(|&(bd, bi)| (bd, bi) < (d, i));
+                    best.insert(at, (d, i));
+                    best.truncate(k);
+                }
+            } else {
+                let (l, r) = (node.left as usize, node.right as usize);
+                let (dl, dr) = (
+                    Self::box_sq_dist(&self.nodes[l], q),
+                    Self::box_sq_dist(&self.nodes[r], q),
+                );
+                // nearer child last, so it is searched first
+                if dl <= dr {
+                    stack.push(node.right);
+                    stack.push(node.left);
+                } else {
+                    stack.push(node.left);
+                    stack.push(node.right);
+                }
+            }
+        }
+        best.into_iter().map(|(d, i)| (i, d.sqrt())).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn k_nearest_matches_brute_force_ties_to_the_lowest_index() {
+        // a grid: many points equally near
+        let mut pts = Vec::new();
+        for x in 0..6 {
+            for y in 0..6 {
+                for z in 0..4 {
+                    pts.push([x as f64, y as f64, z as f64]);
+                }
+            }
+        }
+        let tree = KdTree::new(pts.clone(), Sum::Plain);
+        for q in [
+            [2.5, 2.5, 1.5],
+            [0.0, 0.0, 0.0],
+            [9.0, -1.0, 2.0],
+            [2.0, 3.0, 1.0],
+        ] {
+            for k in [1, 4, 7, 200] {
+                let mut brute: Vec<(f64, u32)> = (0..pts.len() as u32)
+                    .map(|i| (Sum::Plain.sq_dist(&pts[i as usize], &q), i))
+                    .collect();
+                brute.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                let want: Vec<(u32, f64)> =
+                    brute.iter().take(k).map(|&(d, i)| (i, d.sqrt())).collect();
+                assert_eq!(tree.k_nearest(&q, k), want, "q {q:?} k {k}");
+            }
+        }
+        assert!(
+            KdTree::new(Vec::new(), Sum::Plain)
+                .k_nearest(&[0.0; 3], 3)
+                .is_empty()
+        );
+    }
 
     /// A deterministic scatter of points.
     fn scatter(n: usize) -> Vec<[f64; 3]> {

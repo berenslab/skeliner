@@ -1,7 +1,7 @@
 //! `skeliner._rs.post`: the `post` crate's kernels for `skeliner.post`.
 
 use numpy::ndarray::Array1;
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -155,7 +155,6 @@ fn calibrate_radii<'py>(
     ))
 }
 
-/// Add this module's functions and classes to `m`.
 /// Node types after the nodes are renumbered by `old2new` (−1 for a node
 /// dropped) into `new_len` nodes: each new node the most common non-zero
 /// label of the nodes merged into it (ties by soma, root mark, neurite
@@ -194,7 +193,109 @@ fn fill_ntype_gaps<'py>(
     Ok(Array1::from_vec(filled).into_pyarray(py))
 }
 
+/// `downsample`'s result: nodes, radii `(K, M)`, edges in the order they
+/// were made, `old2new`, and the bins as a CSR (`None`, `None` without).
+type DownsampledOut<'py> = (
+    Bound<'py, PyArray2<f64>>,
+    Bound<'py, PyArray2<f64>>,
+    Bound<'py, PyArray2<i64>>,
+    Bound<'py, PyArray1<i64>>,
+    Option<Bound<'py, PyArray1<i64>>>,
+    Option<Bound<'py, PyArray1<i64>>>,
+);
+
+/// `post.downsample` on arrays: `nodes` `(N, 3)`, `radii` `(K, N)` (row
+/// `key` decides), `edges` `(E, 2)`, the bins as a CSR (`ptr`, `idx`) or
+/// `None`: `(nodes, radii, edges, old2new, ptr, idx)`.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn downsample<'py>(
+    py: Python<'py>,
+    nodes: PyReadonlyArray2<'py, f64>,
+    radii: PyReadonlyArray2<'py, f64>,
+    key: usize,
+    edges: PyReadonlyArray2<'py, i64>,
+    ptr: Option<numpy::PyReadonlyArray1<'py, i64>>,
+    idx: Option<numpy::PyReadonlyArray1<'py, i64>>,
+    rtol: f64,
+    atol: f64,
+    aggregate: &str,
+    merge_endpoints: bool,
+    slide_branchpoints: bool,
+    max_anchor_shift: Option<f64>,
+) -> PyResult<DownsampledOut<'py>> {
+    use ::post::downsample::{Aggregate, Settings};
+
+    let nodes = rows3("N", &nodes)?;
+    let n = nodes.len();
+    let edges = node_pairs(&edges, n)?;
+    let radii = radii.as_array();
+    if radii.ncols() != n {
+        return Err(PyValueError::new_err("one radius per node"));
+    }
+    let radii: Vec<Vec<f64>> = radii.rows().into_iter().map(|r| r.to_vec()).collect();
+    if key >= radii.len() {
+        return Err(PyValueError::new_err("no such radius"));
+    }
+    let aggregate = Aggregate::parse(aggregate)
+        .ok_or_else(|| PyValueError::new_err("aggregate must be 'median', 'mean', or 'area'"))?;
+    let bins = match (ptr, idx) {
+        (Some(ptr), Some(idx)) => {
+            let bins = csr_lists(&ptr, &idx, None, "the bins")?;
+            if bins.len() != n {
+                return Err(PyValueError::new_err(
+                    "the bins must be a CSR (ptr, idx) over the nodes",
+                ));
+            }
+            Some(bins)
+        }
+        _ => None,
+    };
+    let s = Settings {
+        rtol,
+        atol,
+        aggregate,
+        merge_endpoints,
+        slide_branchpoints,
+        max_anchor_shift,
+    };
+    let d = py
+        .detach(|| ::post::downsample::downsample(&nodes, &radii, key, &edges, bins.as_deref(), s));
+    let m = d.nodes.len();
+    let flat: Vec<f64> = d.radii.iter().flatten().copied().collect();
+    let radii = numpy::ndarray::Array2::from_shape_vec((d.radii.len(), m), flat)
+        .expect("one radius per node");
+    let pairs: Vec<i64> = d.edges.iter().flatten().map(|&v| v as i64).collect();
+    let edges = numpy::ndarray::Array2::from_shape_vec((d.edges.len(), 2), pairs)
+        .expect("two ends per edge");
+    let (ptr, idx) = match d.node2verts {
+        Some(bins) => {
+            let mut ptr = vec![0i64];
+            let mut idx = Vec::new();
+            for b in &bins {
+                idx.extend(b.iter().map(|&v| v as i64));
+                ptr.push(idx.len() as i64);
+            }
+            (
+                Some(Array1::from_vec(ptr).into_pyarray(py)),
+                Some(Array1::from_vec(idx).into_pyarray(py)),
+            )
+        }
+        None => (None, None),
+    };
+    Ok((
+        rows_to_array(&d.nodes).into_pyarray(py),
+        radii.into_pyarray(py),
+        edges.into_pyarray(py),
+        Array1::from_vec(d.old2new).into_pyarray(py),
+        ptr,
+        idx,
+    ))
+}
+
+/// Add this module's functions and classes to `m`.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(downsample, m)?)?;
     m.add_function(wrap_pyfunction!(remap_ntype, m)?)?;
     m.add_function(wrap_pyfunction!(fill_ntype_gaps, m)?)?;
     m.add_class::<PyVertexFaces>()?;

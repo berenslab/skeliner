@@ -1,7 +1,7 @@
 //! `skeliner._rs.pair`: the `pair` crate's kernels for `skeliner.pair`.
 
 use numpy::ndarray::Array1;
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -105,8 +105,73 @@ fn contact_faces<'py>(
     ))
 }
 
+/// The nearest points' arrays: points `(P, 3)`, distances `(P,)`, faces
+/// `(P,)`.
+type NearestOut<'py> = (
+    Bound<'py, PyArray2<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<i64>>,
+);
+
+/// trimesh's `ProximityQuery.on_surface` of the mesh `vertices` `(N, 3)`,
+/// `faces` `(F, 3)` with its face `normals` `(F, 3)`, for each of `points`
+/// `(P, 3)`: `(closest points, distances, faces)`. Where faces tie (squared
+/// distances within 1e-8 of the nearest, itself over 1e-8), the one whose
+/// normal best faces the point, then the nearer, then the lower id.
+#[pyfunction]
+fn closest_points<'py>(
+    py: Python<'py>,
+    vertices: PyReadonlyArray2<'py, f64>,
+    faces: PyReadonlyArray2<'py, i64>,
+    normals: PyReadonlyArray2<'py, f64>,
+    points: PyReadonlyArray2<'py, f64>,
+) -> PyResult<NearestOut<'py>> {
+    let verts = rows3("V", &vertices)?;
+    let (tris, _) = checked_faces(&faces, Some(verts.len()))?;
+    let normals = rows3("F", &normals)?;
+    if normals.len() != tris.len() {
+        return Err(PyValueError::new_err("one normal per face"));
+    }
+    let pts = finite("points", rows3("P", &points)?)?;
+    if tris.is_empty() && !pts.is_empty() {
+        return Err(PyValueError::new_err("the mesh has no faces"));
+    }
+    let tris: Vec<[[f64; 3]; 3]> = tris.iter().map(|f| f.map(|v| verts[v as usize])).collect();
+    let found = py.detach(|| ::pair::closest_points(tris, normals, &pts));
+    let mut close = Vec::with_capacity(pts.len());
+    let mut dist = Vec::with_capacity(pts.len());
+    let mut face = Vec::with_capacity(pts.len());
+    for f in found {
+        let (q, d, t) = f.expect("a triangle per point");
+        close.push(q);
+        dist.push(d);
+        face.push(t as i64);
+    }
+    Ok((
+        rows_to_array(&close).into_pyarray(py),
+        Array1::from(dist).into_pyarray(py),
+        Array1::from(face).into_pyarray(py),
+    ))
+}
+
+/// The farthest any face's corner lies from its centre (`(0 + a + b + c) /
+/// 3`, as trimesh places it), over the mesh `vertices` `(N, 3)` and
+/// `faces` `(F, 3)`; 0 without faces, NaN when a coordinate is NaN.
+#[pyfunction]
+fn face_reach(
+    py: Python<'_>,
+    vertices: PyReadonlyArray2<'_, f64>,
+    faces: PyReadonlyArray2<'_, i64>,
+) -> PyResult<f64> {
+    let verts = rows3("V", &vertices)?;
+    let (faces, _) = checked_faces(&faces, Some(verts.len()))?;
+    Ok(py.detach(|| ::pair::face_reach(&verts, &faces)))
+}
+
 /// Add this module's functions and classes to `m`.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(closest_points, m)?)?;
+    m.add_function(wrap_pyfunction!(face_reach, m)?)?;
     m.add_class::<PyTriangleBvh>()?;
     m.add_function(wrap_pyfunction!(contact_faces, m)?)?;
     Ok(())

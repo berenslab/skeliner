@@ -2,6 +2,7 @@
 members = [
     "mesh",
     "threads",
+    "dataclass",
     "pre",
     "skeletonize",
     "post",
@@ -23,6 +24,7 @@ rust-version = "1.88"
 # builds the extension module `skeliner._rs`
 mesh = { path = "mesh" }
 threads = { path = "threads" }
+dataclass = { path = "dataclass" }
 pre = { path = "pre" }
 skeletonize = { path = "skeletonize" }
 post = { path = "post" }

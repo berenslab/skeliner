@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import dataclasses
-import heapq
 from typing import Callable, List
 
-import igraph as ig
 import numpy as np
-from scipy.spatial import KDTree
 
 from ._backend import kernels
-from ._state import SkeletonState, compact_state, rebuild_vert2node, swap_nodes
+from ._state import SkeletonState, rebuild_vert2node, swap_nodes
 from .dataclass import Soma
 
 __all__ = [
@@ -40,38 +37,21 @@ def _find_soma(
     """
     if nodes.shape[0] == 0:
         raise ValueError("empty skeleton")
-
-    # -------------------------------------------------------------
-    # 1. radius threshold → initial candidate set
-    # -------------------------------------------------------------
-    large_thresh = np.percentile(radii, pct_large)
-    cand_idx = np.where(radii >= large_thresh)[0]
-    if cand_idx.size == 0:
+    found = kernels.skeletonize.find_soma(
+        np.asarray(nodes, dtype=np.float64),
+        np.asarray(radii, dtype=np.float64),
+        float(pct_large),
+        float(dist_factor),
+        int(min_keep),
+    )
+    if found is None:
         raise RuntimeError(
             f"no nodes above the {pct_large:g}-th percentile (try lowering pct_large)"
         )
-    # -------------------------------------------------------------
-    # 2. choose the global-maximum node as “soma anchor”
-    # -------------------------------------------------------------
-    idx_max = int(np.argmax(radii))
-    R_max = radii[idx_max]
-
-    # -------------------------------------------------------------
-    # 3. distance filter: stay close to anchor
-    # -------------------------------------------------------------
-    dists = np.linalg.norm(nodes[cand_idx] - nodes[idx_max], axis=1)
-    keep = dists <= dist_factor * R_max
-    soma_idx = cand_idx[keep]
-    has_soma = soma_idx.size >= min_keep
-
+    soma_idx, idx_max, center, r_max, has_soma = found
     if not has_soma:
-        return Soma.from_sphere(nodes[idx_max], R_max, None), soma_idx, has_soma
-
-    soma = Soma.from_sphere(
-        center=nodes[soma_idx].mean(0),
-        radius=R_max,
-        verts=None,
-    )
+        return Soma.from_sphere(nodes[idx_max], r_max, None), soma_idx, has_soma
+    soma = Soma.from_sphere(center=np.asarray(center), radius=r_max, verts=None)
     return soma, soma_idx, has_soma
 
 
@@ -220,6 +200,7 @@ def _merge_near_soma_nodes(
     near_factor: float = 1.2,
     fat_factor: float = 0.20,
     log: Callable | None = None,
+    with_vert2node: bool = True,
 ):
     """
     Collapse every skeleton node whose sphere overlaps the soma (stage 5).
@@ -250,6 +231,9 @@ def _merge_near_soma_nodes(
         Dimensionless thresholds controlling the tests described above.
     log
         Optional callback used for verbose progress output.
+    with_vert2node
+        Whether to rebuild ``vert2node``; None in its place otherwise (for a
+        caller that rebuilds it later anyway).
 
     Returns
     -------
@@ -258,84 +242,39 @@ def _merge_near_soma_nodes(
         ``node2verts_new`` and ``vert2node`` are *None* when mesh data is
         unavailable.
     """
-    r_soma = soma.spherical_radius
-    r_primary = radii_dict[radius_key]
-    d2s = soma.distance(nodes, to="surface")
-    d2c = soma.distance(nodes, to="center")
-    inside = d2s < -inside_tol
-    near = d2c < near_factor * r_soma
-    fat = r_primary > fat_factor * r_soma
-
-    keep_mask = ~(inside | (near & fat))
-    keep_mask[0] = True
-    merged_idx = np.where(~keep_mask)[0]
-
+    if radius_key not in radii_dict:
+        raise KeyError(radius_key)
+    n = len(nodes)
+    lists = node2verts if node2verts is not None else [np.empty(0, np.int64)] * n
+    keys, radii, ptr, idx = _pack(nodes, radii_dict, lists)
+    arrays, old2new, soma_verts, n_merged = kernels.skeletonize.merge_near_soma_nodes(
+        np.asarray(nodes, dtype=np.float64),
+        keys,
+        radii,
+        ptr,
+        idx,
+        np.asarray(edges, dtype=np.int64).reshape(-1, 2),
+        keys.index(radius_key),
+        np.asarray(soma.center, dtype=np.float64),
+        np.asarray(soma.axes, dtype=np.float64),
+        np.asarray(soma.R, dtype=np.float64),
+        None if soma.verts is None else np.asarray(soma.verts, dtype=np.int64),
+        None if mesh_vertices is None else np.asarray(mesh_vertices, np.float64),
+        float(inside_tol),
+        float(near_factor),
+        float(fat_factor),
+    )
     if log:
-        log(f"{merged_idx.size} nodes merged into soma")
+        log(f"{n_merged} nodes merged into soma")
+    nodes_keep, radii_keep, node2_keep, edges_out = _unpack(arrays, keys, radii_dict)
+    if node2verts is None:
+        node2_keep = None
 
-    state_in = SkeletonState(
-        nodes=nodes,
-        radii=radii_dict,
-        edges=edges,
-        node2verts=node2verts,
-        vert2node=None,
+    vert2node = (
+        rebuild_vert2node(node2_keep)
+        if node2_keep is not None and with_vert2node
+        else None
     )
-    state_out, old2new = compact_state(
-        state_in, keep_mask, rebuild_map=False, return_old2new=True
-    )
-
-    nodes_keep = state_out.nodes
-    radii_keep = state_out.radii
-    node2_keep = state_out.node2verts
-    edges_out = state_out.edges
-
-    leaves: set[int] = set()
-    for u, v in edges:
-        if keep_mask[u] and not keep_mask[v]:
-            leaves.add(int(old2new[u]))
-        elif keep_mask[v] and not keep_mask[u]:
-            leaves.add(int(old2new[v]))
-    if leaves:
-        leaf_edges = np.array([[0, nid] for nid in sorted(leaves)], dtype=np.int64)
-        edges_out = (
-            leaf_edges if edges_out.size == 0 else np.vstack([edges_out, leaf_edges])
-        )
-        edges_out = np.unique(np.sort(edges_out, axis=1), axis=0)
-
-    if merged_idx.size:
-        if node2verts is not None:
-            w = np.array(
-                [len(node2verts[0]), *[len(node2verts[i]) for i in merged_idx]],
-                dtype=np.float64,
-            )
-        else:
-            w = np.ones(merged_idx.size + 1, dtype=np.float64)
-        nodes_keep[0] = np.average(
-            np.vstack([nodes[0], nodes[merged_idx]]), axis=0, weights=w
-        )
-    # the soma's vertices grow here, never on the soma passed in
-    soma_verts = soma.verts
-    if merged_idx.size and node2_keep is not None:
-        for idx in merged_idx:
-            vidx = node2verts[idx]
-            if mesh_vertices is not None:
-                d_local = soma.distance_to_surface(mesh_vertices[vidx])
-                close = d_local < near_factor * r_soma
-                contrib = vidx[close]
-            else:
-                contrib = vidx
-            if contrib.size:
-                soma_verts = (
-                    np.concatenate((soma_verts, contrib))
-                    if soma_verts is not None
-                    else contrib
-                )
-                node2_keep[0] = np.concatenate((node2_keep[0], contrib))
-
-    vert2node = rebuild_vert2node(node2_keep) if node2_keep is not None else None
-
-    if soma_verts is not None:
-        soma_verts = np.unique(soma_verts).astype(np.int64)
 
     if mesh_vertices is None:
         if log:
@@ -534,140 +473,12 @@ def _bridge_gaps(
         component.  The array is sorted row-wise and de-duplicated.
     """
 
-    def _auto_bridge_max(
-        gaps: list[float],
-        edge_mean: float,
-        *,
-        pct: float = 55.0,
-        lo: float = 6.0,
-        hi: float = 12.0,
-    ) -> float:
-        """
-        Choose a bridge_max_factor from the initial gap distribution. Default is the
-        55th percentile of the gap distribution, clipped to [6, 20] times the mean edge
-        """
-        raw = np.percentile(gaps, pct) / edge_mean
-        return float(np.clip(raw, lo, hi))
-
-    def _auto_recalc_after(n_gaps: int) -> int:
-        """Return a suitable recalc period for the given number of gaps."""
-        if n_gaps <= 10:  # tiny: update often
-            return 2
-        if n_gaps <= 50:  # small: every 3–4 merges
-            return 4
-        if n_gaps <= 200:  # medium: every ~5 % of gaps
-            return max(4, n_gaps // 20)
-        # giant meshes: cap to 32 so we never starve
-        return 32
-
-    # -- 0. quick exit if already connected ---------------------------------
-    g = ig.Graph(
-        n=len(nodes), edges=[tuple(map(int, e)) for e in edges], directed=False
+    return kernels.skeletonize.bridge_gaps(
+        np.asarray(nodes, dtype=np.float64),
+        np.asarray(edges, dtype=np.int64).reshape(-1, 2),
+        None if bridge_max_factor is None else float(bridge_max_factor),
+        None if bridge_recalc_after is None else int(bridge_recalc_after),
     )
-    comps = [set(c) for c in g.components()]
-    comp_idx = {
-        cid: np.fromiter(verts, dtype=np.int64) for cid, verts in enumerate(comps)
-    }
-    soma_cid = g.components().membership[0]
-    if len(comps) == 1:
-        return edges
-
-    # -- 1. build one KD-tree per component ---------------------------------
-    edge_len_mean = np.linalg.norm(
-        nodes[edges[:, 0]] - nodes[edges[:, 1]], axis=1
-    ).mean()
-
-    # -- 2. grow the island using a distance-ordered priority queue ---------
-    island = set(comps[soma_cid])
-    island_idx = np.fromiter(island, dtype=np.int64)
-    island_tree = KDTree(nodes[island_idx])
-
-    # helper to compute the *current* closest gap of a component
-    def closest_pair(cid: int) -> tuple[float, int, int]:
-        pts = nodes[comp_idx[cid]]
-        # One thread: the foreign components are a few nodes each, and
-        # starting a thread per core costs 10-30x such a query.
-        dists, idx_is = island_tree.query(pts, k=1, workers=1)
-        best = int(np.argmin(dists))
-        return float(dists[best]), best, np.asarray(idx_is, dtype=np.int64)[best]
-
-    # priority queue of (gap_distance, cid, best_comp_idx, best_island_idx)
-    pq = []
-    gap_samples = []
-    for cid in range(len(comps)):
-        if cid == soma_cid:
-            continue
-        gap, b_comp, b_is = closest_pair(cid)
-        pq.append((gap, cid, b_comp, b_is))
-        gap_samples.append(gap)
-    heapq.heapify(pq)
-
-    # -- heuristic hyperparameters if not given -------------------------------
-    if bridge_max_factor is None:
-        bridge_max_factor = _auto_bridge_max(gap_samples, edge_len_mean)
-
-    if bridge_recalc_after is None:
-        gaps = len(comps) - 1
-        recalc_after = _auto_recalc_after(gaps)
-    else:
-        recalc_after = bridge_recalc_after
-
-    edges_new: list[tuple[int, int]] = []
-    merges_since_recalc = 0
-
-    stall = 0
-    relax_factor = 1.5
-    max_stall = 3 * len(pq)
-    current_max = bridge_max_factor * edge_len_mean
-
-    while pq:
-        _, cid, _, _ = heapq.heappop(pq)
-        # postpone if the component is still too far away
-        gap, best_c, best_i = closest_pair(cid)
-
-        if gap > current_max:
-            heapq.heappush(pq, (gap, cid, best_c, best_i))  # still too far, re-queue
-            stall += 1
-            if stall >= 2 * max_stall:
-                # after too many futile tries, do a *forced* heap rebuild
-                pq = [
-                    (g, cid2, bc, bi)
-                    for _, cid2, _, _ in pq
-                    for g, bc, bi in (closest_pair(cid2),)
-                ]
-                heapq.heapify(pq)
-                current_max *= relax_factor
-                stall = 0
-            continue
-
-        stall = 0
-        verts_idx = comp_idx[cid]
-        u = int(verts_idx[best_c])
-        v = int(island_idx[best_i])
-        edges_new.append((u, v))
-
-        # merge component into island and rebuild KD-tree
-        island |= comps[cid]
-        island_idx = np.concatenate([island_idx, verts_idx])
-        island_tree = KDTree(nodes[island_idx])
-
-        merges_since_recalc += 1
-        if merges_since_recalc >= recalc_after:
-            # distances of *every* remaining component may have changed
-            pq = [
-                (gap, cid, b_comp, b_is)
-                for _, cid, _, _ in pq
-                for gap, b_comp, b_is in (closest_pair(cid),)
-            ]
-            heapq.heapify(pq)
-            merges_since_recalc = 0
-
-    if edges_new:
-        edges_aug = np.vstack([edges, np.asarray(edges_new, dtype=np.int64)])
-    else:
-        edges_aug = edges
-
-    return np.unique(edges_aug, axis=0)
 
 
 def _merge_single_node_branches(
@@ -795,23 +606,23 @@ def _detect_soma(
 
     old2new = _identity()
 
+    # the soma's vertices, before a soma node moves to node 0
+    lists = [np.asarray(node2verts[int(i)], dtype=np.int64) for i in soma_nodes]
+    ptr = np.zeros(len(lists) + 1, dtype=np.int64)
+    ptr[1:] = np.cumsum([len(v) for v in lists])
+    soma_vert_ids = kernels.skeletonize.soma_vertices(
+        np.asarray(nodes[soma_nodes], dtype=np.float64),
+        ptr,
+        np.concatenate(lists) if lists else np.empty(0, dtype=np.int64),
+        np.asarray(soma_est.center, dtype=np.float64),
+        float(soma_est.spherical_radius),
+    )
+
     if 0 not in soma_nodes:
         new_root = int(soma_nodes[np.argmax(radii[radius_key][soma_nodes])])
         swap_nodes(state, 0, new_root)
         old2new[0], old2new[new_root] = old2new[new_root], old2new[0]
 
-    all_close = (
-        soma_est.distance(nodes[soma_nodes], to="center")
-        < soma_est.spherical_radius * 2
-    )
-    close_lists = [
-        node2verts[int(i)] for i in soma_nodes[all_close] if node2verts[int(i)].size
-    ]
-    if close_lists:
-        soma_vert_ids = np.unique(np.concatenate(close_lists)).astype(np.int64)
-    else:
-        fallback = _soma_verts(int(soma_nodes[0]))
-        soma_vert_ids = fallback if fallback is not None else np.empty(0, np.int64)
     soma_est.verts = soma_vert_ids if soma_vert_ids.size else None
 
     nodes[0] = soma_est.center

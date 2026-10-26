@@ -289,10 +289,20 @@ pub struct Isolated {
     pub n_via_geometry: usize,
 }
 
+/// A mesh's faces and vertices with each face's centre, normal and outward
+/// dot: what [`isolated_organelles`] reads.
+pub struct Fragments<'a> {
+    pub faces: &'a [[u32; 3]],
+    pub verts: &'a [[f64; 3]],
+    pub centers: &'a [[f64; 3]],
+    pub normals: &'a [[f64; 3]],
+    pub dots: &'a [f64],
+}
+
 /// `skeliner.pre.find_isolated_organelles`: components other than `main`
 /// that point inward — by a majority of their non-zero outward dots, or,
 /// when all are zero, by most vertices lying behind the nearest main face.
-pub fn isolated_organelles(s: &Surface<'_>, face_comp: &[i64], main: i64) -> Isolated {
+pub fn isolated_organelles(s: &Fragments<'_>, face_comp: &[i64], main: i64) -> Isolated {
     let n = s.faces.len();
     let n_comps = face_comp
         .iter()
@@ -731,7 +741,14 @@ pub fn find_organelles(
     min_cluster_size: usize,
     svd: &dyn Svd,
 ) -> Organelles {
-    let isolated = isolated_organelles(s, face_comp, main);
+    let fragments = Fragments {
+        faces: s.faces,
+        verts: s.verts,
+        centers: s.centers,
+        normals: s.normals,
+        dots: s.dots,
+    };
+    let isolated = isolated_organelles(&fragments, face_comp, main);
     let (structural, non_main, n_structural) =
         structural_masks(face_comp, main, &isolated.mask, min_cluster_size);
     let params = PocketParams {

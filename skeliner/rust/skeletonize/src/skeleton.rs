@@ -700,7 +700,7 @@ pub fn split_branch_bins(g: &WeightedGraph, mut shells: Vec<Vec<Bin>>) -> Vec<Ve
 }
 
 /// `np.quantile(x, q)` (linear) of `x` sorted ascending.
-fn quantile_sorted(x: &[f64], q: f64) -> f64 {
+pub(crate) fn quantile_sorted(x: &[f64], q: f64) -> f64 {
     let n = x.len();
     let v = (n - 1) as f64 * q;
     if v >= (n - 1) as f64 {
@@ -975,6 +975,43 @@ pub fn rebin_chains(
         }
     }
     (out, dists)
+}
+
+/// `_edges_from_mesh`: the skeleton edges the mesh `edges` make between the
+/// nodes owning their two ends (`owner[v]`, −1 for none) — each pair of
+/// distinct owners once, smaller first, in order. `edges` must name
+/// vertices of `owner`.
+pub fn edges_between(edges: &[[usize; 2]], owner: &[i64]) -> Vec<[usize; 2]> {
+    let mut out: Vec<[usize; 2]> = edges
+        .iter()
+        .filter_map(|&[a, b]| {
+            let (na, nb) = (owner[a], owner[b]);
+            (na >= 0 && nb >= 0 && na != nb).then(|| {
+                let (na, nb) = (na as usize, nb as usize);
+                [na.min(nb), na.max(nb)]
+            })
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The `centerline` radius of each node: the trimmed mean (`trim`) of its
+/// vertices' distances to the centreline, `cl[v]` (0 for a vertex without
+/// one), and 0 for a node without vertices. `cl` holds every vertex the
+/// nodes name.
+pub fn centerline_radii(node2verts: &[Vec<usize>], cl: &[f64]) -> Vec<f64> {
+    node2verts
+        .iter()
+        .map(|vs| {
+            if vs.is_empty() {
+                return 0.0;
+            }
+            let d: Vec<f64> = vs.iter().map(|&v| cl[v]).collect();
+            estimate_radius(&d, "trim").expect("a known estimator")
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -1,17 +1,16 @@
 import json
-import pickle
 import re
 from pathlib import Path
 from typing import Iterable, List
 
 import numpy as np
-import trimesh
 
 from ._backend import kernels
 from ._core import _bfs_parents
 from ._state import rebuild_vert2node
 from .dataclass import (
     Discarded,
+    Mesh,
     MeshComponents,
     MeshStats,
     Neurites,
@@ -60,16 +59,28 @@ _META_JSON = re.compile(r"#\s*meta\s+(\{.*\})")  #  single-line JSON
 # ------------
 
 
-def load_mesh(filepath: str | Path) -> trimesh.Trimesh:
-    """Read a mesh file as ``trimesh.load_mesh(filepath, process=False)``
-    reads it.
+def _trimesh():
+    """trimesh, which reads and writes the formats skeliner does not."""
+    try:
+        import trimesh
+    except ImportError:
+        raise ImportError(
+            "formats other than OBJ (and EyeWire 1's CTM) go through trimesh: "
+            "pip install 'skeliner[trimesh]'"
+        ) from None
+    return trimesh
+
+
+def load_mesh(filepath: str | Path) -> Mesh:
+    """Read a mesh file as a :class:`skeliner.Mesh` of the arrays
+    ``trimesh.load_mesh(filepath, process=False)`` reads.
 
     OBJ files of plain vertices and triangles, the form EyeWire 2, MICrONS
     and FlyWire meshes come in and skeliner's own pipeline writes, are read
     by skeliner's own reader on the active path (:class:`skeliner.backend`),
     to the same arrays. An OBJ with anything more (normals, texture
     coordinates, groups, polygons, ...) and every other format are read by
-    trimesh.
+    trimesh, which must then be installed (``skeliner[trimesh]``).
 
     ``.ctm`` (OpenCTM) has a reader of its own here, but it is only for
     reading EyeWire 1's meshes
@@ -87,22 +98,28 @@ def load_mesh(filepath: str | Path) -> trimesh.Trimesh:
         found = getattr(kernels.io, reader)(str(filepath))
         if found is not None:
             vertices, faces = found
-            return trimesh.Trimesh(
-                vertices=vertices,
-                faces=faces,
-                process=False,
-                metadata={"name": filepath.name, "node": filepath.name},
-            )
-    return trimesh.load_mesh(filepath, process=False)
+            return Mesh._adopt(vertices, faces)
+    return Mesh.of(_trimesh().load_mesh(filepath, process=False))
 
 
-def save_mesh(mesh: trimesh.Trimesh, path: str | Path) -> None:
-    """Write a mesh to disk. Format is inferred from the file extension.
+def save_mesh(mesh, path: str | Path) -> None:
+    """Write a mesh to disk, the format by the file's suffix.
 
-    Supports any format that trimesh can export (obj, ply, stl, glb, ...).
+    A :class:`skeliner.Mesh` (or anything with ``vertices`` and ``faces``) goes
+    to OBJ through skeliner's own writer on the active path, as trimesh
+    writes a plain mesh, and to every other format (ply, stl, glb, ...)
+    through trimesh, which must then be installed. A mesh with an
+    ``export`` of its own — a ``trimesh.Trimesh`` — writes itself.
     """
     path = Path(path)
-    mesh.export(str(path))
+    if not isinstance(mesh, Mesh) and hasattr(mesh, "export"):
+        mesh.export(str(path))
+        return
+    mesh = Mesh.of(mesh)
+    if path.suffix.lower() == ".obj":
+        kernels.io.write_obj(str(path), mesh.vertices, mesh.faces)
+    else:
+        mesh.to_trimesh().export(str(path))
 
 
 # -----------
@@ -360,12 +377,8 @@ def load_skeleton_npz(path: str | Path) -> Skeleton:
             # stored as length-1 object array; .item() unwraps the dict
             meta = z["meta"].item()
 
-        node_kdtree = None
-        if "kdtree_nodes" in z.files:
-            blob = z["kdtree_nodes"]
-            if blob.size:
-                node_kdtree = pickle.loads(blob.item())
-
+        # older archives also hold a pickled scipy KD-tree ("kdtree_nodes"),
+        # left unread
         node_neighbors = None
         if "neighbors_idx" in z.files and "neighbors_off" in z.files:
             idx = z["neighbors_idx"].astype(np.int64)
@@ -385,8 +398,6 @@ def load_skeleton_npz(path: str | Path) -> Skeleton:
         extra=extra,
         meta=meta,
     )
-    if node_kdtree is not None:
-        skel._nodes_kdtree = node_kdtree
     if node_neighbors is not None:
         skel._node_neighbors = node_neighbors
     return skel
@@ -407,8 +418,10 @@ def save_skeleton_npz(
     compress
         When *True* use :func:`numpy.savez_compressed`.
     cache_kdtree
-        When *True* (default) ensure the node KD-tree and adjacency caches are
-        built and embedded in the archive for fast reloads.
+        When *True* (default) ensure the adjacency cache (each node's
+        neighbours) is built and embedded in the archive for fast reloads.
+        A KD-tree is no longer stored: :func:`skeliner.dx.distance` builds
+        its own index in milliseconds.
     """
     path = Path(path)
 
@@ -417,7 +430,6 @@ def save_skeleton_npz(
         path = path.with_suffix(".npz")
 
     if cache_kdtree:
-        skeleton._ensure_nodes_kdtree()
         skeleton._ensure_node_neighbors()
 
     # radii_<name>  : one array per estimator
@@ -481,10 +493,6 @@ def save_skeleton_npz(
     extra = {"extra": np.array(skeleton.extra, dtype=object)}
     meta = {"meta": np.array(skeleton.meta, dtype=object)} if skeleton.meta else {}
     tree_payload = {}
-    if skeleton._nodes_kdtree is not None:
-        tree_payload["kdtree_nodes"] = np.array(
-            pickle.dumps(skeleton._nodes_kdtree), dtype=object
-        )
     if skeleton._node_neighbors is not None:
         lengths = np.fromiter(
             (len(nbrs) for nbrs in skeleton._node_neighbors),
@@ -660,7 +668,7 @@ def save_mesh_stats_npz(
 
 def load_mesh_stats_npz(
     path: str | Path,
-    mesh: trimesh.Trimesh | None = None,
+    mesh=None,
 ) -> MeshStats:
     """Load a :class:`MeshStats` written by :func:`save_mesh_stats_npz`.
 
@@ -668,7 +676,7 @@ def load_mesh_stats_npz(
     ----------
     path : str or Path
         Source archive.
-    mesh : trimesh.Trimesh or None, optional
+    mesh : Mesh or None, optional
         If provided, the loaded face count is validated against
         ``len(mesh.faces)``.  A mismatch raises :class:`ValueError`
         because the cached stats no longer match the mesh.

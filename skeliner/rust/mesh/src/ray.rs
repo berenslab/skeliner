@@ -9,7 +9,8 @@
 //! answer is the same ray for ray.
 //!
 //! Nearest points use Ericson's region test (Real-Time Collision Detection,
-//! 5.1.5), exact up to rounding.
+//! 5.1.5), exact up to rounding; [`closest_point_trimesh`] and
+//! [`TriangleBvh::nearest_trimesh`] are trimesh's own, to the bit.
 
 type V3 = [f64; 3];
 
@@ -111,6 +112,52 @@ pub fn closest_point_on_triangle(p: V3, t: &[V3; 3]) -> V3 {
             .expect("three edges");
     }
     add(a, add(scale(ab, vb / denom), scale(ac, vc / denom)))
+}
+
+/// trimesh's zero for the region tests of its closest point.
+const TRIMESH_ZERO: f64 = 1e-13;
+
+/// trimesh's `tol.merge`: squared distances this close tie.
+const TRIMESH_MERGE: f64 = 1e-8;
+
+/// trimesh's `triangles.closest_point` for one triangle: Ericson's regions,
+/// each tested against trimesh's zero (`1e-13`) as trimesh tests them, every
+/// dot product summed in axis order, the face case through
+/// `1 / (va + vb + vc)`.
+pub fn closest_point_trimesh(p: V3, t: &[V3; 3]) -> V3 {
+    let z = TRIMESH_ZERO;
+    let [a, b, c] = *t;
+    let (ab, ac, ap) = (sub(b, a), sub(c, a), sub(p, a));
+    let (d1, d2) = (dd(ab, ap), dd(ac, ap));
+    if d1 < z && d2 < z {
+        return a;
+    }
+    let bp = sub(p, b);
+    let (d3, d4) = (dd(ab, bp), dd(ac, bp));
+    if d3 > -z && d4 <= d3 {
+        return b;
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc < z && d1 > -z && d3 < z {
+        return add(a, scale(ab, d1 / (d1 - d3)));
+    }
+    let cp = sub(p, c);
+    let (d5, d6) = (dd(ab, cp), dd(ac, cp));
+    if d6 > -z && d5 <= d6 {
+        return c;
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb < z && d2 > -z && d6 < z {
+        return add(a, scale(ac, d2 / (d2 - d6)));
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va < z && (d4 - d3) > -z && (d5 - d6) > -z {
+        let d43 = d4 - d3;
+        return add(b, scale(sub(c, b), d43 / (d43 + (d5 - d6))));
+    }
+    let denom = 1.0 / (va + vb + vc);
+    let (v, w) = (vb * denom, vc * denom);
+    add(add(a, scale(ab, v)), scale(ac, w))
 }
 
 /// Squared distance from `p` to the box `[lo, hi]`.
@@ -305,6 +352,83 @@ impl TriangleBvh {
         }
         out.sort_unstable_by_key(|&(t, _)| t);
         out
+    }
+
+    /// trimesh's `proximity.closest_point` of `p` over these triangles: the
+    /// nearest point (each triangle's by [`closest_point_trimesh`]), its
+    /// distance and triangle. Where triangles tie — squared distances
+    /// within `1e-8` of the nearest, itself over `1e-8` — the one whose
+    /// normal best faces the point wins (trimesh's rule, here over every
+    /// tied triangle rather than the two its sort puts first), then the
+    /// nearer, then the lower index.
+    pub fn nearest_trimesh(&self, p: V3) -> Option<(V3, f64, usize)> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+        let mut best = f64::INFINITY;
+        let mut found: Vec<(usize, V3, f64)> = Vec::new();
+        let mut unmeasured: Option<(usize, V3, f64)> = None;
+        let mut stack = vec![0usize];
+        while let Some(i) = stack.pop() {
+            let n = &self.nodes[i];
+            // never past a triangle that may tie, with room for rounding
+            let reach = (best + TRIMESH_MERGE) * (1.0 + 1e-12);
+            if box_distance2(p, n.lo, n.hi) > reach {
+                continue;
+            }
+            if n.left == usize::MAX {
+                for &t in &self.order[n.start..n.end] {
+                    let t = t as usize;
+                    let q = closest_point_trimesh(p, &self.tris[t]);
+                    let v = sub(p, q);
+                    let d2 = dd(v, v);
+                    if d2.is_nan() {
+                        if unmeasured.is_none_or(|u| t < u.0) {
+                            unmeasured = Some((t, q, d2));
+                        }
+                        continue;
+                    }
+                    if d2 < best {
+                        best = d2;
+                    }
+                    if d2 - best < TRIMESH_MERGE {
+                        found.push((t, q, d2));
+                    }
+                }
+            } else {
+                stack.push(n.left);
+                stack.push(n.right);
+            }
+        }
+        if found.is_empty() {
+            // every distance NaN (a degenerate triangle): the lowest one
+            return unmeasured.map(|(t, q, d2)| (q, d2, t));
+        }
+        found.retain(|&(_, _, d2)| d2 - best < TRIMESH_MERGE);
+        let key = |&(t, q, d2): &(usize, V3, f64)| {
+            let facing = if best > TRIMESH_MERGE {
+                let r = d2.sqrt();
+                let v = sub(p, q);
+                dd(self.normals[t], [v[0] / r, v[1] / r, v[2] / r])
+            } else {
+                0.0
+            };
+            (facing, d2, t)
+        };
+        let mut chosen = found[0];
+        let mut chosen_key = key(&chosen);
+        for f in &found[1..] {
+            let k = key(f);
+            let better = k.0 > chosen_key.0
+                || (k.0 == chosen_key.0
+                    && (k.1 < chosen_key.1 || (k.1 == chosen_key.1 && k.2 < chosen_key.2)));
+            if better {
+                chosen = *f;
+                chosen_key = k;
+            }
+        }
+        let (t, q, d2) = chosen;
+        Some((q, d2.sqrt(), t))
     }
 
     /// The normal given for triangle `t`.

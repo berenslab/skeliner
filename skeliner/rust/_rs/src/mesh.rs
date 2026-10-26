@@ -2,7 +2,7 @@
 //! array conversion checks.
 
 use numpy::ndarray::{Array1, Array2};
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyIterator, PyList, PyTuple};
@@ -37,8 +37,8 @@ fn mesh_roundtrip<'py>(
 /// and iteration follows the dict's insertion order.  Faces with a repeated
 /// vertex have no edges.
 #[pyclass(name = "Topology", module = "skeliner._rs.mesh", frozen)]
-struct PyTopology {
-    inner: ::mesh::Topology,
+pub(crate) struct PyTopology {
+    pub(crate) inner: ::mesh::Topology,
 }
 
 impl PyTopology {
@@ -268,11 +268,17 @@ struct PyKdTree {
 
 #[pymethods]
 impl PyKdTree {
+    /// `fused`: whether squared distances are summed with fused
+    /// multiply-adds — by default as scipy's tree sums them here.
     #[new]
-    #[pyo3(signature = (points, fused=false))]
-    fn new(py: Python<'_>, points: PyReadonlyArray2<'_, f64>, fused: bool) -> PyResult<Self> {
+    #[pyo3(signature = (points, fused=None))]
+    fn new(
+        py: Python<'_>,
+        points: PyReadonlyArray2<'_, f64>,
+        fused: Option<bool>,
+    ) -> PyResult<Self> {
         let pts = points3(&points)?;
-        let sum = if fused {
+        let sum = if fused.unwrap_or(::mesh::geometry::HAS_FMA) {
             ::mesh::spatial::Sum::Fused
         } else {
             ::mesh::spatial::Sum::Plain
@@ -286,16 +292,30 @@ impl PyKdTree {
         self.inner.len()
     }
 
-    /// Indices within `r` of each query point, ascending, one array per point.
+    /// Indices within `r` of each query point, ascending, one array per
+    /// point; `r` one radius, or one per point.
     fn query_ball_point<'py>(
         &self,
         py: Python<'py>,
         x: PyReadonlyArray2<'py, f64>,
-        r: f64,
+        r: &Bound<'py, PyAny>,
     ) -> PyResult<Vec<Bound<'py, PyArray1<i64>>>> {
-        let qs = points3(&x)?;
-        let hits: Vec<Vec<u32>> =
-            py.detach(|| qs.iter().map(|q| self.inner.within(q, r)).collect());
+        let qs = finite("query points", points3(&x)?)?;
+        let radii = match r.extract::<f64>() {
+            Ok(r) => vec![r; qs.len()],
+            Err(_) => r
+                .extract::<PyReadonlyArray1<'py, f64>>()
+                .ok()
+                .map(|r| r.as_array().to_vec())
+                .filter(|r| r.len() == qs.len())
+                .ok_or_else(|| PyValueError::new_err("r must be a radius or one per point"))?,
+        };
+        let hits: Vec<Vec<u32>> = py.detach(|| {
+            qs.iter()
+                .zip(&radii)
+                .map(|(q, &r)| self.inner.within(q, r))
+                .collect()
+        });
         Ok(hits
             .into_iter()
             .map(|h| {
@@ -307,7 +327,7 @@ impl PyKdTree {
 
     /// `(distances, indices)` of each query point's nearest point.
     fn query<'py>(&self, py: Python<'py>, x: PyReadonlyArray2<'py, f64>) -> PyResult<Nearest<'py>> {
-        let qs = points3(&x)?;
+        let qs = finite("query points", points3(&x)?)?;
         if self.inner.is_empty() {
             return Err(PyValueError::new_err("the tree is empty"));
         }
@@ -322,9 +342,159 @@ impl PyKdTree {
     }
 }
 
+/// A mesh's vertices and faces as the crates take them.
+type MeshIn = (Vec<[f64; 3]>, Vec<[u32; 3]>);
+
+/// The vertices, and the faces checked against them.
+fn mesh_in(
+    vertices: &PyReadonlyArray2<'_, f64>,
+    faces: &PyReadonlyArray2<'_, i64>,
+) -> PyResult<MeshIn> {
+    let verts = rows3("V", vertices)?;
+    let (tris, _) = checked_faces(faces, Some(verts.len()))?;
+    Ok((verts, tris))
+}
+
+fn pairs_out<'py>(py: Python<'py>, pairs: &[[u32; 2]]) -> Bound<'py, PyArray2<i64>> {
+    let flat: Vec<i64> = pairs.iter().flatten().map(|&v| v as i64).collect();
+    Array2::from_shape_vec((pairs.len(), 2), flat)
+        .expect("two per row")
+        .into_pyarray(py)
+}
+
+/// trimesh's `triangles_cross`: `(t1 − t0) × (t2 − t1)` per face.
+#[pyfunction]
+fn face_crosses<'py>(
+    py: Python<'py>,
+    vertices: PyReadonlyArray2<'py, f64>,
+    faces: PyReadonlyArray2<'py, i64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let (verts, tris) = mesh_in(&vertices, &faces)?;
+    let out = py.detach(|| ::mesh::derived::face_crosses(&verts, &tris));
+    Ok(rows_to_array(&out).into_pyarray(py))
+}
+
+/// trimesh's `face_normals` from `crosses` `(F, 3)`: each cross product
+/// over its norm, zero where the norm is not above trimesh's zero.
+#[pyfunction]
+fn face_normals<'py>(
+    py: Python<'py>,
+    crosses: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let c = rows3("F", &crosses)?;
+    let out = py.detach(|| ::mesh::derived::face_normals(&c));
+    Ok(rows_to_array(&out).into_pyarray(py))
+}
+
+/// trimesh's `area_faces` from `crosses` `(F, 3)`: half each one's norm.
+#[pyfunction]
+fn face_areas<'py>(
+    py: Python<'py>,
+    crosses: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let c = rows3("F", &crosses)?;
+    Ok(Array1::from(::mesh::derived::face_areas(&c)).into_pyarray(py))
+}
+
+/// trimesh's `triangles_center`: each face's vertices, summed, over three.
+#[pyfunction]
+fn face_centers<'py>(
+    py: Python<'py>,
+    vertices: PyReadonlyArray2<'py, f64>,
+    faces: PyReadonlyArray2<'py, i64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let (verts, tris) = mesh_in(&vertices, &faces)?;
+    let out = py.detach(|| ::mesh::derived::face_centers(&verts, &tris));
+    Ok(rows_to_array(&out).into_pyarray(py))
+}
+
+/// trimesh's `face_adjacency` of `faces` `(F, 3)` over `n_vertices`: the
+/// two faces of each edge exactly two face edges share, by the edge's
+/// higher end then its lower, lower face first.
+#[pyfunction]
+fn adjacent_faces<'py>(
+    py: Python<'py>,
+    faces: PyReadonlyArray2<'py, i64>,
+    n_vertices: usize,
+) -> PyResult<Bound<'py, PyArray2<i64>>> {
+    let (tris, n) = checked_faces(&faces, Some(n_vertices))?;
+    let out = py.detach(|| ::mesh::derived::adjacent_faces(&tris, n));
+    Ok(pairs_out(py, &out))
+}
+
+/// trimesh's `edges_unique` of `faces` `(F, 3)` over `n_vertices`: every
+/// distinct edge as `[low, high]`, by `high` then `low`.
+#[pyfunction]
+fn unique_edges<'py>(
+    py: Python<'py>,
+    faces: PyReadonlyArray2<'py, i64>,
+    n_vertices: usize,
+) -> PyResult<Bound<'py, PyArray2<i64>>> {
+    let (tris, n) = checked_faces(&faces, Some(n_vertices))?;
+    let out = py.detach(|| ::mesh::topology::unique_edges(&tris, n));
+    Ok(pairs_out(py, &out))
+}
+
+/// trimesh's `edges_unique_length`: each edge's length,
+/// `sqrt((dx² + dy²) + dz²)`.
+#[pyfunction]
+fn edge_lengths<'py>(
+    py: Python<'py>,
+    vertices: PyReadonlyArray2<'py, f64>,
+    edges: PyReadonlyArray2<'py, i64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let verts = rows3("V", &vertices)?;
+    let pairs = node_pairs(&edges, verts.len())?;
+    let pairs: Vec<[u32; 2]> = pairs.iter().map(|&[a, b]| [a as u32, b as u32]).collect();
+    let out = py.detach(|| ::mesh::geometry::edge_lengths(&verts, &pairs));
+    Ok(Array1::from(out).into_pyarray(py))
+}
+
+/// Rows of a 2D `points` array `(N, 2)`.
+fn points2(points: &PyReadonlyArray2<'_, f64>) -> PyResult<Vec<[f64; 2]>> {
+    let a = points.as_array();
+    if a.ncols() != 2 {
+        return Err(PyValueError::new_err(format!(
+            "expected (N, 2) points, got shape {:?}",
+            a.shape()
+        )));
+    }
+    Ok(a.rows().into_iter().map(|r| [r[0], r[1]]).collect())
+}
+
+/// `(area, perimeter)` of the convex hull of 2D `points` `(N, 2)` — scipy's
+/// `ConvexHull` `volume` and `area` — both 0 where qhull refuses the points
+/// as flat.
+#[pyfunction]
+fn hull_measures(points: PyReadonlyArray2<'_, f64>) -> PyResult<(f64, f64)> {
+    Ok(::mesh::geometry::hull_measures(&points2(&points)?))
+}
+
+/// The edges of the convex hull of 2D `points` `(N, 2)` as scipy's
+/// `ConvexHull.equations` gives them — per edge `(n0, n1, offset)`, the unit
+/// normal pointing out, `n . p + offset <= 0` inside — or None where qhull
+/// refuses the points as flat.
+#[pyfunction]
+fn hull_equations<'py>(
+    py: Python<'py>,
+    points: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+    let found = ::mesh::geometry::hull_equations(&points2(&points)?);
+    Ok(found.map(|eq| rows_to_array(&eq).into_pyarray(py)))
+}
+
 /// Add this module's functions and classes to `m`.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mesh_roundtrip, m)?)?;
+    m.add_function(wrap_pyfunction!(face_crosses, m)?)?;
+    m.add_function(wrap_pyfunction!(face_normals, m)?)?;
+    m.add_function(wrap_pyfunction!(face_areas, m)?)?;
+    m.add_function(wrap_pyfunction!(face_centers, m)?)?;
+    m.add_function(wrap_pyfunction!(adjacent_faces, m)?)?;
+    m.add_function(wrap_pyfunction!(unique_edges, m)?)?;
+    m.add_function(wrap_pyfunction!(edge_lengths, m)?)?;
+    m.add_function(wrap_pyfunction!(hull_measures, m)?)?;
+    m.add_function(wrap_pyfunction!(hull_equations, m)?)?;
     m.add_class::<PyTopology>()?;
     m.add_class::<PyKdTree>()?;
     Ok(())

@@ -1314,17 +1314,14 @@ name = "skeliner"
 version = "0.3.1"
 source = { editable = "." }
 dependencies = [
-    { name = "igraph" },
     { name = "matplotlib" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "python-multipart" },
-    { name = "rtree" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "shapely" },
     { name = "starlette" },
-    { name = "trimesh" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -1332,30 +1329,43 @@ dependencies = [
 dev = [
     { name = "flake8" },
     { name = "httpx2" },
+    { name = "igraph" },
     { name = "pytest" },
+    { name = "rtree" },
     { name = "ruff" },
+    { name = "trimesh" },
     { name = "watermark" },
+]
+python = [
+    { name = "igraph" },
+    { name = "rtree" },
+    { name = "trimesh" },
+]
+trimesh = [
+    { name = "trimesh" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "flake8", marker = "extra == 'dev'", specifier = ">=7.3.0" },
     { name = "httpx2", marker = "extra == 'dev'", specifier = ">=2.0.0" },
-    { name = "igraph", specifier = ">=0.11.8" },
+    { name = "igraph", marker = "extra == 'python'", specifier = ">=0.11.8" },
     { name = "matplotlib", specifier = ">=3.10.3" },
     { name = "numpy", specifier = ">=2.0.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.5" },
     { name = "python-multipart", specifier = ">=0.0.22" },
-    { name = "rtree", specifier = ">=1.4.1" },
+    { name = "rtree", marker = "extra == 'python'", specifier = ">=1.4.1" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "scipy", specifier = ">=1.13.1" },
     { name = "shapely", specifier = ">=2.1.2" },
+    { name = "skeliner", extras = ["python", "trimesh"], marker = "extra == 'dev'" },
     { name = "starlette", specifier = ">=0.52.1" },
-    { name = "trimesh", specifier = "==4.7.4" },
+    { name = "trimesh", marker = "extra == 'python'", specifier = "==4.7.4" },
+    { name = "trimesh", marker = "extra == 'trimesh'", specifier = ">=4.7.4" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34.0" },
     { name = "watermark", marker = "extra == 'dev'", specifier = ">=2.5.0" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["trimesh", "python", "dev"]
 
 [[package]]
 name = "stack-data"

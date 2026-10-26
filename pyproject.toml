@@ -9,11 +9,8 @@ description = "A lightweight neuromorphological mesh skeletonizer."
 authors = []
 requires-python = ">=3.11.0"
 dependencies = [
-    "igraph>=0.11.8",
     "numpy>=2.0.2",
     "scipy>=1.13.1",
-    "trimesh==4.7.4",
-    "rtree>=1.4.1",
     "shapely>=2.1.2",
     "matplotlib>=3.10.3",
     "starlette>=0.52.1",
@@ -25,12 +22,18 @@ license-files = ["LICENSE"]
 readme = {file = "README.md", content-type = "text/markdown"}
 
 [project.optional-dependencies]
+# mesh formats other than OBJ (and EyeWire 1's CTM), and Mesh.to_trimesh
+trimesh = ["trimesh>=4.7.4"]
+# the Python path (sk.backend("python")): its twins call trimesh's ray test
+# (which needs rtree) and walk graphs with igraph
+python = ["trimesh==4.7.4", "rtree>=1.4.1", "igraph>=0.11.8"]
 dev = [
     "pytest>=8.3.5",
     "ruff",
     "flake8>=7.3.0",
     "httpx2>=2.0.0",
     "watermark>=2.5.0",
+    "skeliner[python,trimesh]",
 ]
 
 [project.scripts]

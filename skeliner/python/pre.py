@@ -6,17 +6,18 @@ from __future__ import annotations
 from collections import Counter, defaultdict, deque
 
 import numpy as np
-from scipy.spatial import KDTree
 
 from .mesh import (
     border_loops,
     checked_faces,
     edge_to_faces,
     face_adjacency,
+    hull_measures,
     nearest,
     non_degenerate,
     row_dot,
     rows3,
+    Topology,
 )
 
 
@@ -412,6 +413,7 @@ def outward_dots(
     of the vertices within *radius* of its centre (of its own component's,
     given *vert_comp*) to that centre; 0 where fewer than four vertices are
     near or the direction vanishes."""
+    from scipy.spatial import KDTree
     from scipy.sparse import csr_matrix
 
     verts = rows3("V", vertices)
@@ -853,6 +855,8 @@ def find_disconnected(
     centroid lies in the soma (*soma_w* is ``R / axes``, which maps the soma
     to the unit sphere), or it sits against the inside of the main surface.
     """
+    from scipy.spatial import KDTree
+
     vertices = rows3("V", vertices)
     faces, _ = checked_faces(faces, len(vertices))
     centers = rows3("F", centers)
@@ -1029,23 +1033,42 @@ def rim_enclosed_area(boundary_edges, vertices, svd_rows) -> float:
     return total_area
 
 
+def opening_hull_area(pts, svd_rows) -> float:
+    """``find_pocket_mouths``' opening when no rim loop closes: the
+    convex-hull area of *pts* centred on their mean, on the plane of their
+    first two right-singular vectors (*svd_rows*, numpy's SVD) — 0 where
+    qhull, which scipy's ``ConvexHull`` ran, refuses them as flat
+    (:func:`~skeliner.python.mesh.hull_measures`)."""
+    pts = np.asarray(pts, dtype=np.float64)
+    total = np.zeros(3)
+    for p in pts:
+        total = total + p
+    centred = pts - total / len(pts)
+    vt = svd_rows(centred, True)
+    plane = np.c_[
+        centred[:, 0] * vt[0][0] + centred[:, 1] * vt[0][1] + centred[:, 2] * vt[0][2],
+        centred[:, 0] * vt[1][0] + centred[:, 1] * vt[1][1] + centred[:, 2] * vt[1][2],
+    ]
+    return hull_measures(plane)[0]
+
+
 def pocket_mouths(
     faces,
     vertices,
     areas,
     outward_dots,
     main_face_mask,
-    edge_to_face: dict[tuple[int, int], list[int]],
-    adj: dict[int, set[int]],
+    topology: Topology,
     svd_rows,
-    hull_area,
     *,
     min_pocket_size: int = 5,
     min_fold_ratio: float = 3.0,
     non_main_mask=None,
 ) -> list[list[tuple[int, int]]]:
     """Mouth edges — the boundaries of negative-dot face clusters on the
-    faces of *main_face_mask* — one list per pocket.
+    faces of *main_face_mask* — one list per pocket, pockets in the order of
+    their lowest face, each cluster walked breadth first from it with every
+    face's neighbours ascending.
 
     A valid pocket must satisfy:
 
@@ -1054,30 +1077,30 @@ def pocket_mouths(
        much larger than the mouth's enclosed planar area, indicating the
        surface folds inward through a small opening.
 
-    *hull_area(pts)* is the convex-hull area of points on their best-fit
-    plane, the opening when no rim loop closes.
+    When no rim loop closes, the opening is :func:`opening_area`.
     """
     faces_arr = np.asarray(faces)
     area_arr = np.asarray(areas)
     verts_arr = np.asarray(vertices)
+    edge_to_face = topology
+    adj = topology.face_adjacency()
 
     # Connected components of negative-dot faces on main component
-    neg_idx = set(np.where((outward_dots < 0) & main_face_mask)[0].tolist())
-    visited: set[int] = set()
+    neg = (np.asarray(outward_dots) < 0) & np.asarray(main_face_mask)
+    seen = np.zeros(len(faces_arr), dtype=bool)
     clusters: list[list[int]] = []
-    for fi in neg_idx:
-        if fi in visited:
+    for fi in np.flatnonzero(neg).tolist():
+        if seen[fi]:
             continue
+        seen[fi] = True
         cluster: list[int] = []
         queue = deque([fi])
         while queue:
             curr = queue.popleft()
-            if curr in visited:
-                continue
-            visited.add(curr)
             cluster.append(curr)
-            for nfi in adj.get(curr, set()):
-                if nfi in neg_idx and nfi not in visited:
+            for nfi in sorted(adj.get(curr, set())):
+                if neg[nfi] and not seen[nfi]:
+                    seen[nfi] = True
                     queue.append(nfi)
         clusters.append(cluster)
 
@@ -1122,8 +1145,8 @@ def pocket_mouths(
             # Boundary loops with non-manifold junctions (vertex
             # shared by 4+ boundary edges) get discarded by
             # rim_enclosed_area.  Fall back to the convex hull of
-            # boundary vertices: hull_area >= true opening area, so
-            # pocket_area / hull_area is a *lower bound* on the true
+            # boundary vertices: its area >= true opening area, so
+            # pocket_area / hull area is a *lower bound* on the true
             # fold ratio — this can only recover missed mouths, never
             # reject valid ones.
             # Only apply on the main component — small disconnected
@@ -1133,7 +1156,7 @@ def pocket_mouths(
             if not on_non_main:
                 bverts = sorted({v for e in boundary_edges for v in e})
                 if len(bverts) >= 3:
-                    opening_area = hull_area(verts_arr[bverts])
+                    opening_area = opening_hull_area(verts_arr[bverts], svd_rows)
             if opening_area <= 0:
                 continue
         fold_ratio = pocket_area / opening_area
@@ -1151,10 +1174,8 @@ def pocket_organelles(
     areas,
     outward_dots,
     main_face_mask,
-    edge_to_face: dict[tuple[int, int], list[int]],
-    adj: dict[int, set[int]],
+    topology: Topology,
     svd_rows,
-    hull_area,
     *,
     grow_threshold: float = 0.1,
     bridge_threshold: float = 0.3,
@@ -1189,16 +1210,16 @@ def pocket_organelles(
         "n_holes": 0,
         "n_rejected": 0,
     }
+    edge_to_face = topology
+    adj = topology.face_adjacency()
     mouths = pocket_mouths(
         faces,
         vertices,
         areas,
         outward_dots,
         main_face_mask,
-        edge_to_face,
-        adj,
+        topology,
         svd_rows,
-        hull_area,
         min_pocket_size=min_pocket_size,
         min_fold_ratio=min_fold_ratio,
         non_main_mask=non_main_mask,
@@ -1379,6 +1400,8 @@ def isolated_organelles(
     counts)``, *counts* the fragments marked and their faces, the components
     kept, and how many were judged by their outward dots and how many, all
     dots zero, by the side of the main surface they lie on."""
+    from scipy.spatial import KDTree
+
     faces = np.asarray(faces)
     vertices = np.asarray(vertices)
     face_comp = np.asarray(face_comp)
@@ -1587,7 +1610,6 @@ def find_organelles(
     main: int,
     adjacency,
     svd_rows,
-    hull_area,
     min_cluster_size: int = 5,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
     """Organelle membranes, given the mesh stats: ``(pocket, isolated,
@@ -1636,18 +1658,14 @@ def find_organelles(
             non_main_mask[face_comp == ci] = True
 
     # ── 3. Pocket detection on all structural components ────────────
-    edge_to_face = edge_to_faces(faces)
-    adj = face_adjacency(edge_to_face)
     pocket, pocket_counts = pocket_organelles(
         faces,
         vertices,
         areas,
         outward_dots,
         structural_mask,
-        edge_to_face,
-        adj,
+        Topology(faces, len(vertices)),
         svd_rows,
-        hull_area,
         min_cluster_size=min_cluster_size,
         non_main_mask=non_main_mask,
     )
@@ -1702,6 +1720,8 @@ def find_gaps(
     smaller piece's extent; a component the tree left stranded is retried
     with its cheapest acceptable contact.
     """
+    from scipy.spatial import KDTree
+
     vertices = rows3("V", vertices)
     faces, _ = checked_faces(faces, len(vertices))
     centers = rows3("F", centers)
@@ -2210,6 +2230,7 @@ def zipper_stitch(
         ``fit(ids)`` fits a circle to the loop of vertices *ids*:
         ``(center, radius, normal)``.
     """
+    from scipy.spatial import KDTree
 
     if new_verts is None:
         new_verts_local: list[np.ndarray] = []
@@ -4800,3 +4821,98 @@ class ZScan:
     def raw(self) -> list[tuple]:
         """Per level ``(z, cx, cy, void_r, void_xy, vertex ids, soma_mask)``."""
         return list(self._raw)
+
+
+def find_chunk_boundaries(
+    vertices,
+) -> list[tuple[int, np.ndarray, np.ndarray, np.ndarray]]:
+    """Chunk boundary planes from vertex coordinate clustering: per axis
+    with any, ``(axis, values, counts, spikes)`` — the integer coordinates
+    (the vertices' rounded half to even) where the vertex count spikes over
+    five times the mean count of the five coordinates on either side, less
+    the weaker of two spikes closer than a quarter of the median spacing,
+    with the count and the spike at each. An axis with fewer than three
+    coordinates or no spike has none."""
+    verts = rows3("V", vertices)
+    out = []
+    for axis in range(3):
+        coords = np.round(verts[:, axis]).astype(np.int64)
+        unique, counts = np.unique(coords, return_counts=True)
+
+        if len(unique) < 3:
+            continue
+
+        # Chunk boundaries are sharp spikes: a single coordinate value
+        # with many more vertices than its neighbors.  Detect as values
+        # where count exceeds the local background by a large factor.
+        # Spike ratio: each value's count vs mean of its ±5 neighbors
+        n = len(counts)
+        local_bg = np.empty(n, dtype=float)
+        for i in range(n):
+            lo = max(0, i - 5)
+            hi = min(n, i + 6)
+            # Exclude self from local background
+            neighbors = np.concatenate([counts[lo:i], counts[i + 1 : hi]])
+            local_bg[i] = neighbors.mean() if len(neighbors) > 0 else 1.0
+        spike_ratio = counts / np.maximum(local_bg, 1.0)
+
+        # A boundary is any coordinate with a clear local spike
+        is_boundary = spike_ratio > 5.0
+
+        if not is_boundary.any():
+            continue
+
+        # Remove false boundaries that are too close to a real one.
+        # Real chunk boundaries have consistent spacing; a spike much
+        # closer than the median spacing is a hard-cutoff or other
+        # non-chunk artifact.
+        bvals = unique[is_boundary]
+        if len(bvals) >= 3:
+            spacings = np.diff(bvals)
+            median_sp = float(np.median(spacings))
+            keep = np.ones(len(bvals), dtype=bool)
+            for i in range(len(bvals)):
+                left = spacings[i - 1] if i > 0 else median_sp
+                right = spacings[i] if i < len(spacings) else median_sp
+                # If BOTH neighbors are much closer than median, it's
+                # a cluster — keep the one with the highest spike.
+                # If only one side is short, this boundary is the
+                # non-chunk one if it has a lower spike than its
+                # close neighbor.
+                if min(left, right) < median_sp * 0.25:
+                    # Find the close neighbor
+                    if left < median_sp * 0.25 and i > 0:
+                        # Close to left neighbor — keep the stronger
+                        left_ratio = spike_ratio[np.where(unique == bvals[i - 1])[0][0]]
+                        this_ratio = spike_ratio[np.where(unique == bvals[i])[0][0]]
+                        if this_ratio < left_ratio:
+                            keep[i] = False
+                    if right < median_sp * 0.25 and i < len(spacings):
+                        right_ratio = spike_ratio[
+                            np.where(unique == bvals[i + 1])[0][0]
+                        ]
+                        this_ratio = spike_ratio[np.where(unique == bvals[i])[0][0]]
+                        if this_ratio < right_ratio:
+                            keep[i] = False
+            bvals = bvals[keep]
+
+        at = np.searchsorted(unique, bvals)
+        out.append(
+            (
+                axis,
+                bvals.astype(np.int64),
+                counts[at].astype(np.int64),
+                spike_ratio[at].astype(np.float64),
+            )
+        )
+    return out
+
+
+def usable_faces(vertices, faces) -> np.ndarray:
+    """Faces ``break_up_mesh`` will consider: three distinct vertices and a
+    cross product ``(v1 - v0) x (v2 - v0)`` with a norm above zero."""
+    verts = rows3("V", vertices)
+    faces, _ = checked_faces(faces, len(verts))
+    v0, v1, v2 = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
+    nonzero_area = np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1) > 0
+    return non_degenerate(faces) & nonzero_area

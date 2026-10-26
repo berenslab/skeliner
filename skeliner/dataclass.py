@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
+import functools
+import inspect
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MethodType
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Tuple
 
-import igraph as ig
 import numpy as np
-from scipy.spatial import KDTree
+
+from ._state import VertexMap
 
 if TYPE_CHECKING:
+    import igraph as ig
+
     from . import dx as _dx_mod
     from . import post as _post_mod
 
 __all__ = [
+    "Mesh",
     "Discarded",
     "MeshComponents",
     "Neurites",
@@ -26,6 +31,223 @@ __all__ = [
     "ContactSites",
     "register_skeleton_methods",
 ]
+
+
+class Mesh:
+    """A triangle mesh: *vertices* ``(N, 3)`` float64 and *faces* ``(F, 3)``
+    int64 vertex ids, with the arrays skeliner derives from them — face
+    normals, centres and areas, the unique edges and their lengths, the face
+    adjacency — each computed once, on the active path, equal to trimesh's.
+
+    The arrays are copies and read-only, so what is derived from them stays
+    true: edit a mesh by making a new one. :meth:`Mesh.of` makes one of
+    anything with ``vertices`` and ``faces`` (a ``trimesh.Trimesh``, say);
+    :meth:`to_trimesh` goes the other way when trimesh is installed.
+    """
+
+    __slots__ = ("_vertices", "_faces", "_derived")
+
+    def __init__(self, vertices, faces):
+        from .python.mesh import checked_faces
+
+        vertices = np.array(vertices, dtype=np.float64, order="C")
+        if vertices.size == 0:
+            vertices = vertices.reshape(0, 3)
+        if vertices.ndim != 2 or vertices.shape[1] != 3:
+            raise ValueError(f"vertices must be (N, 3), not {vertices.shape}")
+        faces = np.array(faces, dtype=np.int64, order="C")
+        if faces.size == 0:
+            faces = faces.reshape(0, 3)
+        faces, _ = checked_faces(faces, len(vertices))
+        vertices.flags.writeable = False
+        faces.flags.writeable = False
+        self._vertices = vertices
+        self._faces = faces
+        self._derived: dict[str, np.ndarray] = {}
+
+    @classmethod
+    def _adopt(cls, vertices: np.ndarray, faces: np.ndarray) -> "Mesh":
+        """A mesh of arrays made for it — float64 ``(N, 3)`` vertices and
+        int64 ``(F, 3)`` faces already checked against them — without
+        copying them."""
+        mesh = cls.__new__(cls)
+        vertices.flags.writeable = False
+        faces.flags.writeable = False
+        mesh._vertices = vertices
+        mesh._faces = faces
+        mesh._derived = {}
+        return mesh
+
+    @classmethod
+    def of(cls, mesh) -> "Mesh":
+        """*mesh* as a :class:`Mesh`: itself when it is one, else a copy of its
+        ``vertices`` and ``faces``."""
+        if isinstance(mesh, cls):
+            return mesh
+        try:
+            vertices, faces = mesh.vertices, mesh.faces
+        except AttributeError:
+            raise TypeError(
+                f"a mesh has vertices and faces; {type(mesh).__name__} has not"
+            ) from None
+        return cls(vertices, faces)
+
+    def __reduce__(self):
+        return (Mesh, (self._vertices, self._faces))
+
+    def __repr__(self) -> str:
+        return (
+            f"<skeliner.Mesh: {len(self._vertices):,} vertices, "
+            f"{len(self._faces):,} faces>"
+        )
+
+    @property
+    def vertices(self) -> np.ndarray:
+        """``(N, 3)`` float64 vertex positions, read-only."""
+        return self._vertices
+
+    @property
+    def faces(self) -> np.ndarray:
+        """``(F, 3)`` int64 vertex ids per face, read-only."""
+        return self._faces
+
+    def _get(self, name: str, compute: Callable[[], np.ndarray]) -> np.ndarray:
+        out = self._derived.get(name)
+        if out is None:
+            out = np.asarray(compute())
+            out.flags.writeable = False
+            self._derived[name] = out
+        return out
+
+    @property
+    def triangles(self) -> np.ndarray:
+        """``(F, 3, 3)`` each face's vertex positions."""
+        return self._get("triangles", lambda: self._vertices[self._faces])
+
+    @property
+    def triangles_cross(self) -> np.ndarray:
+        """``(F, 3)`` each face's ``(v1 - v0) x (v2 - v1)``."""
+        return self._get(
+            "triangles_cross",
+            lambda: _kernels().mesh.face_crosses(self._vertices, self._faces),
+        )
+
+    @property
+    def face_normals(self) -> np.ndarray:
+        """``(F, 3)`` unit normals, zero for a face too small to have one."""
+        return self._get(
+            "face_normals", lambda: _kernels().mesh.face_normals(self.triangles_cross)
+        )
+
+    @property
+    def area_faces(self) -> np.ndarray:
+        """``(F,)`` each face's area."""
+        return self._get(
+            "area_faces", lambda: _kernels().mesh.face_areas(self.triangles_cross)
+        )
+
+    @property
+    def triangles_center(self) -> np.ndarray:
+        """``(F, 3)`` each face's centroid."""
+        return self._get(
+            "triangles_center",
+            lambda: _kernels().mesh.face_centers(self._vertices, self._faces),
+        )
+
+    @property
+    def edges_unique(self) -> np.ndarray:
+        """``(E, 2)`` every distinct edge as ``[low, high]``, by ``high``
+        then ``low``."""
+        return self._get(
+            "edges_unique",
+            lambda: _kernels().mesh.unique_edges(self._faces, len(self._vertices)),
+        )
+
+    @property
+    def edges_unique_length(self) -> np.ndarray:
+        """``(E,)`` the length of each of :attr:`edges_unique`."""
+        return self._get(
+            "edges_unique_length",
+            lambda: _kernels().mesh.edge_lengths(self._vertices, self.edges_unique),
+        )
+
+    @property
+    def face_adjacency(self) -> np.ndarray:
+        """``(M, 2)`` the two faces of each edge exactly two faces share,
+        lower first, by the edge's higher end and then its lower."""
+        return self._get(
+            "face_adjacency",
+            lambda: _kernels().mesh.adjacent_faces(self._faces, len(self._vertices)),
+        )
+
+    def submesh(self, faces) -> "Mesh":
+        """The *faces* (ids or a mask) as a mesh of their own, with the
+        vertices they use, ascending, renumbered: trimesh's ``submesh(...,
+        append=True)``."""
+        current = self._faces[np.asarray(faces)].reshape(-1, 3)
+        used = np.unique(current)
+        renumber = np.zeros(len(self._vertices), dtype=np.int64)
+        renumber[used] = np.arange(len(used))
+        return Mesh(self._vertices[used], renumber[current])
+
+    def copy(self) -> "Mesh":
+        """A mesh of the same vertices and faces."""
+        return Mesh(self._vertices, self._faces)
+
+    def to_trimesh(self):
+        """This mesh as a ``trimesh.Trimesh`` (trimesh must be installed)."""
+        try:
+            import trimesh
+        except ImportError:
+            raise ImportError(
+                "Mesh.to_trimesh needs trimesh: pip install 'skeliner[trimesh]'"
+            ) from None
+        return trimesh.Trimesh(
+            vertices=self._vertices.copy(), faces=self._faces.copy(), process=False
+        )
+
+    def export(self, path: str | Path) -> None:
+        """Write the mesh to *path*, the format by its suffix
+        (:func:`skeliner.io.save_mesh`)."""
+        from .io import save_mesh
+
+        save_mesh(self, path)
+
+
+def _kernels():
+    from ._backend import kernels
+
+    return kernels
+
+
+def mesh_args(*names: str):
+    """Decorate a function so that its parameters *names* (``mesh`` when none
+    are named) arrive as :class:`Mesh` — anything with ``vertices`` and
+    ``faces`` converted once, ``None`` left alone."""
+
+    def wrap(fn):
+        params = list(inspect.signature(fn).parameters)
+        at = [(params.index(name), name) for name in names or ("mesh",)]
+
+        @functools.wraps(fn)
+        def inner(*args, **kwargs):
+            if args:
+                args = list(args)
+                for i, name in at:
+                    if i < len(args):
+                        if args[i] is not None:
+                            args[i] = Mesh.of(args[i])
+                    elif kwargs.get(name) is not None:
+                        kwargs[name] = Mesh.of(kwargs[name])
+            else:
+                for _, name in at:
+                    if kwargs.get(name) is not None:
+                        kwargs[name] = Mesh.of(kwargs[name])
+            return fn(*args, **kwargs)
+
+        return inner
+
+    return wrap
 
 
 class _SkeletonModuleView:
@@ -758,15 +980,16 @@ class Skeleton:
 
     # ---- optional mesh data ----------------------------------
     node2verts: list[np.ndarray] | None = None
-    vert2node: dict[int, int] | None = None
+    vert2node: VertexMap | None = None  # a dict given is converted
     # ---- optional dictionary for meta data and future extras -
     meta: dict[str, Any] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
     # ---- cached spatial helpers ------------------------------
-    _nodes_kdtree: KDTree | None = field(
+    _node_neighbors: tuple[np.ndarray, ...] | None = field(
         default=None, init=False, repr=False, compare=False
     )
-    _node_neighbors: tuple[np.ndarray, ...] | None = field(
+    # (path, index): `dx.distance`'s index, built by the path then active
+    _distance_index: tuple[str, Any] | None = field(
         default=None, init=False, repr=False, compare=False
     )
 
@@ -776,6 +999,10 @@ class Skeleton:
     def __post_init__(self) -> None:
         """Validate basic shape constraints."""
         N = self.nodes.shape[0]
+
+        # ---- vert2node --------------------------------------------------
+        if self.vert2node is not None and not isinstance(self.vert2node, VertexMap):
+            self.vert2node = VertexMap(self.vert2node)
 
         # ---- radii ---------------------------------------------------
         if any(len(r) != N for r in self.radii.values()):
@@ -805,34 +1032,49 @@ class Skeleton:
                 raise ValueError("soma_verts must be 1-D")
 
     # ---------------------------------------------------------------------
-    # spatial helpers (KD-tree + adjacency cache)
+    # spatial helpers (distance index + adjacency cache)
     # ---------------------------------------------------------------------
     def _invalidate_spatial_index(self) -> None:
-        """Drop cached spatial structures (KD-tree, adjacency)."""
-        self._nodes_kdtree = None
+        """Drop cached spatial structures (distance index, adjacency)."""
         self._node_neighbors = None
+        self._distance_index = None
 
-    def _ensure_nodes_kdtree(self, *, rebuild: bool = False) -> KDTree:
-        """Return a cached KD-tree over node coordinates."""
-        if rebuild:
-            self._nodes_kdtree = None
-        if self._nodes_kdtree is None:
-            if self.nodes.size == 0:
-                raise ValueError("Cannot build KD-tree: skeleton has no nodes.")
-            self._nodes_kdtree = KDTree(self.nodes)
-        return self._nodes_kdtree
+    def _ensure_distance_index(self):
+        """The active path's ``SkeletonIndex`` over the nodes and their
+        neighbours, which ``dx.distance`` measures against; cached, and built
+        again when the path changes."""
+        from ._backend import backend, kernels
+
+        path = backend.get()
+        if self._distance_index is None or self._distance_index[0] != path:
+            neighbours = self._ensure_node_neighbors()
+            ptr = np.zeros(len(neighbours) + 1, dtype=np.int64)
+            ptr[1:] = np.cumsum([len(nb) for nb in neighbours])
+            idx = (
+                np.concatenate(neighbours).astype(np.int64)
+                if neighbours
+                else np.empty(0, dtype=np.int64)
+            )
+            index = kernels.dx.SkeletonIndex(
+                np.asarray(self.nodes, dtype=np.float64), ptr, idx
+            )
+            self._distance_index = (path, index)
+        return self._distance_index[1]
 
     def _ensure_node_neighbors(self) -> tuple[np.ndarray, ...]:
         """Return cached neighbour lists for every node."""
         if self._node_neighbors is None:
-            neighbours = [[] for _ in range(len(self.nodes))]
-            for u, v in self.edges:
-                neighbours[u].append(v)
-                neighbours[v].append(u)
-            self._node_neighbors = tuple(
-                np.asarray(nbrs, dtype=np.int64) if nbrs else np.empty(0, np.int64)
-                for nbrs in neighbours
-            )
+            # each node's neighbours in the order the edges name them, the
+            # edge's first end before its second (a self-loop lists it twice)
+            n = len(self.nodes)
+            e = np.asarray(self.edges, dtype=np.int64).reshape(-1, 2)
+            if e.size and (e.min() < 0 or e.max() >= n):
+                raise ValueError(f"an edge names a node that is not one of {n}")
+            order = np.argsort(e.reshape(-1), kind="stable")
+            others = e[:, ::-1].reshape(-1)[order]
+            ptr = np.zeros(n + 1, dtype=np.int64)
+            np.cumsum(np.bincount(e.reshape(-1), minlength=n), out=ptr[1:])
+            self._node_neighbors = tuple(others[ptr[i] : ptr[i + 1]] for i in range(n))
         return self._node_neighbors
 
     # ---------------------------------------------------------------------
@@ -840,6 +1082,8 @@ class Skeleton:
     # ---------------------------------------------------------------------
     def _igraph(self) -> ig.Graph:
         """Return an :class:`igraph.Graph` view of self (undirected)."""
+        import igraph as ig
+
         return ig.Graph(
             n=len(self.nodes),
             edges=[tuple(map(int, e)) for e in self.edges],

@@ -53,6 +53,31 @@ def test_graft_then_clip(template_skel):
     assert _is_forest(skel)
 
 
+def _path_skel(n_nodes, edges):
+    return Skeleton(
+        soma=Soma.from_sphere(np.zeros(3), 1.0, verts=None),
+        nodes=np.arange(3 * n_nodes, dtype=np.float64).reshape(-1, 3),
+        radii={"median": np.ones(n_nodes)},
+        edges=np.asarray(edges, dtype=np.int64).reshape(-1, 2),
+        ntype=None,
+    )
+
+
+def test_graft_refuses_a_cycle_through_a_longer_path():
+    # 0-1-2-3 and 4 on its own: joining 0 and 3 closes a loop over three
+    # edges, joining 3 and 4 two trees
+    skel = _path_skel(5, [[0, 1], [1, 2], [2, 3]])
+    with pytest.raises(ValueError, match="cycle"):
+        post.graft(skel, 0, 3, allow_cycle=False)
+    with pytest.raises(ValueError, match="cycle"):
+        post.graft(skel, 3, 1, allow_cycle=False)
+    assert skel.edges.tolist() == [[0, 1], [1, 2], [2, 3]]
+    post.graft(skel, 4, 3, allow_cycle=False)
+    assert skel.edges.tolist() == [[0, 1], [1, 2], [2, 3], [3, 4]]
+    post.graft(skel, 0, 3, allow_cycle=True)
+    assert [0, 3] in skel.edges.tolist()
+
+
 def test_prune_twigs(template_skel):
     skel = copy.deepcopy(template_skel)
     n_before = len(skel.nodes)
@@ -864,6 +889,160 @@ def test_merge_near_soma_nodes_leaves_the_input_skeleton_alone():
         verbose=False,
     )
     assert len(out.nodes) < len(skel.nodes)  # it merged something
+    assert not (out.edges[:, 0] == out.edges[:, 1]).any()  # no self-loop
     assert len(out.soma.verts) > len(before.verts)
     assert np.array_equal(skel.soma.verts, before.verts)
     assert np.array_equal(skel.soma.center, before.center)
+
+
+def _random_tree_case(rng, n, *, cycles):
+    """A forest on *n* nodes along a wobbly line, with branch points; with
+    *cycles*, a few extra edges, rings, a self-loop. Radii in runs of equal
+    values (so groups and absorptions happen) with jitter now and then."""
+    edges = [
+        [int(rng.integers(max(0, i - 3), i)), i]
+        for i in range(1, n)
+        if rng.random() > 0.05
+    ]
+    if cycles:
+        edges += rng.integers(0, n, size=(int(rng.integers(0, 3)), 2)).tolist()
+        if rng.random() < 0.3:
+            v = int(rng.integers(0, n))
+            edges.append([v, v])
+    edges = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
+    nodes = np.cumsum(rng.normal(size=(n, 3)), axis=0)
+    nodes[rng.random(n) < 0.05] = nodes[0]  # some zero-length segments
+    base = np.repeat(rng.uniform(1, 3, size=n // 4 + 1), 4)[:n]
+    radii = np.stack([base, base * rng.choice([1.0, 1.02, 1.3], size=n)])
+    sizes = rng.integers(0, 4, size=n)
+    idx = rng.integers(0, 5 * n, size=int(sizes.sum())).astype(np.int64)
+    ptr = np.zeros(n + 1, dtype=np.int64)
+    np.cumsum(sizes, out=ptr[1:])
+    return nodes, radii, edges, ptr, idx
+
+
+def test_downsample_on_both_paths():
+    from skeliner import _rs
+    from skeliner.python import post as python_post
+
+    from ._parity import assert_parity
+
+    rng = np.random.default_rng(67)
+    merged = absorbed_twice = 0
+    for trial in range(300):
+        n = int(rng.integers(1, 60))
+        nodes, radii, edges, ptr, idx = _random_tree_case(rng, n, cycles=trial % 3 == 0)
+        aggregate = ("area", "mean", "median")[trial % 3]
+        shift = None if trial % 4 else float(rng.uniform(0.5, 3))
+        bins = (ptr, idx) if trial % 5 else (None, None)
+        args = (
+            nodes,
+            radii,
+            int(rng.integers(0, 2)),
+            edges,
+            *bins,
+            float(rng.choice([0.0, 0.05, 0.3])),
+            float(rng.choice([0.0, 0.1])),
+            aggregate,
+            bool(trial % 2),
+            bool(trial % 7 != 3),
+            shift,
+        )
+        rust = _rs.post.downsample(*args)
+        assert_parity(rust, python_post.downsample(*args))
+        assert (rust[3] >= 0).all()  # every node goes somewhere
+        merged += len(rust[0]) < n
+        if bins[0] is not None and len(rust[0]):
+            counts = np.bincount(rust[3], minlength=len(rust[0]))
+            absorbed_twice += int((counts > 3).sum())
+    assert merged > 150 and absorbed_twice > 20
+
+
+def test_downsample_ends_alike_on_both_paths(template_skel):
+    from ._parity import assert_parity, both
+
+    for kwargs in (
+        {},
+        {"aggregate": "median", "slide_branchpoints": False},
+        {"aggregate": "mean", "merge_endpoints": False, "max_anchor_shift": 50.0},
+    ):
+        rust, python = both(post.downsample, template_skel, verbose=False, **kwargs)
+        for field in ("nodes", "radii", "edges", "ntype", "node2verts", "vert2node"):
+            assert_parity(getattr(rust, field), getattr(python, field), field)
+
+
+def _labelled_line(edges, n, radii=None):
+    nodes = np.c_[np.arange(n, dtype=float), np.zeros(n), np.zeros(n)]
+    return Skeleton(
+        soma=Soma.from_sphere(nodes[0], 1.0, verts=None),
+        nodes=nodes,
+        radii={"median": np.ones(n) if radii is None else np.asarray(radii)},
+        edges=np.asarray(edges, dtype=np.int64),
+        ntype=None,
+        node2verts=[np.array([10 * i, 10 * i + 1]) for i in range(n)],
+        vert2node={v: i for i in range(n) for v in (10 * i, 10 * i + 1)},
+    )
+
+
+@pytest.mark.parametrize("path", ["rust", "python"])
+def test_downsample_ends_on_rings_and_loops(path):
+    # Before: a ring through node 0 never ended, a ring with no anchor lost
+    # its nodes, and a loop through a branch point whose run its branch point
+    # absorbed raised "self-loops are not allowed".
+    import skeliner as sk
+
+    with sk.backend(path):
+        ring = _labelled_line([[0, 1], [1, 2], [2, 3], [3, 0]], 4)
+        d = post.downsample(ring, verbose=False)
+        assert len(d.nodes) == 2 and dx.check_bins(d)
+
+        apart = _labelled_line([[0, 1], [1, 2], [2, 3], [4, 5], [5, 6], [6, 4]], 7)
+        d = post.downsample(apart, verbose=False)
+        assert len(d.nodes) == 4  # the path's two and the ring's two
+        assert len(d.vert2node) == 14 and dx.check_bins(d)
+
+        loop = _labelled_line([[0, 1], [1, 2], [2, 3], [3, 1]], 4)
+        d = post.downsample(loop, verbose=False)
+        assert dx.check_bins(d) and (d.edges[:, 0] != d.edges[:, 1]).all()
+
+
+@pytest.mark.parametrize("path", ["rust", "python"])
+def test_a_branch_point_absorbing_from_two_runs_keeps_both(path):
+    # 0-1-2-3 and 3-4-5 and 3-6: node 3 a branch point whose runs 1-2 and
+    # 4 agree with it. Before: the second absorption overwrote the first, so
+    # nodes 1 and 2 mapped to the branch point while their vertices were in
+    # no bin, and dx.check_bins failed.
+    import skeliner as sk
+
+    edges = [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [3, 6]]
+    radii = [5.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0]
+    skel = _labelled_line(edges, 7, radii)
+    with sk.backend(path):
+        d = post.downsample(skel, verbose=False)
+    hub = d.vert2node[30]
+    assert d.vert2node[10] == d.vert2node[20] == d.vert2node[40] == hub
+    assert set(d.node2verts[hub].tolist()) == {10, 11, 20, 21, 30, 31, 40, 41}
+    assert dx.check_bins(d)
+
+
+def test_dropping_the_soma_is_refused():
+    # the guard compared numpy's bool with `is False`, so it never fired
+    skel = _labelled_line([[0, 1], [1, 2]], 3)
+    with pytest.raises(RuntimeError, match="soma"):
+        post._rebuild_drop_set(skel, {0, 2})
+
+
+def test_clip_drops_what_the_soma_no_longer_reaches():
+    skel = _labelled_line([[0, 1], [1, 2], [2, 3], [1, 4]], 5)
+    post.clip(skel, 1, 2, drop_orphans=True)
+    assert len(skel.nodes) == 3 and skel.edges.tolist() == [[0, 1], [1, 2]]
+    assert sorted(skel.vert2node) == [0, 1, 10, 11, 40, 41]
+
+
+def test_pruning_nodes_keeps_a_hub_joining_two_kept_neighbours():
+    # hub 2 joins 1, 3 and 4; dropping 2 and 4 keeps 2, which still joins
+    # two kept neighbours
+    skel = _labelled_line([[0, 1], [1, 2], [2, 3], [2, 4], [4, 5]], 6)
+    post.prune(skel, kind="nodes", nodes=[2, 4])
+    assert len(skel.nodes) == 5
+    assert sorted(skel.vert2node.values()) == sorted([0, 0, 1, 1, 2, 2, 3, 3, 4, 4])

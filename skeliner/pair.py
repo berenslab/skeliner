@@ -17,13 +17,9 @@ Two ways to find contact sites, both returning ``ContactSites``:
 from typing import Iterable
 
 import numpy as np
-import trimesh
-from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import connected_components
-from scipy.spatial import ConvexHull, KDTree
 
 from ._backend import kernels
-from .dataclass import ContactSeeds, ContactSites, ProxySites, Skeleton
+from .dataclass import ContactSeeds, ContactSites, Mesh, ProxySites, Skeleton, mesh_args
 
 ####################
 ## Skeleton-based ##
@@ -93,9 +89,11 @@ def find_contact_seeds(
     XA, RA = xa[idx_a0], ra[idx_a0]
     XB, RB = xb[idx_b0], rb[idx_b0]
 
-    # --- cheap mutual AABB overlap prefilter (pad by robust RB/RA margin)
-    padA = float(RB.max()) + float(delta)
-    padB = float(RA.max()) + float(delta)
+    # --- cheap mutual AABB overlap prefilter: a node can touch the other
+    # skeleton only within its own radius, the other's largest and delta of
+    # the other's box
+    padA = (RA + float(RB.max()) + float(delta))[:, None]
+    padB = (RB + float(RA.max()) + float(delta))[:, None]
 
     Alo, Ahi = XA.min(0), XA.max(0)
     Blo, Bhi = XB.min(0), XB.max(0)
@@ -111,13 +109,9 @@ def find_contact_seeds(
     if XA.size == 0 or XB.size == 0:
         return _empty_contactset(A.meta.get("unit"), key, delta)
 
-    # --- KD-tree superset search
-    tree = KDTree(XB)
-    rb_margin = float(RB.max())  # safe, tight-ish
-    radii_superset = RA + rb_margin + float(delta)  # per-A query radius
-
-    # query_ball_point supports vector radii when x is an array
-    nbrs = tree.query_ball_point(XA, radii_superset)
+    # --- KD-tree superset search: each A node's reach to the largest B node
+    tree = kernels.mesh.KdTree(XB)
+    nbrs = tree.query_ball_point(XA, RA + float(RB.max()) + float(delta))
 
     # flatten candidate pairs
     counts = np.fromiter((len(js) for js in nbrs), dtype=np.int64, count=len(nbrs))
@@ -142,21 +136,11 @@ def find_contact_seeds(
 
     ii, jj, d2 = ii[keep], jj[keep], d2[keep]
 
-    # first-hit semantics: pick nearest B per A
-    order = np.argsort(ii, kind="mergesort")
-    ii_s, jj_s, d2_s = ii[order], jj[order], d2[order]
-    cut = np.r_[True, ii_s[1:] != ii_s[:-1]]
-    starts = np.flatnonzero(cut)
-    ends = np.r_[starts[1:], len(ii_s)]
-
-    best_idx = []
-    for s, e in zip(starts, ends):
-        k = s + np.argmin(d2_s[s:e])
-        best_idx.append(k)
-    best_idx = np.asarray(best_idx, dtype=np.int64)
-
-    ia_loc = ii_s[best_idx]
-    ib_loc = jj_s[best_idx]
+    # first-hit semantics: pick nearest B per A (of equally near, the lowest)
+    order = np.lexsort((jj, d2, ii))
+    first = order[np.r_[True, ii[order][1:] != ii[order][:-1]]]
+    ia_loc = ii[first]
+    ib_loc = jj[first]
 
     # dedupe in case multiple A map to same B and you want uniqueness of (ia,ib)
     pairs = np.unique(np.stack([ia_loc, ib_loc], axis=1), axis=0)
@@ -441,27 +425,63 @@ def approximate_contact_sites(
 # ------------------------ helpers --------------------------------------
 
 
+class _Surface:
+    """The nearest points of a mesh, as trimesh's ``ProximityQuery.on_surface``
+    finds them (``kernels.pair.closest_points``)."""
+
+    def __init__(self, mesh: Mesh):
+        self.mesh = Mesh.of(mesh)
+
+    def on_surface(self, pts) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        m = self.mesh
+        return kernels.pair.closest_points(
+            m.vertices, m.faces, m.face_normals, np.asarray(pts, np.float64)
+        )
+
+
 def _nearest_on_surface(
-    mesh: trimesh.Trimesh, pts: np.ndarray
+    mesh: Mesh, pts: np.ndarray, kdt=None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Robust batched projection using one ProximityQuery, returns (points, dists, face_ids).
+    Robust batched projection, returns (points, dists, face_ids).
+
+    With *kdt*, the tree over the mesh's face centroids, only the faces that
+    can be nearest are searched: a face is no nearer than its centroid less
+    the farthest any face's corner lies from its centroid, and the nearest
+    face no farther than the nearest centroid (within the tie margin). A
+    point whose nearest lies beyond its nearest centroid (that centroid's
+    face unmeasurable) is searched on the whole mesh.
     """
-    pts = np.asarray(pts, np.float64)
-    pq = trimesh.proximity.ProximityQuery(mesh)
-    cp, dist, fid = pq.on_surface(pts)
-    return np.asarray(cp, float), np.asarray(dist, float), np.asarray(fid, np.int64)
+    pts = np.asarray(pts, np.float64).reshape(-1, 3)
+    if kdt is None or not len(pts):
+        return _Surface(mesh).on_surface(pts)
+    reach = kernels.pair.face_reach(mesh.vertices, mesh.faces)
+    if not np.isfinite(reach):
+        return _Surface(mesh).on_surface(pts)
+    d0, _ = kdt.query(pts)
+    r = np.sqrt(d0 * d0 + 1e-8) * (1 + 1e-12)
+    found = kdt.query_ball_point(pts, r + reach + 1e-9 * (1 + r))
+    near = np.unique(np.concatenate(found))
+    if not len(near):  # no point measurable
+        return _Surface(mesh).on_surface(pts)
+    sub, fmap = _submesh_from_faces(mesh, near)
+    close, dist, face = _Surface(sub).on_surface(pts)
+    face = fmap[face]
+    far = ~(dist <= d0)
+    if far.any():
+        close[far], dist[far], face[far] = _Surface(mesh).on_surface(pts[far])
+    return close, dist, face
 
 
 def _sample_points_on_faces(
-    mesh: trimesh.Trimesh, faces: np.ndarray, scheme: str = "7"
+    mesh: Mesh, faces: np.ndarray, scheme: str = "7"
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """
     Return (points, local_face_index_per_point, S) for a list of face indices.
     scheme '7' = centroid + 3 verts + 3 edge midpoints.
     """
     faces = np.asarray(faces, np.int64)
-    tri = mesh.triangles[faces]  # (F,3,3)
+    tri = mesh.vertices[mesh.faces[faces]]  # (F,3,3)
     a = tri[:, 0]
     b = tri[:, 1]
     c = tri[:, 2]
@@ -488,19 +508,21 @@ def _sample_points_on_faces(
     return P, face_of_point, S
 
 
-def median_edge_length(mesh: trimesh.Trimesh, max_faces: int = 50000) -> float:
+@mesh_args()
+def median_edge_length(mesh: Mesh, max_faces: int = 50000) -> float:
     """
     Approximate median edge length without touching edges_unique_length.
     Samples up to max_faces triangles and takes median of their 3 edge lengths.
     """
-    tri = np.asarray(mesh.triangles)
-    if tri.size == 0:
+    faces = mesh.faces
+    if faces.size == 0:
         return 1.0
-    if tri.shape[0] > max_faces:
+    if faces.shape[0] > max_faces:
         # deterministic sample for reproducibility
         rng = np.random.RandomState(0)
-        idx = rng.choice(tri.shape[0], size=max_faces, replace=False)
-        tri = tri[idx]
+        idx = rng.choice(faces.shape[0], size=max_faces, replace=False)
+        faces = faces[idx]
+    tri = mesh.vertices[faces]
     a, b, c = tri[:, 0], tri[:, 1], tri[:, 2]
     L = np.concatenate(
         [
@@ -513,64 +535,42 @@ def median_edge_length(mesh: trimesh.Trimesh, max_faces: int = 50000) -> float:
 
 
 def _build_face_kdt(
-    mesh: trimesh.Trimesh,
-) -> tuple[KDTree, np.ndarray, np.ndarray, np.ndarray]:
+    mesh: Mesh,
+) -> tuple[object, np.ndarray, np.ndarray, np.ndarray]:
     """
     KD-tree on triangle centroids + cached face normals/areas.
     """
     centers = mesh.triangles_center
-    kdt = KDTree(centers) if len(centers) else None
+    kdt = kernels.mesh.KdTree(centers) if len(centers) else None
     normals = mesh.face_normals
     areas = mesh.area_faces
     return kdt, centers, normals, areas
 
 
-def _faces_within_radius(kdt: KDTree, points: np.ndarray, radius: float) -> np.ndarray:
+def _faces_within_radius(kdt, points: np.ndarray, radius: float) -> np.ndarray:
     """
     Union of face indices whose centroids fall within 'radius' of any point in 'points'.
-    Robust to KDTree returning list-of-lists or numpy object arrays.
     """
     if kdt is None:
         return np.empty(0, np.int64)
 
-    pts = np.asarray(points, float)
-    out = kdt.query_ball_point(
-        pts, r=float(radius)
-    )  # could be list-of-lists or ndarray(object)
-
-    # Normalize to python list-of-lists
-    if isinstance(out, np.ndarray):
-        out = out.tolist()  # ndarray(object) -> list
-    if not isinstance(out, list):
-        out = [out]  # single list/int case
-
-    flat: list[int] = []
-    for grp in out:
-        if grp is None:
-            continue
-        if isinstance(grp, (list, tuple, np.ndarray)):
-            if len(grp):
-                flat.extend(np.asarray(grp, np.int64).tolist())
-        else:
-            flat.append(int(grp))
-
-    if not flat:
+    pts = np.asarray(points, float).reshape(-1, 3)
+    found = kdt.query_ball_point(pts, float(radius))
+    if not any(len(f) for f in found):
         return np.empty(0, np.int64)
-    return np.unique(np.asarray(flat, np.int64))
+    return np.unique(np.concatenate(found).astype(np.int64))
 
 
-def _submesh_from_faces(
-    mesh: trimesh.Trimesh, faces_idx: np.ndarray
-) -> tuple[trimesh.Trimesh, np.ndarray]:
+def _submesh_from_faces(mesh: Mesh, faces_idx: np.ndarray) -> tuple[Mesh, np.ndarray]:
     """
     Build a submesh from explicit face indices and return (submesh, face_map_to_global).
     Ordering of submesh faces matches 'faces_idx' exactly.
     """
     faces_idx = np.asarray(faces_idx, np.int64)
     if faces_idx.size == 0:
-        return trimesh.Trimesh(), faces_idx
+        return Mesh(np.empty((0, 3)), np.empty((0, 3), np.int64)), faces_idx
     # Use index list (not boolean mask) so face i in submesh == faces_idx[i]
-    sub = mesh.submesh([faces_idx], append=True, repair=False)
+    sub = Mesh.of(mesh).submesh(faces_idx)
     return sub, faces_idx
 
 
@@ -580,7 +580,9 @@ def _cluster_points(P: np.ndarray, eps: float) -> list[np.ndarray]:
     """
     if len(P) == 0:
         return []
-    kdt = KDTree(P)
+    nbrs_of = kernels.mesh.KdTree(np.asarray(P, float)).query_ball_point(
+        np.asarray(P, float), float(eps)
+    )
     unvisited = np.ones(len(P), dtype=bool)
     clusters: list[np.ndarray] = []
     for i in range(len(P)):
@@ -591,7 +593,7 @@ def _cluster_points(P: np.ndarray, eps: float) -> list[np.ndarray]:
         cur = [i]
         while queue:
             j = queue.pop()
-            nbrs = kdt.query_ball_point(P[j], r=float(eps))
+            nbrs = nbrs_of[j].tolist()
             for n in nbrs:
                 if unvisited[n]:
                     unvisited[n] = False
@@ -601,9 +603,7 @@ def _cluster_points(P: np.ndarray, eps: float) -> list[np.ndarray]:
     return clusters
 
 
-def _aabbs_for_patches(
-    mesh: trimesh.Trimesh, patch_faces: list[np.ndarray]
-) -> np.ndarray:
+def _aabbs_for_patches(mesh: Mesh, patch_faces: list[np.ndarray]) -> np.ndarray:
     """
     Compute per-patch AABBs from lists of face indices.
     Returns (M,2,3) array; rows with no faces are filled with NaNs.
@@ -612,10 +612,9 @@ def _aabbs_for_patches(
     out = np.full((M, 2, 3), np.nan, dtype=float)
     if M == 0:
         return out
-    tri = np.asarray(mesh.triangles)  # (F,3,3)
     for i, faces in enumerate(patch_faces):
         if len(faces):
-            pts = tri[np.asarray(faces, np.int64)].reshape(-1, 3)
+            pts = mesh.vertices[mesh.faces[np.asarray(faces, np.int64)]].reshape(-1, 3)
             out[i, 0] = pts.min(axis=0)
             out[i, 1] = pts.max(axis=0)
     return out
@@ -650,9 +649,10 @@ def _union_aabbs(bA: np.ndarray, bB: np.ndarray) -> np.ndarray:
 # ------------------------ fast extractor --------------------------------
 
 
+@mesh_args("A", "B")
 def map_contact_sites(
-    A: trimesh.Trimesh,
-    B: trimesh.Trimesh,
+    A: Mesh,
+    B: Mesh,
     contact_pos: np.ndarray,
     *,
     tol: float | None = None,  # gap tolerance in mesh unit (nm in your case)
@@ -749,11 +749,11 @@ def map_contact_sites(
 
     # Seed projections
     if doA:
-        seeds_A, _, _ = _nearest_on_surface(A, P)
+        seeds_A, _, _ = _nearest_on_surface(A, P, kdtA)
     else:
         seeds_A = np.full((K, 3), np.nan, float)
     if doB:
-        seeds_B, _, _ = _nearest_on_surface(B, P)
+        seeds_B, _, _ = _nearest_on_surface(B, P, kdtB)
     else:
         seeds_B = np.full((K, 3), np.nan, float)
 
@@ -766,7 +766,10 @@ def map_contact_sites(
     out_frac_B: list[np.ndarray] = [np.empty(0, np.float64) for _ in range(K)]
     out_area_A = np.zeros(K, float)
     out_area_B = np.zeros(K, float)
-    out_pairs: list[np.ndarray] | None = [] if return_pairs else None
+    # per seed, by seed index (results arrive cluster by cluster)
+    out_pairs: list[np.ndarray] | None = (
+        [np.empty((0, 3), np.float64) for _ in range(K)] if return_pairs else None
+    )
 
     # Seed clustering (reuse crops)
     clusters = _cluster_points(P, eps=cluster_eps)
@@ -796,9 +799,7 @@ def map_contact_sites(
         if doA:
             facesB_crop = _faces_within_radius(kdtB, cluster_pts, crop_r)
             subB, mapB = _submesh_from_faces(B, facesB_crop)
-            pq_subB = (
-                trimesh.proximity.ProximityQuery(subB) if len(subB.faces) else None
-            )
+            pq_subB = _Surface(subB) if len(subB.faces) else None
         else:
             mapB = np.empty(0, np.int64)
             pq_subB = None
@@ -806,9 +807,7 @@ def map_contact_sites(
         if doB:
             facesA_crop = _faces_within_radius(kdtA, cluster_pts, crop_r)
             subA, mapA = _submesh_from_faces(A, facesA_crop)
-            pq_subA = (
-                trimesh.proximity.ProximityQuery(subA) if len(subA.faces) else None
-            )
+            pq_subA = _Surface(subA) if len(subA.faces) else None
         else:
             mapA = np.empty(0, np.int64)
             pq_subA = None
@@ -831,7 +830,9 @@ def map_contact_sites(
             fa_list, pts_list, face_of_pt_list, S_A_list = [], [], [], []
             for k in seed_idx:
                 fa = (
-                    np.asarray(kdtA.query_ball_point(seeds_A[k], r=radius), np.int64)
+                    kdtA.query_ball_point(seeds_A[k][None, :], radius)[0].astype(
+                        np.int64
+                    )
                     if kdtA is not None
                     else np.empty(0, np.int64)
                 )
@@ -921,7 +922,9 @@ def map_contact_sites(
             fb_list, pts_list, face_of_pt_list, S_B_list = [], [], [], []
             for k in seed_idx:
                 fb = (
-                    np.asarray(kdtB.query_ball_point(seeds_B[k], r=radius), np.int64)
+                    kdtB.query_ball_point(seeds_B[k][None, :], radius)[0].astype(
+                        np.int64
+                    )
                     if kdtB is not None
                     else np.empty(0, np.int64)
                 )
@@ -1050,7 +1053,7 @@ def map_contact_sites(
         out_area_A[k] = aA
         out_area_B[k] = aB
         if return_pairs:
-            out_pairs.append(prs if prs is not None else np.empty((0, 3), np.float64))
+            out_pairs[k] = prs if prs is not None else np.empty((0, 3), np.float64)
 
     # -------- EARLY PRUNE empty seeds (before merging) --------------------
     EPS = 1e-12
@@ -1395,9 +1398,10 @@ def _shared_edge_links(
     return owner[:-1][same], owner[1:][same]
 
 
+@mesh_args("A", "B")
 def scan_contacts(
-    A: trimesh.Trimesh,
-    B: trimesh.Trimesh,
+    A: Mesh,
+    B: Mesh,
     *,
     tol: float | None = None,
     normal_opposition_dot: float = -0.2,
@@ -1467,8 +1471,7 @@ def scan_contacts(
     )
     n = off + len(nb)
     if n:
-        graph = coo_matrix((np.ones(len(src)), (src, dst)), shape=(n, n))
-        _, node_site = connected_components(graph, directed=False)
+        node_site = kernels.dx.components(np.c_[src, dst], n)
         # number the sites by their first node
         _, first = np.unique(node_site, return_index=True)
         rank = np.empty(len(first), np.int64)
@@ -1540,12 +1543,12 @@ def scan_contacts(
 class _Branches:
     """One mesh, indexed to measure the branch around each contact site."""
 
-    def __init__(self, mesh: trimesh.Trimesh):
+    def __init__(self, mesh: Mesh):
         self.faces = np.asarray(mesh.faces, np.int64)
         self.vertices = np.asarray(mesh.vertices, np.float64)
         self.centers = np.asarray(mesh.triangles_center, np.float64)
         self.normals = np.asarray(mesh.face_normals, np.float64)
-        self.tree = KDTree(self.centers)
+        self.tree = kernels.mesh.KdTree(self.centers)
         self.topology = kernels.mesh.Topology(self.faces, len(self.vertices))
         self.bvh = kernels.pair.TriangleBvh(
             np.asarray(mesh.triangles, np.float64).reshape(-1, 9), self.normals
@@ -1571,11 +1574,10 @@ class _Branches:
         """The faces within *radius* of *center* connected there to the
         *site* faces — the branch the site is on, not others nearby — and
         their distances from *center*."""
-        near = np.asarray(self.tree.query_ball_point(center, radius), np.int64)
+        near = self.tree.query_ball_point(np.asarray(center, float)[None], radius)[0]
         near = np.union1d(near, site)
         a, b = _shared_edge_links(self.faces, near)
-        graph = coo_matrix((np.ones(len(a)), (a, b)), shape=(len(near), len(near)))
-        _, label = connected_components(graph, directed=False)
+        label = kernels.dx.components(np.c_[a, b], len(near))
         piece = near[np.isin(label, np.unique(label[np.isin(near, site)]))]
         return piece, np.linalg.norm(self.centers[piece] - center, axis=1)
 
@@ -1620,8 +1622,8 @@ _SHAPE_KEYS = ("thickness", "ball", "exits", "swelling")
 
 
 def _contact_geometry(
-    A: trimesh.Trimesh,
-    B: trimesh.Trimesh,
+    A: Mesh,
+    B: Mesh,
     contacts: ContactSites,
     *,
     ball_scale: float,
@@ -1678,9 +1680,10 @@ def _contact_kinds(
     return kinds.astype(str)
 
 
+@mesh_args("A", "B")
 def label_contacts(
-    A: trimesh.Trimesh,
-    B: trimesh.Trimesh,
+    A: Mesh,
+    B: Mesh,
     contacts: ContactSites,
     *,
     swelling_min: float = 1.5,
@@ -1772,9 +1775,7 @@ def _plane_project(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarr
     return C, u, v
 
 
-def _shape_stats_for_faces(
-    mesh: trimesh.Trimesh, faces: np.ndarray
-) -> dict[str, float]:
+def _shape_stats_for_faces(mesh: Mesh, faces: np.ndarray) -> dict[str, float]:
     """
     Compute simple 2D shape stats of a patch on a mesh side:
     - extent_long, extent_short, aspect
@@ -1815,14 +1816,9 @@ def _shape_stats_for_faces(
     # Roundness via 2D convex hull
     roundness = np.nan
     if len(Y) >= 3:
-        try:
-            hull = ConvexHull(Y)
-            A2d = float(hull.volume)  # area in 2D
-            P2d = float(hull.area)  # perimeter in 2D
-            if P2d > 0:
-                roundness = float(4.0 * np.pi * A2d / (P2d * P2d))
-        except Exception:
-            pass
+        A2d, P2d = kernels.mesh.hull_measures(np.asarray(Y, np.float64))
+        if P2d > 0:
+            roundness = float(4.0 * np.pi * A2d / (P2d * P2d))
 
     return dict(
         extent_long=length,
@@ -1834,9 +1830,10 @@ def _shape_stats_for_faces(
     )
 
 
+@mesh_args("A", "B")
 def compute_contact_stats(
-    A: trimesh.Trimesh,
-    B: trimesh.Trimesh,
+    A: Mesh,
+    B: Mesh,
     contacts: ContactSites,
     *,
     attach: bool = True,

@@ -426,7 +426,6 @@ fn merge_nested_nodes<'py>(
     ))
 }
 
-/// Add this module's functions and classes to `m`.
 /// Each node's parent in a breadth-first tree from `root` over the
 /// undirected `edges` `(E, 2)`, neighbours in the order the edges name
 /// them; −1 for the root and every node it does not reach.
@@ -645,7 +644,270 @@ fn prune_neurites<'py>(
     ))
 }
 
+/// `merge_near_soma_nodes`' result: the arrays, `old2new`, the soma's
+/// vertices (`None` while it has none) and how many nodes went into it.
+type MergedNearOut<'py> = (
+    ArraysOut<'py>,
+    Bound<'py, PyArray1<i64>>,
+    Option<Bound<'py, PyArray1<i64>>>,
+    usize,
+);
+
+/// `_merge_near_soma_nodes` but the soma's refit, on a skeleton's arrays
+/// (see `arrays_in`) and the soma's ellipsoid (`center`, `axes`, `rotation`
+/// `(3, 3)`): the nodes inside the soma, or near it and fat by radius row
+/// `radius_row`, merged into the root; their vertices near the surface to
+/// the root's and the soma's `soma_verts`. The arrays after, `old2new`, the
+/// soma's vertices and how many nodes went into it.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn merge_near_soma_nodes<'py>(
+    py: Python<'py>,
+    nodes: PyReadonlyArray2<'py, f64>,
+    keys: Vec<String>,
+    radii: PyReadonlyArray2<'py, f64>,
+    ptr: numpy::PyReadonlyArray1<'py, i64>,
+    idx: numpy::PyReadonlyArray1<'py, i64>,
+    edges: PyReadonlyArray2<'py, i64>,
+    radius_row: usize,
+    center: [f64; 3],
+    axes: [f64; 3],
+    rotation: PyReadonlyArray2<'py, f64>,
+    soma_verts: Option<numpy::PyReadonlyArray1<'py, i64>>,
+    mesh_vertices: Option<PyReadonlyArray2<'py, f64>>,
+    inside_tol: f64,
+    near_factor: f64,
+    fat_factor: f64,
+) -> PyResult<MergedNearOut<'py>> {
+    let mv = mesh_vertices.as_ref().map(|m| rows3("V", m)).transpose()?;
+    let n_mesh = mv.as_ref().map(Vec::len);
+    let mut s = arrays_in(&nodes, &keys, &radii, &ptr, &idx, &edges, n_mesh)?;
+    if radius_row >= keys.len() {
+        return Err(PyValueError::new_err(format!(
+            "radius row {radius_row} is not one of {}",
+            keys.len()
+        )));
+    }
+    if s.nodes.is_empty() {
+        return Err(PyValueError::new_err("the skeleton has no nodes"));
+    }
+    let r = rows3("R", &rotation)?;
+    let [r0, r1, r2] = r.as_slice() else {
+        return Err(PyValueError::new_err("the rotation must be (3, 3)"));
+    };
+    let soma = ::skeletonize::core::Ellipsoid {
+        center,
+        axes,
+        r: [*r0, *r1, *r2],
+    };
+    let verts = soma_verts.map(|v| v.as_array().to_vec());
+    let merged = py.detach(|| {
+        ::skeletonize::core::merge_near_soma_nodes(
+            &mut s,
+            radius_row,
+            &soma,
+            verts.as_deref(),
+            mv.as_deref(),
+            inside_tol,
+            near_factor,
+            fat_factor,
+        )
+    });
+    Ok((
+        arrays_out(py, s),
+        Array1::from_vec(merged.old2new).into_pyarray(py),
+        merged
+            .soma_verts
+            .map(|v| Array1::from_vec(v).into_pyarray(py)),
+        merged.n_merged,
+    ))
+}
+
+/// `find_soma`'s result: the soma's nodes, the node of largest radius, the
+/// soma's centre and radius, and whether there are enough nodes for one.
+type FoundSomaOut<'py> = (Bound<'py, PyArray1<i64>>, usize, [f64; 3], f64, bool);
+
+/// `_find_soma` on nodes `(N, 3)` and one radius per node: the nodes at or
+/// above the `pct_large`-th percentile of `radius` within `dist_factor`
+/// times the largest radius of its node, and a soma centred on their mean
+/// when there are `min_keep` or more. None when no node reaches the
+/// percentile.
+#[pyfunction]
+fn find_soma<'py>(
+    py: Python<'py>,
+    nodes: PyReadonlyArray2<'py, f64>,
+    radius: numpy::PyReadonlyArray1<'py, f64>,
+    pct_large: f64,
+    dist_factor: f64,
+    min_keep: usize,
+) -> PyResult<Option<FoundSomaOut<'py>>> {
+    let nodes = rows3("N", &nodes)?;
+    let radius = radius.as_array().to_vec();
+    if radius.len() != nodes.len() {
+        return Err(PyValueError::new_err("one radius per node"));
+    }
+    if nodes.is_empty() {
+        return Err(PyValueError::new_err("empty skeleton"));
+    }
+    if !(0.0..=100.0).contains(&pct_large) {
+        return Err(PyValueError::new_err(
+            "Percentiles must be in the range [0, 100]",
+        ));
+    }
+    let found = ::skeletonize::core::find_soma(&nodes, &radius, pct_large, dist_factor, min_keep);
+    Ok(found.map(|f| {
+        let soma_nodes = Array1::from_iter(f.soma_nodes.iter().map(|&i| i as i64));
+        (
+            soma_nodes.into_pyarray(py),
+            f.idx_max,
+            f.center,
+            f.r_max,
+            f.has_soma,
+        )
+    }))
+}
+
+/// The soma's vertices from its nodes at `points` `(K, 3)` and their vertex
+/// lists (a CSR `ptr` `(K + 1,)`, `idx`): those of the nodes closer to
+/// `center` than twice `r_max`, merged, sorted and unique; failing those,
+/// the first node's list as it is.
+#[pyfunction]
+fn soma_vertices<'py>(
+    py: Python<'py>,
+    points: PyReadonlyArray2<'py, f64>,
+    ptr: numpy::PyReadonlyArray1<'py, i64>,
+    idx: numpy::PyReadonlyArray1<'py, i64>,
+    center: [f64; 3],
+    r_max: f64,
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
+    let points = rows3("P", &points)?;
+    let (ptr, idx) = (ptr.as_array(), idx.as_array());
+    let k = points.len();
+    let well_formed = ptr.len() == k + 1
+        && ptr[0] == 0
+        && ptr.iter().zip(ptr.iter().skip(1)).all(|(a, b)| a <= b)
+        && usize::try_from(ptr[k]).ok() == Some(idx.len())
+        && idx.iter().all(|&v| v >= 0);
+    if !well_formed {
+        return Err(PyValueError::new_err(
+            "the vertex lists must be a CSR over the points",
+        ));
+    }
+    let lists: Vec<Vec<usize>> = (0..k)
+        .map(|i| {
+            idx.slice(numpy::ndarray::s![ptr[i] as usize..ptr[i + 1] as usize])
+                .iter()
+                .map(|&v| v as usize)
+                .collect()
+        })
+        .collect();
+    let verts = ::skeletonize::core::soma_vertices(&points, &lists, center, r_max);
+    Ok(Array1::from_iter(verts.into_iter().map(|v| v as i64)).into_pyarray(py))
+}
+
+/// `_bridge_gaps` on nodes `(N, 3)` and edges `(E, 2)`: every component tied
+/// to node 0's by one new edge, nearest first, waiting past
+/// `bridge_max_factor` mean edge lengths and measuring every gap again
+/// after `bridge_recalc_after` bridges (both chosen from the gaps when
+/// None). The edges with the bridges, unique and in order; the edges as
+/// they are when there is one component.
+#[pyfunction]
+fn bridge_gaps<'py>(
+    py: Python<'py>,
+    nodes: PyReadonlyArray2<'py, f64>,
+    edges: PyReadonlyArray2<'py, i64>,
+    bridge_max_factor: Option<f64>,
+    bridge_recalc_after: Option<usize>,
+) -> PyResult<Bound<'py, PyArray2<i64>>> {
+    let nodes = rows3("N", &nodes)?;
+    let pairs = node_pairs(&edges, nodes.len())?;
+    if nodes.is_empty() {
+        return Err(PyValueError::new_err("the skeleton has no nodes"));
+    }
+    let out = py
+        .detach(|| {
+            ::skeletonize::core::bridge_gaps(&nodes, &pairs, bridge_max_factor, bridge_recalc_after)
+        })
+        .unwrap_or(pairs);
+    let arr = Array2::from_shape_fn((out.len(), 2), |(i, j)| out[i][j] as i64);
+    Ok(arr.into_pyarray(py))
+}
+
+/// `_edges_from_mesh` from the mesh `edges` `(E, 2)` and each vertex's node
+/// `owner` `(V,)` (−1 for none): the node pairs a mesh edge joins, each
+/// once, smaller first, in order, `(K, 2)`.
+#[pyfunction]
+fn edges_between<'py>(
+    py: Python<'py>,
+    edges: PyReadonlyArray2<'py, i64>,
+    owner: numpy::PyReadonlyArray1<'py, i64>,
+) -> PyResult<Bound<'py, PyArray2<i64>>> {
+    let owner = owner.as_array().to_vec();
+    let pairs = node_pairs(&edges, owner.len())?;
+    let out = py.detach(|| ::skeletonize::skeleton::edges_between(&pairs, &owner));
+    let arr = Array2::from_shape_fn((out.len(), 2), |(i, j)| out[i][j] as i64);
+    Ok(arr.into_pyarray(py))
+}
+
+/// Each node's `centerline` radius: the trimmed mean of its vertices'
+/// distances to the centreline — `dists[k]` for vertex `vids[k]`, the last
+/// for a vertex listed twice, 0 for one not listed — and 0 for a node
+/// without vertices; the nodes' vertices as a CSR (`ptr`, `idx`) into
+/// `n_vertices` vertices.
+#[pyfunction]
+fn centerline_radii<'py>(
+    py: Python<'py>,
+    ptr: numpy::PyReadonlyArray1<'py, i64>,
+    idx: numpy::PyReadonlyArray1<'py, i64>,
+    vids: numpy::PyReadonlyArray1<'py, i64>,
+    dists: numpy::PyReadonlyArray1<'py, f64>,
+    n_vertices: usize,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let (ptr, idx) = (ptr.as_array(), idx.as_array());
+    let n = ptr.len().saturating_sub(1);
+    let vertex = |v: i64| {
+        usize::try_from(v)
+            .ok()
+            .filter(|&v| v < n_vertices)
+            .ok_or_else(|| PyValueError::new_err(format!("vertex index {v} is out of range")))
+    };
+    let well_formed = !ptr.is_empty()
+        && ptr[0] == 0
+        && ptr.iter().zip(ptr.iter().skip(1)).all(|(a, b)| a <= b)
+        && usize::try_from(ptr[n]).ok() == Some(idx.len());
+    if !well_formed {
+        return Err(PyValueError::new_err(
+            "node2verts must be a CSR over the nodes",
+        ));
+    }
+    let node2verts = (0..n)
+        .map(|i| {
+            idx.slice(numpy::ndarray::s![ptr[i] as usize..ptr[i + 1] as usize])
+                .iter()
+                .map(|&v| vertex(v))
+                .collect::<PyResult<Vec<usize>>>()
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let (vids, dists) = (vids.as_array(), dists.as_array());
+    if vids.len() != dists.len() {
+        return Err(PyValueError::new_err("one distance per vertex"));
+    }
+    let mut cl = vec![0.0f64; n_vertices];
+    for (&v, &d) in vids.iter().zip(dists.iter()) {
+        cl[vertex(v)?] = d;
+    }
+    let radii = py.detach(|| ::skeletonize::skeleton::centerline_radii(&node2verts, &cl));
+    Ok(Array1::from_vec(radii).into_pyarray(py))
+}
+
+/// Add this module's functions and classes to `m`.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(edges_between, m)?)?;
+    m.add_function(wrap_pyfunction!(centerline_radii, m)?)?;
+    m.add_function(wrap_pyfunction!(bridge_gaps, m)?)?;
+    m.add_function(wrap_pyfunction!(find_soma, m)?)?;
+    m.add_function(wrap_pyfunction!(soma_vertices, m)?)?;
+    m.add_function(wrap_pyfunction!(merge_near_soma_nodes, m)?)?;
     m.add_function(wrap_pyfunction!(merge_single_node_branches, m)?)?;
     m.add_function(wrap_pyfunction!(prune_neurites, m)?)?;
     m.add_function(wrap_pyfunction!(bfs_parents, m)?)?;

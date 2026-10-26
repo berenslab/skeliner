@@ -7,12 +7,15 @@ content.
 """
 
 import copy
+import itertools
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+import skeliner as sk
 from skeliner import dx, post, skeletonize
+from skeliner.dataclass import Skeleton, Soma
 from skeliner.io import load_mesh
 
 
@@ -424,7 +427,6 @@ def _junction_skeleton(arm_lengths, *, unit="nm"):
     and ``len(arm_lengths)`` distal arms, each a straight chain of the given
     total length laid along its own axis so no two arms overlap.
     """
-    from skeliner.dataclass import Skeleton, Soma
 
     nodes = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]  # soma, junction
     edges = [[0, 1]]
@@ -451,7 +453,6 @@ def _junction_skeleton(arm_lengths, *, unit="nm"):
 
 def _fork_skeleton():
     """Soma 0; arm 0-1-2-3 along +x with a twig 2-4; arm 0-5-6 along -x."""
-    from skeliner.dataclass import Skeleton, Soma
 
     nodes = np.asarray(
         [[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0], [2, 1, 0], [-1, 0, 0], [-2, 0, 0]],
@@ -486,7 +487,6 @@ def test_neurite_walks_on_a_forest_keep_to_the_somas_tree():
     """A tree the soma does not reach has no distal direction: its nodes have
     no subtree, and each one outside the box starts its own.  The hop count
     to them is infinite, which used to fail as an integer."""
-    from skeliner.dataclass import Skeleton
 
     s = _fork_skeleton()
     s = Skeleton(
@@ -827,3 +827,468 @@ def test_segment_distances_on_both_paths_agree():
         _rs.dx.segment_distances(points, nodes, centres, segments),
         python_dx.segment_distances(points, nodes, centres, segments),
     )
+
+
+def _index_case(rng, n):
+    """A random tree of *n* nodes and its neighbours as a CSR."""
+    nodes = rng.normal(size=(n, 3)) * 10
+    edges = np.array([[int(rng.integers(0, i)), i] for i in range(1, n)]).reshape(-1, 2)
+    nbrs = [[] for _ in range(n)]
+    for a, b in edges.tolist():
+        nbrs[a].append(b)
+        nbrs[b].append(a)
+    ptr = np.r_[0, np.cumsum([len(x) for x in nbrs])].astype(np.int64)
+    idx = np.array([v for x in nbrs for v in x], dtype=np.int64)
+    return nodes, edges, ptr, idx
+
+
+def test_distances_on_both_paths():
+    from skeliner import _rs
+    from skeliner.python import dx as python_dx
+
+    from ._parity import assert_parity
+
+    rng = np.random.default_rng(31)
+    for trial in range(60):
+        n = int(rng.integers(1, 80))
+        nodes, edges, ptr, idx = _index_case(rng, n)
+        if trial % 3 == 0:
+            nodes = np.round(nodes / 3)  # a grid: equally near nodes
+        points = rng.normal(size=(40, 3)) * 12
+        radii = rng.gamma(2.0, size=n)
+        indices = [
+            _rs.dx.SkeletonIndex(nodes, ptr, idx),
+            python_dx.SkeletonIndex(nodes, ptr, idx),
+        ]
+        some = rng.choice(n, size=min(n, 5), replace=False).tolist()
+        cases = [
+            (r, k, None, None, s)
+            for r in (radii, None)
+            for k in (1, 4, 9)
+            for s in (1.0, 0.5)
+        ] + [
+            (radii, 4, sorted(some), [tuple(e) for e in edges[:3].tolist()], 2.0),
+            (None, 4, [], [], 1.0),
+            (radii, 4, sorted(some), [], 1.0),
+        ]
+        for r, k, centres, segments, s in cases:
+            got = [
+                ix.distance(points, r, k, centres, segments, s, 1.0 / s)
+                for ix in indices
+            ]
+            assert_parity(got[0], got[1])
+    for module in (_rs.dx, python_dx):
+        with pytest.raises(ValueError, match="no nodes"):
+            module.SkeletonIndex(np.zeros((0, 3)), np.zeros(1, int), np.empty(0, int))
+
+
+@pytest.mark.parametrize("mode", ["surface", "centerline"])
+def test_distance_ends_alike_on_both_paths(skel, mode):
+    from ._parity import both
+
+    rng = np.random.default_rng(37)
+    lo, hi = skel.nodes.min(0), skel.nodes.max(0)
+    points = lo + rng.random((200, 3)) * (hi - lo)
+    allowed = list(range(0, len(skel.nodes), 3))
+    for kwargs in ({}, {"allowed_nodes": allowed}, {"allowed_edges": skel.edges[:5]}):
+        rust, python = both(dx.distance, skel, points, mode=mode, **kwargs)
+        np.testing.assert_array_equal(rust, python)
+    # the cached index survives a deep copy (and so pickling)
+    copied = copy.deepcopy(skel)
+    np.testing.assert_array_equal(
+        dx.distance(copied, points, mode=mode), dx.distance(skel, points, mode=mode)
+    )
+
+
+def test_voxel_union_on_both_paths():
+    from skeliner import _rs
+    from skeliner.python import dx as python_dx
+
+    rng = np.random.default_rng(41)
+    filled = 0
+    for trial in range(40):
+        n = int(rng.integers(2, 25))
+        nodes = rng.normal(size=(n, 3)) * 8
+        nodes[1] = nodes[0]  # a degenerate edge, a ball
+        edges = np.array([[int(rng.integers(0, i)), i] for i in range(1, n)])
+        radii = rng.gamma(2.0, size=n)
+        if trial % 7 == 0:
+            radii[2 % n] = np.nan  # skipped, as numpy skips it
+        soma = Soma.fit(nodes[0] + rng.normal(size=(12, 3)) * 3)
+        lo, hi = (
+            soma.center - np.abs(soma.R) @ soma.axes,
+            soma.center + np.abs(soma.R) @ soma.axes,
+        )
+        soma_in = (
+            soma.center.tolist(),
+            soma.axes.tolist(),
+            soma.R.T.tolist(),
+            lo.tolist(),
+            hi.tolist(),
+        )
+        box_lo = nodes.min(0) - 2
+        box_hi = nodes.max(0) + 2
+        if trial % 3 == 0:  # a box cutting through the cell
+            box_hi = (box_lo + box_hi) / 2
+        h = float(rng.uniform(0.4, 1.5))
+        shape = np.maximum(np.ceil((box_hi - box_lo) / h).astype(int), 1).tolist()
+        for s, include in ((soma_in, True), (soma_in, False), (None, True)):
+            args = (
+                nodes,
+                radii,
+                edges,
+                box_lo.tolist(),
+                box_hi.tolist(),
+                h,
+                shape,
+                s,
+                include,
+            )
+            rust = _rs.dx.voxel_union_count(*args)
+            assert rust == python_dx.voxel_union_count(*args)
+            filled += rust > 0
+    assert filled > 80
+
+
+def test_volume_ends_alike_on_both_paths(skel):
+    from ._parity import assert_parity, both
+
+    # a box around a node half way along the cell, which cuts through it
+    c = skel.nodes[len(skel.nodes) // 2]
+    half = (skel.nodes.max(0) - skel.nodes.min(0)) / 8
+    for kwargs in ({}, {"bbox": (c - half, c + half)}, {"include_soma": False}):
+        rust, python = both(dx.volume, skel, return_details=True, **kwargs)
+        assert_parity(rust, python)
+        assert rust[1]["filled_voxels"] > 0
+
+
+def test_path_length_in_a_box_on_both_paths(skel):
+    from skeliner import _rs
+    from skeliner.python import dx as python_dx
+
+    from ._parity import assert_parity, both
+
+    rng = np.random.default_rng(43)
+    hit = 0
+    for _ in range(80):
+        n = int(rng.integers(2, 40))
+        nodes = rng.normal(size=(n, 3)) * 10
+        if n > 3:
+            nodes[3] = nodes[2] + [5.0, 0.0, 0.0]  # parallel to two slabs
+        edges = rng.integers(0, n, size=(int(rng.integers(1, 3 * n)), 2))
+        c, half = rng.normal(size=3) * 4, rng.uniform(1, 15, size=3)
+        args = (nodes, edges, (c - half).tolist(), (c + half).tolist())
+        rust = _rs.dx.path_length_in_box(*args)
+        assert_parity(rust, python_dx.path_length_in_box(*args))
+        hit += rust[1] > 0
+    assert hit > 40
+    c = skel.nodes[len(skel.nodes) // 2]
+    half = (skel.nodes.max(0) - skel.nodes.min(0)) / 8
+    rust, python = both(
+        dx.total_path_length, skel, bbox=(c - half, c + half), return_details=True
+    )
+    assert_parity(rust, python)
+    assert rust[0] > 0
+
+
+def test_arm_cables_on_both_paths(skel):
+    from skeliner import _rs
+    from skeliner.python import dx as python_dx
+
+    from ._parity import assert_parity, both
+
+    rng = np.random.default_rng(47)
+    junctions = 0
+    for _ in range(60):
+        n = int(rng.integers(2, 60))
+        nodes = rng.normal(size=(n, 3)) * 10
+        # a forest with branch points, a self-loop and a doubled edge
+        edges = [
+            [int(rng.integers(0, max(1, i // 2))), i]
+            for i in range(1, n)
+            if rng.random() > 0.1
+        ]
+        edges += [[0, 0], edges[0]] if edges else []
+        edges = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
+        for min_degree in (2, 3, 4):
+            rust = _rs.dx.arm_cables(nodes, edges, min_degree)
+            assert_parity(rust, python_dx.arm_cables(nodes, edges, min_degree))
+            junctions += len(rust[0])
+    assert junctions > 200
+    rust, python = both(dx.suspicious_junctions, skel, min_degree=3, return_stats=True)
+    assert_parity(rust, python)
+
+
+def _random_multigraph(rng, n, *, cycles):
+    """A forest on *n* nodes with branch points; with *cycles*, extra edges, a
+    doubled edge and a self-loop now and then. Edges in either orientation."""
+    edges = [
+        [int(rng.integers(0, max(1, i // 2))), i]
+        for i in range(1, n)
+        if rng.random() > 0.1
+    ]
+    if cycles:
+        edges += rng.integers(0, n, size=(int(rng.integers(0, 5)), 2)).tolist()
+        if edges and rng.random() < 0.5:
+            edges.append(list(edges[int(rng.integers(0, len(edges)))]))
+        if rng.random() < 0.3:
+            v = int(rng.integers(0, n))
+            edges.append([v, v])
+    edges = [e[::-1] if rng.random() < 0.5 else e for e in edges]
+    return np.asarray(edges, dtype=np.int64).reshape(-1, 2)
+
+
+def test_graph_walks_on_both_paths():
+    from skeliner import _rs
+    from skeliner.python import dx as python_dx
+
+    from ._parity import assert_parity
+
+    rng = np.random.default_rng(53)
+    found = {"cycles": 0, "branches": 0, "twigs": 0, "neurite": 0, "outside": 0}
+    for trial in range(400):
+        n = int(rng.integers(1, 40))
+        edges = _random_multigraph(rng, n, cycles=trial % 3 != 0)
+        nodes = rng.normal(size=(n, 3)) * 5
+        lo = rng.normal(size=3) * 3 - 4
+        hi = lo + rng.uniform(2, 12, size=3)
+        calls = [
+            ("components", (edges, n)),
+            ("hops", (edges, n, int(rng.integers(0, n)))),
+            ("cycle_basis", (edges, n)),
+            ("neurites_out_of_bounds", (nodes, edges, lo, hi, trial % 2 == 0)),
+        ]
+        for k in range(0, 6):
+            calls.append(("branches", (edges, n, k, k % 2 == 0)))
+            calls.append(("twigs", (edges, n, k, k % 3 == 0)))
+        for root in rng.integers(0, n, size=3).tolist():
+            calls.append(("neurite", (edges, n, root, root % 2 == 0)))
+        for name, args in calls:
+            rust = getattr(_rs.dx, name)(*args)
+            assert_parity(rust, getattr(python_dx, name)(*args), name)
+            if name in ("cycle_basis", "branches", "twigs"):
+                found[name if name != "cycle_basis" else "cycles"] += len(rust)
+            elif name == "neurite":
+                found["neurite"] += len(rust) > 1
+            elif name == "neurites_out_of_bounds":
+                found["outside"] += len(rust) > 0
+    assert min(found.values()) > 100, found
+
+
+def _tied_cycle_graphs():
+    """Graphs with many minimum cycle bases, so which one igraph returns
+    turns on the edge ids: complete graphs, the cube, the Petersen graph, a
+    bundle of parallel edges, dense random multigraphs."""
+    for k in (4, 5, 6):
+        yield f"K{k}", k, np.array(list(itertools.combinations(range(k), 2)))
+    cube = [(a, a ^ bit) for a in range(8) for bit in (1, 2, 4) if a < a ^ bit]
+    yield "cube", 8, np.array(cube)
+    outer = [(i, (i + 1) % 5) for i in range(5)]
+    spokes = [(i, i + 5) for i in range(5)]
+    star = [(5 + i, 5 + (i + 2) % 5) for i in range(5)]
+    yield "petersen", 10, np.array(outer + spokes + star)
+    yield "bundle", 3, np.array([[0, 1]] * 5 + [[1, 2]] * 3 + [[0, 2]])
+    rng = np.random.default_rng(3)
+    for t in range(3):
+        yield f"dense{t}", 9, rng.integers(0, 9, size=(30, 2))
+
+
+def test_the_cycle_basis_picks_igraphs_among_tied_cycles():
+    from skeliner import _rs
+    from skeliner.python import dx as python_dx
+
+    rng = np.random.default_rng(0)
+    for name, n, edges in _tied_cycle_graphs():
+        picked = set()
+        for _ in range(12):
+            perm = rng.permutation(len(edges))  # edge ids decide among ties
+            e = edges[perm]
+            flip = rng.random(len(e)) < 0.5
+            e[flip] = e[flip, ::-1]
+            rust = [c.tolist() for c in _rs.dx.cycle_basis(e, n)]
+            assert rust == [c.tolist() for c in python_dx.cycle_basis(e, n)], name
+            picked.add(frozenset(frozenset(perm[c].tolist()) for c in rust))
+        assert len(picked) > 1, name  # the ties did decide
+
+
+def test_path_lengths_on_both_paths():
+    from skeliner import _rs
+    from skeliner.python import dx as python_dx
+
+    from ._parity import assert_parity
+
+    rng = np.random.default_rng(59)
+    reached = 0
+    for trial in range(300):
+        n = int(rng.integers(2, 40))
+        edges = _random_multigraph(rng, n, cycles=trial % 2 == 0)
+        # integer lengths tie paths; some zero, some infinite (never taken)
+        weights = rng.integers(0, 4, size=len(edges)).astype(np.float64)
+        weights += rng.random(len(edges)) * (trial % 3 == 0)
+        weights[rng.random(len(edges)) < 0.05] = np.inf
+        sources = rng.integers(0, n, size=int(rng.integers(0, 6)))
+        target = int(rng.integers(0, n))
+        args = (edges, n, weights, sources, target)
+        rust = _rs.dx.path_lengths(*args)
+        assert_parity(rust, python_dx.path_lengths(*args))
+        reached += int(np.isfinite(rust).sum())
+    assert reached > 300
+
+
+def test_graph_kernels_refuse_alike():
+    from skeliner import _rs
+    from skeliner.python import dx as python_dx
+
+    edges = np.array([[0, 1], [1, 2]], dtype=np.int64)
+    w = np.ones(2)
+    cases = [
+        ("hops", (edges, 3, 3), "source 3 is not one of 3 nodes"),
+        ("hops", (edges, 3, -1), "source -1 is not one of 3 nodes"),
+        ("neurite", (edges, 3, 5, True), "root 5 is not one of 3 nodes"),
+        ("components", (edges, 2), "edge names node 2, not one of 2"),
+        ("path_lengths", (edges, 3, np.ones(3), [1], 0), "one weight per edge"),
+        ("path_lengths", (edges, 3, [1.0, np.nan], [1], 0), "must not be NaN"),
+        ("path_lengths", (edges, 3, [1.0, -1.0], [1], 0), "must not be negative"),
+        ("path_lengths", (edges, 3, w, [3], 0), "source 3 is not one of 3 nodes"),
+        ("path_lengths", (edges, 3, w, [1], 4), "target 4 is not one of 3 nodes"),
+    ]
+    for name, args, message in cases:
+        args = tuple(np.asarray(a) if isinstance(a, list) else a for a in args)
+        for path in (_rs.dx, python_dx):
+            with pytest.raises(ValueError, match=message):
+                getattr(path, name)(*args)
+
+
+def test_bin_checks_on_both_paths():
+    from skeliner import _rs
+    from skeliner.python import dx as python_dx
+
+    from ._parity import assert_parity
+
+    rng = np.random.default_rng(61)
+    seen = {"duplicated": 0, "mismatched": 0, "fragmented": 0, "owned": 0}
+    for _ in range(200):
+        m = int(rng.integers(1, 60))  # mesh vertices
+        n_bins = int(rng.integers(1, 12))
+        sizes = rng.integers(0, 8, size=n_bins)
+        idx = rng.integers(0, m, size=int(sizes.sum())).astype(np.int64)
+        ptr = np.zeros(n_bins + 1, dtype=np.int64)
+        np.cumsum(sizes, out=ptr[1:])
+        # vert2node: the inverse, with a few entries wrong or missing
+        lut = np.full(m, -1, dtype=np.int64)
+        for nid in range(n_bins):
+            lut[idx[ptr[nid] : ptr[nid + 1]]] = nid
+        keys = np.flatnonzero(lut >= 0)
+        vals = lut[keys].copy()
+        flip = rng.random(len(keys)) < 0.1
+        vals[flip] = rng.integers(0, n_bins, size=int(flip.sum()))
+        keep = rng.random(len(keys)) > 0.05
+        keys, vals = keys[keep], vals[keep]
+        rust = _rs.dx.check_bins(ptr, idx, keys, vals)
+        assert_parity(rust, python_dx.check_bins(ptr, idx, keys, vals))
+        seen["duplicated"] += rust[1].size > 0
+        seen["mismatched"] += rust[2].size > 0
+
+        mesh_edges = rng.integers(0, m, size=(int(rng.integers(0, 3 * m)), 2))
+        rust = _rs.dx.fragmented_bins(ptr, idx, mesh_edges, m)
+        assert_parity(rust, python_dx.fragmented_bins(ptr, idx, mesh_edges, m))
+        seen["fragmented"] += rust[0].size > 0
+
+        faces = rng.integers(0, m, size=(int(rng.integers(0, 30)), 3))
+        owner = rng.integers(-1, 4, size=m)
+        rust = _rs.dx.face_owner(faces, owner)
+        assert_parity(rust, python_dx.face_owner(faces, owner))
+        seen["owned"] += int((rust >= 0).sum())
+    assert min(seen.values()) > 20, seen
+
+    ptr, idx = np.array([0, 2, 3]), np.array([0, 4, 1])
+    cases = [
+        ("check_bins", (np.array([0, 2]), idx, idx, idx), "must be a CSR"),
+        ("check_bins", (ptr, idx, np.array([-1]), np.array([0])), "not be negative"),
+        ("fragmented_bins", (ptr, idx, np.zeros((0, 2), np.int64), 4), "vertex 4"),
+        ("face_owner", (np.array([[0, 1, 5]]), np.zeros(3, np.int64)), "vertex 5"),
+    ]
+    for name, args, message in cases:
+        for path in (_rs.dx, python_dx):
+            with pytest.raises(ValueError, match=message):
+                getattr(path, name)(*args)
+
+
+def test_the_graph_diagnostics_end_alike_on_both_paths(skel, mesh):
+    from ._parity import assert_parity, both
+
+    looped = copy.deepcopy(skel)
+    leaves = dx.nodes_of_degree(looped, 1)
+    post.graft(looped, int(leaves[0]), int(leaves[-1]))
+    forest = copy.deepcopy(skel)
+    post.clip(forest, *map(int, forest.edges[len(forest.edges) // 2]))
+    lo, hi = skel.nodes.min(0), skel.nodes.max(0)
+    box = (lo + (hi - lo) * 0.2, hi - (hi - lo) * 0.2)
+    for s in (skel, looped, forest):
+        calls = [
+            (dx.check_connectivity, (s,), {"return_isolated": True}),
+            (dx.check_acyclicity, (s,), {"return_cycles": True}),
+            (dx.cycles, (s, mesh), {}),
+            (dx.check_bins, (s,), {"mesh": mesh, "return_report": True}),
+            (dx.edge_support, (s, mesh), {}),
+            (dx.face_owner, (s, mesh), {}),
+            (dx.leaf_depths, (s,), {}),
+            (dx.suspicious_tips, (s,), {"return_stats": True}),
+            (dx.extract_neurites, (s, int(leaves[len(leaves) // 2]) // 2), {}),
+            (dx.neurites_out_of_bounds, (s, box), {}),
+            (dx.degree_distribution, (s,), {"detailed": True}),
+        ]
+        calls += [(dx.branches_of_length, (s, k), {}) for k in (2, 3, 5)]
+        calls += [(dx.twigs_of_length, (s, k), {}) for k in (1, 2, 3)]
+        for fn, args, kwargs in calls:
+            rust, python = both(fn, *args, **kwargs)
+            assert_parity(rust, python, fn.__name__)
+
+
+def test_edge_support_is_the_two_set_differences(skel, mesh):
+    from skeliner.skeletonize import _edges_from_mesh
+
+    looped = copy.deepcopy(skel)
+    leaves = dx.nodes_of_degree(looped, 1)
+    post.graft(looped, int(leaves[0]), int(leaves[-1]))  # no surface behind it
+    rep = dx.edge_support(looped, mesh)
+    g = _edges_from_mesh(
+        np.asarray(mesh.edges_unique), looped.vert2node, len(mesh.vertices)
+    )
+    gset = {(int(u), int(v)) for u, v in g}
+    tset = {tuple(sorted(map(int, e))) for e in looped.edges}
+    assert rep["dropped"] == sorted(gset - tset)
+    assert rep["unsupported"] == sorted(tset - gset)
+    assert rep["n_tree"] == len(tset)
+    assert (min(leaves[0], leaves[-1]), max(leaves[0], leaves[-1])) in rep[
+        "unsupported"
+    ]
+
+
+def _forest_skeleton():
+    """0-1-2-3 with a twig 1-4, and apart from it 5-6-7: two trees."""
+    nodes = np.arange(24, dtype=np.float64).reshape(8, 3)
+    edges = np.array([[0, 1], [1, 2], [2, 3], [1, 4], [5, 6], [6, 7]])
+    return Skeleton(
+        soma=Soma.from_sphere(nodes[0], 1.0, verts=None),
+        nodes=nodes,
+        radii={"median": np.ones(8)},
+        edges=edges,
+        ntype=None,
+    )
+
+
+def test_leaves_of_another_tree_have_no_twig_and_no_depth():
+    # Before: igraph's parent -2 for a node node 0 does not reach indexed the
+    # second-last node, so leaves 5 and 7 grew twigs through unrelated
+    # nodes, and their depth was an infinity cast to an integer.
+    skel = _forest_skeleton()
+    for path in ("rust", "python"):
+        with sk.backend(path):
+            assert dx.twigs_of_length(skel, 1) == [[4]]
+            assert dx.twigs_of_length(skel, 2, include_branching_node=True) == [
+                [1, 2, 3]
+            ]
+            assert dx.leaf_depths(skel).tolist() == [3, 2, -1, -1]
+            assert dx.check_connectivity(skel, return_isolated=True) == [5, 6, 7]
+            assert dx.branches_of_length(skel, 3) == [[1, 2, 3], [5, 6, 7]]

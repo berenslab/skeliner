@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod components;
+pub mod derived;
 pub mod geometry;
 pub mod graph;
 pub mod loops;

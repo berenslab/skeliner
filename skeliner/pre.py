@@ -5,23 +5,27 @@ import time
 import warnings
 from collections import Counter, defaultdict, deque
 from contextlib import contextmanager
+from typing import TYPE_CHECKING
 
 import numpy as np
-import trimesh
-from scipy.spatial import KDTree
 
 from skeliner._backend import kernels
 from skeliner.python import mesh as _py_mesh
 from skeliner.python import pre as _py_pre
 from skeliner.dataclass import (
     Discarded,
+    Mesh,
     MeshComponents,
     MeshStats,
     Neurites,
     Organelles,
     Reassignment,
     Soma,
+    mesh_args,
 )
+
+if TYPE_CHECKING:
+    from scipy.spatial import KDTree
 
 __all__ = [
     "apply_reassignment",
@@ -83,12 +87,12 @@ def _timed(label: str, *, verbose: bool):
 _non_degenerate = _py_mesh.non_degenerate
 
 
-def _edge_to_faces(mesh: trimesh.Trimesh) -> dict[tuple[int, int], list[int]]:
+def _edge_to_faces(mesh: Mesh) -> dict[tuple[int, int], list[int]]:
     """Build edge→face adjacency, skipping degenerate faces."""
     return _py_mesh.edge_to_faces(np.asarray(mesh.faces))
 
 
-def _edge_map(mesh: trimesh.Trimesh):
+def _edge_map(mesh: Mesh):
     """Edge → faces of *mesh* as the active path's ``Topology``.
 
     It reads like the dict :func:`_edge_to_faces` builds — keys, face lists
@@ -108,24 +112,10 @@ def _svd_rows(x: np.ndarray, full_matrices: bool) -> np.ndarray:
     return np.linalg.svd(x, full_matrices=full_matrices)[2]
 
 
-def _mouth_hull_area(pts: np.ndarray) -> float:
-    """Convex-hull area of *pts* projected onto their best-fit plane, 0 when
-    qhull cannot build the hull — :func:`find_pocket_mouths`' opening when
-    no rim loop closes."""
-    from scipy.spatial import ConvexHull
-
-    centered = pts - pts.mean(axis=0)
-    _, _, vh = np.linalg.svd(centered)
-    try:
-        return float(ConvexHull(centered @ vh[:2].T).volume)
-    except Exception:
-        return 0.0
-
-
 _nearest = _py_mesh.nearest
 
 
-def _face_edge_components(mesh: trimesh.Trimesh) -> tuple[np.ndarray, int]:
+def _face_edge_components(mesh: Mesh) -> tuple[np.ndarray, int]:
     """Connected components of faces using edge adjacency.
 
     Two faces are in the same component only if they share an edge
@@ -143,8 +133,9 @@ def _face_edge_components(mesh: trimesh.Trimesh) -> tuple[np.ndarray, int]:
     return kernels.pre.face_edge_components(faces, len(mesh.vertices))
 
 
+@mesh_args()
 def find_holes(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     verbose: bool = False,
 ) -> list[list[int]]:
@@ -157,7 +148,7 @@ def find_holes(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh.
     verbose : bool, default False
         Print summary.
@@ -310,11 +301,11 @@ def _ear_clip_2d(pts_2d: np.ndarray) -> list[tuple[int, int, int]]:
 
 
 def _fill_single_hole(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     loop: list[int],
     target_edge: float,
     vert_offset: int,
-    vtree: KDTree | None = None,
+    vtree: "KDTree | None" = None,
     vert_to_faces: list[list[int]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Fill one boundary loop with curvature-aware tessellation.
@@ -324,6 +315,7 @@ def _fill_single_hole(
     and ``vert_offset + i`` for newly created vertices.
     """
     from scipy.interpolate import RBFInterpolator
+    from scipy.spatial import KDTree
 
     verts = mesh.vertices
     boundary_pts = verts[loop]
@@ -724,20 +716,21 @@ def _fill_dome(
     return new_verts, np.array(faces, dtype=np.int64)
 
 
+@mesh_args()
 def fill_holes(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     holes: list[list[int]] | None = None,
     method: str = "advancing_front",
     max_perimeter_mult: float | None = None,
     dome_factor: float = 0.5,
     verbose: bool = False,
-) -> trimesh.Trimesh:
+) -> Mesh:
     """Fill holes in the mesh.
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh (typically after ``remove_organelles``).
     holes : list[list[int]] or None
         Pre-computed boundary loops from :func:`find_holes`.  If
@@ -765,7 +758,7 @@ def fill_holes(
 
     Returns
     -------
-    trimesh.Trimesh
+    Mesh
         Mesh with holes filled.
     """
     if holes is not None:
@@ -840,7 +833,7 @@ def fill_holes(
             return mesh
 
         all_faces = np.vstack([mesh.faces] + new_faces)
-        result = trimesh.Trimesh(vertices=mesh.vertices, faces=all_faces, process=False)
+        result = Mesh(mesh.vertices, all_faces)
 
     elif method == "dome":
         new_verts: list[np.ndarray] = []
@@ -867,13 +860,11 @@ def fill_holes(
 
         v_parts = [mesh.vertices] + new_verts
         f_parts = [mesh.faces] + new_face_list
-        result = trimesh.Trimesh(
-            vertices=np.vstack(v_parts),
-            faces=np.vstack(f_parts),
-            process=False,
-        )
+        result = Mesh(np.vstack(v_parts), np.vstack(f_parts))
 
     elif method == "rbf":
+        from scipy.spatial import KDTree
+
         vtree = KDTree(mesh.vertices)
         new_verts_rbf: list[np.ndarray] = []
         new_face_rbf: list[np.ndarray] = []
@@ -889,11 +880,7 @@ def fill_holes(
 
         v_parts = [mesh.vertices] + [v for v in new_verts_rbf if len(v) > 0]
         f_parts = [mesh.faces] + [f for f in new_face_rbf if len(f) > 0]
-        result = trimesh.Trimesh(
-            vertices=np.vstack(v_parts),
-            faces=np.vstack(f_parts),
-            process=False,
-        )
+        result = Mesh(np.vstack(v_parts), np.vstack(f_parts))
     else:
         raise ValueError(
             f"Unknown method: {method!r}. Use 'advancing_front', 'dome', or 'rbf'."
@@ -1072,10 +1059,10 @@ def _fit_loop_circle(pts: np.ndarray) -> tuple[np.ndarray, float, np.ndarray]:
 
 
 def _stitch_and_rebuild(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     sel: set[int],
     loop_pairs: list[tuple[list[int], list[int]]],
-) -> trimesh.Trimesh:
+) -> Mesh:
     """Remove *sel* faces, stitch each loop pair, rebuild mesh once."""
     verts = np.asarray(mesh.vertices, dtype=np.float64)
     new_verts, faces = kernels.pre.stitch_and_rebuild(
@@ -1090,15 +1077,16 @@ def _stitch_and_rebuild(
     )
     if len(new_verts):
         verts = np.vstack([verts, new_verts])
-    return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    return Mesh(verts, faces)
 
 
+@mesh_args()
 def merge_selected_faces(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     face_indices: list[int],
     *,
     verbose: bool = False,
-) -> trimesh.Trimesh:
+) -> Mesh:
     """Remove selected faces and stitch the resulting boundary loops.
 
     Workflow: lasso-select faces at the tips of two disconnected
@@ -1109,7 +1097,7 @@ def merge_selected_faces(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh.
     face_indices : list[int]
         Indices of faces to remove (the "bridge" region).
@@ -1117,7 +1105,7 @@ def merge_selected_faces(
 
     Returns
     -------
-    trimesh.Trimesh
+    Mesh
         Mesh with selected faces replaced by a stitched strip.
     """
     sel_input = set(face_indices)
@@ -1200,12 +1188,13 @@ def merge_selected_faces(
     return _stitch_and_rebuild(mesh, sel, pairs)
 
 
+@mesh_args()
 def remove_selected_faces(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     face_indices: list[int],
     *,
     verbose: bool = False,
-) -> trimesh.Trimesh:
+) -> Mesh:
     """Remove the selected faces from the mesh, leaving open holes.
 
     Companion to :func:`merge_selected_faces`.  Where
@@ -1219,7 +1208,7 @@ def remove_selected_faces(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh.
     face_indices : list[int]
         Indices of faces to remove.
@@ -1227,7 +1216,7 @@ def remove_selected_faces(
 
     Returns
     -------
-    trimesh.Trimesh
+    Mesh
         Mesh with selected faces removed.
     """
     if not face_indices:
@@ -1341,8 +1330,9 @@ def _find_fin_faces(
     return total_mask
 
 
+@mesh_args()
 def find_fragments(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     min_faces: int = 3,
     verbose: bool = False,
@@ -1354,7 +1344,7 @@ def find_fragments(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh.
     min_faces : int, default 3
         Edge-connected components with fewer faces than this are islands.
@@ -1396,8 +1386,9 @@ def find_fragments(
 _otsu_threshold = _py_pre.otsu_threshold
 
 
+@mesh_args()
 def find_soma_via_ring_cutoff(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     organelles: Organelles | None = None,
     verbose: bool = False,
@@ -1414,7 +1405,7 @@ def find_soma_via_ring_cutoff(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh (before organelle removal).
     organelles : Organelles or None
         Pre-computed organelles from :func:`find_organelles`.  If
@@ -1480,7 +1471,7 @@ def find_soma_via_ring_cutoff(
 
 
 def _ring_cutoff_soma(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     nuc: dict,
     labels: np.ndarray,
     main: int,
@@ -1575,13 +1566,12 @@ def _face_components(faces, edge_to_faces, face_indices):
     return components
 
 
-def _usable_face_mask(mesh: trimesh.Trimesh) -> np.ndarray:
+def _usable_face_mask(mesh: Mesh) -> np.ndarray:
     """Faces :func:`break_up_mesh` will consider: 3 distinct verts, non-zero area."""
-    faces = np.asarray(mesh.faces)
-    verts = mesh.vertices
-    v0, v1, v2 = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
-    nonzero_area = np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1) > 0
-    return _non_degenerate(faces) & nonzero_area
+    return kernels.pre.usable_faces(
+        np.asarray(mesh.vertices, dtype=np.float64),
+        np.asarray(mesh.faces, dtype=np.int64),
+    )
 
 
 def soma_face_mask(
@@ -1627,8 +1617,9 @@ def _build_org_output(
     )
 
 
+@mesh_args()
 def break_up_mesh(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     soma: Soma | None,
     organelles: Organelles,
     *,
@@ -1670,7 +1661,7 @@ def break_up_mesh(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
     soma : Soma or None
         From ``find_soma_via_ring_cutoff`` (must have ``.verts``).
         Pass ``None`` if the mesh has no soma.
@@ -1965,8 +1956,9 @@ def _numbered(kinds: list[str]):
         seen[k] = seen.get(k, 0) + 1
 
 
+@mesh_args()
 def preview_reassignment(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     components: MeshComponents,
     faces,
     *,
@@ -2007,7 +1999,7 @@ def preview_reassignment(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
     components : MeshComponents
         Current state, from :func:`break_up_mesh`.
     faces : array-like of int
@@ -2144,8 +2136,9 @@ def apply_reassignment(
     components.discarded = after.discarded
 
 
+@mesh_args()
 def find_soma_via_neurite_exclusion(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     organelles: Organelles | None = None,
     verbose: bool = False,
@@ -2169,6 +2162,8 @@ def find_soma_via_neurite_exclusion(
          exclusion handles shared branches automatically.
       4. Fit ellipsoid to the cleaned set
     """
+    from scipy.spatial import KDTree
+
     warnings.warn(
         "find_soma_via_neurite_exclusion is deprecated, "
         "use find_soma_via_ring_cutoff instead.",
@@ -2190,13 +2185,7 @@ def find_soma_via_neurite_exclusion(
         return None
 
     org_fi = np.where(organelles.mask)[0]
-    org_labels, _ = _face_edge_components(
-        trimesh.Trimesh(
-            vertices=mesh.vertices,
-            faces=mesh.faces[org_fi],
-            process=False,
-        )
-    )
+    org_labels, _ = _face_edge_components(Mesh(mesh.vertices, mesh.faces[org_fi]))
     centroids = []
     for cid in np.unique(org_labels):
         local_fi = org_fi[org_labels == cid]
@@ -2580,8 +2569,9 @@ def find_soma_via_neurite_exclusion(
     return soma
 
 
+@mesh_args()
 def find_soma_via_geodesic(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     organelles: Organelles | None = None,
     verbose: bool = False,
@@ -2626,13 +2616,7 @@ def find_soma_via_geodesic(
         return None
 
     org_fi = np.where(organelles.mask)[0]
-    org_labels, _ = _face_edge_components(
-        trimesh.Trimesh(
-            vertices=mesh.vertices,
-            faces=mesh.faces[org_fi],
-            process=False,
-        )
-    )
+    org_labels, _ = _face_edge_components(Mesh(mesh.vertices, mesh.faces[org_fi]))
     clusters: list[dict] = []
     for cid in np.unique(org_labels):
         local_fi = org_fi[org_labels == cid]
@@ -3018,7 +3002,7 @@ def find_soma_via_geodesic(
 
 
 def _refine_components_with_fusions(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     labels: np.ndarray,
     main: int,
     fusions: list[list[int]],
@@ -3043,7 +3027,7 @@ def _refine_components_with_fusions(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
     labels : np.ndarray
         Output of :func:`_face_edge_components`.
     main : int
@@ -3071,8 +3055,9 @@ def _refine_components_with_fusions(
     return new_labels.astype(labels.dtype, copy=False), new_main
 
 
+@mesh_args()
 def find_disconnected(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     verbose: bool = False,
     soma: Soma | None = None,
@@ -3088,7 +3073,7 @@ def find_disconnected(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh.
     verbose : bool, default False
         Print summary.
@@ -3175,8 +3160,9 @@ def find_disconnected(
     return components
 
 
+@mesh_args()
 def find_gaps(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     tip_rings: int = 3,
     verbose: bool = False,
@@ -3201,7 +3187,7 @@ def find_gaps(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh.
     tip_rings : int, default 3
         Number of face-graph BFS rings from the closest face to
@@ -3378,15 +3364,16 @@ def _report_gaps(gaps, disc, n_capped: int, n_repaired: int, t0: float) -> None:
     )
 
 
+@mesh_args()
 def remove_gaps(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     verbose: bool = False,
     soma: Soma | None = None,
     gaps: list | None = None,
     organelles: Organelles | None = None,
     mesh_stats: MeshStats | None = None,
-) -> trimesh.Trimesh:
+) -> Mesh:
     """Bridge all detected gaps in a single mesh rebuild.
 
     All gap tip faces are removed at once and boundary loops from each
@@ -3395,7 +3382,7 @@ def remove_gaps(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh.
     verbose : bool, default False
         Print progress.
@@ -3407,7 +3394,7 @@ def remove_gaps(
 
     Returns
     -------
-    trimesh.Trimesh
+    Mesh
         Mesh with gaps bridged.
     """
     if verbose:
@@ -3498,16 +3485,17 @@ def _bridge_gaps(mesh, gaps, labels):
         return None, 0, 0, n_skipped
     if len(new_verts):
         verts = np.vstack([verts, new_verts])
-    result = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    result = Mesh(verts, faces)
     return result, n_bridged, n_removed, n_skipped
 
 
+@mesh_args()
 def remove_islands(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     min_faces: int = 3,
     verbose: bool = False,
-) -> trimesh.Trimesh:
+) -> Mesh:
     """Remove small edge-disconnected components (islands).
 
     An island is a cluster of faces that shares no edge with the main
@@ -3517,7 +3505,7 @@ def remove_islands(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh.
     min_faces : int, default 3
         Edge-connected components with fewer faces than this are removed.
@@ -3526,7 +3514,7 @@ def remove_islands(
 
     Returns
     -------
-    trimesh.Trimesh
+    Mesh
         Mesh with islands removed.
     """
     active = np.ones(len(mesh.faces), dtype=bool)
@@ -3545,11 +3533,12 @@ def remove_islands(
     return clean
 
 
+@mesh_args()
 def remove_fins(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     verbose: bool = False,
-) -> trimesh.Trimesh:
+) -> Mesh:
     """Remove fin faces — faces with 2+ boundary edges.
 
     A fin is a face hanging off the surface by a single edge (2 of its
@@ -3573,13 +3562,14 @@ def remove_fins(
     return result
 
 
+@mesh_args()
 def remove_fragments(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     min_faces: int = 3,
     verbose: bool = False,
     fragments: np.ndarray | None = None,
-) -> trimesh.Trimesh:
+) -> Mesh:
     """Remove all fragments (islands and fins) by alternating until convergence.
 
     Islands are small edge-disconnected components; fins are faces
@@ -3589,7 +3579,7 @@ def remove_fragments(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh.
     min_faces : int, default 3
         Passed to island detection.
@@ -3598,7 +3588,7 @@ def remove_fragments(
 
     Returns
     -------
-    trimesh.Trimesh
+    Mesh
         Mesh with all fragments removed.
     """
     if fragments is not None:
@@ -3623,7 +3613,7 @@ def remove_fragments(
 
 
 def _outward_dot(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     radius: float,
     vert_comp: np.ndarray | None = None,
 ) -> np.ndarray:
@@ -3639,7 +3629,7 @@ def _outward_dot(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh.
     radius : float
         Ball-query radius for local centre-of-mass.
@@ -3665,7 +3655,7 @@ def _outward_dot(
 
 
 def _filter_small_clusters(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     face_mask: np.ndarray,
     min_cluster_size: int,
 ) -> np.ndarray:
@@ -3694,8 +3684,9 @@ def _filter_small_clusters(
     )
 
 
+@mesh_args()
 def compute_mesh_stats(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     radius: float | None = None,
     radius_multiplier: float = 5.0,
     verbose: bool = False,
@@ -3739,8 +3730,9 @@ def _report_mesh_stats(face_comp, outward_dots, radius, n_faces, t0) -> None:
     )
 
 
+@mesh_args()
 def find_pocket_mouths(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     radius: float | None = None,
     radius_multiplier: float = 5.0,
@@ -3748,8 +3740,6 @@ def find_pocket_mouths(
     min_fold_ratio: float = 3.0,
     verbose: bool = False,
     mesh_stats: MeshStats | None = None,
-    _adj: dict[int, set[int]] | None = None,
-    _edge_to_face: dict[tuple[int, int], list[int]] | None = None,
     _non_main_mask: np.ndarray | None = None,
 ) -> list[list[tuple[int, int]]]:
     """Find mouth edges — boundaries of negative-dot face clusters.
@@ -3783,19 +3773,15 @@ def find_pocket_mouths(
         )
         outward_dots = mesh_stats.outward_dots
         main_face_mask = mesh_stats.main_face_mask
-    edge_to_face = _edge_to_face if _edge_to_face is not None else _edge_to_faces(mesh)
-    adj = _adj if _adj is not None else _face_adjacency(mesh, edge_to_face)
-
+    faces = np.asarray(mesh.faces, dtype=np.int64)
     return kernels.pre.pocket_mouths(
-        np.asarray(mesh.faces),
-        np.asarray(mesh.vertices),
-        np.asarray(mesh.area_faces),
-        outward_dots,
-        main_face_mask,
-        edge_to_face,
-        adj,
+        faces,
+        np.asarray(mesh.vertices, dtype=np.float64),
+        np.asarray(mesh.area_faces, dtype=np.float64),
+        np.asarray(outward_dots, dtype=np.float64),
+        np.asarray(main_face_mask, dtype=bool),
+        kernels.mesh.Topology(faces, len(mesh.vertices)),
         _svd_rows,
-        _mouth_hull_area,
         min_pocket_size=min_pocket_size,
         min_fold_ratio=min_fold_ratio,
         non_main_mask=_non_main_mask,
@@ -3803,7 +3789,7 @@ def find_pocket_mouths(
 
 
 def _face_adjacency(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     edge_to_face: dict[tuple[int, int], list[int]] | None = None,
 ) -> dict[int, set[int]]:
     """Build face adjacency map (edge-connected neighbors)."""
@@ -3812,8 +3798,9 @@ def _face_adjacency(
     return _py_mesh.face_adjacency(edge_to_face)
 
 
+@mesh_args()
 def find_pocket_organelles(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     radius: float | None = None,
     radius_multiplier: float = 5.0,
@@ -3846,7 +3833,7 @@ def find_pocket_organelles(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input neuron mesh.
     radius : float or None
         Radius for outward_dot computation. Auto-computed if None.
@@ -3894,20 +3881,15 @@ def find_pocket_organelles(
         )
         outward_dots = mesh_stats.outward_dots
         main_face_mask = mesh_stats.main_face_mask
-    # Compute shared structures once
-    edge_to_face = _edge_to_faces(mesh)
-    adj = _face_adjacency(mesh, edge_to_face)
-
+    faces = np.asarray(mesh.faces, dtype=np.int64)
     pocket, counts = kernels.pre.pocket_organelles(
-        np.asarray(mesh.faces),
-        np.asarray(mesh.vertices),
-        np.asarray(mesh.area_faces),
-        outward_dots,
-        main_face_mask,
-        edge_to_face,
-        adj,
+        faces,
+        np.asarray(mesh.vertices, dtype=np.float64),
+        np.asarray(mesh.area_faces, dtype=np.float64),
+        np.asarray(outward_dots, dtype=np.float64),
+        np.asarray(main_face_mask, dtype=bool),
+        kernels.mesh.Topology(faces, len(mesh.vertices)),
         _svd_rows,
-        _mouth_hull_area,
         grow_threshold=grow_threshold,
         bridge_threshold=bridge_threshold,
         max_hole_size=max_hole_size,
@@ -3934,8 +3916,9 @@ def find_pocket_organelles(
     return pocket
 
 
+@mesh_args()
 def find_isolated_organelles(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     radius: float | None = None,
     radius_multiplier: float = 5.0,
@@ -3969,13 +3952,13 @@ def find_isolated_organelles(
     else:
         face_comp, main_ci = _face_edge_components(mesh)
     isolated, counts = kernels.pre.isolated_organelles(
-        np.asarray(mesh.faces),
-        np.asarray(mesh.vertices),
-        np.asarray(mesh.triangles_center),
-        np.asarray(mesh.face_normals),
-        outward_dots,
-        face_comp,
-        main_ci,
+        np.asarray(mesh.faces, dtype=np.int64),
+        np.asarray(mesh.vertices, dtype=np.float64),
+        np.asarray(mesh.triangles_center, dtype=np.float64),
+        np.asarray(mesh.face_normals, dtype=np.float64),
+        np.asarray(outward_dots, dtype=np.float64),
+        np.asarray(face_comp, dtype=np.int64),
+        int(main_ci),
     )
 
     if verbose:
@@ -3992,8 +3975,9 @@ def find_isolated_organelles(
     return isolated
 
 
+@mesh_args()
 def find_organelles(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     radius: float | None = None,
     radius_multiplier: float = 5.0,
@@ -4014,7 +3998,7 @@ def find_organelles(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input neuron mesh.
     radius : float or None, default None
         Radius (in mesh units, typically nm) for the local center-of-mass
@@ -4072,7 +4056,6 @@ def find_organelles(
         int(main_ci),
         np.asarray(mesh.face_adjacency, dtype=np.int64),
         _svd_rows,
-        _mouth_hull_area,
         int(min_cluster_size),
     )
     n_structural, enclosed_count = rep["n_structural"], rep["n_enclosed"]
@@ -4118,7 +4101,7 @@ def find_organelles(
 
 
 def _find_nonmanifold_fusions(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     radius: float | None = None,
     radius_multiplier: float = 5.0,
@@ -4152,8 +4135,9 @@ def _outward_dots_for(mesh, radius, radius_multiplier, mesh_stats) -> np.ndarray
     return np.asarray(dots, dtype=np.float64)
 
 
+@mesh_args()
 def find_fusions(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     radius: float | None = None,
     radius_multiplier: float = 5.0,
@@ -4168,7 +4152,7 @@ def find_fusions(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input neuron mesh (ideally after organelle removal).
     radius : float or None
         Radius for outward_dot computation. Auto-computed if None.
@@ -4224,10 +4208,10 @@ def find_fusions(
 
 
 def _split_fan_vertices(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     candidate_verts: set[int] | None = None,
     verbose: bool = False,
-) -> trimesh.Trimesh:
+) -> Mesh:
     """Split vertices whose face fan is disconnected by face-edge adjacency.
 
     At a manifold fusion, two branches share vertices but not face-edges.
@@ -4247,9 +4231,7 @@ def _split_fan_vertices(
     if len(sources) == 0:
         return mesh
     verts = np.asarray(mesh.vertices)
-    result = trimesh.Trimesh(
-        vertices=np.vstack([verts, verts[sources]]), faces=faces, process=False
-    )
+    result = Mesh(np.vstack([verts, verts[sources]]), faces)
     if verbose:
         print(
             f"[skeliner.pre] Split {len(sources)} fan vertices "
@@ -4258,15 +4240,16 @@ def _split_fan_vertices(
     return result
 
 
+@mesh_args()
 def remove_fusions(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     fusions: list[list[int]] | None = None,
     radius: float | None = None,
     radius_multiplier: float = 5.0,
     verbose: bool = False,
     mesh_stats: MeshStats | None = None,
-) -> trimesh.Trimesh:
+) -> Mesh:
     """Remove fusion faces and split shared vertices between branches.
 
     Two-step process:
@@ -4279,7 +4262,7 @@ def remove_fusions(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input neuron mesh (ideally after organelle removal).
     fusion_clusters : list[list[int]] or None
         Pre-computed clusters from :func:`find_fusions`.  If provided,
@@ -4292,7 +4275,7 @@ def remove_fusions(
 
     Returns
     -------
-    trimesh.Trimesh
+    Mesh
         Mesh with fusions removed and shared vertices split.
     """
     if verbose:
@@ -4322,7 +4305,7 @@ def remove_fusions(
         verts = np.asarray(mesh.vertices)
         if len(sources):
             verts = np.vstack([verts, verts[sources]])
-        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        mesh = Mesh(verts, faces)
     n_split = len(mesh.vertices) - n_verts_before
 
     if verbose:
@@ -4340,9 +4323,9 @@ def remove_fusions(
 
 
 def _rebuild_mesh(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     keep_mask: np.ndarray,
-) -> trimesh.Trimesh:
+) -> Mesh:
     """Remove faces from a mesh, preserving all indices.
 
     Removed faces are replaced with degenerate triangles ``[0, 0, 0]``
@@ -4352,35 +4335,32 @@ def _rebuild_mesh(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Original mesh.
     keep_mask : np.ndarray
         Boolean mask ``(nFaces,)`` — True for faces to keep.
 
     Returns
     -------
-    trimesh.Trimesh
+    Mesh
         Mesh with removed faces degenerated.  Same vertex and face
         array sizes as the input.
     """
     new_faces = mesh.faces.copy()
     new_faces[~keep_mask] = 0
-    return trimesh.Trimesh(
-        vertices=mesh.vertices,
-        faces=new_faces,
-        process=False,
-    )
+    return Mesh(mesh.vertices, new_faces)
 
 
+@mesh_args()
 def remove_organelles(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     organelles: Organelles | None = None,
     radius: float | None = None,
     radius_multiplier: float = 5.0,
     min_cluster_size: int = 5,
     verbose: bool = False,
-) -> trimesh.Trimesh:
+) -> Mesh:
     """Remove internal mesh fragments (organelle membranes) from a neuron mesh.
 
     Organelle membranes (mitochondria, ER, etc.) often appear as
@@ -4397,7 +4377,7 @@ def remove_organelles(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input neuron mesh.
     organelles : Organelles or None
         Pre-computed organelles from :func:`find_organelles`.  If
@@ -4417,7 +4397,7 @@ def remove_organelles(
 
     Returns
     -------
-    trimesh.Trimesh
+    Mesh
         Cleaned mesh with internal fragments removed.  Vertex indices
         are unchanged from the input mesh.
 
@@ -4461,8 +4441,9 @@ def remove_organelles(
 # ── Chunk boundary / sandwich detection ────────────────────────────
 
 
+@mesh_args()
 def find_chunk_boundaries(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     verbose: bool = False,
 ) -> dict[int, np.ndarray]:
@@ -4475,7 +4456,7 @@ def find_chunk_boundaries(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh.
     verbose : bool, default False
         Print detected boundaries.
@@ -4486,86 +4467,24 @@ def find_chunk_boundaries(
         Mapping ``{axis: array_of_boundary_coordinates}`` where *axis*
         is 0 (X), 1 (Y), or 2 (Z).  Each array is sorted.
     """
-    verts = mesh.vertices
     boundaries: dict[int, np.ndarray] = {}
-
-    for axis in range(3):
-        coords = np.round(verts[:, axis]).astype(np.int64)
-        unique, counts = np.unique(coords, return_counts=True)
-
-        if len(unique) < 3:
-            continue
-
-        # Chunk boundaries are sharp spikes: a single coordinate value
-        # with many more vertices than its neighbors.  Detect as values
-        # where count exceeds the local background by a large factor.
-        # Spike ratio: each value's count vs mean of its ±5 neighbors
-        n = len(counts)
-        local_bg = np.empty(n, dtype=float)
-        for i in range(n):
-            lo = max(0, i - 5)
-            hi = min(n, i + 6)
-            # Exclude self from local background
-            neighbors = np.concatenate([counts[lo:i], counts[i + 1 : hi]])
-            local_bg[i] = neighbors.mean() if len(neighbors) > 0 else 1.0
-        spike_ratio = counts / np.maximum(local_bg, 1.0)
-
-        # A boundary is any coordinate with a clear local spike
-        is_boundary = spike_ratio > 5.0
-
-        if not is_boundary.any():
-            continue
-
-        # Remove false boundaries that are too close to a real one.
-        # Real chunk boundaries have consistent spacing; a spike much
-        # closer than the median spacing is a hard-cutoff or other
-        # non-chunk artifact.
-        bvals = unique[is_boundary]
-        if len(bvals) >= 3:
-            spacings = np.diff(bvals)
-            median_sp = float(np.median(spacings))
-            keep = np.ones(len(bvals), dtype=bool)
-            for i in range(len(bvals)):
-                left = spacings[i - 1] if i > 0 else median_sp
-                right = spacings[i] if i < len(spacings) else median_sp
-                # If BOTH neighbors are much closer than median, it's
-                # a cluster — keep the one with the highest spike.
-                # If only one side is short, this boundary is the
-                # non-chunk one if it has a lower spike than its
-                # close neighbor.
-                if min(left, right) < median_sp * 0.25:
-                    # Find the close neighbor
-                    if left < median_sp * 0.25 and i > 0:
-                        # Close to left neighbor — keep the stronger
-                        left_ratio = spike_ratio[np.where(unique == bvals[i - 1])[0][0]]
-                        this_ratio = spike_ratio[np.where(unique == bvals[i])[0][0]]
-                        if this_ratio < left_ratio:
-                            keep[i] = False
-                    if right < median_sp * 0.25 and i < len(spacings):
-                        right_ratio = spike_ratio[
-                            np.where(unique == bvals[i + 1])[0][0]
-                        ]
-                        this_ratio = spike_ratio[np.where(unique == bvals[i])[0][0]]
-                        if this_ratio < right_ratio:
-                            keep[i] = False
-            bvals = bvals[keep]
-
+    found = kernels.pre.find_chunk_boundaries(
+        np.asarray(mesh.vertices, dtype=np.float64)
+    )
+    for axis, bvals, counts, spikes in found:
         boundaries[axis] = bvals
-
         if verbose:
             name = "XYZ"[axis]
             print(f"[skeliner.pre] Chunk boundaries {name}: {len(bvals)} planes")
-            for val in bvals:
-                idx = np.where(unique == val)[0][0]
-                print(
-                    f"  {name}={val}: {counts[idx]} verts (spike {spike_ratio[idx]:.1f}x)"
-                )
+            for val, count, spike in zip(bvals, counts, spikes, strict=True):
+                print(f"  {name}={val}: {count} verts (spike {spike:.1f}x)")
 
     return boundaries
 
 
+@mesh_args()
 def find_parallel_patches(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     boundaries: dict[int, np.ndarray] | None = None,
     normal_thresh: float = 0.99,
@@ -4585,7 +4504,7 @@ def find_parallel_patches(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh.
     boundaries : dict or None
         Output of :func:`find_chunk_boundaries`.  Computed if *None*.
@@ -4662,7 +4581,7 @@ def find_parallel_patches(
 
 
 def _trim_patches_to_overlap(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     patches: list[dict],
 ) -> list[dict]:
     """Trim each patch to the subset of faces whose projection onto
@@ -4762,7 +4681,7 @@ def _trim_patches_to_overlap(
 
 
 def _sandwich_overlap_ratio(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     faces_a: list[int],
     faces_b: list[int],
     axis: int,
@@ -4802,7 +4721,7 @@ def _sandwich_overlap_ratio(
 
 
 def _filter_weak_sandwich_pairs(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     patches: list[dict],
     *,
     min_overlap: float = 0.3,
@@ -4854,14 +4773,15 @@ def _filter_weak_sandwich_pairs(
     return [p for pi, p in enumerate(patches) if keep[pi]]
 
 
+@mesh_args()
 def remove_parallel_patches(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     patches: list[dict] | None = None,
     boundaries: dict[int, np.ndarray] | None = None,
     verbose: bool = False,
     mesh_stats: MeshStats | None = None,
-) -> trimesh.Trimesh:
+) -> Mesh:
     """Remove parallel-patch artifacts at chunk boundaries.
 
     1. Classify each patch as Mode A (has fold edges, where an up face
@@ -4874,7 +4794,7 @@ def remove_parallel_patches(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh.
     patches : list[dict] or None
         Output of :func:`find_parallel_patches`.  Computed if *None*.
@@ -4885,7 +4805,7 @@ def remove_parallel_patches(
 
     Returns
     -------
-    trimesh.Trimesh
+    Mesh
         Mesh with patch artifacts and Mode A orphans removed.
     """
     if verbose:
@@ -4921,7 +4841,7 @@ def remove_parallel_patches(
             ],
         )
     )
-    result = trimesh.Trimesh(vertices=mesh.vertices, faces=faces_out, process=False)
+    result = Mesh(mesh.vertices, faces_out)
     n_trimmed = n_faces_before_trim - n_faces_after_trim
 
     # Invalidate topology; pad outward_dots for appended stitch faces
@@ -4956,16 +4876,14 @@ def remove_parallel_patches(
     return result
 
 
+@mesh_args()
 def compact_mesh(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     components: MeshComponents,
     *,
     return_maps: bool = False,
     verbose: bool = False,
-) -> (
-    tuple[trimesh.Trimesh, MeshComponents]
-    | tuple[trimesh.Trimesh, MeshComponents, np.ndarray, np.ndarray]
-):
+) -> tuple[Mesh, MeshComponents] | tuple[Mesh, MeshComponents, np.ndarray, np.ndarray]:
     """Remove degenerate faces, drop unreferenced vertices, reindex.
 
     Call once at the end of preprocessing, after all face removals.
@@ -4973,7 +4891,7 @@ def compact_mesh(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Mesh after face removals.
     components : MeshComponents
         All face-indexed data is remapped to match the compacted mesh.
@@ -4985,7 +4903,7 @@ def compact_mesh(
 
     Returns
     -------
-    clean : trimesh.Trimesh
+    clean : Mesh
         Compacted mesh with no unreferenced vertices.
     components : MeshComponents
         Remapped components.
@@ -5003,11 +4921,7 @@ def compact_mesh(
     vert_map = np.full(n_old, -1, dtype=np.int64)
     vert_map[referenced] = np.arange(len(referenced), dtype=np.int64)
 
-    clean = trimesh.Trimesh(
-        vertices=mesh.vertices[referenced],
-        faces=vert_map[live_faces],
-        process=False,
-    )
+    clean = Mesh(mesh.vertices[referenced], vert_map[live_faces])
 
     if verbose:
         n_removed_v = n_old - len(clean.vertices)
@@ -5080,15 +4994,16 @@ def compact_mesh(
 # -----------------------------------------------------------------------------
 
 
+@mesh_args()
 def preprocess(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     rescued=None,
     released=None,
     claim_min_faces: int = 0,
     compact: bool = False,
     verbose: bool = False,
-) -> tuple[trimesh.Trimesh, MeshComponents]:
+) -> tuple[Mesh, MeshComponents]:
     """Run the full preprocessing pipeline in one call.
 
     Pipeline order:
@@ -5105,7 +5020,7 @@ def preprocess(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh.
     rescued : array-like of int, optional
         Face ids the caller has declared arbor, passed through to
@@ -5127,7 +5042,7 @@ def preprocess(
 
     Returns
     -------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Cleaned mesh (gaps stitched, fusions removed, optionally
         compacted).
     components : MeshComponents
@@ -5227,8 +5142,9 @@ def preprocess(
 # =====================================================================
 
 
+@mesh_args()
 def find_nucleus_center(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     grid_res: float = 200.0,
     z_tol: float = 150.0,
@@ -5264,7 +5180,7 @@ def find_nucleus_center(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input neuron mesh (any cell type).
     grid_res : float
         2D rasterization cell size in nm.  200 nm works well: fine
@@ -5370,8 +5286,6 @@ def _z_scan(
     soma_mask), ...]``, *best_run* is the indices into *raw* of the
     nucleus chain (or None), and *nucleus_center* is ``(3,)`` or None.
     """
-    from scipy.spatial import ConvexHull
-
     verts = np.asarray(verts, dtype=np.float64)
     scan = kernels.pre.ZScan(verts, grid_res, z_tol, min_void_r, max_shift)
     if scan.best is not None and retry_broken:
@@ -5379,13 +5293,8 @@ def _z_scan(
         hulls = []
         for ref_i in scan.chain_ends():
             sv = scan.soma_vertices(ref_i)
-            eq = None
-            if sv is not None and len(sv) >= 4:
-                try:
-                    eq = ConvexHull(verts[sv, :2]).equations
-                except Exception:
-                    eq = None
-            hulls.append(eq)
+            ok = sv is not None and len(sv) >= 4
+            hulls.append(kernels.mesh.hull_equations(verts[sv, :2]) if ok else None)
         scan.retry(*hulls)
     return scan.raw(), scan.best, scan.center
 
@@ -5603,8 +5512,9 @@ def _soma_hulls(
     return {i: hulls[i] for i in accepted}, extend_lo, extend_hi
 
 
+@mesh_args()
 def find_soma_via_z_contour(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     organelles: Organelles | None = None,
     grid_res: float = 200.0,
@@ -5624,7 +5534,7 @@ def find_soma_via_z_contour(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input neuron mesh.
     organelles : Organelles or None
         Pre-computed organelles from :func:`find_organelles`.  If

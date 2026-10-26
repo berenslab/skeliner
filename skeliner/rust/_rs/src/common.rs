@@ -97,6 +97,16 @@ pub(crate) fn points3(a: &PyReadonlyArray2<'_, f64>) -> PyResult<Vec<[f64; 3]>> 
     rows3("N", a)
 }
 
+/// `points`, refused with `what must be finite` when a coordinate is NaN or
+/// infinite (scipy's trees refuse such queries).
+pub(crate) fn finite(what: &str, points: Vec<[f64; 3]>) -> PyResult<Vec<[f64; 3]>> {
+    if points.iter().flatten().all(|x| x.is_finite()) {
+        Ok(points)
+    } else {
+        Err(PyValueError::new_err(format!("{what} must be finite")))
+    }
+}
+
 /// Triangles given as `(F, 3, 3)` flattened to `(F, 9)`.
 pub(crate) fn triangles9(a: &PyReadonlyArray2<'_, f64>) -> PyResult<Vec<[[f64; 3]; 3]>> {
     let t = a.as_array();
@@ -139,5 +149,41 @@ pub(crate) fn node_pairs(edges: &PyReadonlyArray2<'_, i64>, n: usize) -> PyResul
     e.rows()
         .into_iter()
         .map(|r| Ok([node(r[0])?, node(r[1])?]))
+        .collect()
+}
+
+/// A CSR (`ptr` `(K + 1,)` from 0, never decreasing, `idx`) as `K` lists of
+/// ids, each one `0 ≤ id < bound` when there is a bound, else `0 ≤ id`;
+/// `what` names the lists in the errors.
+pub(crate) fn csr_lists(
+    ptr: &numpy::PyReadonlyArray1<'_, i64>,
+    idx: &numpy::PyReadonlyArray1<'_, i64>,
+    bound: Option<usize>,
+    what: &str,
+) -> PyResult<Vec<Vec<usize>>> {
+    let (ptr, idx) = (ptr.as_array(), idx.as_array());
+    let well_formed = !ptr.is_empty()
+        && ptr[0] == 0
+        && ptr.iter().zip(ptr.iter().skip(1)).all(|(a, b)| a <= b)
+        && usize::try_from(ptr[ptr.len() - 1]).ok() == Some(idx.len());
+    if !well_formed {
+        return Err(PyValueError::new_err(format!(
+            "{what} must be a CSR (ptr, idx)"
+        )));
+    }
+    let id = |v: i64| {
+        usize::try_from(v)
+            .ok()
+            .filter(|&v| bound.is_none_or(|n| v < n))
+            .ok_or_else(|| match bound {
+                Some(n) => PyValueError::new_err(format!(
+                    "{what} name vertex {v}, but there are {n} vertices"
+                )),
+                None => PyValueError::new_err("vertex ids must not be negative"),
+            })
+    };
+    ptr.iter()
+        .zip(ptr.iter().skip(1))
+        .map(|(&a, &b)| (a as usize..b as usize).map(|i| id(idx[i])).collect())
         .collect()
 }

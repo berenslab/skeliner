@@ -1,9 +1,13 @@
 //! `skeliner._core`'s stages, run by both tracks of `skeletonize` and by
 //! `post`'s wrappers.
 
-use std::collections::VecDeque;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, VecDeque};
 
-use crate::skeleton::estimate_radius;
+use mesh::geometry::{numpy_order, numpy_sum, row_times_matrix};
+use mesh::spatial::{KdTree, Sum};
+
+use crate::skeleton::{estimate_radius, quantile_sorted};
 
 /// A skeleton's node-aligned arrays, as `_state.SkeletonState` holds them.
 #[derive(Debug, Clone, PartialEq)]
@@ -71,6 +75,109 @@ fn retain_kept<T>(v: &mut Vec<T>, keep: &[bool]) {
         i += 1;
         keep[i - 1]
     });
+}
+
+/// `dataclass.Soma`'s ellipsoid: `world = R @ body + center`, its semi-axes
+/// largest first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ellipsoid {
+    pub center: [f64; 3],
+    pub axes: [f64; 3],
+    /// The rows of `R`, whose columns are the principal axes.
+    pub r: [[f64; 3]; 3],
+}
+
+impl Ellipsoid {
+    /// `Soma.spherical_radius`: Python's `max` over the axes.
+    pub fn spherical_radius(&self) -> f64 {
+        let mut best = self.axes[0];
+        for &a in &self.axes[1..] {
+            if a > best {
+                best = a;
+            }
+        }
+        best
+    }
+
+    /// `Soma.distance_to_center`: `‖x − center‖`, summed left to right.
+    pub fn distance_to_center(&self, x: &[[f64; 3]]) -> Vec<f64> {
+        x.iter()
+            .map(|p| {
+                let d = [0, 1, 2].map(|k| p[k] - self.center[k]);
+                (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+            })
+            .collect()
+    }
+
+    /// `Soma.distance_to_surface` (`atol` 1e-9, 64 steps at most): the
+    /// signed distance to the surface, negative inside, as numpy computes
+    /// it — the body coordinates through `dgemm`'s FMA chain, every sum left
+    /// to right, `** 3` as `pow`, and one Newton loop for all the points
+    /// outside, stopped once every step is below `atol`, so a point's result
+    /// depends on the others in the same call.
+    pub fn distance_to_surface(&self, x: &[[f64; 3]]) -> Vec<f64> {
+        const ATOL: f64 = 1e-9;
+        let a = self.axes;
+        let a2 = [a[0] * a[0], a[1] * a[1], a[2] * a[2]];
+        let p: Vec<[f64; 3]> = x
+            .iter()
+            .map(|q| row_times_matrix(&[0, 1, 2].map(|k| q[k] - self.center[k]), &self.r))
+            .collect();
+        let r2: Vec<f64> = p
+            .iter()
+            .map(|q| (q[0] * q[0] / a2[0] + q[1] * q[1] / a2[1]) + q[2] * q[2] / a2[2])
+            .collect();
+        let out: Vec<usize> = (0..p.len()).filter(|&i| r2[i] > 1.0 + 1e-12).collect();
+        let mut t = vec![0.0f64; out.len()];
+        for _ in 0..64 {
+            let dts: Vec<f64> = out
+                .iter()
+                .zip(&t)
+                .map(|(&i, &ti)| {
+                    let q = p[i];
+                    let den = [ti + a2[0], ti + a2[1], ti + a2[2]];
+                    let f = [0, 1, 2].map(|k| a2[k] * (q[k] * q[k]) / (den[k] * den[k]));
+                    let fp = [0, 1, 2].map(|k| (-2.0 * a2[k]) * (q[k] * q[k]) / den[k].powf(3.0));
+                    -((f[0] + f[1]) + f[2] - 1.0) / ((fp[0] + fp[1]) + fp[2])
+                })
+                .collect();
+            let mut converged = true;
+            for (ti, dt) in t.iter_mut().zip(&dts) {
+                *ti += dt;
+                // a NaN step never converges, as with numpy's `all`
+                converged &= dt.abs() < ATOL;
+            }
+            if converged {
+                break;
+            }
+        }
+        let norm = |e: [f64; 3]| (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt();
+        let mut dist = vec![0.0f64; p.len()];
+        let mut outside = vec![false; p.len()];
+        for (&i, &ti) in out.iter().zip(&t) {
+            outside[i] = true;
+            let q = p[i];
+            dist[i] = norm([0, 1, 2].map(|k| a2[k] * q[k] / (ti + a2[k]) - q[k]));
+        }
+        // numpy's `min` of the axes
+        let min_axis = a.iter().copied().fold(f64::INFINITY, |m, v| {
+            if m.is_nan() || v.is_nan() {
+                f64::NAN
+            } else {
+                m.min(v)
+            }
+        });
+        for i in (0..p.len()).filter(|&i| !outside[i]) {
+            let s = r2[i].sqrt();
+            dist[i] = if s > ATOL {
+                let q = p[i];
+                -norm([0, 1, 2].map(|k| q[k] / s - q[k]))
+            } else {
+                -min_axis
+            };
+        }
+        dist
+    }
 }
 
 /// `remap_edges`: the edges between kept nodes, renumbered, each sorted, no
@@ -485,6 +592,388 @@ pub fn build_mst(nodes: &[[f64; 3]], edges: &[[usize; 2]]) -> Result<Vec<[usize;
     }
     tree.sort_unstable();
     Ok(tree)
+}
+
+/// What `merge_near_soma_nodes` changed: per node before, its index after
+/// (−1 for a node merged into the soma), the soma's vertices to refit it
+/// from (`None` while it has none), and how many nodes went into it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergedNear {
+    pub old2new: Vec<i64>,
+    pub soma_verts: Option<Vec<i64>>,
+    pub n_merged: usize,
+}
+
+/// `_merge_near_soma_nodes` but the soma's refit: every node but the root
+/// inside the soma (`distance_to_surface < −inside_tol`), or near it
+/// (`distance_to_center < near_factor × r_soma`) and fat (its radius in row
+/// `radius_row` above `fat_factor × r_soma`), is merged into the root and
+/// dropped; the kept nodes it touched are tied to the root. Of the merged
+/// nodes' vertices, in order, those within `near_factor × r_soma` of the
+/// surface (all of them without `mesh_vertices`) join the root's vertices
+/// and the soma's, which end sorted and unique.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_near_soma_nodes(
+    s: &mut Arrays,
+    radius_row: usize,
+    soma: &Ellipsoid,
+    soma_verts: Option<&[i64]>,
+    mesh_vertices: Option<&[[f64; 3]]>,
+    inside_tol: f64,
+    near_factor: f64,
+    fat_factor: f64,
+) -> MergedNear {
+    let r_soma = soma.spherical_radius();
+    let d2s = soma.distance_to_surface(&s.nodes);
+    let d2c = soma.distance_to_center(&s.nodes);
+    let n = s.nodes.len();
+    let mut keep: Vec<bool> = (0..n)
+        .map(|i| {
+            let inside = d2s[i] < -inside_tol;
+            let near = d2c[i] < near_factor * r_soma;
+            let fat = s.radii[radius_row][i] > fat_factor * r_soma;
+            !(inside || (near && fat))
+        })
+        .collect();
+    keep[0] = true;
+    let merged: Vec<usize> = (0..n).filter(|&i| !keep[i]).collect();
+    let edges = s.edges.clone();
+    let merged_verts: Vec<Vec<usize>> = merged.iter().map(|&i| s.node2verts[i].clone()).collect();
+    let old2new = s.compact(&keep);
+
+    let mut leaves: Vec<usize> = edges
+        .iter()
+        .filter_map(|&[u, v]| match (keep[u], keep[v]) {
+            (true, false) => Some(old2new[u] as usize),
+            (false, true) => Some(old2new[v] as usize),
+            _ => None,
+        })
+        .filter(|&l| l != 0)
+        .collect();
+    leaves.sort_unstable();
+    leaves.dedup();
+    if !leaves.is_empty() {
+        s.edges.extend(leaves.iter().map(|&l| [0, l]));
+        s.edges.sort_unstable();
+        s.edges.dedup();
+    }
+
+    let mut verts: Option<Vec<i64>> = soma_verts.map(<[i64]>::to_vec);
+    let limit = near_factor * r_soma;
+    for vidx in &merged_verts {
+        let contrib: Vec<usize> = match mesh_vertices {
+            Some(mv) => {
+                let pts: Vec<[f64; 3]> = vidx.iter().map(|&v| mv[v]).collect();
+                let d = soma.distance_to_surface(&pts);
+                vidx.iter()
+                    .zip(&d)
+                    .filter(|&(_, &d)| d < limit)
+                    .map(|(&v, _)| v)
+                    .collect()
+            }
+            None => vidx.clone(),
+        };
+        if !contrib.is_empty() {
+            verts
+                .get_or_insert_with(Vec::new)
+                .extend(contrib.iter().map(|&v| v as i64));
+            s.node2verts[0].extend_from_slice(&contrib);
+        }
+    }
+    if let Some(v) = &mut verts {
+        v.sort_unstable();
+        v.dedup();
+    }
+    MergedNear {
+        old2new,
+        soma_verts: verts,
+        n_merged: merged.len(),
+    }
+}
+
+/// What `find_soma` found: the soma's nodes, the node of largest radius,
+/// the soma's centre and radius, and whether there are enough nodes for a
+/// soma.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FoundSoma {
+    pub soma_nodes: Vec<usize>,
+    pub idx_max: usize,
+    pub center: [f64; 3],
+    pub r_max: f64,
+    pub has_soma: bool,
+}
+
+/// numpy's `argmax`: the first largest value, or the first NaN.
+fn numpy_argmax(v: &[f64]) -> usize {
+    let mut best = 0;
+    for (i, &x) in v.iter().enumerate() {
+        if x.is_nan() {
+            return i;
+        }
+        if x > v[best] {
+            best = i;
+        }
+    }
+    best
+}
+
+/// `_find_soma`: the nodes whose `radius` is at least its `pct_large`-th
+/// percentile (numpy's linear one; NaN, so no nodes, if any radius is
+/// NaN) and which lie within `dist_factor` times the largest radius of the
+/// node that has it. A soma with `min_keep` such nodes or more is centred
+/// on their mean (summed row by row from the first); otherwise on that
+/// node. `None` when no node reaches the percentile.
+pub fn find_soma(
+    nodes: &[[f64; 3]],
+    radius: &[f64],
+    pct_large: f64,
+    dist_factor: f64,
+    min_keep: usize,
+) -> Option<FoundSoma> {
+    let threshold = if radius.iter().any(|r| r.is_nan()) {
+        f64::NAN
+    } else {
+        let mut sorted = radius.to_vec();
+        sorted.sort_by(numpy_order);
+        quantile_sorted(&sorted, pct_large / 100.0)
+    };
+    let candidates: Vec<usize> = (0..radius.len())
+        .filter(|&i| radius[i] >= threshold)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let idx_max = numpy_argmax(radius);
+    let r_max = radius[idx_max];
+    let c = nodes[idx_max];
+    let soma_nodes: Vec<usize> = candidates
+        .into_iter()
+        .filter(|&i| {
+            let d = [0, 1, 2].map(|k| nodes[i][k] - c[k]);
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() <= dist_factor * r_max
+        })
+        .collect();
+    let has_soma = soma_nodes.len() >= min_keep;
+    let center = match (has_soma, soma_nodes.split_first()) {
+        (true, Some((&first, rest))) => {
+            let mut sum = nodes[first];
+            for &i in rest {
+                for k in 0..3 {
+                    sum[k] += nodes[i][k];
+                }
+            }
+            sum.map(|s| s / soma_nodes.len() as f64)
+        }
+        _ => c,
+    };
+    Some(FoundSoma {
+        soma_nodes,
+        idx_max,
+        center,
+        r_max,
+        has_soma,
+    })
+}
+
+/// The soma's vertices, from its nodes at `points` with their vertex lists
+/// `lists`: those of the nodes closer to `center` than twice `r_max`
+/// (lists that are not empty), merged, sorted and unique; failing those,
+/// the first node's list as it is.
+pub fn soma_vertices(
+    points: &[[f64; 3]],
+    lists: &[Vec<usize>],
+    center: [f64; 3],
+    r_max: f64,
+) -> Vec<usize> {
+    let mut verts: Vec<usize> = points
+        .iter()
+        .zip(lists)
+        .filter(|(p, l)| {
+            let d = [0, 1, 2].map(|k| p[k] - center[k]);
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() < r_max * 2.0 && !l.is_empty()
+        })
+        .flat_map(|(_, l)| l.iter().copied())
+        .collect();
+    if verts.is_empty() {
+        return lists.first().cloned().unwrap_or_default();
+    }
+    verts.sort_unstable();
+    verts.dedup();
+    verts
+}
+
+/// A component's gap to the tied part: its length, the component, the
+/// index of its node in the component and of the tied node, ordered as
+/// Python orders the tuple (the gap, then the rest).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Gap(f64, usize, usize, usize);
+
+impl Eq for Gap {}
+
+impl Ord for Gap {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // reversed, so `BinaryHeap` pops the smallest
+        other
+            .0
+            .total_cmp(&self.0)
+            .then(other.1.cmp(&self.1))
+            .then(other.2.cmp(&self.2))
+            .then(other.3.cmp(&self.3))
+    }
+}
+
+impl PartialOrd for Gap {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// numpy's `argmin`: the first smallest value, or the first NaN.
+fn numpy_argmin(v: &[f64]) -> usize {
+    let mut best = 0;
+    for (i, &x) in v.iter().enumerate() {
+        if x.is_nan() {
+            return i;
+        }
+        if x < v[best] {
+            best = i;
+        }
+    }
+    best
+}
+
+/// `_bridge_gaps`: every connected component of `edges` tied to the
+/// component of node 0 by one new edge, nearest component first — the
+/// closest pair of nodes between it and what is tied so far (a component's
+/// nodes ascending, the first of equally close ones; the tied nodes in the
+/// order they joined, ties to the earliest). A component farther than
+/// `bridge_max_factor` mean edge lengths waits (by default the 55th
+/// percentile of the first gaps over the mean edge length, clipped to 6 to
+/// 12), and the limit grows by half after twice three times as many waits
+/// as there were gaps; every gap is measured again after
+/// `bridge_recalc_after` bridges (by default 2 to 32 by the number of
+/// gaps). The edges with the bridges, unique and in order; `None` when
+/// there is one component (the edges stay as they are).
+pub fn bridge_gaps(
+    nodes: &[[f64; 3]],
+    edges: &[[usize; 2]],
+    bridge_max_factor: Option<f64>,
+    bridge_recalc_after: Option<usize>,
+) -> Option<Vec<[usize; 2]>> {
+    let n = nodes.len();
+    // components numbered as igraph numbers them: by their lowest node
+    let mut adj = vec![Vec::new(); n];
+    for &[a, b] in edges {
+        adj[a].push(b);
+        adj[b].push(a);
+    }
+    let mut membership = vec![usize::MAX; n];
+    let mut n_comp = 0;
+    for start in 0..n {
+        if membership[start] != usize::MAX {
+            continue;
+        }
+        membership[start] = n_comp;
+        let mut stack = vec![start];
+        while let Some(u) = stack.pop() {
+            for &v in &adj[u] {
+                if membership[v] == usize::MAX {
+                    membership[v] = n_comp;
+                    stack.push(v);
+                }
+            }
+        }
+        n_comp += 1;
+    }
+    if n_comp == 1 {
+        return None;
+    }
+    let mut comps: Vec<Vec<usize>> = vec![Vec::new(); n_comp];
+    for (v, &c) in membership.iter().enumerate() {
+        comps[c].push(v);
+    }
+    let soma_cid = membership[0];
+    let lengths: Vec<f64> = edges
+        .iter()
+        .map(|&[a, b]| {
+            let d = [0, 1, 2].map(|k| nodes[a][k] - nodes[b][k]);
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        })
+        .collect();
+    let edge_len_mean = numpy_sum(&lengths) / lengths.len() as f64;
+
+    let mut island: Vec<usize> = comps[soma_cid].clone();
+    let points = |island: &[usize]| island.iter().map(|&v| nodes[v]).collect::<Vec<_>>();
+    let mut tree = KdTree::new(points(&island), Sum::Plain);
+    let closest = |tree: &KdTree, cid: usize| -> (f64, usize, usize) {
+        let found: Vec<(u32, f64)> = comps[cid]
+            .iter()
+            .map(|&v| tree.nearest(&nodes[v]).expect("the tied part has nodes"))
+            .collect();
+        let dists: Vec<f64> = found.iter().map(|f| f.1).collect();
+        let best = numpy_argmin(&dists);
+        (dists[best], best, found[best].0 as usize)
+    };
+    let measured = |tree: &KdTree, cids: &mut dyn Iterator<Item = usize>| {
+        cids.map(|c| {
+            let (g, bc, bi) = closest(tree, c);
+            Gap(g, c, bc, bi)
+        })
+        .collect::<BinaryHeap<Gap>>()
+    };
+
+    let mut pq = measured(&tree, &mut (0..n_comp).filter(|&c| c != soma_cid));
+    let factor = bridge_max_factor.unwrap_or_else(|| {
+        let mut gaps: Vec<f64> = pq.iter().map(|g| g.0).collect();
+        let raw = if gaps.iter().any(|g| g.is_nan()) {
+            f64::NAN
+        } else {
+            gaps.sort_by(numpy_order);
+            quantile_sorted(&gaps, 55.0 / 100.0)
+        } / edge_len_mean;
+        raw.clamp(6.0, 12.0)
+    });
+    let n_gaps = n_comp - 1;
+    let recalc_after = bridge_recalc_after.unwrap_or(match n_gaps {
+        0..=10 => 2,
+        11..=50 => 4,
+        51..=200 => (n_gaps / 20).max(4),
+        _ => 32,
+    });
+
+    let mut bridges: Vec<[usize; 2]> = Vec::new();
+    let (mut since_recalc, mut stall) = (0usize, 0usize);
+    let max_stall = 3 * pq.len();
+    let mut current_max = factor * edge_len_mean;
+    while let Some(Gap(_, cid, _, _)) = pq.pop() {
+        let (gap, best_c, best_i) = closest(&tree, cid);
+        if gap > current_max {
+            pq.push(Gap(gap, cid, best_c, best_i));
+            stall += 1;
+            if stall >= 2 * max_stall {
+                let cids: Vec<usize> = pq.iter().map(|g| g.1).collect();
+                pq = measured(&tree, &mut cids.into_iter());
+                current_max *= 1.5;
+                stall = 0;
+            }
+            continue;
+        }
+        stall = 0;
+        bridges.push([comps[cid][best_c], island[best_i]]);
+        island.extend_from_slice(&comps[cid]);
+        tree = KdTree::new(points(&island), Sum::Plain);
+        since_recalc += 1;
+        if since_recalc >= recalc_after {
+            let cids: Vec<usize> = pq.iter().map(|g| g.1).collect();
+            pq = measured(&tree, &mut cids.into_iter());
+            since_recalc = 0;
+        }
+    }
+    let mut out: Vec<[usize; 2]> = edges.to_vec();
+    out.extend(bridges);
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
 }
 
 #[cfg(test)]

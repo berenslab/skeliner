@@ -1314,3 +1314,217 @@ def test_pruning_ends_alike_on_both_paths(reference_mesh):
             **kwargs,
         )
         assert_parity(_skeleton_fields(rust), _skeleton_fields(python))
+
+
+def test_soma_merge_on_both_paths():
+    rng = np.random.default_rng(13)
+    merged = with_verts = 0
+    for trial in range(150):
+        s = _random_skeleton(rng, int(rng.integers(2, 50)))
+        mesh = s["mesh_vertices"] if trial % 3 else None
+        # a soma around node 0, big enough to take some nodes in
+        soma = Soma.fit(s["nodes"][0] + rng.normal(size=(8, 3)) * rng.uniform(2, 12))
+        verts = None if trial % 4 == 0 else rng.integers(0, 400, size=5)
+        args = [s[k] for k in ("nodes", "keys", "radii", "ptr", "idx", "edges")]
+        rest = (
+            int(rng.integers(0, 2)),
+            soma.center,
+            soma.axes,
+            soma.R,
+            verts,
+            mesh,
+            float(rng.choice([0.0, 1.0])),
+            float(rng.uniform(0.5, 3)),
+            float(rng.uniform(0.0, 0.5)),
+        )
+        rust = _rs.skeletonize.merge_near_soma_nodes(*args, *rest)
+        assert_parity(rust, python_skel.merge_near_soma_nodes(*args, *rest))
+        merged += rust[3] > 0
+        with_verts += rust[2] is not None and len(rust[2]) > (0 if verts is None else 5)
+        assert not (rust[0][4][:, 0] == rust[0][4][:, 1]).any()
+    assert merged > 50 and with_verts > 20
+
+
+def test_soma_distances_follow_numpy():
+    """The kernel's distances to the soma reach the merge masks through
+    every point; check the ellipsoid on its own too, through the merge's
+    `inside` test with a zero tolerance and no fat test."""
+    rng = np.random.default_rng(17)
+    for _ in range(40):
+        n = int(rng.integers(2, 200))
+        nodes = rng.normal(size=(n, 3)) * rng.uniform(1, 1e3)
+        soma = Soma.fit(rng.normal(size=(20, 3)) * rng.uniform(1, 1e3))
+        d = soma.distance_to_surface(nodes)
+        args = (
+            nodes,
+            ["median"],
+            np.ones((1, n)),
+            np.zeros(n + 1, dtype=np.int64),
+            np.empty(0, dtype=np.int64),
+            np.empty((0, 2), dtype=np.int64),
+            0,
+            soma.center,
+            soma.axes,
+            soma.R,
+            None,
+            None,
+        )
+        for tol in np.unique(np.abs(d))[:3]:
+            # nodes exactly at -tol stay: the masks need the exact distances
+            rust = _rs.skeletonize.merge_near_soma_nodes(*args, float(tol), 0.0, 1e9)
+            want = d < -tol
+            want[0] = False
+            assert rust[1].tolist() == np.where(want, -1, np.cumsum(~want) - 1).tolist()
+
+
+def test_soma_merge_ends_alike_on_both_paths(reference_mesh):
+    skel = sk.skeletonize(reference_mesh, verbose=False)
+    for kwargs in (
+        dict(near_factor=3.0, fat_factor=0.05),
+        dict(near_factor=1.2, fat_factor=0.2, inside_tol=0.5),
+    ):
+        rust, python = both(
+            sk.post.merge_near_soma_nodes,
+            skel,
+            mesh_vertices=reference_mesh.vertices,
+            verbose=False,
+            **kwargs,
+        )
+        assert_parity(_skeleton_fields(rust), _skeleton_fields(python))
+
+
+def test_soma_detection_collects_the_soma_nodes_after_moving_one_to_the_root():
+    from skeliner._core import _detect_soma
+
+    # node 0 lies apart; nodes 2, 3, 5 make the soma, 3 the biggest, so it
+    # moves to node 0 — and its vertices must count, the old root's not
+    rng = np.random.default_rng(2)
+    nodes = np.array(
+        [[100.0, 0, 0], [50, 0, 0], [0, 0, 1], [0, 1, 0], [60, 0, 0], [1, 0, 0]]
+    )
+    radii = {"median": np.array([1.0, 10, 12, 30, 11, 13])}
+    node2verts = [np.arange(4 * i, 4 * i + 4) for i in range(6)]
+    mesh_vertices = np.repeat(nodes, 4, axis=0) + rng.normal(size=(24, 3))
+    *_, soma, has_soma, old2new = _detect_soma(
+        nodes.copy(),
+        {k: v.copy() for k, v in radii.items()},
+        [v.copy() for v in node2verts],
+        {},
+        soma_radius_percentile_threshold=50,
+        soma_radius_distance_factor=3,
+        soma_min_nodes=2,
+        detect_soma=True,
+        radius_key="median",
+        mesh_vertices=mesh_vertices,
+    )
+    assert has_soma and old2new[3] == 0 and old2new[0] == 3
+    assert set(soma.verts) == set(node2verts[2]) | set(node2verts[3]) | set(
+        node2verts[5]
+    )
+
+
+def test_soma_finding_on_both_paths():
+    rng = np.random.default_rng(19)
+    found = 0
+    for trial in range(200):
+        n = int(rng.integers(1, 60))
+        nodes = rng.normal(size=(n, 3)) * 10
+        radius = rng.gamma(2.0, size=n)
+        if trial % 5 == 0:
+            radius = np.round(radius)  # ties at the percentile and the max
+        pct = float(rng.choice([50.0, 90.0, 95.0, 99.9, 100.0, 0.0]))
+        args = (nodes, radius, pct, float(rng.uniform(0.5, 6)), int(rng.integers(1, 4)))
+        rust = _rs.skeletonize.find_soma(*args)
+        assert_parity(rust, python_skel.find_soma(*args))
+        found += rust[4]
+        soma_nodes = rust[0]
+        lists = [rng.integers(0, 500, size=int(rng.integers(0, 4))) for _ in soma_nodes]
+        ptr = np.r_[0, np.cumsum([len(v) for v in lists])].astype(np.int64)
+        idx = np.concatenate(lists).astype(np.int64) if lists else np.empty(0, int)
+        vargs = (nodes[soma_nodes], ptr, idx, np.asarray(rust[2]), rust[3])
+        assert_parity(
+            _rs.skeletonize.soma_vertices(*vargs), python_skel.soma_vertices(*vargs)
+        )
+    assert found > 50
+    with_nan = np.array([1.0, np.nan, 2.0])
+    for module in (_rs.skeletonize, python_skel):
+        assert module.find_soma(np.zeros((3, 3)), with_nan, 50.0, 3.0, 2) is None
+        with pytest.raises(ValueError, match="empty skeleton"):
+            module.find_soma(np.zeros((0, 3)), np.zeros(0), 50.0, 3.0, 2)
+        with pytest.raises(ValueError, match="in the range"):
+            module.find_soma(np.zeros((2, 3)), np.ones(2), 101.0, 3.0, 2)
+
+
+def test_soma_detection_ends_alike_on_both_paths(reference_mesh):
+    skel = sk.skeletonize(reference_mesh, verbose=False)
+    rust, python = both(
+        sk.post.detect_soma,
+        skel,
+        mesh_vertices=reference_mesh.vertices,
+        soma_radius_percentile_threshold=90,
+        soma_radius_distance_factor=4,
+        verbose=False,
+    )
+    assert_parity(_skeleton_fields(rust), _skeleton_fields(python))
+
+
+def test_gap_bridging_on_both_paths():
+    rng = np.random.default_rng(23)
+    bridged = relaxed = 0
+    for trial in range(120):
+        n = int(rng.integers(2, 80))
+        # a forest: each node joins an earlier one, or starts a new tree
+        edges = [
+            [int(rng.integers(0, i)), i] for i in range(1, n) if rng.random() > 0.15
+        ]
+        edges = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
+        nodes = rng.normal(size=(n, 3)) * 10
+        if trial % 3 == 0:
+            nodes = np.round(nodes)  # on a grid: equal gaps
+        for factor, recalc in ((None, None), (0.5, 1), (2.0, 3)):
+            args = (nodes, edges, factor, recalc)
+            rust = _rs.skeletonize.bridge_gaps(*args)
+            assert_parity(rust, python_skel.bridge_gaps(*args))
+            bridged += len(rust) > len(edges)
+            relaxed += factor == 0.5 and len(rust) > len(edges)
+    assert bridged > 100 and relaxed > 20
+    for module in (_rs.skeletonize, python_skel):
+        one = np.array([[0, 1], [1, 2]])
+        assert module.bridge_gaps(np.zeros((3, 3)), one, None, None).tolist() == [
+            [0, 1],
+            [1, 2],
+        ]
+        with pytest.raises(ValueError, match="no nodes"):
+            module.bridge_gaps(np.zeros((0, 3)), np.empty((0, 2), int), None, None)
+
+
+def test_mesh_edges_and_centreline_radii_on_both_paths():
+    rng = np.random.default_rng(29)
+    for _ in range(100):
+        n_vertices = int(rng.integers(1, 300))
+        n_nodes = int(rng.integers(1, 40))
+        owner = rng.integers(-1, n_nodes, size=n_vertices)
+        edges = rng.integers(0, n_vertices, size=(int(rng.integers(0, 600)), 2))
+        assert_parity(
+            _rs.skeletonize.edges_between(edges, owner),
+            python_skel.edges_between(edges, owner),
+        )
+        lens = rng.integers(0, 6, size=n_nodes)
+        ptr = np.r_[0, np.cumsum(lens)].astype(np.int64)
+        idx = rng.integers(0, n_vertices, size=int(ptr[-1])).astype(np.int64)
+        # some vertices measured twice (the last counts), some not at all
+        vids = rng.integers(0, n_vertices, size=int(rng.integers(0, n_vertices + 1)))
+        dists = rng.gamma(2.0, size=len(vids))
+        assert_parity(
+            _rs.skeletonize.centerline_radii(ptr, idx, vids, dists, n_vertices),
+            python_skel.centerline_radii(ptr, idx, vids, dists, n_vertices),
+        )
+    for module in (_rs.skeletonize, python_skel):
+        with pytest.raises(ValueError, match="vertex index 5 is out of range"):
+            module.centerline_radii(
+                np.array([0, 1]), np.array([5]), np.empty(0, int), np.empty(0), 5
+            )
+        assert module.edges_between(np.empty((0, 2), int), np.zeros(3, int)).shape == (
+            0,
+            2,
+        )

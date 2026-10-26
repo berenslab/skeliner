@@ -1,9 +1,10 @@
 //! `skeliner.post`'s kernels: `calibrate_radii` (its ray cast and the faces
-//! of a vertex set on their own too), and node types through edits
-//! (`ntype`).
+//! of a vertex set on their own too), node types through edits (`ntype`),
+//! and `downsample`.
 
 #![forbid(unsafe_code)]
 
+pub mod downsample;
 pub mod ntype;
 
 use std::collections::HashMap;

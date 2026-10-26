@@ -4,10 +4,16 @@ Rust one is."""
 
 from __future__ import annotations
 
+import math
+import struct
+import sys
 from collections import defaultdict
+from typing import TYPE_CHECKING
 
 import numpy as np
-from scipy.spatial import KDTree as _KDTree
+
+if TYPE_CHECKING:
+    from scipy.spatial import KDTree as _KDTree
 
 # The three vertex-column pairs that make a face's edges.
 EDGE_COLS = ((0, 1), (1, 2), (0, 2))
@@ -19,6 +25,103 @@ def rows3(name: str, a) -> np.ndarray:
     if a.ndim != 2 or a.shape[1] != 3:
         raise ValueError(f"expected ({name}, 3) array, got shape {list(a.shape)}")
     return a
+
+
+def total_key(x: float) -> int:
+    """A sort key that orders floats as Rust's ``f64::total_cmp`` does:
+    -NaN, -inf, …, -0.0, +0.0, …, +inf, +NaN."""
+    bits = struct.unpack("<q", struct.pack("<d", x))[0]
+    return bits ^ ((bits >> 63) & 0x7FFF_FFFF_FFFF_FFFF)
+
+
+def convex_hull(points) -> list[tuple[float, float]]:
+    """The convex hull of 2D *points*, counter-clockwise, by the monotone
+    chain: the points sorted by x then y (as ``f64::total_cmp`` orders
+    them), repeats dropped, collinear points on the hull left out. Fewer
+    than three distinct points come back as they are, sorted."""
+    pts = sorted(
+        ((float(x), float(y)) for x, y in np.asarray(points, dtype=np.float64)),
+        key=lambda q: (total_key(q[0]), total_key(q[1])),
+    )
+    p = [q for i, q in enumerate(pts) if i == 0 or q != pts[i - 1]]
+    if len(p) < 3:
+        return p
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    hull: list[tuple[float, float]] = []
+    for chain in (p, p[::-1]):
+        start = len(hull)
+        for q in chain:
+            while len(hull) >= start + 2 and cross(hull[-2], hull[-1], q) <= 0.0:
+                hull.pop()
+            hull.append(q)
+        hull.pop()
+    return hull
+
+
+def qhull_flat(points, hull) -> bool:
+    """Whether qhull, as scipy's ``ConvexHull`` runs it, refuses *points*
+    (their *hull* from :func:`convex_hull`) as flat: fewer than three
+    distinct points, or the triangle it starts from — the hull's points of
+    least and greatest x and the one farthest from their line — with its
+    centroid within qhull's roundoff of that line (``DISTround``, from the
+    largest coordinate)."""
+    if len(hull) < 3:
+        return True
+    maxabs = maxsum = 0.0
+    for x, y in np.asarray(points, dtype=np.float64).tolist():
+        maxabs = max(maxabs, abs(x), abs(y))
+        maxsum = max(maxsum, abs(x) + abs(y))
+    distsum = min(math.sqrt(2.0) * maxabs, maxsum)
+    roundoff = sys.float_info.epsilon * (2.0 * distsum * 1.01 + maxabs)
+    order = sorted(hull, key=lambda q: (total_key(q[0]), total_key(q[1])))
+    a, b = order[0], order[-1]
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    length = math.sqrt(dx * dx + dy * dy)
+    height = 0.0
+    for q in hull:
+        height = max(height, abs((q[0] - a[0]) * dy - (q[1] - a[1]) * dx) / length)
+    return height / 3.0 <= roundoff
+
+
+def hull_measures(points) -> tuple[float, float]:
+    """``(area, perimeter)`` of the convex hull of 2D *points* — scipy's
+    ``ConvexHull`` ``volume`` and ``area`` — by the shoelace formula about
+    the hull's first point (far from the origin, the products otherwise
+    cancel) and the edge lengths; both 0 where qhull refuses the points as
+    flat."""
+    hull = convex_hull(points)
+    if qhull_flat(points, hull):
+        return 0.0, 0.0
+    o = hull[0]
+    s = perimeter = 0.0
+    for i, a in enumerate(hull):
+        b = hull[(i + 1) % len(hull)]
+        s += (a[0] - o[0]) * (b[1] - o[1]) - (b[0] - o[0]) * (a[1] - o[1])
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        perimeter += math.sqrt(dx * dx + dy * dy)
+    return 0.5 * abs(s), perimeter
+
+
+def hull_equations(points) -> np.ndarray | None:
+    """The edges of the convex hull of 2D *points* as scipy's
+    ``ConvexHull.equations`` gives them: per edge ``(n0, n1, offset)``, the
+    unit normal pointing out, ``n . p + offset <= 0`` inside, counter-
+    clockwise from the lowest point; None where qhull refuses the points
+    as flat."""
+    hull = convex_hull(points)
+    if qhull_flat(points, hull):
+        return None
+    rows = []
+    for i, a in enumerate(hull):
+        b = hull[(i + 1) % len(hull)]
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        length = math.sqrt(dx * dx + dy * dy)
+        n0, n1 = dy / length, -dx / length
+        rows.append((n0, n1, -(n0 * a[0] + n1 * a[1])))
+    return np.array(rows, dtype=np.float64)
 
 
 def node_pairs(edges, n: int) -> np.ndarray:
@@ -80,6 +183,76 @@ def edge_lengths(vertices: np.ndarray, edges: np.ndarray) -> np.ndarray:
     them in that order."""
     d = vertices[edges[:, 0]] - vertices[edges[:, 1]]
     return np.sqrt(d[:, 0] * d[:, 0] + d[:, 1] * d[:, 1] + d[:, 2] * d[:, 2])
+
+
+#: trimesh's zero for a cross product's norm.
+TOL_ZERO = np.finfo(np.float64).resolution * 100
+
+
+def face_crosses(vertices, faces) -> np.ndarray:
+    """trimesh's ``triangles_cross``: ``(t1 - t0) x (t2 - t1)`` per face,
+    each component numpy's product less a product."""
+    vertices = rows3("V", vertices)
+    faces, _ = checked_faces(faces, len(vertices))
+    t = vertices[faces]
+    u = t[:, 1] - t[:, 0]
+    w = t[:, 2] - t[:, 1]
+    cross = np.empty((len(faces), 3), dtype=np.float64)
+    cross[:, 0] = u[:, 1] * w[:, 2] - u[:, 2] * w[:, 1]
+    cross[:, 1] = u[:, 2] * w[:, 0] - u[:, 0] * w[:, 2]
+    cross[:, 2] = u[:, 0] * w[:, 1] - u[:, 1] * w[:, 0]
+    return cross
+
+
+def _cross_norm(c: np.ndarray) -> np.ndarray:
+    """Each cross product's norm, ``sqrt((x² + y²) + z²)``: trimesh's BLAS dot
+    of the squares with ones."""
+    return np.sqrt((c[:, 0] * c[:, 0] + c[:, 1] * c[:, 1]) + c[:, 2] * c[:, 2])
+
+
+def face_normals(crosses) -> np.ndarray:
+    """trimesh's ``face_normals`` from the *crosses*: each times the
+    reciprocal of its norm, zero where the norm is not above ``TOL_ZERO``."""
+    c = rows3("F", crosses)
+    norm = _cross_norm(c)
+    valid = norm > TOL_ZERO
+    out = np.zeros_like(c)
+    out[valid] = c[valid] * (1.0 / norm[valid])[:, None]
+    return out
+
+
+def face_areas(crosses) -> np.ndarray:
+    """trimesh's ``area_faces`` from the *crosses*: half each one's norm."""
+    return _cross_norm(rows3("F", crosses)) / 2.0
+
+
+def face_centers(vertices, faces) -> np.ndarray:
+    """trimesh's ``triangles_center``: each face's vertices summed in order
+    from zero, as numpy's mean sums them, over three."""
+    vertices = rows3("V", vertices)
+    faces, _ = checked_faces(faces, len(vertices))
+    t = vertices[faces]
+    return (((0.0 + t[:, 0]) + t[:, 1]) + t[:, 2]) / 3.0
+
+
+def adjacent_faces(faces, n_vertices: int) -> np.ndarray:
+    """trimesh's ``face_adjacency``: for every edge two face edges share — by
+    its higher end, then its lower — the two faces, lower first; an edge
+    three or more face edges share has none, and one a face shares with
+    itself (a repeated vertex) is left out."""
+    faces, n = checked_faces(faces, n_vertices)
+    if len(faces) == 0:
+        return np.empty((0, 2), dtype=np.int64)
+    e = np.sort(faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+    owner = np.repeat(np.arange(len(faces), dtype=np.int64), 3)
+    key = e[:, 1] * max(n, 1) + e[:, 0]
+    order = np.lexsort((owner, key))
+    key = key[order]
+    starts = np.flatnonzero(np.r_[True, key[1:] != key[:-1]])
+    sizes = np.diff(np.r_[starts, len(key)])
+    two = starts[sizes == 2]
+    pairs = np.stack([owner[order[two]], owner[order[two + 1]]], axis=1)
+    return pairs[pairs[:, 0] != pairs[:, 1]]
 
 
 def row_dot(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -367,6 +540,14 @@ def nearest(tree: _KDTree, points) -> tuple[np.ndarray, np.ndarray]:
     return d, i
 
 
+def _finite(what: str, points) -> np.ndarray:
+    """*points* as floats, refused when a coordinate is NaN or infinite."""
+    points = np.asarray(points, dtype=np.float64)
+    if not np.isfinite(points).all():
+        raise ValueError(f"{what} must be finite")
+    return points
+
+
 class KdTree:
     """A KD-tree over ``(N, 3)`` points: scipy's, with exact ties in
     :meth:`query` going to the lowest index.
@@ -375,7 +556,9 @@ class KdTree:
     scipy sums them its own one way, so it is not read here.
     """
 
-    def __init__(self, points, fused: bool = False):
+    def __init__(self, points, fused: bool | None = None):
+        from scipy.spatial import KDTree as _KDTree
+
         points = np.asarray(points, dtype=np.float64)
         if points.ndim != 2 or points.shape[1] != 3:
             raise ValueError(f"expected (N, 3) array, got shape {points.shape}")
@@ -385,16 +568,19 @@ class KdTree:
     def __len__(self) -> int:
         return self._tree.n
 
-    def query_ball_point(self, x, r: float) -> list[np.ndarray]:
+    def query_ball_point(self, x, r) -> list[np.ndarray]:
         """Indices within *r* of each query point, ascending, one array per
-        point."""
-        found = self._tree.query_ball_point(
-            np.asarray(x, dtype=np.float64), r, return_sorted=True
-        )
+        point; *r* one radius, or one per point."""
+        x = _finite("query points", x)
+        r = np.asarray(r, dtype=np.float64)
+        if r.ndim and r.shape != x.shape[:1]:
+            raise ValueError("r must be a radius or one per point")
+        found = self._tree.query_ball_point(x, r, return_sorted=True)
         return [np.asarray(h, dtype=np.int64) for h in found]
 
     def query(self, x) -> tuple[np.ndarray, np.ndarray]:
         """``(distances, indices)`` of each query point's nearest point."""
+        x = _finite("query points", x)
         if self._tree.n == 0:
             raise ValueError("the tree is empty")
         d, i = nearest(self._tree, x)

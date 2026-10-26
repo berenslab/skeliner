@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import trimesh
 
+import skeliner as sk
 from skeliner import _rs, pre
 from skeliner.io import load_mesh
 
@@ -538,6 +539,87 @@ class TestFindOrganelles:
         assert found["flask", None][0] > 1000
         assert found["internal", None][1] > 0
 
+    def test_the_public_organelle_stages_are_the_same_on_both_paths(
+        self, dirty_mesh, reference_mesh
+    ):
+        from skeliner.python import mesh as python_mesh
+        from skeliner.python import pre as python_pre
+
+        from .test_pre import _sphere_with_internal, _subdivided_tube
+
+        meshes = {
+            "flask": _flask(),
+            "internal": _sphere_with_internal(),
+            "tube": _subdivided_tube(),
+            "dirty": dirty_mesh,
+            "reference": reference_mesh,
+        }
+        found = {"mouths": 0, "pocket": 0, "isolated": 0}
+        for name, mesh in meshes.items():
+            for radius in (None, 50.0):
+                st = pre.compute_mesh_stats(mesh, radius)
+                for fn in (
+                    pre.find_pocket_mouths,
+                    pre.find_pocket_organelles,
+                    pre.find_isolated_organelles,
+                ):
+                    rust, python = both(fn, mesh, mesh_stats=st)
+                    assert_parity(rust, python, f"{name} {fn.__name__}")
+                faces = np.asarray(mesh.faces, dtype=np.int64)
+                verts = np.asarray(mesh.vertices, dtype=np.float64)
+                areas = np.asarray(mesh.area_faces, dtype=np.float64)
+                main = st.main_face_mask
+                non_main = ~main & (st.face_comp >= 0)
+                for kwargs in ({}, {"non_main_mask": non_main, "max_hole_size": 50}):
+                    args = (faces, verts, areas, st.outward_dots, main)
+                    tail = (pre._svd_rows,)
+                    rust = _rs.pre.pocket_organelles(
+                        *args, _rs.mesh.Topology(faces, len(verts)), *tail, **kwargs
+                    )
+                    python = python_pre.pocket_organelles(
+                        *args, python_mesh.Topology(faces, len(verts)), *tail, **kwargs
+                    )
+                    assert_parity(rust, python, name)
+                iso_args = (
+                    faces,
+                    verts,
+                    np.asarray(mesh.triangles_center, dtype=np.float64),
+                    np.asarray(mesh.face_normals, dtype=np.float64),
+                    st.outward_dots,
+                    st.face_comp,
+                    st.main_ci,
+                )
+                rust = _rs.pre.isolated_organelles(*iso_args)
+                assert_parity(rust, python_pre.isolated_organelles(*iso_args), name)
+                found["mouths"] += len(pre.find_pocket_mouths(mesh, mesh_stats=st))
+                found["pocket"] += int(
+                    pre.find_pocket_organelles(mesh, mesh_stats=st).sum()
+                )
+                found["isolated"] += int(rust[0].sum())
+        # the flask's pocket behind its two mouths, the sphere's fragment
+        assert found["mouths"] >= 2 and min(found.values()) > 0, found
+
+    def test_a_callback_s_error_is_raised_as_itself(self):
+        # it once panicked in the binding (pyo3's PanicException, which
+        # `except Exception` does not catch)
+        mesh = _flask()
+        st = pre.compute_mesh_stats(mesh, None)
+        faces = np.asarray(mesh.faces, dtype=np.int64)
+        verts = np.asarray(mesh.vertices, dtype=np.float64)
+        args = (faces, verts, np.asarray(mesh.area_faces), st.outward_dots)
+        topology = _rs.mesh.Topology(faces, len(verts))
+        calls = []
+
+        def svd_fails(x, full_matrices):
+            calls.append((len(x), full_matrices))
+            raise RuntimeError("no SVD here")
+
+        for fn in (_rs.pre.pocket_mouths, _rs.pre.pocket_organelles):
+            calls.clear()
+            with pytest.raises(RuntimeError, match="no SVD here"):
+                fn(*args, st.main_face_mask, topology, svd_fails)
+            assert len(calls) == 1  # no call back after the first failure
+
     def test_the_enclosure_pass_is_the_same_on_both_paths(
         self, dirty_mesh, reference_mesh
     ):
@@ -907,6 +989,77 @@ class TestPythonPath:
         assert_parity(
             py.query_ball_point(queries, 2.0), rs.query_ball_point(queries, 2.0)
         )
+        # a radius per point, on the grid's ties too
+        radii = rng.integers(0, 5, len(queries)) * 0.5 + 0.5
+        found = rs.query_ball_point(queries, radii)
+        assert_parity(py.query_ball_point(queries, radii), found)
+        for q, r, f in zip(queries[:50], radii[:50], found[:50]):
+            assert np.array_equal(f, rs.query_ball_point(q[None], float(r))[0])
+        for tree in (rs, py):
+            with pytest.raises(ValueError, match="a radius or one per point"):
+                tree.query_ball_point(queries, radii[1:])
+            for bad in (np.nan, np.inf):
+                q = queries[:3].copy()
+                q[1, 2] = bad
+                with pytest.raises(ValueError, match="query points must be finite"):
+                    tree.query(q)
+                with pytest.raises(ValueError, match="query points must be finite"):
+                    tree.query_ball_point(q, 2.0)
+
+    def test_hulls_are_scipys(self):
+        # a 2D convex hull's area, perimeter and edges on both paths: scipy's
+        # ConvexHull where qhull builds one, refused where qhull refuses
+        from fractions import Fraction
+
+        from scipy.spatial import ConvexHull, QhullError
+
+        from skeliner.python import mesh as python_mesh
+
+        from ._parity import assert_parity
+
+        rng = np.random.default_rng(5)
+        t = np.arange(20.0) * 37
+        jitter = np.where(np.arange(20) % 3 == 0, 1e-10, 0.0)
+        built = [
+            rng.normal(size=(3, 2)),
+            rng.normal(size=(10, 2)) * 50 + 1e5,
+            rng.normal(size=(200, 2)) * 300 + 5e5,
+            np.c_[np.repeat(np.arange(5.0), 5), np.tile(np.arange(5.0), 5)],
+        ]
+        for pts in built:
+            ref = ConvexHull(pts)
+            for path in (_rs.mesh, python_mesh):
+                area, perimeter = path.hull_measures(pts)
+                assert np.isclose(area, ref.volume, rtol=1e-10)
+                assert np.isclose(perimeter, ref.area, rtol=1e-10)
+                eq = path.hull_equations(pts)
+                assert len(eq) == len(ref.equations)
+                for row in ref.equations:  # the same edges, in another order
+                    assert np.abs(eq - row).max(axis=1).min() < 1e-6
+                assert (pts @ eq[:, :2].T + eq[:, 2] <= 1e-6).all()
+            assert_parity(python_mesh.hull_measures(pts), _rs.mesh.hull_measures(pts))
+            assert_parity(python_mesh.hull_equations(pts), _rs.mesh.hull_equations(pts))
+        flat = [
+            np.zeros((2, 2)),
+            np.ones((6, 2)),
+            np.c_[t, 2 * t],
+            np.c_[5e5 + t, 3e5 + 0.5 * t + jitter],  # a line to qhull's roundoff
+        ]
+        for pts in flat:
+            with pytest.raises((QhullError, ValueError)):
+                ConvexHull(pts)
+            for path in (_rs.mesh, python_mesh):
+                assert path.hull_measures(pts) == (0.0, 0.0)
+                assert path.hull_equations(pts) is None
+        # a sliver 1e-6 wide far from the origin: qhull's area is off in
+        # the fifth digit, the shoelace about the hull's first point exact
+        sliver = np.c_[5e5 + t, 3e5 + 0.5 * t + jitter * 1e4]
+        hull = [(Fraction(x), Fraction(y)) for x, y in python_mesh.convex_hull(sliver)]
+        twice = sum(
+            a[0] * b[1] - b[0] * a[1] for a, b in zip(hull, hull[1:] + hull[:1])
+        )
+        assert _rs.mesh.hull_measures(sliver)[0] == float(abs(twice) / 2)
+        assert ConvexHull(sliver).volume != float(abs(twice) / 2)
 
     def test_mesh_roundtrip(self, square_pair):
         from skeliner.python import mesh as python_mesh
@@ -925,3 +1078,118 @@ class TestPythonPath:
             with pytest.raises(ValueError) as py_err:
                 python_mesh.mesh_roundtrip(vertices, bad)
             assert str(py_err.value) == str(rs_err.value)
+
+
+def test_chunk_boundaries_and_usable_faces_are_the_same_on_both_paths(
+    dirty_mesh, reference_mesh
+):
+    from skeliner.python import pre as python_pre
+
+    rng = np.random.default_rng(71)
+    found = 0
+    cases = [
+        np.asarray(m.vertices, dtype=np.float64) for m in (dirty_mesh, reference_mesh)
+    ]
+    for _ in range(40):
+        # background vertices with planes planted every ~60 units, some in
+        # close pairs (the weaker one goes), and rounding ties at .5
+        v = rng.uniform(0, 600, size=(3000, 3))
+        planes = np.arange(30, 600, 60) + rng.integers(-3, 4, size=10)
+        twins = planes[rng.random(10) < 0.3] + rng.integers(4, 9)
+        for x in np.r_[planes, twins]:
+            k = int(rng.integers(60, 200))
+            pts = rng.uniform(0, 600, size=(k, 3))
+            pts[:, int(rng.integers(0, 3))] = x + rng.choice(
+                [0.0, 0.5, -0.5, 0.2], size=k
+            )
+            v = np.vstack([v, pts])
+        cases.append(v)
+    for v in cases:
+        rust = _rs.pre.find_chunk_boundaries(v)
+        assert_parity(rust, python_pre.find_chunk_boundaries(v))
+        found += sum(len(b[1]) for b in rust)
+    assert found > 300
+
+    # planes every 60 on x, and one 3 from x = 120 but weaker: it goes
+    v = rng.uniform(0, 600, size=(3000, 3))
+    for x, k in [(60, 150), (120, 150), (123, 80), (180, 150), (240, 150)]:
+        pts = rng.uniform(0, 600, size=(k, 3))
+        pts[:, 0] = x
+        v = np.vstack([v, pts])
+    for path in (_rs.pre, python_pre):
+        (axis, values, counts, _), *_ = path.find_chunk_boundaries(v)
+        assert axis == 0 and values.tolist() == [60, 120, 180, 240]
+
+    for mesh in (dirty_mesh, reference_mesh):
+        v = np.asarray(mesh.vertices, dtype=np.float64)
+        f = np.asarray(mesh.faces, dtype=np.int64)
+        # two degenerate faces, a collinear one, one whose cross product
+        # underflows to zero
+        n = len(v)
+        tiny = [[0, 0, 0], [1, 1, 1], [2, 2, 2], [1e-170, 0, 0], [0, 1e-170, 0]]
+        v2 = np.vstack([v, tiny])
+        extra = [[0, 0, 1], [3, 3, 3], [n, n + 1, n + 2], [n, n + 3, n + 4]]
+        f2 = np.vstack([f, np.asarray(extra, dtype=np.int64)])
+        rust = _rs.pre.usable_faces(v2, f2)
+        assert_parity(rust, python_pre.usable_faces(v2, f2))
+        assert not rust[-4:].any() and rust[:-4].mean() > 0.9
+
+
+def test_the_derived_arrays_are_trimeshs_on_both_paths(dirty_mesh, reference_mesh):
+    from skeliner.python import mesh as python_mesh
+
+    names = [
+        "triangles",
+        "triangles_cross",
+        "face_normals",
+        "area_faces",
+        "triangles_center",
+        "edges_unique",
+        "edges_unique_length",
+        "face_adjacency",
+    ]
+    rng = np.random.default_rng(73)
+    v = rng.normal(size=(60, 3)) * 1e3
+    v[:5] = v[5]  # coincident vertices: zero-area faces
+    f = rng.integers(0, 60, size=(150, 3))
+    f[:10, 1] = f[:10, 0]  # repeated vertices
+    f[10:20] = f[20:30]  # a doubled face: edges three faces share
+    tiny = np.array([[0.0, 0.0, 0.0], [1e-160, 0, 0], [0, 1e-160, 0]])
+    meshes = [
+        dirty_mesh,
+        reference_mesh,
+        trimesh.Trimesh(v, f, process=False),
+        trimesh.Trimesh(tiny, [[0, 1, 2]], process=False),
+        trimesh.Trimesh(np.zeros((0, 3)), np.zeros((0, 3), np.int64), process=False),
+    ]
+    compared = 0
+    for tm in meshes:
+        # trimesh's own arrays are the reference
+        tm = trimesh.Trimesh(
+            np.asarray(tm.vertices), np.asarray(tm.faces), process=False
+        )
+        for path in ("rust", "python"):
+            with sk.backend(path):
+                m = sk.Mesh(tm.vertices, tm.faces)
+                for name in names:
+                    want = np.asarray(getattr(tm, name))
+                    got = getattr(m, name)
+                    assert got.dtype == want.dtype and got.shape == want.shape, name
+                    assert np.array_equal(got, want), (path, name)
+                    assert not got.flags.writeable
+                    compared += want.size
+        # the kernels alone, with what the binding refuses
+        verts = np.asarray(tm.vertices, np.float64)
+        faces = np.asarray(tm.faces, np.int64)
+        crosses = python_mesh.face_crosses(verts, faces)
+        assert_parity(_rs.mesh.face_crosses(verts, faces), crosses)
+        assert_parity(_rs.mesh.face_normals(crosses), python_mesh.face_normals(crosses))
+        assert_parity(_rs.mesh.face_areas(crosses), python_mesh.face_areas(crosses))
+        assert_parity(
+            _rs.mesh.adjacent_faces(faces, len(verts)),
+            python_mesh.adjacent_faces(faces, len(verts)),
+        )
+    assert compared > 100_000, compared
+    for path in (_rs.mesh, python_mesh):
+        with pytest.raises(ValueError, match="names vertex 7"):
+            path.face_crosses(np.zeros((3, 3)), np.array([[0, 1, 7]]))

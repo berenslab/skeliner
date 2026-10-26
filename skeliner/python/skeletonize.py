@@ -8,17 +8,25 @@ vertex's neighbours in igraph's order, ascending.
 
 from __future__ import annotations
 
+import heapq
 from collections import deque
 from typing import Dict, List
 
 import igraph as ig
 import numpy as np
-import trimesh
 from scipy.spatial import KDTree
 
 from .._core import RECOMPUTABLE_RADII, TRIM_FRACTION, _estimate_radius
 from .._state import remap_edges
-from .mesh import checked_faces, edge_lengths, node_pairs, rows3, unique_edges
+from ..dataclass import Mesh, Soma
+from .mesh import (
+    KdTree,
+    checked_faces,
+    edge_lengths,
+    node_pairs,
+    rows3,
+    unique_edges,
+)
 
 #: Where a bin sits: shell index, then index within the shell.
 Key = tuple[int, int]
@@ -38,7 +46,7 @@ def _shells(shells, n: int) -> list[list[np.ndarray]]:
     return [[_vertex_ids(b, n) for b in band] for band in shells]
 
 
-def surface_graph(mesh: trimesh.Trimesh) -> ig.Graph:
+def surface_graph(mesh: Mesh) -> ig.Graph:
     """Return an edge‑weighted triangle‑adjacency graph.
 
     The graph has one vertex per mesh‑vertex and an undirected edge for every
@@ -527,7 +535,7 @@ def bin_one_component(
 
 
 def bin_geodesic_shells(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     gsurf: ig.Graph,
     *,
     seed_vid: int,
@@ -1295,3 +1303,282 @@ def prune_neurites(
         soma_verts,
         n_merged,
     )
+
+
+def merge_near_soma_nodes(
+    nodes,
+    keys,
+    radii,
+    ptr,
+    idx,
+    edges,
+    radius_row,
+    center,
+    axes,
+    rotation,
+    soma_verts,
+    mesh_vertices,
+    inside_tol,
+    near_factor,
+    fat_factor,
+):
+    """``_merge_near_soma_nodes`` but the soma's refit, on a skeleton's arrays
+    (see ``_arrays_in``) and the soma's ellipsoid (*center*, *axes*,
+    *rotation*): every node but the root inside the soma
+    (``distance_to_surface < -inside_tol``), or near it (``distance_to_center
+    < near_factor × r_soma``) and fat (its radius in row *radius_row* above
+    ``fat_factor × r_soma``), is merged into the root and dropped; the kept
+    nodes it touched are tied to the root. Of the merged nodes' vertices, in
+    order, those within ``near_factor × r_soma`` of the surface (all of them
+    without *mesh_vertices*) join the root's and the soma's *soma_verts*,
+    which end sorted and unique. The arrays after, ``old2new``, the soma's
+    vertices (None while it has none) and how many nodes went into it."""
+    if mesh_vertices is not None:
+        mesh_vertices = rows3("V", mesh_vertices)
+    nodes, radii, node2verts, edges = _arrays_in(
+        nodes, keys, radii, ptr, idx, edges, mesh_vertices
+    )
+    if not 0 <= radius_row < len(keys):
+        raise ValueError(f"radius row {radius_row} is not one of {len(keys)}")
+    if len(nodes) == 0:
+        raise ValueError("the skeleton has no nodes")
+    soma = Soma(center=center, axes=axes, R=rows3("R", rotation))
+    r_soma = soma.spherical_radius
+    inside = soma.distance_to_surface(nodes) < -inside_tol
+    near = soma.distance_to_center(nodes) < near_factor * r_soma
+    fat = radii[radius_row] > fat_factor * r_soma
+    keep = ~(inside | (near & fat))
+    keep[0] = True
+    merged = np.flatnonzero(~keep)
+    kept_nodes, kept_radii, kept_verts, kept_edges, old2new = _compact(
+        nodes, radii, node2verts, edges, keep
+    )
+
+    leaves = set()
+    for u, v in edges.tolist():
+        if keep[u] and not keep[v]:
+            leaves.add(int(old2new[u]))
+        elif keep[v] and not keep[u]:
+            leaves.add(int(old2new[v]))
+    leaves.discard(0)  # the soma took the merged nodes in
+    if leaves:
+        tie = np.array([[0, nid] for nid in sorted(leaves)], dtype=np.int64)
+        kept_edges = np.unique(np.sort(np.vstack([kept_edges, tie]), axis=1), axis=0)
+
+    verts = None if soma_verts is None else np.asarray(soma_verts, dtype=np.int64)
+    for i in merged:
+        vidx = node2verts[i]
+        if mesh_vertices is not None:
+            close = soma.distance_to_surface(mesh_vertices[vidx]) < near_factor * r_soma
+            contrib = vidx[close]
+        else:
+            contrib = vidx
+        if contrib.size:
+            verts = contrib if verts is None else np.concatenate((verts, contrib))
+            kept_verts[0] = np.concatenate((kept_verts[0], contrib))
+    if verts is not None:
+        verts = np.unique(verts).astype(np.int64)
+    return (
+        _arrays_out(kept_nodes, kept_radii, kept_verts, kept_edges),
+        old2new,
+        verts,
+        int(merged.size),
+    )
+
+
+def find_soma(nodes, radius, pct_large, dist_factor, min_keep):
+    """``_find_soma``: the nodes whose *radius* is at least its
+    *pct_large*-th percentile and which lie within *dist_factor* times the
+    largest radius of the node that has it. A soma with *min_keep* such
+    nodes or more is centred on their mean; otherwise on that node.
+    ``(soma_nodes, idx_max, center, r_max, has_soma)``, or None when no node
+    reaches the percentile."""
+    nodes = rows3("N", nodes)
+    radius = np.asarray(radius, dtype=np.float64)
+    if len(radius) != len(nodes):
+        raise ValueError("one radius per node")
+    if len(nodes) == 0:
+        raise ValueError("empty skeleton")
+    if not 0 <= pct_large <= 100:
+        raise ValueError("Percentiles must be in the range [0, 100]")
+    cand = np.flatnonzero(radius >= np.percentile(radius, pct_large))
+    if cand.size == 0:
+        return None
+    idx_max = int(np.argmax(radius))
+    r_max = float(radius[idx_max])
+    dists = np.linalg.norm(nodes[cand] - nodes[idx_max], axis=1)
+    soma_nodes = cand[dists <= dist_factor * r_max].astype(np.int64)
+    has_soma = bool(soma_nodes.size >= min_keep)
+    center = (
+        nodes[soma_nodes].mean(0) if has_soma and soma_nodes.size else nodes[idx_max]
+    )
+    return soma_nodes, idx_max, [float(c) for c in center], r_max, has_soma
+
+
+def soma_vertices(points, ptr, idx, center, r_max) -> np.ndarray:
+    """The soma's vertices from its nodes at *points* and their vertex lists
+    (a CSR *ptr*, *idx*): those of the nodes closer to *center* than twice
+    *r_max* (lists that are not empty), merged, sorted and unique; failing
+    those, the first node's list as it is."""
+    points = rows3("P", points)
+    ptr = np.asarray(ptr, dtype=np.int64)
+    idx = np.asarray(idx, dtype=np.int64)
+    k = len(points)
+    if (
+        len(ptr) != k + 1
+        or ptr[0] != 0
+        or np.any(np.diff(ptr) < 0)
+        or ptr[-1] != len(idx)
+        or np.any(idx < 0)
+    ):
+        raise ValueError("the vertex lists must be a CSR over the points")
+    lists = [idx[ptr[i] : ptr[i + 1]] for i in range(k)]
+    close = np.linalg.norm(points - np.asarray(center, dtype=np.float64), axis=1) < (
+        r_max * 2
+    )
+    found = [lists[i] for i in np.flatnonzero(close) if lists[i].size]
+    if found:
+        return np.unique(np.concatenate(found)).astype(np.int64)
+    return lists[0] if k else np.empty(0, dtype=np.int64)
+
+
+def _auto_bridge_max(gaps, edge_mean: float) -> float:
+    """The largest bridge, in mean edge lengths, when none is given: the
+    55th percentile of the first gaps over the mean edge length, clipped to
+    6 to 12."""
+    return float(np.clip(np.percentile(gaps, 55.0) / edge_mean, 6.0, 12.0))
+
+
+def _auto_recalc_after(n_gaps: int) -> int:
+    """After how many bridges every gap is measured again, when not given:
+    often for few gaps, at most every 32."""
+    if n_gaps <= 10:
+        return 2
+    if n_gaps <= 50:
+        return 4
+    if n_gaps <= 200:
+        return max(4, n_gaps // 20)
+    return 32
+
+
+def bridge_gaps(nodes, edges, bridge_max_factor, bridge_recalc_after) -> np.ndarray:
+    """``_bridge_gaps``: every connected component of the skeleton *edges*
+    ``(E, 2)`` tied to the component of node 0 by one new edge, nearest
+    component first — the closest pair of nodes between it and what is tied
+    so far (a component's nodes in ascending order, the first of equally
+    close ones; the tied nodes in the order they joined, ties to the
+    earliest). A component farther than *bridge_max_factor* mean edge
+    lengths (by default from the gaps, ``_auto_bridge_max``) waits, and the
+    limit grows by half after twice three times as many waits as there were
+    gaps; every gap is measured again after *bridge_recalc_after* bridges
+    (by default ``_auto_recalc_after``). The edges with the bridges, unique
+    and in order; the edges as they are when there is one component."""
+    nodes = rows3("N", nodes)
+    edges = node_pairs(edges, len(nodes))
+    if len(nodes) == 0:
+        raise ValueError("the skeleton has no nodes")
+    g = ig.Graph(n=len(nodes), edges=edges.tolist(), directed=False)
+    membership = np.asarray(g.components().membership, dtype=np.int64)
+    n_comp = int(membership.max()) + 1
+    if n_comp == 1:
+        return edges
+    by_comp = np.argsort(membership, kind="stable")
+    comps = np.split(by_comp, np.cumsum(np.bincount(membership))[:-1])
+    soma_cid = int(membership[0])
+    edge_len_mean = np.linalg.norm(
+        nodes[edges[:, 0]] - nodes[edges[:, 1]], axis=1
+    ).mean()
+
+    island_idx = comps[soma_cid]
+    tree = KdTree(nodes[island_idx])
+
+    def closest_pair(cid: int) -> tuple[float, int, int]:
+        dists, idx = tree.query(nodes[comps[cid]])
+        best = int(np.argmin(dists))
+        return float(dists[best]), best, int(idx[best])
+
+    def measured(cids) -> list[tuple[float, int, int, int]]:
+        """The gaps of components *cids* as a heap of (gap, component, its
+        node, the tied node)."""
+        pq = [(g, c, bc, bi) for c in cids for g, bc, bi in (closest_pair(c),)]
+        heapq.heapify(pq)
+        return pq
+
+    pq = measured([c for c in range(n_comp) if c != soma_cid])
+    if bridge_max_factor is None:
+        bridge_max_factor = _auto_bridge_max([q[0] for q in pq], edge_len_mean)
+    recalc_after = (
+        _auto_recalc_after(n_comp - 1)
+        if bridge_recalc_after is None
+        else bridge_recalc_after
+    )
+
+    bridges: list[tuple[int, int]] = []
+    since_recalc = stall = 0
+    max_stall = 3 * len(pq)
+    current_max = bridge_max_factor * edge_len_mean
+    while pq:
+        _, cid, _, _ = heapq.heappop(pq)
+        gap, best_c, best_i = closest_pair(cid)
+        if gap > current_max:  # still too far
+            heapq.heappush(pq, (gap, cid, best_c, best_i))
+            stall += 1
+            if stall >= 2 * max_stall:
+                pq = measured([q[1] for q in pq])
+                current_max *= 1.5
+                stall = 0
+            continue
+        stall = 0
+        bridges.append((int(comps[cid][best_c]), int(island_idx[best_i])))
+        island_idx = np.concatenate([island_idx, comps[cid]])
+        tree = KdTree(nodes[island_idx])
+        since_recalc += 1
+        if since_recalc >= recalc_after:
+            pq = measured([q[1] for q in pq])
+            since_recalc = 0
+    if not bridges:
+        return np.unique(edges, axis=0)
+    return np.unique(np.vstack([edges, np.asarray(bridges, dtype=np.int64)]), axis=0)
+
+
+def edges_between(edges, owner) -> np.ndarray:
+    """``_edges_from_mesh``: the node pairs the mesh *edges* ``(E, 2)`` join,
+    by each vertex's node *owner* (-1 for none) — each pair of distinct
+    nodes once, smaller first, in order, ``(K, 2)``."""
+    owner = np.asarray(owner, dtype=np.int64)
+    edges = node_pairs(edges, len(owner))
+    na, nb = owner[edges[:, 0]], owner[edges[:, 1]]
+    keep = (na >= 0) & (nb >= 0) & (na != nb)
+    lo = np.minimum(na[keep], nb[keep])
+    hi = np.maximum(na[keep], nb[keep])
+    # one key per pair sorts as the (lo, hi) rows do
+    width = int(hi.max()) + 1 if hi.size else 1
+    key = np.unique(lo * width + hi)
+    return np.stack([key // width, key % width], axis=1)
+
+
+def centerline_radii(ptr, idx, vids, dists, n_vertices: int) -> np.ndarray:
+    """Each node's ``centerline`` radius: the trimmed mean of its vertices'
+    distances to the centreline — *dists[k]* for vertex *vids[k]*, the last
+    for a vertex listed twice, 0 for one not listed — and 0 for a node
+    without vertices; the nodes' vertices as a CSR (*ptr*, *idx*) into
+    *n_vertices* vertices."""
+    ptr = np.asarray(ptr, dtype=np.int64)
+    idx = np.asarray(idx, dtype=np.int64)
+    if len(ptr) == 0 or ptr[0] != 0 or np.any(np.diff(ptr) < 0) or ptr[-1] != len(idx):
+        raise ValueError("node2verts must be a CSR over the nodes")
+    vids = np.asarray(vids, dtype=np.int64)
+    dists = np.asarray(dists, dtype=np.float64)
+    for ids in (idx, vids):
+        out = ids[(ids < 0) | (ids >= n_vertices)]
+        if out.size:
+            raise ValueError(f"vertex index {out[0]} is out of range")
+        if ids is idx and len(vids) != len(dists):
+            raise ValueError("one distance per vertex")
+    cl = dict(zip(vids.tolist(), dists.tolist()))
+    radii = np.zeros(len(ptr) - 1)
+    for i in range(len(ptr) - 1):
+        d = np.array([cl.get(v, 0.0) for v in idx[ptr[i] : ptr[i + 1]].tolist()])
+        if len(d):
+            radii[i] = _estimate_radius(d, method="trim", trim_fraction=TRIM_FRACTION)
+    return radii

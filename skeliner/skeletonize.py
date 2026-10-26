@@ -4,21 +4,17 @@ from importlib import metadata as _metadata
 from typing import Any
 
 import numpy as np
-import trimesh
 
 from ._backend import kernels
 from ._core import (
-    TRIM_FRACTION,
     _bridge_gaps,
     _build_mst,
     _detect_soma,
-    _estimate_radius,
     _merge_near_soma_nodes,
     _prune_neurites,
 )
-from ._state import rebuild_vert2node
-from .dataclass import MeshComponents, Skeleton, Soma
-from .python import skeletonize as _py_skel
+from ._state import rebuild_vert2node, vertex_lut
+from .dataclass import Mesh, MeshComponents, Skeleton, Soma, mesh_args
 
 _SKELINER_VERSION = _metadata.version("skeliner")
 
@@ -27,14 +23,24 @@ __all__ = [
     "skeletonize",
 ]
 
-# the Python path's igraph binning, under the names the legacy elongated-shell
-# split, `dev/` and the tests use
-_surface_graph = _py_skel.surface_graph
-_dist_vec_for_component = _py_skel.dist_vec_for_component
-_neighbour_groups = _py_skel.neighbour_groups
-_split_branch_band = _py_skel.split_branch_band
-_bin_one_component = _py_skel.bin_one_component
-_bin_geodesic_shells = _py_skel.bin_geodesic_shells
+# the Python path's igraph binning, under the names `dev/` and the tests
+# use; imported on first use, as it imports igraph
+_PYTHON_BINNING = {
+    "_surface_graph": "surface_graph",
+    "_dist_vec_for_component": "dist_vec_for_component",
+    "_neighbour_groups": "neighbour_groups",
+    "_split_branch_band": "split_branch_band",
+    "_bin_one_component": "bin_one_component",
+    "_bin_geodesic_shells": "bin_geodesic_shells",
+}
+
+
+def __getattr__(name: str):
+    if name in _PYTHON_BINNING:
+        from .python import skeletonize as python_skeletonize
+
+        return getattr(python_skeletonize, _PYTHON_BINNING[name])
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _jsonable(v):
@@ -137,7 +143,7 @@ def _no_stage(_label: str):
 # -----------------------------------------------------------------------------
 
 
-def _surface_graph_of(mesh: trimesh.Trimesh):
+def _surface_graph_of(mesh: Mesh):
     """The active path's ``SurfaceGraph`` of *mesh*, built from the faces.
     Its ``edges`` and ``lengths`` are the mesh's ``edges_unique`` and
     ``edges_unique_length``, value for value, without trimesh computing
@@ -156,28 +162,29 @@ def _edges_from_mesh(
     """
     Vectorised remap of mesh edges -> skeleton edges.
     """
-    # 1. build an int64 lookup table  mesh_vid -> node_id  (-1 if absent)
-    lut = np.full(n_mesh_verts, -1, dtype=np.int64)
-    n = len(v2n)
-    lut[np.fromiter(v2n.keys(), np.int64, n)] = np.fromiter(v2n.values(), np.int64, n)
-
-    # 2. map both columns in one shot
-    a, b = edges_unique.T  # views, no copy
-    na, nb = lut[a], lut[b]  # vectorised gather
-
-    # 3. keep edges whose *both* endpoints exist and are different
-    mask = (na >= 0) & (nb >= 0) & (na != nb)
-    na, nb = na[mask], nb[mask]
-    lo, hi = np.minimum(na, nb), np.maximum(na, nb)  # canonical order
-
-    # 4. drop duplicates.  One key per edge sorts as the (lo, hi) rows do,
-    #    and np.unique on it is far faster than on the rows (axis=0).
-    width = int(hi.max()) + 1 if hi.size else 1
-    key = np.unique(lo * width + hi)
-    return np.stack([key // width, key % width], axis=1)
+    lut = vertex_lut(v2n, n_mesh_verts)
+    return kernels.skeletonize.edges_between(
+        np.asarray(edges_unique, dtype=np.int64).reshape(-1, 2), lut
+    )
 
 
-def _extreme_vertex(mesh: trimesh.Trimesh, axis: str = "z", mode: str = "min") -> int:
+def _edges_from_bins(
+    edges_unique: np.ndarray, node2verts: list[np.ndarray], n_mesh_verts: int
+) -> np.ndarray:
+    """:func:`_edges_from_mesh` from the nodes' vertex lists, which share no
+    vertex, without a ``vert2node`` dict."""
+    owner = np.full(n_mesh_verts, -1, dtype=np.int64)
+    if node2verts:
+        lens = [len(v) for v in node2verts]
+        owner[np.concatenate(node2verts).astype(np.int64)] = np.repeat(
+            np.arange(len(node2verts), dtype=np.int64), lens
+        )
+    return kernels.skeletonize.edges_between(
+        np.asarray(edges_unique, dtype=np.int64).reshape(-1, 2), owner
+    )
+
+
+def _extreme_vertex(mesh: Mesh, axis: str = "z", mode: str = "min") -> int:
     """
     Return the mesh-vertex index with either the minimal or maximal coordinate
     along *axis* (“x”, “y” or “z”).
@@ -199,11 +206,12 @@ def _make_nodes(
     radius_estimators: list[str],
     merge_nested: bool = True,
     merge_kwargs: dict | None = None,
+    with_vert2node: bool = True,
 ) -> tuple[
     np.ndarray,  # nodes_arr
     dict[str, np.ndarray],  # radii_dict
     list[np.ndarray],  # node2verts
-    dict[int, int],  # vert2node
+    dict[int, int] | None,  # vert2node, None without with_vert2node
 ]:
     """
     Convert geodesic bins into skeleton nodes **and** run the optional
@@ -223,6 +231,8 @@ def _make_nodes(
     merge_kwargs
         Passed straight through to ``merge_nested_nodes`` (``inside_frac``,
         ``keep_root``, ``tol``).
+    with_vert2node
+        Whether to build ``vert2node``; None in its place otherwise.
 
     Returns
     -------
@@ -232,7 +242,12 @@ def _make_nodes(
     node2verts = [b for band in bins for b in band]
     if not node2verts:
         empty = {k: np.asarray(np.array([])) for k in radius_estimators}
-        return np.asarray([], dtype=np.float64), empty, [], {}
+        return (
+            np.asarray([], dtype=np.float64),
+            empty,
+            [],
+            {} if with_vert2node else None,
+        )
     nodes_arr, radii = kernels.skeletonize.skeleton_nodes(
         [[b.tolist() for b in band] for band in bins],
         vertices,
@@ -248,6 +263,8 @@ def _make_nodes(
         )
         nodes_arr = nodes_arr[keep]
         radii_dict = {k: np.asanyarray(v[keep]) for k, v in radii_dict.items()}
+    if not with_vert2node:
+        return nodes_arr, radii_dict, node2verts, None
     vert2node = rebuild_vert2node(node2verts) or {}
     return nodes_arr, radii_dict, node2verts, vert2node
 
@@ -287,7 +304,7 @@ def _perpendicular_rebin(
     mesh_vertices: np.ndarray,
     radius_estimators: list[str],
     radii_dict: dict[str, np.ndarray],
-) -> tuple[list[list[np.ndarray]], dict[int, float]]:
+) -> tuple[list[list[np.ndarray]], tuple[np.ndarray, np.ndarray]]:
     """Re-assign vertices along skeleton chains for perpendicular
     bins.
 
@@ -298,12 +315,13 @@ def _perpendicular_rebin(
     more territory): ``rebin_chains`` on the active path, after the
     branch nodes' donations.
 
-    Returns new shells (one band per node, one bin per band) and each
-    re-assigned vertex's distance to the centreline.
+    Returns new shells (one band per node, one bin per band) and the
+    re-assigned vertices with their distances to the centreline, as
+    ``(vids, dists)`` (:func:`_as_map`).
     """
     n_skel = len(nodes_arr)
     if n_skel < 2 or edges_mst.size == 0:
-        return [[n2v] for n2v in node2verts], {}
+        return [[n2v] for n2v in node2verts], _no_centreline()
     adj: dict[int, set[int]] = {i: set() for i in range(n_skel)}
     for a, b in edges_mst:
         adj[int(a)].add(int(b))
@@ -319,11 +337,26 @@ def _perpendicular_rebin(
         [(b, nb, v) for (b, nb), v in donated.items()],
     )
     shells = [[v] for v in out if len(v)]
-    return shells, dict(zip(vids.tolist(), dists.tolist()))
+    return shells, _as_map(vids, dists)
+
+
+def _no_centreline() -> tuple[np.ndarray, np.ndarray]:
+    return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
+
+
+def _as_map(vids: np.ndarray, vals: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``vids`` → ``vals`` as ``dict(zip(vids, vals))`` would hold them, in
+    two arrays: each id once, where it first appears, with its last value."""
+    vids = np.asarray(vids, dtype=np.int64)
+    vals = np.asarray(vals, dtype=np.float64)
+    if vids.size == 0 or np.bincount(vids).max() <= 1:
+        return vids, vals
+    m = dict(zip(vids.tolist(), vals.tolist()))
+    return np.fromiter(m, np.int64, len(m)), np.fromiter(m.values(), np.float64, len(m))
 
 
 def _skeletonize_component(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     sgraph,
     vert_ids: np.ndarray,
     *,
@@ -339,9 +372,8 @@ def _skeletonize_component(
     np.ndarray,
     dict[str, np.ndarray],
     list[np.ndarray],
-    dict[int, int],
     np.ndarray,
-    dict[int, float],
+    tuple[np.ndarray, np.ndarray],
 ]:
     """Bin, build nodes, and extract edges for one component.
 
@@ -369,17 +401,18 @@ def _skeletonize_component(
 
     Returns
     -------
-    nodes_arr, radii_dict, node2verts, vert2node, edges_arr, vid_cl_dist
+    nodes_arr, radii_dict, node2verts, edges_arr, vid_cl_dist
 
-    ``vid_cl_dist`` maps mesh vertex -> perpendicular distance to the
-    centreline, and is empty when the second pass does not run.  It is
+    ``vid_cl_dist`` is ``(vids, dists)``: each mesh vertex the second pass
+    re-assigned and its perpendicular distance to the centreline, empty
+    when the second pass does not run.  It is
     returned rather than consumed because it is the only input to the
     ``centerline`` radius that cannot be recovered from the vertices alone;
     keeping it lets that radius be recomputed after a bin is edited.
     """
     mesh_vertices = mesh.vertices.view(np.ndarray)
     e_m = float(sgraph.lengths.mean())
-    vid_cl_dist: dict[int, float] = {}
+    vid_cl_dist = _no_centreline()
     verts = np.asarray(vert_ids, dtype=np.int64)
 
     with stage("bin vertices by geodesic distance"):
@@ -394,17 +427,16 @@ def _skeletonize_component(
         )
 
     with stage("compute bin centroids and radii"):
-        nodes_arr, radii_dict, node2verts, vert2node = _make_nodes(
+        nodes_arr, radii_dict, node2verts, _ = _make_nodes(
             all_shells,
             mesh_vertices,
             radius_estimators=radius_estimators,
             merge_nested=False,
+            with_vert2node=False,
         )
 
     with stage("derive edges from mesh edges"):
-        edges_arr = _edges_from_mesh(
-            sgraph.edges, vert2node, n_mesh_verts=len(mesh.vertices)
-        )
+        edges_arr = _edges_from_bins(sgraph.edges, node2verts, len(mesh.vertices))
 
     if second_pass and len(nodes_arr) > 1 and edges_arr.size:
         with stage("re-bin perpendicular to the centreline"):
@@ -431,29 +463,28 @@ def _skeletonize_component(
             final_shells = sgraph.split_branch_bins(_lists(final_shells))
 
         with stage("recompute centroids and centerline radii"):
-            nodes_arr, radii_dict, node2verts, vert2node = _make_nodes(
+            nodes_arr, radii_dict, node2verts, _ = _make_nodes(
                 final_shells,
                 mesh_vertices,
                 radius_estimators=radius_estimators,
                 merge_nested=False,
+                with_vert2node=False,
             )
-            cl_radii = np.empty(len(nodes_arr))
-            for ni, n2v in enumerate(node2verts):
-                dists = np.array([vid_cl_dist.get(int(v), 0.0) for v in n2v])
-                if len(dists) > 0:
-                    cl_radii[ni] = _estimate_radius(
-                        dists, method="trim", trim_fraction=TRIM_FRACTION
-                    )
-                else:
-                    cl_radii[ni] = 0.0
-            radii_dict["centerline"] = cl_radii
+            ptr = np.zeros(len(node2verts) + 1, dtype=np.int64)
+            ptr[1:] = np.cumsum([len(v) for v in node2verts])
+            radii_dict["centerline"] = kernels.skeletonize.centerline_radii(
+                ptr,
+                np.concatenate(node2verts).astype(np.int64)
+                if node2verts
+                else np.empty(0, dtype=np.int64),
+                *vid_cl_dist,
+                len(mesh_vertices),
+            )
 
         with stage("re-derive edges from mesh edges"):
-            edges_arr = _edges_from_mesh(
-                sgraph.edges, vert2node, n_mesh_verts=len(mesh.vertices)
-            )
+            edges_arr = _edges_from_bins(sgraph.edges, node2verts, len(mesh.vertices))
 
-    return nodes_arr, radii_dict, node2verts, vert2node, edges_arr, vid_cl_dist
+    return nodes_arr, radii_dict, node2verts, edges_arr, vid_cl_dist
 
 
 # -----------------------------------------------------------------------------
@@ -513,9 +544,8 @@ def _stitch_to_soma(
             np.ndarray,
             dict[str, np.ndarray],
             list[np.ndarray],
-            dict[int, int],
             np.ndarray,
-            dict[int, float],
+            tuple[np.ndarray, np.ndarray],
         ]
     ],
     soma: Soma,
@@ -548,7 +578,7 @@ def _stitch_to_soma(
     all_edges: list[np.ndarray] = []
 
     offset = 1  # node 0 is soma
-    for nodes, radii, n2v, _, edges, _cl in sub_skeletons:
+    for nodes, radii, n2v, edges, _cl in sub_skeletons:
         if len(nodes) == 0:
             continue
 
@@ -572,10 +602,7 @@ def _stitch_to_soma(
     edges_arr = np.sort(edges_arr, axis=1)
     edges_arr = np.unique(edges_arr, axis=0)
 
-    vert2node: dict[int, int] = {}
-    for nid, verts in enumerate(all_n2v):
-        for vid in verts:
-            vert2node[int(vid)] = nid
+    vert2node = rebuild_vert2node(all_n2v) or {}
 
     return (
         nodes_arr,
@@ -624,9 +651,8 @@ def _concatenate_sub_skeletons(
             np.ndarray,
             dict[str, np.ndarray],
             list[np.ndarray],
-            dict[int, int],
             np.ndarray,
-            dict[int, float],
+            tuple[np.ndarray, np.ndarray],
         ]
     ],
     radius_estimators: list[str],
@@ -649,7 +675,7 @@ def _concatenate_sub_skeletons(
     all_edges: list[np.ndarray] = []
 
     offset = 0
-    for nodes, radii, n2v, _, edges, _cl in sub_skeletons:
+    for nodes, radii, n2v, edges, _cl in sub_skeletons:
         if len(nodes) == 0:
             continue
         all_nodes.append(nodes)
@@ -666,10 +692,7 @@ def _concatenate_sub_skeletons(
         edges_arr = np.sort(edges_arr, axis=1)
         edges_arr = np.unique(edges_arr, axis=0)
 
-    vert2node: dict[int, int] = {}
-    for nid, verts in enumerate(all_n2v):
-        for vid in verts:
-            vert2node[int(vid)] = nid
+    vert2node = rebuild_vert2node(all_n2v) or {}
 
     return (
         nodes_arr,
@@ -681,7 +704,7 @@ def _concatenate_sub_skeletons(
 
 
 def _skeletonize_preproc(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     components: MeshComponents,
     *,
     radius_estimators: list[str],
@@ -807,11 +830,12 @@ def _skeletonize_preproc(
     # what lets it be recomputed when a bin changes; every other radius is
     # already recoverable from the vertices alone.  Vertex ids are global,
     # so the per-neurite maps merge without any offsetting.
-    cl_vids: list[int] = []
-    cl_dists: list[float] = []
-    for *_rest, cl in sub_skeletons:
-        cl_vids.extend(cl.keys())
-        cl_dists.extend(cl.values())
+    cl_vids = np.concatenate(
+        [np.empty(0, np.int64)] + [cl[0] for *_rest, cl in sub_skeletons]
+    )
+    cl_dists = np.concatenate(
+        [np.empty(0, np.float64)] + [cl[1] for *_rest, cl in sub_skeletons]
+    )
 
     # -- global MST --
     with _timed(
@@ -889,24 +913,20 @@ def _skeletonize_preproc(
             "cl_dist_vids": np.asarray(cl_vids, dtype=np.int64),
             "cl_dist_vals": np.asarray(cl_dists, dtype=np.float64),
         }
-        if cl_vids
+        if cl_vids.size
         else {}
     )
 
     if components.neurites.named:
         node2neurite = np.full(len(nodes_arr), -1, dtype=np.int32)
+        owner = vertex_lut(vert2node, len(mesh.vertices))
         for ni, (face_idx, code) in enumerate(
             zip(components.neurites.components, components.neurites.swc_types)
         ):
-            nids = {
-                vert2node[int(v)]
-                for v in np.unique(mesh.faces[face_idx].ravel())
-                if int(v) in vert2node
-            }
-            nids.discard(0)
-            if not nids:
+            owned = np.unique(owner[np.asarray(mesh.faces)[face_idx].ravel()])
+            owned = owned[owned > 0]
+            if not owned.size:
                 continue
-            owned = np.fromiter(nids, dtype=np.int64, count=len(nids))
             node2neurite[owned] = ni
             if code:
                 ntype[owned] = code
@@ -933,7 +953,7 @@ def _skeletonize_preproc(
 
 
 def _skeletonize_direct(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     # --- radius estimation ---
     radius_estimators: list[str] = ["median", "mean", "trim"],
     # --- soma detection ---
@@ -1016,10 +1036,16 @@ def _skeletonize_direct(
         run_mst = False
 
     legacy_split = split_elongated_shells
+    if legacy_split:
+        from .python import skeletonize as python_skeletonize
 
     # 0. build surface graph -----------------------------------------------
     with _timed("↳  build surface graph", verbose=verbose):
-        gsurf = _surface_graph(mesh) if legacy_split else _surface_graph_of(mesh)
+        gsurf = (
+            python_skeletonize.surface_graph(mesh)
+            if legacy_split
+            else _surface_graph_of(mesh)
+        )
 
     # 1. binning surface vertices by geodesic distance ----------------------------------
     with _timed("↳  bin surface vertices by geodesic distance", verbose=verbose):
@@ -1056,7 +1082,7 @@ def _skeletonize_direct(
             )
 
         if legacy_split:
-            all_shells = _bin_geodesic_shells(
+            all_shells = python_skeletonize.bin_geodesic_shells(
                 mesh,
                 gsurf,
                 seed_vid=seed_vid,
@@ -1119,10 +1145,10 @@ def _skeletonize_direct(
 
     # 4. edges from mesh connectivity -----------------------------------
     with _timed("↳  map mesh faces to skeleton edges", verbose=verbose):
-        edges_arr = _edges_from_mesh(
+        edges_arr = _edges_from_bins(
             mesh.edges_unique if legacy_split else gsurf.edges,
-            vert2node,
-            n_mesh_verts=len(mesh.vertices),
+            node2verts,
+            len(mesh.vertices),
         )
 
     # 5. collapse soma‑like / fat nodes ---------------------------
@@ -1149,6 +1175,8 @@ def _skeletonize_direct(
                 fat_factor=collapse_soma_radius_factor,
                 near_factor=collapse_soma_dist_factor,
                 log=log,
+                # pruning rebuilds it from the final bins
+                with_vert2node=not prune_tiny_neurites,
             )
 
         if verbose:
@@ -1237,8 +1265,9 @@ def _skeletonize_direct(
     )
 
 
+@mesh_args()
 def skeletonize(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     # --- preprocessing track ---
     components: MeshComponents | None = None,
     # --- radius estimation ---
@@ -1306,7 +1335,7 @@ def skeletonize(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Surface mesh of the neuron.
     components : MeshComponents or None
         If provided, skeletonize from preprocessed mesh components.

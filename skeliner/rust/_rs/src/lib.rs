@@ -6,6 +6,7 @@
 use pyo3::prelude::*;
 
 mod common;
+mod dataclass;
 mod dx;
 mod io;
 mod mesh;
@@ -35,6 +36,7 @@ fn submodule(
 #[pymodule]
 fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     submodule(m, "mesh", mesh::register)?;
+    submodule(m, "dataclass", dataclass::register)?;
     submodule(m, "pre", pre::register)?;
     submodule(m, "skeletonize", skeletonize::register)?;
     submodule(m, "post", post::register)?;

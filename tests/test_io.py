@@ -46,9 +46,10 @@ def reference_mesh():
 def test_io_roundtrip(reference_mesh, tmp_path):
     skel = skeletonize(reference_mesh, verbose=False)
 
-    # warm up KD-tree cache (and verify it exists)
+    # warm up the distance index (and verify it exists)
     dx.distance(skel, skel.nodes[0], point_unit=skel.meta.get("unit", "nm"))
-    assert skel._nodes_kdtree is not None
+    assert skel._distance_index is not None
+    assert skel._node_neighbors is not None
 
     # --- write ---------------------------------------------------------
     swc_path = tmp_path / "60427_test.swc"
@@ -62,7 +63,6 @@ def test_io_roundtrip(reference_mesh, tmp_path):
     # --- read back -----------------------------------------------------
     skel_from_swc = load_skeleton_swc(swc_path)
     skel_from_npz = load_skeleton_npz(npz_path)
-    assert skel_from_npz._nodes_kdtree is not None
     assert skel_from_npz._node_neighbors is not None
 
     # --- very coarse equivalence checks --------------------------------
@@ -543,7 +543,7 @@ def test_what_the_readers_do_not_read_goes_to_trimesh(reference_mesh, tmp_path):
         path = tmp_path / name
         want = trimesh.load_mesh(path, process=False)
         for mesh in both(load_mesh, path):
-            assert type(mesh) is type(want), name
+            assert type(mesh) is sk.Mesh, name
             assert np.array_equal(mesh.vertices, want.vertices), name
             assert np.array_equal(mesh.faces, want.faces), name
 
@@ -723,3 +723,96 @@ def test_eyewire_ctm_refuses_the_same_broken_files_on_both_paths(tmp_path):
         with pytest.raises(error, match=match) as python:
             python_io.read_ctm(str(path))
         assert str(rust.value) == str(python.value), name
+
+
+def test_a_mesh_is_read_only_and_converts_both_ways(reference_mesh):
+    import copy
+    import pickle
+
+    import trimesh
+
+    m = reference_mesh
+    assert type(m) is sk.Mesh and sk.Mesh.of(m) is m
+    with pytest.raises(ValueError):
+        m.vertices[0, 0] = 1.0
+    with pytest.raises(AttributeError):
+        m.vertices = m.vertices * 2
+    # anything with vertices and faces; the arrays are copied
+    tm = m.to_trimesh()
+    assert type(tm) is trimesh.Trimesh
+    back = sk.Mesh.of(tm)
+    tm.vertices[0] += 1.0
+    assert np.array_equal(back.vertices, m.vertices)
+    assert np.array_equal(back.faces, m.faces)
+
+    class Plain:
+        vertices = [[0, 0, 0], [1, 0, 0], [0, 1, 0]]
+        faces = [[0, 1, 2]]
+
+    p = sk.Mesh.of(Plain())
+    assert p.vertices.dtype == np.float64 and p.faces.dtype == np.int64
+    assert np.array_equal(p.face_normals, [[0.0, 0.0, 1.0]])
+    with pytest.raises(TypeError, match="vertices and faces"):
+        sk.Mesh.of(object())
+    with pytest.raises(ValueError, match="names vertex 3"):
+        sk.Mesh([[0, 0, 0]] * 3, [[0, 1, 3]])
+    for twin in (pickle.loads(pickle.dumps(m)), copy.deepcopy(m), m.copy()):
+        assert np.array_equal(twin.vertices, m.vertices)
+        assert np.array_equal(twin.faces, m.faces)
+    # trimesh's submesh: the faces given, in order, their vertices ascending
+    pick = [5, 2, 40, 2]
+    want = tm.submesh([pick], append=True, repair=False)
+    sub = m.submesh(pick)
+    assert np.array_equal(sub.faces, want.faces)
+    assert np.array_equal(
+        sub.vertices, m.to_trimesh().submesh([pick], append=True, repair=False).vertices
+    )
+    mask = np.zeros(len(m.faces), bool)
+    mask[pick] = True
+    assert np.array_equal(
+        m.submesh(mask).faces, m.to_trimesh().submesh([mask], repair=False)[0].faces
+    )
+
+
+def test_obj_is_written_as_trimesh_writes_it_on_both_paths(reference_mesh, tmp_path):
+    import trimesh
+
+    from skeliner import _rs
+    from skeliner.python import io as python_io
+
+    rng = np.random.default_rng(79)
+    v = np.r_[
+        reference_mesh.vertices[:200] + rng.normal(size=(200, 3)) / 512,
+        [[np.nan, -0.0, 1e20], [np.inf, -np.inf, 1 / 512]],
+    ]
+    inside = reference_mesh.faces[(reference_mesh.faces < 200).all(axis=1)][:90]
+    cases = {"reference": reference_mesh, "odd": sk.Mesh(v, inside)}
+    for name, mesh in cases.items():
+        want = tmp_path / f"{name}_trimesh.obj"
+        trimesh.Trimesh(
+            vertices=mesh.vertices.copy(), faces=mesh.faces.copy(), process=False
+        ).export(str(want))
+        for path in (_rs.io, python_io):
+            got = tmp_path / f"{name}_{path.__name__}.obj"
+            path.write_obj(str(got), mesh.vertices, mesh.faces)
+            assert got.read_bytes() == want.read_bytes(), (name, path)
+        # save_mesh on both paths, and what reads it back
+        for path in ("rust", "python"):
+            with sk.backend(path):
+                out = tmp_path / f"{name}_save_{path}.obj"
+                sk.io.save_mesh(mesh, out)
+                assert out.read_bytes() == want.read_bytes()
+    back = load_mesh(tmp_path / "reference_save_rust.obj")
+    assert np.array_equal(back.faces, reference_mesh.faces)
+    # a trimesh mesh writes itself, as before
+    tm = reference_mesh.to_trimesh()
+    sk.io.save_mesh(tm, tmp_path / "self.obj")
+    tm.export(str(tmp_path / "direct.obj"))
+    assert (tmp_path / "self.obj").read_bytes() == (
+        tmp_path / "direct.obj"
+    ).read_bytes()
+    for path in (_rs.io, python_io):
+        with pytest.raises(OSError):
+            path.write_obj(
+                str(tmp_path / "no" / "dir.obj"), v[:3], np.array([[0, 1, 2]])
+            )

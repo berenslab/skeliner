@@ -4,7 +4,6 @@ the faces of a vertex set, and node types through edits."""
 from __future__ import annotations
 
 import numpy as np
-import trimesh
 
 from .mesh import checked_faces, node_pairs, rows3
 
@@ -125,6 +124,8 @@ def ray_hits(triangles, normals, origins, directions) -> np.ndarray:
     test: per ray from ``origins[k]`` along ``directions[k]``. *triangles*
     are ``(F, 3, 3)`` flattened to ``(F, 9)``, *normals* their face normals.
     """
+    import trimesh
+
     tris = np.asarray(triangles, dtype=np.float64).reshape(-1, 3, 3)
     normals = np.asarray(normals, dtype=np.float64)
     if len(normals) != len(tris):
@@ -306,3 +307,257 @@ def calibrate_radii(
                 radii[i] = r
                 kinds[i] = FULL_CENTERLINE
     return radii, kinds
+
+
+# ---------------------------------------------------------------------
+# downsample
+# ---------------------------------------------------------------------
+AGGREGATES = ("median", "mean", "area")
+
+
+def _aggregate(vals: np.ndarray, how: str) -> float:
+    """One radius for a merged node from its nodes' radii *vals*."""
+    if how == "median":
+        return float(np.median(vals))
+    if how == "mean":
+        return float(np.mean(vals))
+    if how == "area":  # preserve the mean cross-section
+        return float(np.sqrt(np.mean(vals * vals)))
+    raise ValueError("aggregate must be 'median', 'mean', or 'area'")
+
+
+def _centroid(nodes: np.ndarray, lines: list[list[int]], members: list[int]):
+    """The length-weighted centroid of the polylines *lines* (node ids):
+    segment midpoints weighted by segment length; the mean of the
+    *members* when a length is not finite or every one is zero; the one
+    member's position when there is one."""
+    if len(members) <= 1:
+        return nodes[members[0]].copy()
+    xs = [nodes[line] for line in lines]
+    seg = np.concatenate([x[1:] - x[:-1] for x in xs])
+    L = np.linalg.norm(seg, axis=1)
+    if not np.isfinite(L).all() or np.all(L == 0):
+        return nodes[members].mean(axis=0)
+    mids = np.concatenate([0.5 * (x[1:] + x[:-1]) for x in xs])
+    return (mids * L[:, None]).sum(axis=0) / L.sum()
+
+
+def _partition_by_radius(ids: list[int], r: np.ndarray, rtol: float, atol: float):
+    """Greedy 1D segmentation along a path based on a running radius
+    reference: a new group starts when the next radius deviates beyond
+    tolerance."""
+    if not ids:
+        return []
+    groups: list[list[int]] = []
+    cur: list[int] = [ids[0]]
+    r_ref = float(r[ids[0]])
+    for nid in ids[1:]:
+        ri = float(r[nid])
+        tol = float(atol) + float(rtol) * max(abs(r_ref), abs(ri))
+        if abs(ri - r_ref) <= tol:
+            cur.append(nid)
+            # running mean keeps the reference centered without exploding variance
+            r_ref += (ri - r_ref) / len(cur)
+        else:
+            groups.append(cur)
+            cur = [nid]
+            r_ref = ri
+    groups.append(cur)
+    return groups
+
+
+def downsample(
+    nodes,
+    radii,
+    key: int,
+    edges,
+    ptr,
+    idx,
+    rtol: float,
+    atol: float,
+    aggregate: str,
+    merge_endpoints: bool,
+    slide_branchpoints: bool,
+    max_anchor_shift: float | None,
+):
+    """``post.downsample`` on arrays: *nodes* ``(N, 3)``, *radii* ``(K, N)``
+    (row *key* decides), *edges* ``(E, 2)``, the bins as a CSR (*ptr*,
+    *idx*) or ``None``.
+
+    Every run of degree-2 nodes between anchors — node 0 and the nodes of
+    another degree, ascending, each one's neighbours ascending; then the
+    lowest node of each ring with none — splits greedily into groups whose
+    radii stay within ``atol + rtol * max(|r|)`` of their running mean, each
+    group one node at its length-weighted centroid with aggregated radii and
+    the union of its bins. A leaf (with *merge_endpoints*) or a branch
+    point (with *slide_branchpoints*), node 0 never, absorbs the group
+    beside it when that group's radius is within tolerance of its own and
+    it moves no more than *max_anchor_shift*; an anchor absorbing from
+    several runs takes them all — the centroid of every absorbed run, the
+    radii of all its nodes, their bins. A node with no other node to join
+    stays as it is.
+
+    ``(nodes, radii (K, M), edges (P, 2) in the order they were made,
+    old2new (N,) with -1 for none, ptr, idx)``; ``ptr``, ``idx`` ``None``
+    without bins.
+    """
+    nodes = rows3("N", nodes)
+    n = len(nodes)
+    edges = node_pairs(edges, n)
+    radii = np.asarray(radii, dtype=np.float64).reshape(-1, n)
+    if aggregate not in AGGREGATES:
+        raise ValueError("aggregate must be 'median', 'mean', or 'area'")
+    r = radii[key]
+    bins = None
+    if ptr is not None:
+        ptr = np.asarray(ptr, dtype=np.int64).reshape(-1)
+        idx = np.asarray(idx, dtype=np.int64).reshape(-1)
+        if len(ptr) != n + 1 or ptr[0] != 0 or ptr[-1] != len(idx):
+            raise ValueError("the bins must be a CSR (ptr, idx) over the nodes")
+        bins = [idx[ptr[i] : ptr[i + 1]] for i in range(n)]
+
+    deg = np.bincount(edges.ravel(), minlength=n)
+    adj_sets: list[set[int]] = [set() for _ in range(n)]
+    for a, b in edges.tolist():
+        if a != b:
+            adj_sets[a].add(b)
+            adj_sets[b].add(a)
+    adj = [sorted(s) for s in adj_sets]
+    anchors = [v for v in range(n) if v == 0 or deg[v] != 2]
+
+    new_nodes: list[np.ndarray] = []
+    new_radii: list[list[float]] = [[] for _ in range(len(radii))]
+    new_bins: list[np.ndarray] | None = [] if bins is not None else None
+    new_edges: list[tuple[int, int]] = []
+    old2new: dict[int, int] = {}
+    held: dict[int, list[int]] = {}  # an anchor's old nodes, in aggregate order
+    runs: dict[int, list[list[int]]] = {}  # the runs it absorbed
+
+    def merged_bins(ids: list[int]) -> np.ndarray:
+        parts = [bins[j] for j in ids if bins[j].size]
+        return np.unique(np.concatenate(parts)) if parts else np.empty(0, np.int64)
+
+    def add_anchor(oid: int) -> int:
+        if oid in old2new:
+            return old2new[oid]
+        nid = len(new_nodes)
+        new_nodes.append(nodes[oid].astype(np.float64))
+        for k in range(len(radii)):
+            new_radii[k].append(float(radii[k][oid]))
+        if new_bins is not None:
+            new_bins.append(np.asarray(bins[oid], dtype=np.int64))
+        old2new[oid] = nid
+        return nid
+
+    def add_group(gids: list[int]) -> int:
+        nid = len(new_nodes)
+        new_nodes.append(_centroid(nodes, [gids], gids))
+        for k in range(len(radii)):
+            new_radii[k].append(_aggregate(radii[k][gids], aggregate))
+        if new_bins is not None:
+            new_bins.append(merged_bins(gids))
+        for j in gids:
+            old2new[j] = nid
+        return nid
+
+    def within_tol(ra: float, rb: float) -> bool:
+        tol = float(atol) + float(rtol) * max(abs(ra), abs(rb))
+        return abs(ra - rb) <= tol
+
+    def absorbs(oid: int) -> bool:
+        return oid != 0 and (
+            (merge_endpoints and deg[oid] == 1)
+            or (slide_branchpoints and deg[oid] >= 3)
+        )
+
+    def absorb(nid: int, oid: int, group: list[int], anchor_first: bool) -> bool:
+        """*group* into anchor *nid* (old node *oid*), unless that moves it
+        more than *max_anchor_shift*."""
+        if not within_tol(float(r[oid]), _aggregate(r[group], aggregate)):
+            return False
+        line = [oid] + group if anchor_first else group + [oid]
+        members = line if nid not in held else held[nid] + group
+        lines = [line] if nid not in runs else runs[nid] + [line]
+        pos = _centroid(nodes, lines, members)
+        if max_anchor_shift is not None and not (
+            np.linalg.norm(pos - nodes[oid]) <= max_anchor_shift
+        ):
+            return False
+        new_nodes[nid] = pos
+        for k in range(len(radii)):
+            new_radii[k][nid] = _aggregate(radii[k][members], aggregate)
+        if new_bins is not None:
+            new_bins[nid] = merged_bins(members)
+        held[nid], runs[nid] = members, lines
+        for j in group:
+            old2new[j] = nid
+        return True
+
+    visited: set[tuple[int, int]] = set()
+
+    def walk_from(a: int) -> None:
+        for b in adj[a]:
+            if (min(a, b), max(a, b)) in visited:
+                continue
+            # walk a → ... → z along the corridor
+            path = [a]
+            prev, cur = a, b
+            visited.add((min(a, b), max(a, b)))
+            while deg[cur] == 2 and cur != a:
+                path.append(cur)
+                nxts = [x for x in adj[cur] if x != prev]
+                if len(nxts) != 1:
+                    break
+                nxt = nxts[0]
+                visited.add((min(cur, nxt), max(cur, nxt)))
+                prev, cur = cur, nxt
+            if cur != path[-1]:
+                path.append(cur)
+
+            a_id, z_id = path[0], path[-1]
+            left = add_anchor(a_id)
+            right = add_anchor(z_id)
+            groups = _partition_by_radius(path[1:-1], r, rtol, atol)
+            if groups and absorbs(a_id) and absorb(left, a_id, groups[0], True):
+                groups = groups[1:]
+            if groups and absorbs(z_id) and absorb(right, z_id, groups[-1], False):
+                groups = groups[:-1]
+
+            # wire: left → groups → right
+            L = left
+            for grp in groups:
+                g_id = add_group(grp)
+                new_edges.append((min(L, g_id), max(L, g_id)))
+                L = g_id
+            if L != right:
+                new_edges.append((min(L, right), max(L, right)))
+
+    for a in anchors:
+        walk_from(a)
+    for v in range(n):  # a ring of degree-2 nodes, from its lowest node
+        if v not in old2new and deg[v] == 2 and adj[v]:
+            walk_from(v)
+    for v in range(n):  # a node with no other node to join
+        if v not in old2new and not adj[v]:
+            add_anchor(v)
+
+    m = len(new_nodes)
+    out_nodes = np.asarray(new_nodes, dtype=np.float64).reshape(m, 3)
+    out_radii = np.asarray(new_radii, dtype=np.float64).reshape(len(radii), m)
+    out_edges = np.asarray(new_edges, dtype=np.int64).reshape(-1, 2)
+    old2new_arr = np.full(n, -1, dtype=np.int64)
+    for old, new in old2new.items():
+        old2new_arr[old] = new
+    if new_bins is None:
+        return out_nodes, out_radii, out_edges, old2new_arr, None, None
+    out_ptr = np.zeros(m + 1, dtype=np.int64)
+    np.cumsum([b.size for b in new_bins], out=out_ptr[1:])
+    out_idx = np.concatenate(new_bins) if new_bins else np.empty(0, np.int64)
+    return (
+        out_nodes,
+        out_radii,
+        out_edges,
+        old2new_arr,
+        out_ptr,
+        out_idx.astype(np.int64),
+    )

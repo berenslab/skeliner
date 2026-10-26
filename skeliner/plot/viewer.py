@@ -26,7 +26,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import trimesh
+
+from ..dataclass import Mesh
+from ..io import load_mesh
 
 _STATE_DIR = Path(os.environ.get("SKELINER_VIEW_STATE_DIR", "/tmp/skeliner_view"))
 
@@ -39,7 +41,7 @@ def _ensure_state_dir():
 
 
 def _mesh_to_buffers(
-    mesh: trimesh.Trimesh, *, centroid: np.ndarray | None = None
+    mesh: Mesh, *, centroid: np.ndarray | None = None
 ) -> dict[str, Any]:
     verts = np.asarray(mesh.vertices, dtype=np.float32)
     faces = np.asarray(mesh.faces, dtype=np.int32)
@@ -324,7 +326,7 @@ def _create_app(
     mesh_path: str | Path | None = None,
     port: int = 8777,
     *,
-    preload_mesh: trimesh.Trimesh | None = None,
+    preload_mesh: Mesh | None = None,
     preload_centroid: np.ndarray | None = None,
     extra_meshes: dict[str, dict[str, Any]] | None = None,
     contact_state: dict[str, Any] | None = None,
@@ -340,7 +342,7 @@ def _create_app(
     # ── Shared mutable state ──────────────────────────────────────────
     # These are modified by upload/remove endpoints
     mesh_state: dict[str, Any] = {
-        "mesh": None,  # trimesh object
+        "mesh": None,  # a skeliner.Mesh
         "buffers": None,  # JSON-serialisable mesh data
         "path": None,  # source file path
         "centroid": np.zeros(3, dtype=np.float32),
@@ -411,7 +413,7 @@ def _create_app(
 
     # Pre-load mesh from path or object
     if preload_mesh is not None:
-        mesh = preload_mesh
+        mesh = Mesh.of(preload_mesh)
         print(
             f"Loaded mesh: {len(mesh.vertices):,} vertices, {len(mesh.faces):,} faces"
         )
@@ -422,7 +424,7 @@ def _create_app(
         mesh_state["centroid"] = np.asarray(buffers["centroid"], dtype=np.float32)
     elif mesh_path is not None:
         mesh_path = Path(mesh_path)
-        mesh = trimesh.load_mesh(str(mesh_path), process=False)
+        mesh = load_mesh(mesh_path)
         print(
             f"Loaded mesh: {len(mesh.vertices):,} vertices, {len(mesh.faces):,} faces"
         )
@@ -483,7 +485,7 @@ def _create_app(
     state_path.write_text(json.dumps(initial, indent=2), encoding="utf-8")
 
     connected_clients: list[WebSocket] = []
-    _undo_stack: list[trimesh.Trimesh] = []
+    _undo_stack: list[Mesh] = []
     _UNDO_LIMIT = 10
 
     # ── Broadcast helper ──────────────────────────────────────────────
@@ -664,7 +666,7 @@ def _create_app(
 
         try:
             if suffix in (".obj", ".ply", ".stl"):
-                mesh = trimesh.load_mesh(str(tmp_path), process=False)
+                mesh = load_mesh(tmp_path)
                 print(
                     f"Uploaded mesh: {len(mesh.vertices):,} verts, {len(mesh.faces):,} faces"
                 )
@@ -2443,7 +2445,7 @@ def _create_app(
                     new_verts[vi][2] + centroid[2],
                 ]
 
-        new_mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        new_mesh = Mesh(verts, faces)
         mesh_state["mesh"] = new_mesh
 
         # Keep the original centroid
@@ -3268,7 +3270,7 @@ def _create_app(
             )
 
         mesh = mesh_state["mesh"]
-        sub = mesh.submesh([faces], append=True)
+        sub = mesh.submesh(faces)
 
         fmt = request.query_params.get("format", "obj")
         prefix = request.query_params.get("prefix", "")
@@ -4023,11 +4025,14 @@ def _create_app(
         An editing UI that can produce an orphan or a cycle should say so
         when it happens, not leave it for an exporter to trip on.
         """
-        g = skel._igraph()
-        n_comp = len(g.components())
+        from skeliner._backend import kernels
+
+        edges = np.asarray(skel.edges, dtype=np.int64).reshape(-1, 2)
+        n = len(skel.nodes)
+        n_comp = int(kernels.dx.components(edges, n).max()) + 1 if n else 0
         return {
-            "components": int(n_comp),
-            "cycles": int(g.ecount() - g.vcount() + n_comp),
+            "components": n_comp,
+            "cycles": int(len(edges) - n + n_comp),
         }
 
     async def edge_support(request):
@@ -4472,11 +4477,11 @@ def _create_app(
         # How far apart the two already are along the tree, which is how big
         # a cycle a restore or a graft would close.  ``-1`` when the tree does
         # not join them at all — then the edit reconnects the skeleton instead
-        # of closing anything.  Asked of the components first, because
-        # ``get_shortest_path`` warns when there is no path to find.
-        g = skel._igraph()
-        comp = g.components().membership
-        hops = len(g.get_shortest_path(u, v)) - 1 if comp[u] == comp[v] else -1
+        # of closing anything.
+        from skeliner._backend import kernels
+
+        apart = kernels.dx.hops(tree.reshape(-1, 2), n, u)[v]
+        hops = int(apart) if np.isfinite(apart) else -1
 
         before = _graph_shape(skel)
         before_iso = set(dx.check_connectivity(skel, return_isolated=True))
@@ -5036,7 +5041,7 @@ def view(
 
 
 def _bbox_from_faces(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     faces_idx: np.ndarray,
     centroid: np.ndarray,
 ) -> list[list[float]] | None:
@@ -5146,11 +5151,9 @@ def view3d(
 
     # Scale meshes
     scaled_meshes = []
-    for m in meshes:
+    for m in map(Mesh.of, meshes):
         if mesh_scale != 1.0:
-            mc = m.copy()
-            mc.vertices = m.vertices * mesh_scale
-            scaled_meshes.append(mc)
+            scaled_meshes.append(Mesh(m.vertices * mesh_scale, m.faces))
         else:
             scaled_meshes.append(m)
 
@@ -5225,8 +5228,8 @@ _SITE_COLORS = [
 
 
 def _contact_overlay(
-    A: trimesh.Trimesh,
-    B: trimesh.Trimesh,
+    A: Mesh,
+    B: Mesh,
     centroid: np.ndarray,
     contacts,
     *,
@@ -5346,8 +5349,8 @@ def _contact_overlay(
 
 
 def view_contacts(
-    A: trimesh.Trimesh,
-    B: trimesh.Trimesh,
+    A: Mesh,
+    B: Mesh,
     contacts,  # ContactSites
     *,
     scale: float = 1.0,
@@ -5375,11 +5378,10 @@ def view_contacts(
     centroid = all_verts.mean(axis=0)
 
     # Scale meshes
-    A_scaled = A.copy()
-    B_scaled = B.copy()
+    A_scaled, B_scaled = Mesh.of(A), Mesh.of(B)
     if scale != 1.0:
-        A_scaled.vertices = A.vertices * float(scale)
-        B_scaled.vertices = B.vertices * float(scale)
+        A_scaled = Mesh(A_scaled.vertices * float(scale), A_scaled.faces)
+        B_scaled = Mesh(B_scaled.vertices * float(scale), B_scaled.faces)
         centroid = centroid * float(scale)
 
     # Buffers for B (extra); A renders through the primary mesh_state

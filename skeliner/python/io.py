@@ -257,3 +257,21 @@ def read_ctm(path) -> tuple[np.ndarray, np.ndarray] | None:
     if len(tris) and tris.max() >= n_vertices:
         raise ValueError("a CTM triangle names a vertex past the last")
     return np.asarray(verts, dtype=np.float64), np.asarray(tris, dtype=np.int64)
+
+
+def write_obj(path, vertices, faces) -> None:
+    """Write *vertices* ``(N, 3)`` and *faces* ``(F, 3)`` to *path* as
+    trimesh's ``export_obj`` writes a plain mesh (no normals, colours,
+    texture or name): its header comment, a ``v`` line per vertex with eight
+    decimals, an ``f`` line per face numbered from one, and a blank line to
+    end."""
+    from .mesh import checked_faces, rows3
+
+    vertices = rows3("V", vertices)
+    faces, _ = checked_faces(faces, len(vertices))
+    v = "\nv ".join(
+        " ".join(format(x, ".8f") for x in row) for row in vertices.tolist()
+    )
+    f = "\nf ".join(f"{a} {b} {c}" for a, b, c in (faces + 1).tolist())
+    text = "\n".join(["# https://github.com/mikedh/trimesh", f"v {v}\nf {f}", "\n"])
+    Path(path).write_bytes(text.encode())

@@ -7,6 +7,8 @@ use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBytes, PyDict};
 
+use crate::common::*;
+
 /// A mesh's vertices `(V, 3)` and faces `(F, 3)`.
 type MeshOut<'py> = (Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<i64>>);
 
@@ -38,6 +40,21 @@ fn read_obj<'py>(py: Python<'py>, path: &str) -> PyResult<Option<MeshOut<'py>>> 
         .detach(|| std::fs::read(path).map(|data| ::io::read_obj(&data)))
         .map_err(|e| os_error(path, e))?;
     Ok(found.map(|m| mesh_out(py, m)))
+}
+
+/// Write `vertices` `(N, 3)` and `faces` `(F, 3)` to `path` as trimesh's
+/// `export_obj` writes a plain mesh.
+#[pyfunction]
+fn write_obj(
+    py: Python<'_>,
+    path: &str,
+    vertices: numpy::PyReadonlyArray2<'_, f64>,
+    faces: numpy::PyReadonlyArray2<'_, i64>,
+) -> PyResult<()> {
+    let verts = rows3("V", &vertices)?;
+    let (tris, _) = checked_faces(&faces, Some(verts.len()))?;
+    py.detach(|| std::fs::write(path, ::io::write_obj(&verts, &tris)))
+        .map_err(|e| os_error(path, e))
 }
 
 /// The vertices and triangles of the OpenCTM v5 file at `path`, only for
@@ -85,5 +102,6 @@ fn read_ctm<'py>(py: Python<'py>, path: &str) -> PyResult<Option<MeshOut<'py>>> 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_obj, m)?)?;
     m.add_function(wrap_pyfunction!(read_ctm, m)?)?;
+    m.add_function(wrap_pyfunction!(write_obj, m)?)?;
     Ok(())
 }

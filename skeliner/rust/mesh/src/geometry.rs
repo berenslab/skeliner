@@ -199,14 +199,16 @@ pub fn polygon_area(p: &[[f64; 2]]) -> f64 {
     0.5 * s.abs()
 }
 
-/// Area of the convex hull of 2D points (monotone chain); 0 for fewer than
-/// three points or collinear ones.
-pub fn convex_hull_area(points: &[[f64; 2]]) -> f64 {
+/// The convex hull of 2D points, counter-clockwise, by the monotone chain:
+/// the points sorted by x then y (`total_cmp`), repeats dropped, collinear
+/// points on the hull left out. Fewer than three distinct points come back
+/// as they are, sorted.
+pub fn convex_hull(points: &[[f64; 2]]) -> Vec<[f64; 2]> {
     let mut p: Vec<[f64; 2]> = points.to_vec();
     p.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
     p.dedup();
     if p.len() < 3 {
-        return 0.0;
+        return p;
     }
     let cross = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| {
         (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
@@ -229,7 +231,77 @@ pub fn convex_hull_area(points: &[[f64; 2]]) -> f64 {
         }
         hull.pop();
     }
-    polygon_area(&hull)
+    hull
+}
+
+/// Whether qhull, as scipy's `ConvexHull` runs it, refuses `points` (their
+/// `hull` from [`convex_hull`]) as flat: fewer than three distinct points,
+/// or the triangle it starts from — the hull's points of least and greatest
+/// x and the one farthest from their line — with its centroid within
+/// qhull's roundoff of that line (`DISTround`, from the largest coordinate).
+pub fn qhull_flat(points: &[[f64; 2]], hull: &[[f64; 2]]) -> bool {
+    if hull.len() < 3 {
+        return true;
+    }
+    let (mut maxabs, mut maxsum) = (0.0f64, 0.0f64);
+    for p in points {
+        maxabs = maxabs.max(p[0].abs()).max(p[1].abs());
+        maxsum = maxsum.max(p[0].abs() + p[1].abs());
+    }
+    let distsum = (2f64.sqrt() * maxabs).min(maxsum);
+    let roundoff = f64::EPSILON * (2.0 * distsum * 1.01 + maxabs);
+    let order = |p: &&[f64; 2], q: &&[f64; 2]| p[0].total_cmp(&q[0]).then(p[1].total_cmp(&q[1]));
+    let a = *hull.iter().min_by(order).expect("three points");
+    let b = *hull.iter().max_by(order).expect("three points");
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let length = (dx * dx + dy * dy).sqrt();
+    let height = hull
+        .iter()
+        .map(|q| ((q[0] - a[0]) * dy - (q[1] - a[1]) * dx).abs() / length)
+        .fold(0.0f64, f64::max);
+    height / 3.0 <= roundoff
+}
+
+/// `(area, perimeter)` of the convex hull of 2D points — scipy's
+/// `ConvexHull` `volume` and `area` — by the shoelace formula about the
+/// hull's first point (far from the origin, the products otherwise cancel)
+/// and the edge lengths; both 0 where qhull refuses the points as flat.
+pub fn hull_measures(points: &[[f64; 2]]) -> (f64, f64) {
+    let hull = convex_hull(points);
+    if qhull_flat(points, &hull) {
+        return (0.0, 0.0);
+    }
+    let o = hull[0];
+    let (mut s, mut perimeter) = (0.0, 0.0);
+    for (i, &a) in hull.iter().enumerate() {
+        let b = hull[(i + 1) % hull.len()];
+        s += (a[0] - o[0]) * (b[1] - o[1]) - (b[0] - o[0]) * (a[1] - o[1]);
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        perimeter += (dx * dx + dy * dy).sqrt();
+    }
+    (0.5 * s.abs(), perimeter)
+}
+
+/// The edges of the convex hull of 2D points as scipy's
+/// `ConvexHull.equations` gives them: per edge `(n0, n1, offset)`, the unit
+/// normal pointing out, `n . p + offset <= 0` inside, counter-clockwise from
+/// the lowest point; None where qhull refuses the points as flat.
+pub fn hull_equations(points: &[[f64; 2]]) -> Option<Vec<[f64; 3]>> {
+    let hull = convex_hull(points);
+    if qhull_flat(points, &hull) {
+        return None;
+    }
+    Some(
+        (0..hull.len())
+            .map(|i| {
+                let (a, b) = (hull[i], hull[(i + 1) % hull.len()]);
+                let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                let length = (dx * dx + dy * dy).sqrt();
+                let n = [dy / length, -dx / length];
+                [n[0], n[1], -(n[0] * a[0] + n[1] * a[1])]
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -293,7 +365,7 @@ mod tests {
         let (o, u, w) = best_fit_plane(&sq);
         let area = polygon_area(&project(&sq, o, u, w));
         assert!((area - 1.0).abs() < 1e-12, "{area}");
-        assert!((convex_hull_area(&project(&sq, o, u, w)) - 1.0).abs() < 1e-12);
+        assert!((hull_measures(&project(&sq, o, u, w)).0 - 1.0).abs() < 1e-12);
     }
 
     #[test]
@@ -306,7 +378,55 @@ mod tests {
             [1.0, 1.0],
             [1.0, 0.0],
         ];
-        assert_eq!(convex_hull_area(&pts), 4.0);
-        assert_eq!(convex_hull_area(&[[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]), 0.0);
+        assert_eq!(hull_measures(&pts), (4.0, 8.0));
+        assert_eq!(
+            convex_hull(&pts),
+            [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]]
+        );
+        // collinear, too few, and repeated points span no area
+        assert_eq!(
+            hull_measures(&[[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]),
+            (0.0, 0.0)
+        );
+        assert_eq!(hull_measures(&[[0.0, 0.0], [1.0, 1.0]]), (0.0, 0.0));
+        assert!(hull_equations(&[[1.0, 1.0]; 5]).is_none());
+    }
+
+    #[test]
+    fn hull_edges_point_out() {
+        let eq = hull_equations(&[[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0], [1.0, 1.0]])
+            .expect("a square");
+        assert_eq!(
+            eq,
+            [
+                [0.0, -1.0, 0.0],
+                [1.0, 0.0, -2.0],
+                [0.0, 1.0, -2.0],
+                [-1.0, 0.0, 0.0]
+            ]
+        );
+    }
+
+    #[test]
+    fn points_flat_to_rounding_are_flat_as_qhull_has_them() {
+        // on a line through large coordinates, off it by a couple of ulps
+        // there, far less than qhull's roundoff: refused, as qhull refuses
+        let line: Vec<[f64; 2]> = (0..20)
+            .map(|i| {
+                let t = f64::from(i) * 37.0;
+                [
+                    500_000.0 + t,
+                    300_000.0 + 0.5 * t + if i % 3 == 0 { 1e-10 } else { 0.0 },
+                ]
+            })
+            .collect();
+        assert!(convex_hull(&line).len() >= 3);
+        assert_eq!(hull_measures(&line), (0.0, 0.0));
+        assert!(hull_equations(&line).is_none());
+        // a nanometre off the line is a (thin) hull
+        let mut thin = line.clone();
+        thin[7][1] += 1.0;
+        assert!(hull_measures(&thin).0 > 0.0);
+        assert!(hull_equations(&thin).is_some());
     }
 }
