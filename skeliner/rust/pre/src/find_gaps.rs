@@ -382,68 +382,79 @@ pub fn find_gaps(
     let mut comps: HashMap<i64, Component> = HashMap::new();
     comps.insert(main, component(main_faces));
     let disc_cids: Vec<i64> = disc.iter().map(|fis| labels[fis[0] as usize]).collect();
-    for (fis, &cid) in disc.iter().zip(&disc_cids) {
-        comps.insert(cid, component(fis.clone()));
-    }
+    let built: Vec<Component> =
+        threads::install(|| disc.par_iter().map(|fis| component(fis.clone())).collect());
+    comps.extend(disc_cids.iter().copied().zip(built));
     let all_cids: Vec<i64> = std::iter::once(main)
         .chain(disc_cids.iter().copied())
         .collect();
     let orig_label = |cid: i64| labels_pre_fusion[comps[&cid].faces[0] as usize];
 
-    // Pairwise candidate bridges.
+    // Pairwise candidate bridges: every pair's closest points at once (a
+    // pair's are its two components' alone, and a small pair's work is less
+    // than entering the pool for it), then the bridges in order.
+    let pairs: Vec<(i64, i64)> = all_cids
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &a)| all_cids[i + 1..].iter().map(move |&b| (a, b)))
+        .collect();
+    let closest: Vec<(Hit, Option<Hit>)> = threads::install(|| {
+        pairs
+            .par_iter()
+            .map(|&(cid_a, cid_b)| {
+                let (da, db) = (&comps[&cid_a], &comps[&cid_b]);
+                let clear_of_fusions;
+                let valid: Option<&(dyn Fn(usize, u32) -> bool + Sync)> =
+                    match (&fusion_tree, &da.fusion_dist, &db.fusion_dist) {
+                        (Some(_), Some(fa), Some(fb)) => {
+                            clear_of_fusions = |k: usize, j: u32| {
+                                fa[k] > params.fusion_clear && fb[j as usize] > params.fusion_clear
+                            };
+                            Some(&clear_of_fusions)
+                        }
+                        _ => None,
+                    };
+                closest_pair(da, db, valid, params.fusion_clear)
+            })
+            .collect()
+    });
     let mut edge_info: HashMap<(i64, i64), EdgeInfo> = HashMap::new();
     let mut pair_order: Vec<(i64, i64)> = Vec::new();
-    for (i, &cid_a) in all_cids.iter().enumerate() {
-        for &cid_b in &all_cids[i + 1..] {
-            let (da, db) = (&comps[&cid_a], &comps[&cid_b]);
-            let clear_of_fusions;
-            let valid: Option<&(dyn Fn(usize, u32) -> bool + Sync)> =
-                match (&fusion_tree, &da.fusion_dist, &db.fusion_dist) {
-                    (Some(_), Some(fa), Some(fb)) => {
-                        clear_of_fusions = |k: usize, j: u32| {
-                            fa[k] > params.fusion_clear && fb[j as usize] > params.fusion_clear
-                        };
-                        Some(&clear_of_fusions)
-                    }
-                    _ => None,
-                };
-            let (raw, kept) = threads::install(|| closest_pair(da, db, valid, params.fusion_clear));
-            let raw_dist = raw.1;
-            let (min_i, cost, ib) = match kept {
-                Some((fi, fd, fj)) if !(fd > params.fusion_fallback && raw_dist >= 1.0) => {
-                    (fi, fd, fj)
-                }
-                _ => raw,
-            };
-            let ib = ib as usize;
-            let mut mst_cost = cost;
-            if cost >= 1.0 {
-                let f = flank(da, min_i, params.kiss_r, svd).min(flank(db, ib, params.kiss_r, svd));
-                mst_cost = cost * (1.0 + params.kiss_penalty * f);
-            }
-            let fusion_join = match (&da.fusion_dist, &db.fusion_dist) {
-                (Some(fa), Some(fb)) if cost < 1.0 && orig_label(cid_a) == orig_label(cid_b) => {
-                    fa[min_i].min(fb[ib]) <= params.fusion_clear
-                }
-                _ => false,
-            };
-            let key = (cid_a.min(cid_b), cid_a.max(cid_b));
-            if !edge_info.contains_key(&key) {
-                pair_order.push(key);
-            }
-            edge_info.insert(
-                key,
-                EdgeInfo {
-                    mst_cost,
-                    dist: cost,
-                    a: cid_a,
-                    ia: min_i,
-                    b: cid_b,
-                    ib,
-                    fusion_join,
-                },
-            );
+    for (&(cid_a, cid_b), (raw, kept)) in pairs.iter().zip(closest) {
+        let (da, db) = (&comps[&cid_a], &comps[&cid_b]);
+        let raw_dist = raw.1;
+        let (min_i, cost, ib) = match kept {
+            Some((fi, fd, fj)) if !(fd > params.fusion_fallback && raw_dist >= 1.0) => (fi, fd, fj),
+            _ => raw,
+        };
+        let ib = ib as usize;
+        let mut mst_cost = cost;
+        if cost >= 1.0 {
+            let f = flank(da, min_i, params.kiss_r, svd).min(flank(db, ib, params.kiss_r, svd));
+            mst_cost = cost * (1.0 + params.kiss_penalty * f);
         }
+        let fusion_join = match (&da.fusion_dist, &db.fusion_dist) {
+            (Some(fa), Some(fb)) if cost < 1.0 && orig_label(cid_a) == orig_label(cid_b) => {
+                fa[min_i].min(fb[ib]) <= params.fusion_clear
+            }
+            _ => false,
+        };
+        let key = (cid_a.min(cid_b), cid_a.max(cid_b));
+        if !edge_info.contains_key(&key) {
+            pair_order.push(key);
+        }
+        edge_info.insert(
+            key,
+            EdgeInfo {
+                mst_cost,
+                dist: cost,
+                a: cid_a,
+                ia: min_i,
+                b: cid_b,
+                ib,
+                fusion_join,
+            },
+        );
     }
 
     // Union-find over components the bridges (or sub-1 nm contacts) join.
