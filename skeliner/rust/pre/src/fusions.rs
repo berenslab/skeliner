@@ -1,8 +1,9 @@
 //! Non-manifold fusions: where two branches share edges or vertices.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 
 use mesh::Topology;
+use rayon::prelude::*;
 
 /// Faces with area below this count as zero-area.
 const ZERO_AREA: f64 = 1e-6;
@@ -45,23 +46,27 @@ fn manifold_components(t: &Topology, region: &BTreeSet<u32>) -> Vec<BTreeSet<u32
     comps
 }
 
-/// Whether the faces in `fan` around one vertex fall into more than one
-/// edge-connected piece.
+/// Whether the faces in `fan` (distinct, ascending) around one vertex fall
+/// into more than one edge-connected piece.
 fn fan_is_split(t: &Topology, fan: &[u32]) -> bool {
-    let members: BTreeSet<u32> = fan.iter().copied().collect();
-    let mut seen: BTreeSet<u32> = BTreeSet::new();
-    let mut queue = VecDeque::from([fan[0]]);
-    while let Some(f) = queue.pop_front() {
-        if !seen.insert(f) {
+    let mut seen = vec![false; fan.len()];
+    let mut n_seen = 0;
+    let mut queue = VecDeque::from([0usize]);
+    while let Some(i) = queue.pop_front() {
+        if seen[i] {
             continue;
         }
-        for g in t.face_neighbors(f as usize) {
-            if members.contains(&g) && !seen.contains(&g) {
-                queue.push_back(g);
+        seen[i] = true;
+        n_seen += 1;
+        for g in t.face_neighbors(fan[i] as usize) {
+            if let Ok(j) = fan.binary_search(&g)
+                && !seen[j]
+            {
+                queue.push_back(j);
             }
         }
     }
-    seen.len() < members.len()
+    n_seen < fan.len()
 }
 
 /// `skeliner.pre._find_nonmanifold_fusions` with the outward dots given.
@@ -81,7 +86,18 @@ pub fn find_nonmanifold_fusions(
     grow_rings: usize,
     min_branch_size: usize,
 ) -> Vec<Vec<u32>> {
-    let zero: Vec<bool> = areas.iter().map(|&a| a < ZERO_AREA).collect();
+    threads::install(|| fusions_of(t, faces, areas, outward_dots, grow_rings, min_branch_size))
+}
+
+fn fusions_of(
+    t: &Topology,
+    faces: &[[u32; 3]],
+    areas: &[f64],
+    outward_dots: &[f64],
+    grow_rings: usize,
+    min_branch_size: usize,
+) -> Vec<Vec<u32>> {
+    let zero: Vec<bool> = areas.par_iter().map(|&a| a < ZERO_AREA).collect();
 
     // Signal 1: negative-dot faces on non-manifold edges.
     let mut seeds: BTreeSet<u32> = BTreeSet::new();
@@ -96,35 +112,46 @@ pub fn find_nonmanifold_fusions(
         }
     }
 
-    // Signal 2: duplicated faces with more than three neighbours.
-    let key = |f: &[u32; 3]| {
-        let mut k = *f;
-        k.sort_unstable();
-        k
-    };
-    let mut copies: HashMap<[u32; 3], usize> = HashMap::new();
-    for f in faces {
-        *copies.entry(key(f)).or_default() += 1;
-    }
-    for (fi, f) in faces.iter().enumerate() {
-        if copies[&key(f)] > 1 && !zero[fi] && t.face_neighbors(fi).len() > 3 {
-            seeds.insert(fi as u32);
+    // Signal 2: duplicated faces (the same three vertices) with more than
+    // three neighbours.
+    let mut keyed: Vec<([u32; 3], u32)> = faces
+        .par_iter()
+        .enumerate()
+        .map(|(fi, f)| {
+            let mut k = *f;
+            k.sort_unstable();
+            (k, fi as u32)
+        })
+        .collect();
+    keyed.par_sort_unstable();
+    let mut copied = vec![false; faces.len()];
+    for run in keyed.chunk_by(|x, y| x.0 == y.0) {
+        if run.len() > 1 {
+            for &(_, fi) in run {
+                copied[fi as usize] = true;
+            }
         }
     }
+    let duplicated: Vec<u32> = (0..faces.len())
+        .into_par_iter()
+        .filter(|&fi| copied[fi] && !zero[fi] && t.face_neighbors(fi).len() > 3)
+        .map(|fi| fi as u32)
+        .collect();
+    seeds.extend(duplicated);
 
-    // Signal 3: vertices whose fan falls apart.
-    let mut fans: Vec<Vec<u32>> = vec![Vec::new(); t.n_vertices()];
-    for (fi, f) in faces.iter().enumerate() {
-        if t.is_degenerate(fi) || zero[fi] {
-            continue;
-        }
-        for &v in f {
-            fans[v as usize].push(fi as u32);
-        }
-    }
-    let fan_clusters: Vec<Vec<u32>> = fans
-        .into_iter()
-        .filter(|fan| fan.len() >= 2 && fan_is_split(t, fan))
+    // Signal 3: vertices whose fan — its faces that have edges and area, in
+    // face order — falls apart.
+    let fan_clusters: Vec<Vec<u32>> = (0..t.n_vertices())
+        .into_par_iter()
+        .filter_map(|v| {
+            let fan: Vec<u32> = t
+                .vertex_faces(v)
+                .iter()
+                .copied()
+                .filter(|&f| !zero[f as usize])
+                .collect();
+            (fan.len() >= 2 && fan_is_split(t, &fan)).then_some(fan)
+        })
         .collect();
 
     if seeds.is_empty() && fan_clusters.is_empty() {

@@ -1,6 +1,7 @@
 //! Choosing the bridges that reconnect disconnected components.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::OnceLock;
 
 use mesh::Topology;
 use mesh::geometry::numpy_order;
@@ -51,11 +52,130 @@ pub struct Gaps {
 
 struct Component {
     faces: Vec<u32>,
+    /// `faces` as a set, built when a bridge first needs it.
+    face_set: OnceLock<HashSet<u32>>,
     verts: Vec<u32>,
     coords: Vec<[f64; 3]>,
     tree: KdTree,
     fusion_dist: Option<Vec<f64>>,
     bbox: f64,
+}
+
+impl Component {
+    fn face_set(&self) -> &HashSet<u32> {
+        self.face_set
+            .get_or_init(|| self.faces.iter().copied().collect())
+    }
+}
+
+/// A pair of points, one of each component: the index into `a`'s points,
+/// their distance, the index into `b`'s.
+type Hit = (usize, f64, u32);
+
+/// What the pair loop reads off each point of `a` and its nearest point of
+/// `b`: the first point of `a` (the lowest index among the equally near)
+/// whose nearest is closest, and the first such among the pairs `valid`
+/// keeps — `None` when it keeps none — every point of `a` queried.
+fn scan_all(
+    a: &Component,
+    b: &Component,
+    valid: Option<&(dyn Fn(usize, u32) -> bool + Sync)>,
+) -> (Hit, Option<Hit>) {
+    let found: Vec<(u32, f64)> = a
+        .coords
+        .par_iter()
+        .map(|p| b.tree.nearest(p).expect("non-empty"))
+        .collect();
+    let first_min = |keep: &dyn Fn(usize) -> bool| {
+        let mut best: Option<(usize, f64)> = None;
+        for (k, &(_, d)) in found.iter().enumerate() {
+            if keep(k) && best.is_none_or(|(_, b)| d < b) {
+                best = Some((k, d));
+            }
+        }
+        best.map(|(k, d)| (k, d, found[k].0))
+    };
+    let raw = first_min(&|_| true).expect("non-empty component");
+    let kept = valid.and_then(|v| first_min(&|k| v(k, found[k].0)));
+    (raw, kept)
+}
+
+/// [`scan_all`]'s answer, querying only the points of `a` that can be in
+/// it: those whose distance to `b`'s box — never more than the distance to
+/// a point inside it — is within the answer.  That is the two components'
+/// closest distance, found from `b`'s side, and for `valid` it grows in
+/// rounds (doubling, plus `widen`) until a kept pair lies within it.  With
+/// a coordinate that is not finite every point is queried.
+fn closest_pair(
+    a: &Component,
+    b: &Component,
+    valid: Option<&(dyn Fn(usize, u32) -> bool + Sync)>,
+    widen: f64,
+) -> (Hit, Option<Hit>) {
+    let finite = |c: &Component| c.coords.iter().flatten().all(|x| x.is_finite());
+    if !finite(a) || !finite(b) {
+        return scan_all(a, b, valid);
+    }
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for q in &b.coords {
+        for k in 0..3 {
+            lo[k] = lo[k].min(q[k]);
+            hi[k] = hi[k].max(q[k]);
+        }
+    }
+    // summed as `Sum::Plain` sums a squared distance, so never more than it
+    let to_box = |p: &[f64; 3]| {
+        let g = |k: usize| {
+            if p[k] < lo[k] {
+                lo[k] - p[k]
+            } else if p[k] > hi[k] {
+                p[k] - hi[k]
+            } else {
+                0.0
+            }
+        };
+        let (gx, gy, gz) = (g(0), g(1), g(2));
+        (gx * gx + gy * gy + gz * gz).sqrt()
+    };
+    let reach: Vec<f64> = a.coords.par_iter().map(to_box).collect();
+    let closest = b
+        .coords
+        .par_iter()
+        .map(|q| a.tree.nearest(q).expect("non-empty").1)
+        .reduce(|| f64::INFINITY, f64::min);
+    let before = |x: Hit, y: Option<Hit>| y.is_none_or(|y| x.1 < y.1 || (x.1 == y.1 && x.0 < y.0));
+    let (mut raw, mut kept): (Option<Hit>, Option<Hit>) = (None, None);
+    let (mut done, mut within) = (f64::NEG_INFINITY, closest);
+    loop {
+        let hits: Vec<Hit> = (0..reach.len())
+            .into_par_iter()
+            .filter(|&k| reach[k] > done && reach[k] <= within)
+            .map(|k| {
+                let (j, d) = b.tree.nearest(&a.coords[k]).expect("non-empty");
+                (k, d, j)
+            })
+            .collect();
+        for &h in &hits {
+            if before(h, raw) {
+                raw = Some(h);
+            }
+            if valid.is_some_and(|v| v(h.0, h.2)) && before(h, kept) {
+                kept = Some(h);
+            }
+        }
+        let settled = valid.is_none() || kept.is_some_and(|h| h.1 <= within);
+        let next = reach
+            .par_iter()
+            .copied()
+            .filter(|&x| x > within)
+            .reduce(|| f64::INFINITY, f64::min);
+        if settled || next == f64::INFINITY {
+            break;
+        }
+        (done, within) = (within, (2.0 * within + widen).max(next));
+    }
+    (raw.expect("non-empty component"), kept)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -124,25 +244,34 @@ fn tip_faces(
     rings: usize,
 ) -> Vec<u32> {
     let p = m.verts[tip as usize];
-    let mut best = (0usize, f64::INFINITY);
-    for (k, &f) in comp_faces.iter().enumerate() {
-        let t = m.faces[f as usize];
-        let (a, b, c) = (
-            m.verts[t[0] as usize],
-            m.verts[t[1] as usize],
-            m.verts[t[2] as usize],
-        );
-        let centroid = [
-            (a[0] + b[0] + c[0]) / 3.0,
-            (a[1] + b[1] + c[1]) / 3.0,
-            (a[2] + b[2] + c[2]) / 3.0,
-        ];
-        let d = norm(sub(centroid, p));
-        if d < best.1 {
-            best = (k, d);
-        }
-    }
-    let seed = comp_faces[best.0];
+    // the first face whose centroid is nearest, the first face when none
+    // is nearer than infinity
+    let nearest = comp_faces
+        .par_iter()
+        .enumerate()
+        .filter_map(|(k, &f)| {
+            let t = m.faces[f as usize];
+            let (a, b, c) = (
+                m.verts[t[0] as usize],
+                m.verts[t[1] as usize],
+                m.verts[t[2] as usize],
+            );
+            let centroid = [
+                (a[0] + b[0] + c[0]) / 3.0,
+                (a[1] + b[1] + c[1]) / 3.0,
+                (a[2] + b[2] + c[2]) / 3.0,
+            ];
+            let d = norm(sub(centroid, p));
+            (d < f64::INFINITY).then_some((d, k))
+        })
+        .reduce_with(|x, y| {
+            if y.0 < x.0 || (y.0 == x.0 && y.1 < x.1) {
+                y
+            } else {
+                x
+            }
+        });
+    let seed = comp_faces[nearest.map_or(0, |(_, k)| k)];
     let mut visited: BTreeSet<u32> = BTreeSet::from([seed]);
     let mut frontier: BTreeSet<u32> = BTreeSet::from([seed]);
     for _ in 0..rings {
@@ -199,7 +328,7 @@ pub fn find_gaps(
 
     let component = |faces: Vec<u32>| -> Component {
         let mut verts: Vec<u32> = faces.iter().flat_map(|&f| m.faces[f as usize]).collect();
-        verts.sort_unstable();
+        threads::install(|| verts.par_sort_unstable());
         verts.dedup();
         if !fusion_verts.is_empty() {
             let kept: Vec<u32> = verts
@@ -239,6 +368,7 @@ pub fn find_gaps(
         Component {
             tree: KdTree::new(coords.clone(), Sum::Plain),
             faces,
+            face_set: OnceLock::new(),
             verts,
             coords,
             fusion_dist,
@@ -266,41 +396,26 @@ pub fn find_gaps(
     for (i, &cid_a) in all_cids.iter().enumerate() {
         for &cid_b in &all_cids[i + 1..] {
             let (da, db) = (&comps[&cid_a], &comps[&cid_b]);
-            let found: Vec<(u32, f64)> = threads::install(|| {
-                da.coords
-                    .par_iter()
-                    .map(|p| db.tree.nearest(p).expect("non-empty"))
-                    .collect()
-            });
-            let first_min = |valid: &dyn Fn(usize) -> bool| {
-                let mut best: Option<(usize, f64)> = None;
-                for (k, &(_, d)) in found.iter().enumerate() {
-                    if valid(k) && best.is_none_or(|(_, b)| d < b) {
-                        best = Some((k, d));
+            let clear_of_fusions;
+            let valid: Option<&(dyn Fn(usize, u32) -> bool + Sync)> =
+                match (&fusion_tree, &da.fusion_dist, &db.fusion_dist) {
+                    (Some(_), Some(fa), Some(fb)) => {
+                        clear_of_fusions = |k: usize, j: u32| {
+                            fa[k] > params.fusion_clear && fb[j as usize] > params.fusion_clear
+                        };
+                        Some(&clear_of_fusions)
                     }
+                    _ => None,
+                };
+            let (raw, kept) = threads::install(|| closest_pair(da, db, valid, params.fusion_clear));
+            let raw_dist = raw.1;
+            let (min_i, cost, ib) = match kept {
+                Some((fi, fd, fj)) if !(fd > params.fusion_fallback && raw_dist >= 1.0) => {
+                    (fi, fd, fj)
                 }
-                best
+                _ => raw,
             };
-            let (raw_i, raw_dist) = first_min(&|_| true).expect("non-empty component");
-            let (min_i, cost) = match (&fusion_tree, &da.fusion_dist, &db.fusion_dist) {
-                (Some(_), Some(fa), Some(fb)) => {
-                    let valid = |k: usize| {
-                        fa[k] > params.fusion_clear && fb[found[k].0 as usize] > params.fusion_clear
-                    };
-                    match first_min(&valid) {
-                        None => (raw_i, raw_dist),
-                        Some((fi, fd)) => {
-                            if fd > params.fusion_fallback && raw_dist >= 1.0 {
-                                (raw_i, raw_dist)
-                            } else {
-                                (fi, fd)
-                            }
-                        }
-                    }
-                }
-                _ => (raw_i, raw_dist),
-            };
-            let ib = found[min_i].0 as usize;
+            let ib = ib as usize;
             let mut mst_cost = cost;
             if cost >= 1.0 {
                 let f = flank(da, min_i, params.kiss_r, svd).min(flank(db, ib, params.kiss_r, svd));
@@ -385,10 +500,24 @@ pub fn find_gaps(
             return false;
         }
         let (ca, cb) = (&comps[&e.a], &comps[&e.b]);
-        let set_a: HashSet<u32> = ca.faces.iter().copied().collect();
-        let set_b: HashSet<u32> = cb.faces.iter().copied().collect();
-        let fa = tip_faces(m, &ca.faces, &set_a, ca.verts[e.ia], params.tip_rings);
-        let fb = tip_faces(m, &cb.faces, &set_b, cb.verts[e.ib], params.tip_rings);
+        let fa = threads::install(|| {
+            tip_faces(
+                m,
+                &ca.faces,
+                ca.face_set(),
+                ca.verts[e.ia],
+                params.tip_rings,
+            )
+        });
+        let fb = threads::install(|| {
+            tip_faces(
+                m,
+                &cb.faces,
+                cb.face_set(),
+                cb.verts[e.ib],
+                params.tip_rings,
+            )
+        });
         if fa.is_empty() || fb.is_empty() {
             return false;
         }

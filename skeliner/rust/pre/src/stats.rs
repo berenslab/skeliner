@@ -1,7 +1,5 @@
 //! Per-face statistics the organelle and gap steps share.
 
-use std::collections::BTreeMap;
-
 use mesh::geometry::HAS_FMA;
 use mesh::spatial::{KdTree, Sum};
 use rayon::prelude::*;
@@ -66,27 +64,35 @@ pub fn outward_dots(
             &one_component
         }
     };
-    // Vertices and faces grouped by label, each group in ascending order.
-    let mut verts_of: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+    // Vertices and faces grouped by label (offset by the lowest, as labels
+    // go negative), each group in ascending order.
+    let lowest = labels.iter().copied().min().unwrap_or(0);
+    let span = labels
+        .iter()
+        .copied()
+        .max()
+        .map_or(0, |m| (m - lowest + 1) as usize);
+    let mut verts_of: Vec<Vec<usize>> = vec![Vec::new(); span];
     for (v, &c) in labels.iter().enumerate() {
-        verts_of.entry(c).or_default().push(v);
+        verts_of[(c - lowest) as usize].push(v);
     }
-    let mut faces_of: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+    let mut faces_of: Vec<Vec<usize>> = vec![Vec::new(); span];
     for (fi, f) in faces.iter().enumerate() {
-        faces_of.entry(labels[f[0] as usize]).or_default().push(fi);
+        faces_of[(labels[f[0] as usize] - lowest) as usize].push(fi);
     }
-    for (c, face_ids) in faces_of {
-        let members = verts_of.get(&c).map_or(&[][..], Vec::as_slice);
-        if members.len() < 4 {
+    for (members, face_ids) in verts_of.iter().zip(&faces_of) {
+        if face_ids.is_empty() || members.len() < 4 {
             continue;
         }
         let tree = KdTree::new(members.iter().map(|&v| verts[v]).collect(), Sum::Plain);
         let dots: Vec<f64> = threads::install(|| {
             face_ids
                 .par_iter()
-                .map(|&fi| {
-                    let near = tree.within(&centers[fi], radius);
-                    face_dot(&centers[fi], &normals[fi], tree.points(), &near)
+                .map_init(Vec::new, |near, &fi| {
+                    near.clear();
+                    tree.within_into(&centers[fi], radius, near);
+                    near.sort_unstable();
+                    face_dot(&centers[fi], &normals[fi], tree.points(), near)
                 })
                 .collect()
         });

@@ -1,3 +1,11 @@
+"""Figures of skeletons and meshes, drawn with matplotlib.
+
+The interactive web viewer is :mod:`skeliner.viewer`.
+"""
+
+import importlib
+import sys
+import warnings
 from typing import Mapping, Sequence
 
 import matplotlib as mpl
@@ -9,7 +17,7 @@ from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.figure import Figure
 from matplotlib.patches import Circle, Ellipse
 
-from ..dataclass import Mesh, MeshComponents, Organelles, Skeleton
+from .dataclass import Mesh, MeshComponents, Organelles, Skeleton
 
 __all__ = [
     "projection",
@@ -1634,7 +1642,7 @@ def diagnose_soma(
     -------
     fig, axes : Figure, list[Axes]
     """
-    # Color scheme — matches skeliner.plot.viewer
+    # Color scheme — matches skeliner.viewer
     SOMA_COLOR = (0.9, 0.5, 0.9)
     POCKET_COLOR = (1.0, 0.15, 0.15)
     ISOLATED_COLOR = (0.15, 0.8, 0.15)
@@ -1793,7 +1801,7 @@ def diagnose_components(
     -------
     fig, axes : Figure, list[Axes]
     """
-    # Color scheme — matches skeliner.plot.viewer post break_up_mesh
+    # Color scheme — matches skeliner.viewer post break_up_mesh
     SOMA_COLOR = (0.9, 0.5, 0.9)
     ORG_COLOR = (1.0, 0.8, 0.0)
     NEURITE_COLORS = [
@@ -2071,3 +2079,26 @@ def diagnose_discarded(
 
     fig.tight_layout()
     return fig, all_axes
+
+
+# `skeliner.plot` held the web viewer too, and these figures as `vis2d`,
+# until the viewer became `skeliner.viewer`
+_MOVED = ("view", "view3d", "view_contacts", "stop_viewer")
+
+
+def __getattr__(name: str):
+    if name in _MOVED:
+        warnings.warn(
+            f"sk.plot.{name}() is deprecated, use sk.viewer.{name}() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return getattr(importlib.import_module("skeliner.viewer"), name)
+    if name == "vis2d":
+        warnings.warn(
+            "sk.plot.vis2d is deprecated, its figures are sk.plot's own.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return sys.modules[__name__]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

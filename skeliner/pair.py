@@ -1749,7 +1749,7 @@ def pick_contacts(contacts: ContactSites, keep: np.ndarray) -> ContactSites:
     The sites where *keep* (one bool per site) is True, as a new
     ``ContactSites`` with everything per site carried along — e.g.
     ``pick_contacts(sites, sites.kind == "crossing")`` for
-    ``sk.plot.view_contacts``.
+    ``sk.viewer.view_contacts``.
     """
     return _subset_contact_sites(contacts, keep)
 

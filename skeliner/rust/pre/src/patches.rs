@@ -7,11 +7,13 @@
 //! face's three column pairs, a degenerate face listed once per pair —
 //! because neighbour counts read those lists directly.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use mesh::Topology;
-use mesh::components::face_edge_components;
+use mesh::components::{face_edge_components, face_edge_components_without};
 use mesh::geometry::{numpy_order, numpy_sum};
+use rayon::prelude::*;
 
 type V3 = [f64; 3];
 type Edge = (u32, u32);
@@ -61,7 +63,7 @@ fn perp(axis: usize) -> [usize; 2] {
 /// `verts[faces].mean(axis=1)`.
 fn centroids(m: &PatchMesh<'_>) -> Vec<V3> {
     m.faces
-        .iter()
+        .par_iter()
         .map(|f| {
             let (a, b, c) = (
                 m.verts[f[0] as usize],
@@ -145,12 +147,17 @@ fn any_face_overlaps(m: &PatchMesh<'_>, fa: &[u32], fb: &[u32], axis: usize) -> 
 
 /// `find_parallel_patches` up to (not including) the sandwich-overlap
 /// filter and the final sort.  `boundaries` are `find_chunk_boundaries`'
-/// planes per axis, in its order.
+/// planes per axis, in its order.  The loops over every face run on
+/// [`threads`]' pool.
 pub fn find_parallel_patches(
     m: &PatchMesh<'_>,
     boundaries: &[(usize, Vec<f64>)],
     p: &FindParams,
 ) -> Vec<Patch> {
+    threads::install(|| find_patches(m, boundaries, p))
+}
+
+fn find_patches(m: &PatchMesh<'_>, boundaries: &[(usize, Vec<f64>)], p: &FindParams) -> Vec<Patch> {
     let nf = m.faces.len();
     let cent = centroids(m);
     let mut results: Vec<Patch> = Vec::new();
@@ -158,18 +165,20 @@ pub fn find_parallel_patches(
     for (axis, bvals) in boundaries {
         let axis = *axis;
         let n_ax = |f: u32| m.normals[f as usize][axis];
-        let mut face_bval = vec![-1i64; nf];
-        let mut near = vec![false; nf];
-        for &bv in bvals {
-            for f in 0..nf {
-                if (cent[f][axis] - bv).abs() < p.boundary_dist {
-                    near[f] = true;
-                    face_bval[f] = round_i64(bv);
-                }
-            }
-        }
+        // the last plane within `boundary_dist` of each face's centroid
+        let face_bval: Vec<Option<i64>> = cent
+            .par_iter()
+            .map(|c| {
+                bvals
+                    .iter()
+                    .rev()
+                    .find(|&&bv| (c[axis] - bv).abs() < p.boundary_dist)
+                    .map(|&bv| round_i64(bv))
+            })
+            .collect();
         let target: Vec<u32> = (0..nf as u32)
-            .filter(|&f| n_ax(f).abs() > p.normal_thresh && near[f as usize])
+            .into_par_iter()
+            .filter(|&f| n_ax(f).abs() > p.normal_thresh && face_bval[f as usize].is_some())
             .collect();
         if target.len() < 2 {
             continue;
@@ -203,7 +212,7 @@ pub fn find_parallel_patches(
                     }
                 }
             }
-            pieces.push((comp, sbv));
+            pieces.push((comp, sbv.expect("a target face is near a plane")));
         }
 
         for (comp, bv) in pieces {
@@ -224,7 +233,7 @@ pub fn find_parallel_patches(
                 let others: Vec<u32> = target
                     .iter()
                     .copied()
-                    .filter(|f| face_bval[*f as usize] == bv && !in_comp.contains(f))
+                    .filter(|f| face_bval[*f as usize] == Some(bv) && !in_comp.contains(f))
                     .collect();
                 if !others.is_empty() {
                     let dirs: Vec<f64> = comp.iter().map(|&f| n_ax(f)).collect();
@@ -256,35 +265,36 @@ pub fn find_parallel_patches(
     }
 
     // faces bordering two or more patch faces join, among faces near any
-    // boundary
+    // boundary: a face's count is, over its edges (a degenerate face's
+    // repeated one twice), how often the patch faces have that edge
     let mut in_patch = vec![false; nf];
+    let mut patch_edges: HashMap<Edge, usize> = HashMap::new();
     for r in &results {
         for &f in &r.faces {
             in_patch[f as usize] = true;
         }
     }
-    let near_any: Vec<u32> = (0..nf as u32)
-        .filter(|&f| {
-            boundaries
-                .iter()
-                .any(|(ax, bv)| bv.iter().any(|&b| (cent[f as usize][*ax] - b).abs() < 30.0))
-        })
-        .collect();
-    let full_e2f = edge_map(m, near_any.into_iter());
-    let mut count: HashMap<u32, usize> = HashMap::new();
-    for f in (0..nf as u32).filter(|&f| in_patch[f as usize]) {
-        for e in face_edges(m.faces[f as usize]) {
-            for &nb in full_e2f.get(&e).map_or(&[][..], Vec::as_slice) {
-                if !in_patch[nb as usize] {
-                    *count.entry(nb).or_insert(0) += 1;
-                }
-            }
+    for f in (0..nf).filter(|&f| in_patch[f]) {
+        for e in face_edges(m.faces[f]) {
+            *patch_edges.entry(e).or_insert(0) += 1;
         }
     }
-    for (nb, c) in count {
-        if c >= 2 {
-            in_patch[nb as usize] = true;
-        }
+    let joining: Vec<usize> = (0..nf)
+        .into_par_iter()
+        .filter(|&f| {
+            !in_patch[f]
+                && face_edges(m.faces[f])
+                    .iter()
+                    .map(|e| patch_edges.get(e).copied().unwrap_or(0))
+                    .sum::<usize>()
+                    >= 2
+                && boundaries
+                    .iter()
+                    .any(|(ax, bv)| bv.iter().any(|&b| (cent[f][*ax] - b).abs() < 30.0))
+        })
+        .collect();
+    for f in joining {
+        in_patch[f] = true;
     }
 
     // merge into connected patches, each sorted, by lowest face
@@ -414,11 +424,28 @@ fn expand_parallel_patches(
     }
     let nf = m.faces.len();
     let expand_dist = 2.0 * boundary_dist;
-    let non_degenerate = (0..nf as u32).filter(|&f| {
-        let t = m.faces[f as usize];
-        t[0] != t[1] && t[1] != t[2] && t[0] != t[2]
-    });
-    let full_ef = edge_map(m, non_degenerate);
+    // a face joins only along a group's axis and near its plane (the tests
+    // below; NaN fails neither there, so it is no reason to leave a face
+    // out here); the edge map need hold no other face
+    let planes: Vec<(usize, f64)> = groups(patches)
+        .iter()
+        .map(|&((axis, bval), _)| (axis, bval as f64))
+        .collect();
+    let candidates: Vec<u32> = (0..nf as u32)
+        .into_par_iter()
+        .filter(|&f| {
+            let (t, n, c) = (m.faces[f as usize], m.normals[f as usize], cent[f as usize]);
+            t[0] != t[1]
+                && t[1] != t[2]
+                && t[0] != t[2]
+                && planes.iter().any(|&(axis, bval)| {
+                    n[axis].abs().partial_cmp(&loose) != Some(Ordering::Less)
+                        && (c[axis] - bval).abs().partial_cmp(&expand_dist)
+                            != Some(Ordering::Greater)
+                })
+        })
+        .collect();
+    let full_ef = edge_map(m, candidates.into_iter());
     let mut expansions: Vec<HashSet<u32>> = patches
         .iter()
         .map(|p| p.faces.iter().copied().collect())
@@ -708,23 +735,26 @@ fn zip_vertex_loops(
 /// `_stitch_mode_b`: per `(axis, bval)` group of patches with Mode B faces,
 /// trace the rims each removed side leaves, pair up-side with down-side
 /// rims (largest first, nearest centre with overlapping bboxes) and zip
-/// each pair.  Returns the new triangles.
+/// each pair.  `topo` is the mesh's before the removal and `gone` the faces
+/// removed.  Returns the new triangles.
 fn stitch_mode_b(
     verts: &[V3],
-    rebuilt: &[[u32; 3]],
+    topo: &Topology,
+    gone: &[bool],
     orig: &[[u32; 3]],
     mode_b: &HashSet<u32>,
     patches: &[Patch],
 ) -> Vec<[u32; 3]> {
-    let mut surv: HashMap<Edge, HashSet<u32>> = HashMap::new();
-    for (fi, f) in rebuilt.iter().enumerate() {
-        if *f == [0, 0, 0] || f[0] == f[1] || f[1] == f[2] || f[0] == f[2] {
-            continue;
-        }
-        for e in [edge(f[0], f[1]), edge(f[1], f[2]), edge(f[0], f[2])] {
-            surv.entry(e).or_default().insert(fi as u32);
-        }
-    }
+    // an edge is a rim edge when exactly one face that has it is left
+    let one_left = |(a, b): Edge| {
+        topo.edge_id(a, b).is_some_and(|e| {
+            topo.edge_faces(e)
+                .iter()
+                .filter(|&&f| !gone[f as usize])
+                .count()
+                == 1
+        })
+    };
     let rim_edges = |side: &HashSet<u32>| -> Vec<Edge> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
@@ -739,7 +769,7 @@ fn stitch_mode_b(
                 if seen.contains(&e) {
                     continue;
                 }
-                if surv.get(&e).is_some_and(|s| s.len() == 1) {
+                if one_left(e) {
                     seen.insert(e);
                     out.push(e);
                 }
@@ -840,7 +870,12 @@ pub struct Removed {
 /// `remove_parallel_patches` on already trimmed patches: classify each
 /// (fold or parallel), remove them all, drop pieces the removal cut off
 /// main that border only fold patches, then stitch the parallel sides.
+/// The loops over every face run on [`threads`]' pool.
 pub fn remove_parallel_patches(m: &PatchMesh<'_>, patches: &[Patch]) -> Removed {
+    threads::install(|| remove_patches(m, patches))
+}
+
+fn remove_patches(m: &PatchMesh<'_>, patches: &[Patch]) -> Removed {
     let nf = m.faces.len();
     let nv = m.verts.len();
     let mut mode_a: HashSet<u32> = HashSet::new();
@@ -873,17 +908,22 @@ pub fn remove_parallel_patches(m: &PatchMesh<'_>, patches: &[Patch]) -> Removed 
     };
     let mut faces = rebuild(&removed);
 
-    let (before, main_before) = face_edge_components(&Topology::new(m.faces, nv));
-    let (after, main_after) = face_edge_components(&Topology::new(&faces, nv));
+    // the removed faces are collapsed to [0, 0, 0], so the mesh after has
+    // the topology before without them
+    let topo = Topology::new(m.faces, nv);
+    let (before, main_before) = face_edge_components(&topo);
+    let (after, main_after) = face_edge_components_without(&topo, &removed);
     let main_before = main_before as i64;
     let main_after = main_after as i64;
     let newly: Vec<u32> = (0..nf as u32)
+        .into_par_iter()
         .filter(|&f| {
             let f = f as usize;
-            before[f] == main_before && faces[f] != [0, 0, 0] && after[f] != main_after
+            before[f] == main_before && !removed[f] && after[f] != main_after
         })
         .collect();
     let mut n_orphan = 0;
+    let mut gone = removed.clone();
     if !newly.is_empty() {
         // an edge of a removed face is "b" if any removed face on it is
         let mut edge_b: HashMap<Edge, bool> = HashMap::new();
@@ -894,31 +934,43 @@ pub fn remove_parallel_patches(m: &PatchMesh<'_>, patches: &[Patch]) -> Removed 
                 *t |= is_b;
             }
         }
-        let comps: HashSet<i64> = newly.iter().map(|&f| after[f as usize]).collect();
-        let mut orphan = vec![false; nf];
-        for c in comps {
-            let members: Vec<u32> = (0..nf as u32).filter(|&f| after[f as usize] == c).collect();
-            let borders_b = members.iter().any(|&f| {
+        // the faces of each component holding a newly cut off face
+        let n_labels = after.iter().max().map_or(0, |&l| (l + 1).max(0) as usize);
+        let mut slot = vec![usize::MAX; n_labels];
+        let mut members: Vec<Vec<u32>> = Vec::new();
+        for &f in &newly {
+            let c = after[f as usize] as usize;
+            if slot[c] == usize::MAX {
+                slot[c] = members.len();
+                members.push(Vec::new());
+            }
+        }
+        for (f, &c) in after.iter().enumerate() {
+            if c >= 0 && slot[c as usize] != usize::MAX {
+                members[slot[c as usize]].push(f as u32);
+            }
+        }
+        for comp in members {
+            let borders_b = comp.iter().any(|&f| {
                 face_edges(m.faces[f as usize])
                     .iter()
                     .any(|e| edge_b.get(e).copied().unwrap_or(false))
             });
             if !borders_b {
-                for f in members {
-                    orphan[f as usize] = true;
+                for f in comp {
+                    gone[f as usize] = true;
                     n_orphan += 1;
                 }
             }
         }
         if n_orphan > 0 {
-            let drop: Vec<bool> = (0..nf).map(|f| removed[f] || orphan[f]).collect();
-            faces = rebuild(&drop);
+            faces = rebuild(&gone);
         }
     }
     let n_removed = removed.iter().filter(|&&r| r).count();
     let mut n_stitched = 0;
     if !mode_b.is_empty() {
-        let new = stitch_mode_b(m.verts, &faces, m.faces, &mode_b, patches);
+        let new = stitch_mode_b(m.verts, &topo, &gone, m.faces, &mode_b, patches);
         n_stitched = new.len();
         faces.extend(new);
     }

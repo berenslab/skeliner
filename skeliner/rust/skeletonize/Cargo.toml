@@ -8,6 +8,8 @@ rust-version.workspace = true
 
 [dependencies]
 mesh.workspace = true
+threads.workspace = true
+rayon.workspace = true
 
 [lints]
 workspace = true

@@ -539,6 +539,9 @@ class TestFindOrganelles:
         assert found["flask", None][0] > 1000
         assert found["internal", None][1] > 0
 
+    @pytest.mark.filterwarnings(
+        r"ignore:sk\.pre\.find_pocket_mouths\(\):DeprecationWarning"
+    )
     def test_the_public_organelle_stages_are_the_same_on_both_paths(
         self, dirty_mesh, reference_mesh
     ):
@@ -795,18 +798,18 @@ class TestFindSomaViaRingCutoff:
             return fit(cls, pts, verts=verts)
 
         monkeypatch.setattr(Soma, "fit", classmethod(counted))
-        rust, python = both(pre.find_soma_via_ring_cutoff, mesh, organelles=org)
+        rust, python = both(pre.find_soma, mesh, organelles=org)
         for k in ("center", "axes", "R", "verts"):
             assert_parity(getattr(rust, k), getattr(python, k), k)
         assert_parity(rust.nucleus, python.nucleus)
         # both paths fit the same points: rings, assignment, pruning,
         # organelle exclusion
         assert len(fits) == 8 and fits[:4] == fits[4:]
-        assert both(pre.find_soma_via_ring_cutoff, _icosphere_soma()) == (None, None)
+        assert both(pre.find_soma, _icosphere_soma()) == (None, None)
 
     def test_finds_the_soma_and_leaves_out_the_organelle(self):
         mesh, org = _soma_cell()
-        soma = pre.find_soma_via_ring_cutoff(mesh, organelles=org)
+        soma = pre.find_soma(mesh, organelles=org)
         assert soma is not None and soma.nucleus is not None
         assert np.abs(soma.center).max() < 100.0
         # the 3 um body, not the neurites tapering away from it
@@ -817,7 +820,7 @@ class TestFindSomaViaRingCutoff:
     def test_no_nucleus(self):
         # every cross-section's hollow is under the 500 nm void minimum
         mesh = trimesh.creation.icosphere(subdivisions=3, radius=300.0)
-        assert pre.find_soma_via_ring_cutoff(mesh) is None
+        assert pre.find_soma(mesh) is None
 
 
 class TestBreakUpMesh:
@@ -833,7 +836,7 @@ class TestBreakUpMesh:
     def test_the_stranded_tip_is_trapped_unless_rescued_on_both_paths(self):
         mesh, org = _soma_cell()
         assert self._cut(mesh, org) > 0
-        soma = pre.find_soma_via_ring_cutoff(mesh, organelles=org)
+        soma = pre.find_soma(mesh, organelles=org)
         found = []
         for kwargs in (
             {},

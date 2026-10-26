@@ -3,6 +3,10 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+use rayon::prelude::*;
+
+use crate::components::LowestRootSets;
+
 /// Adjacency as compressed rows: each vertex's neighbours ascending by id,
 /// the order igraph's `incident` lists them in, with the edge weights.
 #[derive(Debug, Clone)]
@@ -60,31 +64,30 @@ impl WeightedGraph {
     /// Connected components, each ascending, in order of their smallest
     /// vertex — igraph's `components()`.
     pub fn components(&self) -> Vec<Vec<u32>> {
-        let n = self.n_vertices();
-        let mut label = vec![usize::MAX; n];
-        let mut count = 0;
-        let mut stack = Vec::new();
-        for s in 0..n {
-            if label[s] != usize::MAX {
-                continue;
-            }
-            label[s] = count;
-            stack.push(s as u32);
-            while let Some(v) = stack.pop() {
+        threads::install(|| {
+            let n = self.n_vertices();
+            // each set's root is its lowest vertex, so the order holds
+            let sets = LowestRootSets::new(n);
+            (0..n as u32).into_par_iter().for_each(|v| {
                 for &u in self.neighbors(v) {
-                    if label[u as usize] == usize::MAX {
-                        label[u as usize] = count;
-                        stack.push(u);
+                    if u > v {
+                        sets.join(v, u);
                     }
                 }
+            });
+            let roots = sets.roots();
+            let mut slot = vec![usize::MAX; n];
+            let mut out: Vec<Vec<u32>> = Vec::new();
+            for (v, &r) in roots.iter().enumerate() {
+                let r = r as usize;
+                if slot[r] == usize::MAX {
+                    slot[r] = out.len();
+                    out.push(Vec::new());
+                }
+                out[slot[r]].push(v as u32);
             }
-            count += 1;
-        }
-        let mut out = vec![Vec::new(); count];
-        for (v, &c) in label.iter().enumerate() {
-            out[c].push(v as u32);
-        }
-        out
+            out
+        })
     }
 
     /// Shortest-path distance to each vertex marked `inside` from the

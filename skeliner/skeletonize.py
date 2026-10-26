@@ -1,11 +1,12 @@
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from importlib import metadata as _metadata
 from typing import Any
 
 import numpy as np
 
-from ._backend import kernels
+from ._backend import backend, kernels
 from ._core import (
     _bridge_gaps,
     _build_mst,
@@ -14,6 +15,7 @@ from ._core import (
     _prune_neurites,
 )
 from ._state import rebuild_vert2node, vertex_lut
+from ._threads import threads
 from .dataclass import Mesh, MeshComponents, Skeleton, Soma, mesh_args
 
 _SKELINER_VERSION = _metadata.version("skeliner")
@@ -136,6 +138,27 @@ def _timed(label: str, *, verbose: bool):
 def _no_stage(_label: str):
     """Report nothing — the default when a caller wants no progress."""
     return nullcontext()
+
+
+def _recorded(tag: str, into: list[tuple[str, float]]):
+    """A stage reporter that keeps each stage's label and time in *into*, to
+    print once the stage's work is all done (:func:`_print_recorded`)."""
+
+    @contextmanager
+    def stage(label: str):
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            into.append((f"↳  {tag}{label}", time.perf_counter() - t0))
+
+    return stage
+
+
+def _print_recorded(stages: list[tuple[str, float]]) -> None:
+    """Print stages as :func:`_timed` prints them."""
+    for label, dt in stages:
+        print(f" {label:<47} … {dt:.2f} s")
 
 
 # -----------------------------------------------------------------------------
@@ -764,21 +787,15 @@ def _skeletonize_preproc(
     # of the run, and `_timed` holds its sub-messages until the block
     # ends, so nothing would appear while it was actually working.
     n_neurites = len(components.neurites)
-    sub_skeletons = []
-    for i, face_idx in enumerate(components.neurites):
-        neurite_verts = np.unique(mesh.faces[face_idx].ravel()).astype(np.int64)
 
+    def one(i: int, stage):
+        face_idx = components.neurites[i]
+        neurite_verts = np.unique(mesh.faces[face_idx].ravel()).astype(np.int64)
         seed_vid = _pick_neurite_seed(
             neurite_verts,
             mesh_vertices,
             soma,
         )
-
-        tag = f"neurite {i}: " if n_neurites > 1 else ""
-
-        def stage(label, _tag=tag):
-            return _timed(f"↳  {_tag}{label}", verbose=verbose)
-
         sub = _skeletonize_component(
             mesh,
             sgraph,
@@ -792,12 +809,42 @@ def _skeletonize_preproc(
             second_pass=second_pass,
             stage=stage,
         )
-        sub_skeletons.append(sub)
+        return len(neurite_verts), sub
+
+    def made(i: int, n_verts: int, sub) -> None:
         if verbose:
             print(
-                f"      └─ neurite {i}: {len(neurite_verts):,} verts "
-                f"→ {sub[0].shape[0]:,} nodes"
+                f"      └─ neurite {i}: {n_verts:,} verts → {sub[0].shape[0]:,} nodes"
             )
+
+    tags = [f"neurite {i}: " if n_neurites > 1 else "" for i in range(n_neurites)]
+    # The neurites are independent and the Rust path's kernels let go of the
+    # GIL, so there they run at once, each on a thread; a neurite's stages
+    # then print when all are done, in order.
+    workers = min(n_neurites, threads.get()) if backend.get() == "rust" else 1
+    sub_skeletons = []
+    if workers > 1:
+        reports: list[list[tuple[str, float]]] = [[] for _ in range(n_neurites)]
+        with ThreadPoolExecutor(workers) as pool:
+            done = list(
+                pool.map(
+                    lambda i: one(i, _recorded(tags[i], reports[i])), range(n_neurites)
+                )
+            )
+        for i, (n_verts, sub) in enumerate(done):
+            if verbose:
+                _print_recorded(reports[i])
+            made(i, n_verts, sub)
+            sub_skeletons.append(sub)
+    else:
+        for i in range(n_neurites):
+
+            def stage(label, _tag=tags[i]):
+                return _timed(f"↳  {_tag}{label}", verbose=verbose)
+
+            n_verts, sub = one(i, stage)
+            made(i, n_verts, sub)
+            sub_skeletons.append(sub)
 
     # -- assemble skeleton -----------------------------------------
     if has_soma:

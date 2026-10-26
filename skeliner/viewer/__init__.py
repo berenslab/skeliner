@@ -1,10 +1,8 @@
-from .vis2d import details, node_details, projection, threeviews
+"""The interactive web viewer: meshes, skeletons and their annotations in
+the browser, served by a small local app.  Its dependencies load on first
+use."""
 
 __all__ = [
-    "details",
-    "node_details",
-    "projection",
-    "threeviews",
     "view",
     "view3d",
     "view_contacts",

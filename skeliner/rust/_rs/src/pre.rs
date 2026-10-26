@@ -1241,7 +1241,7 @@ fn break_up_classify<'py>(
 /// stands, the soma's vertices, the cutoff ring and the last ring.
 type SomaOut<'py> = (usize, Bound<'py, PyArray1<i64>>, usize, usize);
 
-/// `skeliner.pre.find_soma_via_ring_cutoff` from the nucleus on.
+/// `skeliner.pre.find_soma` from the nucleus on.
 ///
 /// `fit(ids, refit)` fits the soma to vertices `ids` (ascending int64) and
 /// returns `(center, W, smallest axis)`, or None when a refit fails; the

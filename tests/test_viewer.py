@@ -1,4 +1,4 @@
-"""Tests for skeliner.plot.viewer — the interactive server.
+"""Tests for skeliner.viewer — the interactive server.
 
 The viewer mirrors an operation's terminal output into the browser over
 the WebSocket, which is the only sign a long-running step is moving.
@@ -15,7 +15,7 @@ import pytest
 import trimesh
 
 from skeliner.dataclass import Discarded, Neurites, Organelles, Soma
-from skeliner.plot.viewer import _LogTee, _create_app
+from skeliner.viewer.viewer import _LogTee, _create_app
 from skeliner.skeletonize import _timed
 
 
@@ -119,7 +119,7 @@ def reassign_client(tmp_path, monkeypatch):
     """A viewer serving a tube whose components are already derived."""
     from starlette.testclient import TestClient
 
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
     mesh, soma, org, neurites = _tube_with_components()
@@ -338,7 +338,7 @@ def bin_client(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
 
     from skeliner import skeletonize
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
     mesh = trimesh.creation.cylinder(radius=40.0, height=1200.0, sections=24)
@@ -590,7 +590,7 @@ def rescue_client(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
 
     from skeliner import pre
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
 
@@ -1172,7 +1172,7 @@ def loop_client(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
 
     from skeliner import skeletonize
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
     mesh = trimesh.creation.torus(
@@ -1638,7 +1638,7 @@ def named_client(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
 
     from skeliner import pre
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
 
@@ -1877,7 +1877,7 @@ def drop_files(tmp_path):
 def drop_client(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
 
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path / "state", raising=False)
     with TestClient(_create_app(port=8913)) as client:
@@ -2038,7 +2038,7 @@ def _skel_defaults_tracks():
     import re
     from pathlib import Path
 
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     html = Path(viewer_mod.__file__).with_name("viewer.html").read_text()
     block = html.split("const SKEL_DEFAULTS = {")[1].split("\n            };")[0]
@@ -2112,7 +2112,7 @@ def _skel_defaults_values():
     import re
     from pathlib import Path
 
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     html = Path(viewer_mod.__file__).with_name("viewer.html").read_text()
     block = html.split("const SKEL_DEFAULTS = {")[1].split("\n            };")[0]
@@ -2168,7 +2168,7 @@ def _mode_wiring():
     import re
     from pathlib import Path
 
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     html = Path(viewer_mod.__file__).with_name("viewer.html").read_text()
 
@@ -2241,7 +2241,7 @@ def mismatch_client(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
 
     from skeliner import skeletonize
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
     own = trimesh.creation.cylinder(radius=40.0, height=1200.0, sections=24)
@@ -2355,7 +2355,7 @@ def test_the_dropdown_offers_exactly_the_diagnostics_that_exist(bin_client):
     import re
     from pathlib import Path
 
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     client, name, _mesh, _skel = bin_client
     html = Path(viewer_mod.__file__).with_name("viewer.html").read_text()
@@ -2395,7 +2395,7 @@ def test_the_diagnostics_are_listed_in_the_order_dx_lists_them():
     from pathlib import Path
 
     from skeliner import dx
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     html = Path(viewer_mod.__file__).with_name("viewer.html").read_text()
     sel = re.search(r'id="dxKindSel".*?</select>', html, re.S | re.I)
@@ -2520,7 +2520,7 @@ def test_a_marker_lands_exactly_on_the_node_it_marks(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
 
     from skeliner import skeletonize
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
     mesh = trimesh.creation.cylinder(radius=40.0, height=1200.0, sections=24)
@@ -2574,7 +2574,7 @@ def test_a_loop_is_drawn_so_it_can_be_traced(tmp_path, monkeypatch):
 
     from skeliner import post, skeletonize
     from skeliner.io import load_mesh
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
     mesh = load_mesh(Path(__file__).parent / "data" / "60427.obj")
@@ -2639,7 +2639,7 @@ def _focus_wiring():
     import re
     from pathlib import Path
 
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     html = Path(viewer_mod.__file__).with_name("viewer.html").read_text()
     defined = set(re.findall(r"function (focusOn\w+)\(", html))
@@ -2698,14 +2698,14 @@ def two_kinds():
 
 
 def _overlay(a, b, sites, **kw):
-    from skeliner.plot.viewer import _contact_overlay
+    from skeliner.viewer.viewer import _contact_overlay
 
     args = dict(sides="both", show_aabb=True, aabb_mode="union", color_by="kind")
     return _contact_overlay(a, b, np.zeros(3), sites, **{**args, **kw})
 
 
 def test_contact_sites_are_coloured_and_labelled_by_kind(two_kinds):
-    from skeliner.plot.viewer import _KIND_COLORS
+    from skeliner.viewer.viewer import _KIND_COLORS
 
     a, b, sites = two_kinds
     assert sorted(sites.kind.tolist()) == ["crossing", "other"]
@@ -2719,7 +2719,7 @@ def test_contact_sites_are_coloured_and_labelled_by_kind(two_kinds):
 
 
 def test_colouring_by_site_keeps_the_kinds_in_the_labels(two_kinds):
-    from skeliner.plot.viewer import _SITE_COLORS
+    from skeliner.viewer.viewer import _SITE_COLORS
 
     a, b, sites = two_kinds
     ann, state = _overlay(a, b, sites, color_by="site")
@@ -2731,7 +2731,7 @@ def test_colouring_by_site_keeps_the_kinds_in_the_labels(two_kinds):
 
 def test_sites_without_kinds_look_as_before(two_kinds):
     from skeliner import pair
-    from skeliner.plot.viewer import _SITE_COLORS
+    from skeliner.viewer.viewer import _SITE_COLORS
 
     a, b, _ = two_kinds
     plain = pair.scan_contacts(a, b, tol=20.0, label=False)

@@ -1,4 +1,4 @@
-//! `skeliner.pre.find_soma_via_ring_cutoff` and `_assign_soma_verts`.
+//! `skeliner.pre.find_soma` (the ring cutoff) and `_assign_soma_verts`.
 //!
 //! Rings of vertices grow outward from the nucleus seeds over the soma's
 //! component; the soma ends where the largest connected piece of a ring
@@ -450,7 +450,7 @@ fn assign_soma_verts<E>(
     cur.refit(soma_set.sorted(), fit)
 }
 
-/// `find_soma_via_ring_cutoff` from the nucleus on: everything but the
+/// `find_soma` from the nucleus on: everything but the
 /// nucleus scan, the ellipsoid fits (`fit`) and the verbose report.
 pub fn ring_cutoff<E>(
     m: &SomaMesh<'_>,
@@ -638,7 +638,7 @@ pub fn ring_cutoff<E>(
     })
 }
 
-/// Step 6 of `find_soma_via_ring_cutoff`: drop neurite tubes reaching far
+/// Step 6 of `find_soma`: drop neurite tubes reaching far
 /// out of the initial ellipsoid, erode the stubs at each neurite exit, keep
 /// the largest connected piece, and refit if the vertex count changed.
 fn prune<E>(

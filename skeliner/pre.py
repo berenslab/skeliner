@@ -1,6 +1,7 @@
 """skeliner.pre – mesh preprocessing utilities."""
 
 import copy
+import functools
 import time
 import warnings
 from collections import Counter, defaultdict, deque
@@ -41,6 +42,7 @@ __all__ = [
     "find_nucleus_center",
     "find_organelles",
     "find_parallel_patches",
+    "find_soma",
     "find_soma_via_ring_cutoff",
     "preprocess",
     "preview_reassignment",
@@ -82,6 +84,27 @@ def _timed(label: str, *, verbose: bool):
         print(f" {dt:.2f} s")
         for m in _msgs:
             print(f"      └─ {m}")
+
+
+def _deprecated(instead: str | None = None):
+    """Mark a public function deprecated: each call warns, at the caller's
+    line, naming *instead* when there is something to use in its place.
+    The outermost decorator, so that the warning skips the others' frames
+    (a warning placed inside skeliner is not shown by default)."""
+
+    def wrap(fn):
+        message = f"sk.pre.{fn.__name__}() is deprecated and will be removed"
+        if instead:
+            message += f"; use {instead} instead"
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            warnings.warn(message, DeprecationWarning, stacklevel=2)
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return wrap
 
 
 _non_degenerate = _py_mesh.non_degenerate
@@ -133,6 +156,7 @@ def _face_edge_components(mesh: Mesh) -> tuple[np.ndarray, int]:
     return kernels.pre.face_edge_components(faces, len(mesh.vertices))
 
 
+@_deprecated()
 @mesh_args()
 def find_holes(
     mesh: Mesh,
@@ -140,6 +164,9 @@ def find_holes(
     verbose: bool = False,
 ) -> list[list[int]]:
     """Find boundary loops (holes) in the main surface of the mesh.
+
+    .. deprecated::
+        Neither the pipeline nor the viewer uses it; it will be removed.
 
     A hole is a closed loop of boundary edges — edges used by exactly
     one face.  Only holes in the main edge-adjacency component are
@@ -159,6 +186,11 @@ def find_holes(
         Each element is an ordered list of vertex indices forming one
         boundary loop.
     """
+    return _find_holes(mesh, verbose)
+
+
+def _find_holes(mesh: Mesh, verbose: bool) -> list[list[int]]:
+    """The boundary loops :func:`find_holes` returns."""
     face_comp, main_comp = _face_edge_components(mesh)
 
     # Build edge → face mapping and identify boundary edges
@@ -716,6 +748,7 @@ def _fill_dome(
     return new_verts, np.array(faces, dtype=np.int64)
 
 
+@_deprecated()
 @mesh_args()
 def fill_holes(
     mesh: Mesh,
@@ -727,6 +760,9 @@ def fill_holes(
     verbose: bool = False,
 ) -> Mesh:
     """Fill holes in the mesh.
+
+    .. deprecated::
+        Neither the pipeline nor the viewer uses it; it will be removed.
 
     Parameters
     ----------
@@ -766,7 +802,7 @@ def fill_holes(
         if verbose:
             print(f"[skeliner.pre] Using provided holes ({len(loops)} loops)")
     else:
-        loops = find_holes(mesh, verbose=verbose)
+        loops = _find_holes(mesh, verbose)
     if not loops:
         return mesh
 
@@ -1330,6 +1366,7 @@ def _find_fin_faces(
     return total_mask
 
 
+@_deprecated()
 @mesh_args()
 def find_fragments(
     mesh: Mesh,
@@ -1338,6 +1375,9 @@ def find_fragments(
     verbose: bool = False,
 ) -> np.ndarray:
     """Detect all fragment faces (islands and fins) without modifying the mesh.
+
+    .. deprecated::
+        Neither the pipeline nor the viewer uses it; it will be removed.
 
     Alternates island and fin detection on a boolean mask until stable,
     exactly mirroring the logic of :func:`remove_fragments`.
@@ -1356,6 +1396,11 @@ def find_fragments(
     np.ndarray
         Boolean mask ``(nFaces,)`` — fragment faces (islands + fins).
     """
+    return _find_fragments(mesh, min_faces, verbose)
+
+
+def _find_fragments(mesh: Mesh, min_faces: int, verbose: bool) -> np.ndarray:
+    """The fragment mask :func:`find_fragments` returns."""
     faces = mesh.faces
     active = np.ones(len(faces), dtype=bool)
     fragment = np.zeros(len(faces), dtype=bool)
@@ -1387,21 +1432,35 @@ _otsu_threshold = _py_pre.otsu_threshold
 
 
 @mesh_args()
-def find_soma_via_ring_cutoff(
+def find_soma(
     mesh: Mesh,
     *,
     organelles: Organelles | None = None,
     verbose: bool = False,
     mesh_stats: MeshStats | None = None,
 ) -> Soma | None:
-    """Soma detection via BFS ring analysis + Otsu cutoff.
+    """Find the soma by its ring cutoff: rings of vertices grown over the
+    surface from the nucleus widen through the soma and narrow into the
+    neurites, and the soma ends where they narrow.
 
-    Uses :func:`find_nucleus_center` to locate the soma centre, then
-    grows a BFS flood on the main-component surface outward from that
-    centre.  The soma boundary is where the largest connected ring
-    component peaks and drops (Otsu on post-peak sizes).
+    1. The nucleus (:func:`find_nucleus_center`): its void in the mesh's
+       Z-slices gives the centre, the nucleus' height, and the seeds — the
+       soma surface's vertices at the nucleus' middle Z-level.
+    2. Rings: breadth-first over the component most seeds lie on, from the
+       seeds (or from its vertex nearest the centre), one ring per step.
+    3. The cutoff: the largest connected piece of each ring grows to a
+       peak inside the soma and falls once the rings pass into the
+       neurites; the soma ends at the first ring after the peak whose
+       piece is under Otsu's threshold of the sizes from the peak on.  The
+       peak is sought within three nucleus heights of rings, and the soma
+       spans at least one.
+    4. The soma: an ellipsoid fitted to the rings up to the cutoff, which
+       then claims the vertices inside it, absorbs small pockets, sheds the
+       neurite stubs at its exits and lets go of vertices that only
+       organelle faces hold, refitted as its vertices change.
 
-    All internal thresholds are derived from the mesh data.
+    All thresholds are derived from the mesh.  It was
+    ``find_soma_via_ring_cutoff``, now a deprecated alias.
 
     Parameters
     ----------
@@ -1477,7 +1536,7 @@ def _ring_cutoff_soma(
     main: int,
     organelles: Organelles,
 ) -> tuple["Soma", int, int]:
-    """The soma :func:`find_soma_via_ring_cutoff` grows from nucleus *nuc*:
+    """The soma :func:`find_soma` grows from nucleus *nuc*:
     ``(soma, cutoff ring, last ring)``.
 
     The rings, vertex assignment and pruning run in Rust; each ellipsoid
@@ -1663,7 +1722,7 @@ def break_up_mesh(
     ----------
     mesh : Mesh
     soma : Soma or None
-        From ``find_soma_via_ring_cutoff`` (must have ``.verts``).
+        From :func:`find_soma` (must have ``.verts``).
         Pass ``None`` if the mesh has no soma.
     organelles : Organelles
         From :func:`find_organelles`.
@@ -2136,6 +2195,7 @@ def apply_reassignment(
     components.discarded = after.discarded
 
 
+@_deprecated("find_soma()")
 @mesh_args()
 def find_soma_via_neurite_exclusion(
     mesh: Mesh,
@@ -2147,8 +2207,7 @@ def find_soma_via_neurite_exclusion(
     """Estimate soma by per-tip neurite exclusion.
 
     .. deprecated::
-        Prefer :func:`find_soma_via_ring_cutoff`, which is the promoted
-        soma detection method.
+        Use :func:`find_soma`.
 
     Approach:
       0. Organelle clustering → soma center
@@ -2163,13 +2222,6 @@ def find_soma_via_neurite_exclusion(
       4. Fit ellipsoid to the cleaned set
     """
     from scipy.spatial import KDTree
-
-    warnings.warn(
-        "find_soma_via_neurite_exclusion is deprecated, "
-        "use find_soma_via_ring_cutoff instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
 
     if mesh_stats is not None and mesh_stats.face_comp is not None:
         labels, main = mesh_stats.face_comp, mesh_stats.main_ci
@@ -2569,6 +2621,7 @@ def find_soma_via_neurite_exclusion(
     return soma
 
 
+@_deprecated("find_soma()")
 @mesh_args()
 def find_soma_via_geodesic(
     mesh: Mesh,
@@ -2580,8 +2633,7 @@ def find_soma_via_geodesic(
     """Experimental soma detection — geodesic proximity + mass boundary.
 
     .. deprecated::
-        Prefer :func:`find_soma_via_ring_cutoff`, which is the promoted
-        soma detection method.
+        Use :func:`find_soma`.
 
     Work-in-progress.  Key differences from
     :func:`find_soma_via_neurite_exclusion`:
@@ -2596,12 +2648,6 @@ def find_soma_via_geodesic(
       3. Per-tip neurite exclusion (same).
       4. Fit ellipsoid (same).
     """
-    warnings.warn(
-        "find_soma_via_geodesic is deprecated, use find_soma_via_ring_cutoff instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-
     if mesh_stats is not None and mesh_stats.face_comp is not None:
         labels, main = mesh_stats.face_comp, mesh_stats.main_ci
     else:
@@ -3113,7 +3159,7 @@ def find_disconnected(
         labels, main = _refine_components_with_fusions(mesh, labels, main, fusions)
     # Locate soma so we can exclude components inside it
     if soma is None:
-        soma = find_soma_via_ring_cutoff(
+        soma = find_soma(
             mesh,
             organelles=organelles,
             mesh_stats=mesh_stats,
@@ -3489,6 +3535,7 @@ def _bridge_gaps(mesh, gaps, labels):
     return result, n_bridged, n_removed, n_skipped
 
 
+@_deprecated()
 @mesh_args()
 def remove_islands(
     mesh: Mesh,
@@ -3497,6 +3544,9 @@ def remove_islands(
     verbose: bool = False,
 ) -> Mesh:
     """Remove small edge-disconnected components (islands).
+
+    .. deprecated::
+        Neither the pipeline nor the viewer uses it; it will be removed.
 
     An island is a cluster of faces that shares no edge with the main
     surface — it may touch via a vertex, but has no edge connectivity.
@@ -3533,6 +3583,7 @@ def remove_islands(
     return clean
 
 
+@_deprecated()
 @mesh_args()
 def remove_fins(
     mesh: Mesh,
@@ -3540,6 +3591,9 @@ def remove_fins(
     verbose: bool = False,
 ) -> Mesh:
     """Remove fin faces — faces with 2+ boundary edges.
+
+    .. deprecated::
+        Neither the pipeline nor the viewer uses it; it will be removed.
 
     A fin is a face hanging off the surface by a single edge (2 of its
     3 edges are boundary edges).  This iterates until no more fins
@@ -3562,6 +3616,7 @@ def remove_fins(
     return result
 
 
+@_deprecated()
 @mesh_args()
 def remove_fragments(
     mesh: Mesh,
@@ -3571,6 +3626,9 @@ def remove_fragments(
     fragments: np.ndarray | None = None,
 ) -> Mesh:
     """Remove all fragments (islands and fins) by alternating until convergence.
+
+    .. deprecated::
+        Neither the pipeline nor the viewer uses it; it will be removed.
 
     Islands are small edge-disconnected components; fins are faces
     hanging by a single edge.  Removing one type can create the other,
@@ -3598,7 +3656,7 @@ def remove_fragments(
                 f"[skeliner.pre] Using provided fragment mask ({int(fragment.sum()):,} faces)"
             )
     else:
-        fragment = find_fragments(mesh, min_faces=min_faces, verbose=verbose)
+        fragment = _find_fragments(mesh, min_faces, verbose)
 
     n_removed = int(fragment.sum())
     if n_removed == 0:
@@ -3730,6 +3788,7 @@ def _report_mesh_stats(face_comp, outward_dots, radius, n_faces, t0) -> None:
     )
 
 
+@_deprecated()
 @mesh_args()
 def find_pocket_mouths(
     mesh: Mesh,
@@ -3743,6 +3802,9 @@ def find_pocket_mouths(
     _non_main_mask: np.ndarray | None = None,
 ) -> list[list[tuple[int, int]]]:
     """Find mouth edges — boundaries of negative-dot face clusters.
+
+    .. deprecated::
+        Neither the pipeline nor the viewer uses it; it will be removed.
 
     A valid pocket must satisfy:
 
@@ -4404,7 +4466,7 @@ def remove_organelles(
     Examples
     --------
     org = find_organelles(mesh, verbose=True)
-    soma = find_soma_via_ring_cutoff(mesh, organelles=org)
+    soma = find_soma(mesh, organelles=org)
     clean = remove_organelles(mesh, organelles=org)
     # soma.verts is still valid on clean — no remapping needed
     """
@@ -4916,8 +4978,10 @@ def compact_mesh(
     good = ~np.all(mesh.faces == mesh.faces[:, :1], axis=1)
     live_faces = mesh.faces[good]
 
-    referenced = np.sort(np.unique(live_faces.ravel()))
     n_old = len(mesh.vertices)
+    used = np.zeros(n_old, dtype=bool)
+    used[live_faces.ravel()] = True
+    referenced = np.flatnonzero(used)
     vert_map = np.full(n_old, -1, dtype=np.int64)
     vert_map[referenced] = np.arange(len(referenced), dtype=np.int64)
 
@@ -5010,7 +5074,7 @@ def preprocess(
 
       1. find_parallel_patches → remove_parallel_patches
       2. find_organelles
-      3. find_soma_via_ring_cutoff
+      3. find_soma
       4. find_fusions → find_disconnected → find_gaps
       5. remove_gaps → remove_fusions
       6. break_up_mesh
@@ -5069,7 +5133,7 @@ def preprocess(
 
     # 3. Soma
     with _timed("↳  find soma", verbose=verbose) as log:
-        soma = find_soma_via_ring_cutoff(mesh, organelles=org, mesh_stats=mesh_stats)
+        soma = find_soma(mesh, organelles=org, mesh_stats=mesh_stats)
         if soma is not None:
             log(f"center={soma.center.round(0).tolist()}")
         else:
@@ -5512,6 +5576,7 @@ def _soma_hulls(
     return {i: hulls[i] for i in accepted}, extend_lo, extend_hi
 
 
+@_deprecated("find_soma()")
 @mesh_args()
 def find_soma_via_z_contour(
     mesh: Mesh,
@@ -5524,8 +5589,7 @@ def find_soma_via_z_contour(
     """Detect the soma by first locating the nucleus void.
 
     .. deprecated::
-        Prefer :func:`find_soma_via_ring_cutoff`, which is the promoted
-        soma detection method.
+        Use :func:`find_soma`.
 
     Uses :func:`_z_scan` (fast) to find the nucleus, then builds
     per-Z soma hulls with neurite protrusions stripped via
@@ -5550,11 +5614,6 @@ def find_soma_via_z_contour(
     -------
     Soma or None
     """
-    warnings.warn(
-        "find_soma_via_z_contour is deprecated, use find_soma_via_ring_cutoff instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
     from shapely.geometry import Point
 
     _p = "[find_soma_via_z_contour]"
@@ -5714,13 +5773,11 @@ def find_soma_via_z_contour(
 
 
 def _deprecated_alias(old_name: str, new_func):
-    import functools
-    import warnings
-
     @functools.wraps(new_func)
     def wrapper(*args, **kwargs):
         warnings.warn(
-            f"{old_name}() is deprecated, use {new_func.__name__}() instead.",
+            f"sk.pre.{old_name}() is deprecated and will be removed; "
+            f"use {new_func.__name__}() instead",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -5729,4 +5786,4 @@ def _deprecated_alias(old_name: str, new_func):
     return wrapper
 
 
-find_soma = _deprecated_alias("find_soma", find_soma_via_neurite_exclusion)
+find_soma_via_ring_cutoff = _deprecated_alias("find_soma_via_ring_cutoff", find_soma)

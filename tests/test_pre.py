@@ -24,6 +24,12 @@ from skeliner.pre import _non_degenerate
 from ._parity import assert_parity, both
 
 
+#: Tests of a deprecated function, which warns on every call
+deprecated = pytest.mark.filterwarnings(
+    r"ignore:sk\.pre\.\w+\(\) is deprecated:DeprecationWarning"
+)
+
+
 def _live_faces(mesh):
     """Count non-degenerate faces (degenerate = removed by _rebuild_mesh)."""
     return int(_non_degenerate(mesh.faces).sum())
@@ -244,6 +250,7 @@ class TestFaceEdgeComponents:
 # ── find_holes / fill_holes ──────────────────────────────────────────
 
 
+@deprecated
 class TestFindHoles:
     def test_watertight_has_no_holes(self):
         mesh = _icosphere()
@@ -267,6 +274,7 @@ class TestFindHoles:
                 assert 0 <= vid < len(mesh.vertices)
 
 
+@deprecated
 class TestFillHoles:
     @pytest.mark.parametrize("method", ["advancing_front", "dome"])
     def test_fill_reduces_holes(self, method):
@@ -293,6 +301,7 @@ class TestFillHoles:
 # ── find_fragments / remove_fragments ────────────────────────────────
 
 
+@deprecated
 class TestFindFragments:
     def test_clean_mesh_no_fragments(self):
         mesh = _icosphere()
@@ -324,6 +333,7 @@ class TestFindFragments:
         assert mask.sum() >= 1
 
 
+@deprecated
 class TestRemoveFragments:
     def test_removes_islands(self):
         mesh = _mesh_with_island(n_island_faces=2)
@@ -353,6 +363,7 @@ class TestRemoveFragments:
 # ── remove_islands / remove_fins ─────────────────────────────────────
 
 
+@deprecated
 class TestRemoveIslands:
     def test_removes_small_components(self):
         mesh = _mesh_with_island(n_island_faces=2)
@@ -370,6 +381,7 @@ class TestRemoveIslands:
         assert _live_faces(clean) == _live_faces(mesh)
 
 
+@deprecated
 class TestRemoveFins:
     def test_removes_dangling_faces(self):
         mesh = _mesh_with_fin()
@@ -781,14 +793,43 @@ class TestRescueSize:
         assert pre._rescue_size(labels, counts, fa, fb) == smaller
 
 
-# ── find_soma_via_ring_cutoff ─────────────────────────────────────────
+# ── find_soma ─────────────────────────────────────────
 
 
 class TestFindSoma:
     def test_no_fragments_returns_none(self):
         mesh = _icosphere()
-        soma = pre.find_soma_via_ring_cutoff(mesh)
+        soma = pre.find_soma(mesh)
         assert soma is None
+
+
+@pytest.mark.parametrize(
+    "name, instead",
+    [
+        ("find_holes", None),
+        ("fill_holes", None),
+        ("find_fragments", None),
+        ("remove_fragments", None),
+        ("remove_islands", None),
+        ("remove_fins", None),
+        ("find_pocket_mouths", None),
+        ("find_soma_via_neurite_exclusion", "find_soma"),
+        ("find_soma_via_geodesic", "find_soma"),
+        ("find_soma_via_z_contour", "find_soma"),
+        ("find_soma_via_ring_cutoff", "find_soma"),
+    ],
+)
+def test_a_deprecated_function_warns_at_the_line_that_calls_it(name, instead):
+    pattern = rf"sk\.pre\.{name}\(\) is deprecated"
+    with pytest.warns(DeprecationWarning, match=pattern) as caught:
+        try:
+            getattr(pre, name)(_icosphere())
+        except Exception:
+            pass  # what the call does is not the point
+    (warning,) = [w for w in caught if name in str(w.message)]
+    assert warning.filename == __file__
+    if instead:
+        assert f"use {instead}()" in str(warning.message)
 
 
 # ── find_organelles (isolated) ───────────────────────────────────────
@@ -1533,10 +1574,12 @@ def reference_mesh():
 
 
 class TestRealMesh:
+    @deprecated
     def test_find_holes_returns_list(self, reference_mesh):
         holes = pre.find_holes(reference_mesh)
         assert isinstance(holes, list)
 
+    @deprecated
     def test_find_fragments_returns_mask(self, reference_mesh):
         mask = pre.find_fragments(reference_mesh)
         assert mask.shape == (len(reference_mesh.faces),)
@@ -1546,6 +1589,7 @@ class TestRealMesh:
         comps = pre.find_disconnected(reference_mesh)
         assert isinstance(comps, list)
 
+    @deprecated
     def test_remove_fragments_preserves_main(self, reference_mesh):
         clean = pre.remove_fragments(reference_mesh)
         # Should keep at least 90% of faces (main component)

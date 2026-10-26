@@ -214,8 +214,10 @@ mod tests {
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use mesh::Topology;
+use mesh::components::LowestRootSets;
 use mesh::geometry::numpy_sum;
 use mesh::spatial::{KdTree, Sum};
+use rayon::prelude::*;
 
 use crate::fits::Svd;
 
@@ -278,6 +280,43 @@ fn components_where(s: &Surface<'_>, inside: impl Fn(usize) -> bool) -> Vec<Vec<
     comps
 }
 
+/// [`components_where`]'s components with each one's faces ascending: the
+/// same faces, the components in the same order (by lowest face), for the
+/// passes that read no order inside one.
+fn components_where_unordered(
+    s: &Surface<'_>,
+    inside: impl Fn(usize) -> bool + Sync,
+) -> Vec<Vec<u32>> {
+    let n = s.faces.len();
+    let is_in: Vec<bool> = (0..n).into_par_iter().map(&inside).collect();
+    let sets = LowestRootSets::new(n);
+    (0..s.topo.n_edges()).into_par_iter().for_each(|e| {
+        let mut on = s
+            .topo
+            .edge_faces(e)
+            .iter()
+            .copied()
+            .filter(|&f| is_in[f as usize]);
+        if let Some(first) = on.next() {
+            for f in on {
+                sets.join(first, f);
+            }
+        }
+    });
+    let roots = sets.roots();
+    let mut slot = vec![usize::MAX; n];
+    let mut comps: Vec<Vec<u32>> = Vec::new();
+    for f in (0..n).filter(|&f| is_in[f]) {
+        let r = roots[f] as usize;
+        if slot[r] == usize::MAX {
+            slot[r] = comps.len();
+            comps.push(Vec::new());
+        }
+        comps[slot[r]].push(f as u32);
+    }
+    comps
+}
+
 /// What [`isolated_organelles`] found.
 #[derive(Debug, Clone, Default)]
 pub struct Isolated {
@@ -316,46 +355,61 @@ pub fn isolated_organelles(s: &Fragments<'_>, face_comp: &[i64], main: i64) -> I
         }
     }
     let main_faces: Vec<usize> = (0..n).filter(|&f| face_comp[f] == main).collect();
-    let mut tree: Option<KdTree> = None;
+    let others: Vec<&Vec<usize>> = by_comp
+        .iter()
+        .enumerate()
+        .filter(|&(ci, fis)| ci as i64 != main && !fis.is_empty())
+        .map(|(_, fis)| fis)
+        .collect();
+    let by_dots = |fis: &[usize]| fis.iter().any(|&f| s.dots[f] != 0.0);
+    // the main faces' tree, for components whose outward dots are all zero
+    let tree = others.iter().any(|fis| !by_dots(fis)).then(|| {
+        KdTree::new(
+            main_faces.iter().map(|&f| s.centers[f]).collect(),
+            Sum::Plain,
+        )
+    });
+    // each component: whether it points inward, and whether by its dots
+    let decided: Vec<(bool, bool)> = threads::install(|| {
+        others
+            .par_iter()
+            .map(|fis| {
+                let n_valid = fis.iter().filter(|&&f| s.dots[f] != 0.0).count();
+                if n_valid > 0 {
+                    let neg = fis.iter().filter(|&&f| s.dots[f] < 0.0).count();
+                    return (neg as f64 > n_valid as f64 / 2.0, true);
+                }
+                let tree = tree.as_ref().expect("built for these");
+                let mut vids: Vec<u32> = fis.iter().flat_map(|&f| s.faces[f]).collect();
+                vids.sort_unstable();
+                vids.dedup();
+                let mut neg = 0usize;
+                for &v in &vids {
+                    let p = s.verts[v as usize];
+                    let (j, _) = tree.nearest(&p).expect("main has faces");
+                    let f = main_faces[j as usize];
+                    let (c, nr) = (s.centers[f], s.normals[f]);
+                    let d = (p[0] - c[0]) * nr[0] + (p[1] - c[1]) * nr[1] + (p[2] - c[2]) * nr[2];
+                    neg += usize::from(d < 0.0);
+                }
+                (neg as f64 > vids.len() as f64 / 2.0, false)
+            })
+            .collect()
+    });
     let mut out = Isolated {
         mask: vec![false; n],
         ..Default::default()
     };
-    for (ci, fis) in by_comp.iter().enumerate() {
-        if ci as i64 == main || fis.is_empty() {
-            continue;
-        }
-        let n_valid = fis.iter().filter(|&&f| s.dots[f] != 0.0).count();
-        let internal = if n_valid > 0 {
+    for (fis, &(internal, via_dots)) in others.iter().zip(&decided) {
+        if via_dots {
             out.n_via_dots += 1;
-            let neg = fis.iter().filter(|&&f| s.dots[f] < 0.0).count();
-            neg as f64 > n_valid as f64 / 2.0
         } else {
             out.n_via_geometry += 1;
-            let tree = tree.get_or_insert_with(|| {
-                KdTree::new(
-                    main_faces.iter().map(|&f| s.centers[f]).collect(),
-                    Sum::Plain,
-                )
-            });
-            let mut vids: Vec<u32> = fis.iter().flat_map(|&f| s.faces[f]).collect();
-            vids.sort_unstable();
-            vids.dedup();
-            let mut neg = 0usize;
-            for &v in &vids {
-                let p = s.verts[v as usize];
-                let (j, _) = tree.nearest(&p).expect("main has faces");
-                let f = main_faces[j as usize];
-                let (c, nr) = (s.centers[f], s.normals[f]);
-                let d = (p[0] - c[0]) * nr[0] + (p[1] - c[1]) * nr[1] + (p[2] - c[2]) * nr[2];
-                neg += usize::from(d < 0.0);
-            }
-            neg as f64 > vids.len() as f64 / 2.0
-        };
+        }
         if internal {
             out.n_internal += 1;
             out.n_internal_faces += fis.len();
-            for &f in fis {
+            for &f in fis.iter() {
                 out.mask[f] = true;
             }
         } else {
@@ -374,21 +428,30 @@ pub fn structural_masks(
     isolated: &[bool],
     min_cluster_size: usize,
 ) -> (Vec<bool>, Vec<bool>, usize) {
-    let mut non_iso: HashMap<i64, usize> = HashMap::new();
+    // per label, offset by the lowest one, as labels go negative
+    let lowest = face_comp.iter().copied().min().unwrap_or(0);
+    let highest = face_comp.iter().copied().max().unwrap_or(0);
+    let span = (highest - lowest + 1).max(0) as usize;
+    let (mut non_iso, mut present) = (vec![0usize; span], vec![false; span]);
     for (fi, &c) in face_comp.iter().enumerate() {
-        *non_iso.entry(c).or_default() += usize::from(!isolated[fi]);
+        non_iso[(c - lowest) as usize] += usize::from(!isolated[fi]);
+        present[(c - lowest) as usize] = true;
     }
-    let structural: BTreeSet<i64> = non_iso
-        .into_iter()
-        .filter(|&(_, n)| n >= min_cluster_size)
-        .map(|(c, _)| c)
-        .collect();
-    let mask: Vec<bool> = face_comp.iter().map(|c| structural.contains(c)).collect();
-    let non_main: Vec<bool> = face_comp
+    let structural: Vec<bool> = non_iso
         .iter()
-        .map(|&c| c != main && structural.contains(&c))
+        .zip(&present)
+        .map(|(&n, &p)| p && n >= min_cluster_size)
         .collect();
-    (mask, non_main, structural.len())
+    let n_structural = structural.iter().filter(|&&s| s).count();
+    let mask: Vec<bool> = face_comp
+        .par_iter()
+        .map(|&c| structural[(c - lowest) as usize])
+        .collect();
+    let non_main: Vec<bool> = face_comp
+        .par_iter()
+        .map(|&c| c != main && structural[(c - lowest) as usize])
+        .collect();
+    (mask, non_main, n_structural)
 }
 
 /// `skeliner.pre._rim_enclosed_area`: total planar area enclosed by the
@@ -659,8 +722,12 @@ pub fn pocket_organelles(
 
     // Phase 2: fill holes — non-pocket clusters mostly enclosed by pocket.
     let open: Vec<bool> = (0..n).map(|f| main_mask[f] && !pocket[f]).collect();
-    let holes = components_where(s, |f| open[f]);
+    let holes = components_where_unordered(s, |f| open[f]);
     for cluster in holes {
+        // neither small nor under 5% of the mesh: never filled
+        if cluster.len() > params.max_hole_size && cluster.len() as f64 >= n as f64 * 0.05 {
+            continue;
+        }
         let (mut total, mut walled) = (0usize, 0usize);
         let mut walls: BTreeSet<u32> = BTreeSet::new();
         for &f in &cluster {
@@ -697,21 +764,30 @@ pub fn pocket_organelles(
     let kept = mesh::components::keep_large_clusters(s.faces, pocket, params.min_cluster_size);
     *pocket = kept;
     let flagged = pocket.clone();
-    for comp in components_where(s, |f| flagged[f]) {
-        let members: BTreeSet<u32> = comp.iter().copied().collect();
-        let cap: BTreeSet<u32> = comp
-            .iter()
-            .flat_map(|&f| s.topo.face_neighbors(f as usize))
-            .filter(|g| !members.contains(g))
-            .collect();
-        let pocket_area = area_of(s, &members);
-        let cap_area = if cap.is_empty() {
-            0.0
-        } else {
-            area_of(s, &cap)
-        };
-        if cap_area <= 0.0 || pocket_area / cap_area < params.min_fold_ratio {
-            for &f in &comp {
+    let comps = components_where_unordered(s, |f| flagged[f]);
+    let shallow: Vec<bool> = threads::install(|| {
+        comps
+            .par_iter()
+            .map(|comp| {
+                let members: BTreeSet<u32> = comp.iter().copied().collect();
+                let cap: BTreeSet<u32> = comp
+                    .iter()
+                    .flat_map(|&f| s.topo.face_neighbors(f as usize))
+                    .filter(|g| !members.contains(g))
+                    .collect();
+                let pocket_area = area_of(s, &members);
+                let cap_area = if cap.is_empty() {
+                    0.0
+                } else {
+                    area_of(s, &cap)
+                };
+                cap_area <= 0.0 || pocket_area / cap_area < params.min_fold_ratio
+            })
+            .collect()
+    });
+    for (comp, &drop) in comps.iter().zip(&shallow) {
+        if drop {
+            for &f in comp {
                 pocket[f as usize] = false;
             }
             out.n_rejected += 1;

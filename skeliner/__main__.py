@@ -27,7 +27,7 @@ def main():
     args = parser.parse_args()
 
     if args.command == "view":
-        from skeliner.plot.viewer import view
+        from skeliner.viewer.viewer import view
 
         view(args.mesh, host=args.host, port=args.port, no_browser=args.no_browser)
     else:

@@ -1,5 +1,7 @@
 //! Nearest-neighbour and radius queries over 3D points.
 
+use rayon::prelude::*;
+
 /// How a squared distance is summed.  scipy's KD-tree accumulates
 /// `s += d * d` per coordinate, which a compiler may or may not fuse into a
 /// multiply-add; the two round differently in the last bit.
@@ -45,19 +47,114 @@ pub struct KdTree {
     sum: Sum,
 }
 
-impl KdTree {
-    /// Build a tree over `points`, measuring distances the `sum` way.
-    pub fn new(points: Vec<[f64; 3]>, sum: Sum) -> Self {
-        let mut tree = Self {
-            order: (0..points.len() as u32).collect(),
-            points,
-            nodes: Vec::new(),
-            sum,
-        };
-        if !tree.points.is_empty() {
-            tree.build(0, tree.points.len());
+/// Subtrees over at least this many points build their halves in parallel.
+const PARALLEL: usize = 1 << 15;
+
+/// How many nodes a subtree over `n` points has.
+fn node_count(n: usize) -> usize {
+    if n <= LEAF {
+        1
+    } else {
+        1 + node_count(n / 2) + node_count(n - n / 2)
+    }
+}
+
+/// Bounding box of the points `order` lists.
+fn bounds(points: &[[f64; 3]], order: &[u32]) -> ([f64; 3], [f64; 3]) {
+    let grow = |(mut bmin, mut bmax): ([f64; 3], [f64; 3]), p: &[f64; 3]| {
+        for ((lo_d, hi_d), &x) in bmin.iter_mut().zip(bmax.iter_mut()).zip(p) {
+            *lo_d = lo_d.min(x);
+            *hi_d = hi_d.max(x);
         }
-        tree
+        (bmin, bmax)
+    };
+    let empty = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+    if order.len() < PARALLEL {
+        return order
+            .iter()
+            .fold(empty, |b, &i| grow(b, &points[i as usize]));
+    }
+    // min and max ignore NaN and take the same value in any order
+    order
+        .par_iter()
+        .fold(|| empty, |b, &i| grow(b, &points[i as usize]))
+        .reduce(
+            || empty,
+            |(amin, amax), (bmin, bmax)| {
+                (
+                    [0, 1, 2].map(|k| amin[k].min(bmin[k])),
+                    [0, 1, 2].map(|k| amax[k].max(bmax[k])),
+                )
+            },
+        )
+}
+
+/// Build the subtree over `order` — the slots `at..at + order.len()` of the
+/// tree's order — into `nodes`, numbered from `id` as a depth-first build
+/// numbers them: the node, its left subtree, then its right.  The halves of
+/// a large subtree build in parallel; the tree is the same either way.
+fn build(points: &[[f64; 3]], order: &mut [u32], at: usize, nodes: &mut [Node], id: u32) {
+    let n = order.len();
+    let (bmin, bmax) = bounds(points, order);
+    nodes[0] = Node {
+        lo: at,
+        hi: at + n,
+        bmin,
+        bmax,
+        left: NONE,
+        right: NONE,
+    };
+    if n <= LEAF {
+        return;
+    }
+    let dim = (0..3)
+        .max_by(|&a, &b| (bmax[a] - bmin[a]).total_cmp(&(bmax[b] - bmin[b])))
+        .expect("three axes");
+    let mid = n / 2;
+    order.select_nth_unstable_by(mid, |&a, &b| {
+        points[a as usize][dim].total_cmp(&points[b as usize][dim])
+    });
+    let n_left = node_count(mid);
+    let (left, right) = (id + 1, id + 1 + n_left as u32);
+    nodes[0].left = left;
+    nodes[0].right = right;
+    let (left_nodes, right_nodes) = nodes[1..].split_at_mut(n_left);
+    let (left_order, right_order) = order.split_at_mut(mid);
+    let mut build_left = || build(points, left_order, at, left_nodes, left);
+    let mut build_right = || build(points, right_order, at + mid, right_nodes, right);
+    if n >= PARALLEL {
+        rayon::join(build_left, build_right);
+    } else {
+        build_left();
+        build_right();
+    }
+}
+
+impl KdTree {
+    /// Build a tree over `points`, measuring distances the `sum` way, in
+    /// parallel on [`threads`]' pool.
+    pub fn new(points: Vec<[f64; 3]>, sum: Sum) -> Self {
+        let n = points.len();
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        let placeholder = Node {
+            lo: 0,
+            hi: 0,
+            bmin: [0.0; 3],
+            bmax: [0.0; 3],
+            left: NONE,
+            right: NONE,
+        };
+        let mut nodes = Vec::new();
+        if n > 0 {
+            nodes = vec![placeholder; node_count(n)];
+            threads::install(|| build(&points, &mut order, 0, &mut nodes, 0));
+        }
+        Self {
+            points,
+            order,
+            nodes,
+            sum,
+        }
     }
 
     /// Number of points.
@@ -73,43 +170,6 @@ impl KdTree {
     /// Whether the tree holds no points.
     pub fn is_empty(&self) -> bool {
         self.points.is_empty()
-    }
-
-    fn build(&mut self, lo: usize, hi: usize) -> u32 {
-        let mut bmin = [f64::INFINITY; 3];
-        let mut bmax = [f64::NEG_INFINITY; 3];
-        for &i in &self.order[lo..hi] {
-            let p = self.points[i as usize];
-            for ((lo_d, hi_d), &x) in bmin.iter_mut().zip(bmax.iter_mut()).zip(&p) {
-                *lo_d = lo_d.min(x);
-                *hi_d = hi_d.max(x);
-            }
-        }
-        let id = self.nodes.len() as u32;
-        self.nodes.push(Node {
-            lo,
-            hi,
-            bmin,
-            bmax,
-            left: NONE,
-            right: NONE,
-        });
-        if hi - lo > LEAF {
-            let dim = (0..3)
-                .max_by(|&a, &b| (bmax[a] - bmin[a]).total_cmp(&(bmax[b] - bmin[b])))
-                .expect("three axes");
-            let mid = lo + (hi - lo) / 2;
-            let points = &self.points;
-            self.order[lo..hi].select_nth_unstable_by(mid - lo, |&a, &b| {
-                points[a as usize][dim].total_cmp(&points[b as usize][dim])
-            });
-            let left = self.build(lo, mid);
-            let right = self.build(mid, hi);
-            let node = &mut self.nodes[id as usize];
-            node.left = left;
-            node.right = right;
-        }
-        id
     }
 
     /// Squared distance from `q` to the node's box, a lower bound that never
@@ -260,6 +320,82 @@ impl KdTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tree as one depth-first pass builds it, a node at a time:
+    /// `(order, [(lo, hi, bmin, bmax, left, right)])`.
+    #[allow(clippy::type_complexity)]
+    fn built_one_node_at_a_time(
+        points: &[[f64; 3]],
+    ) -> (Vec<u32>, Vec<(usize, usize, [f64; 3], [f64; 3], u32, u32)>) {
+        fn go(
+            points: &[[f64; 3]],
+            order: &mut [u32],
+            nodes: &mut Vec<(usize, usize, [f64; 3], [f64; 3], u32, u32)>,
+            lo: usize,
+            hi: usize,
+        ) -> u32 {
+            let mut bmin = [f64::INFINITY; 3];
+            let mut bmax = [f64::NEG_INFINITY; 3];
+            for &i in &order[lo..hi] {
+                for k in 0..3 {
+                    bmin[k] = bmin[k].min(points[i as usize][k]);
+                    bmax[k] = bmax[k].max(points[i as usize][k]);
+                }
+            }
+            let id = nodes.len() as u32;
+            nodes.push((lo, hi, bmin, bmax, NONE, NONE));
+            if hi - lo > LEAF {
+                let dim = (0..3)
+                    .max_by(|&a, &b| (bmax[a] - bmin[a]).total_cmp(&(bmax[b] - bmin[b])))
+                    .unwrap();
+                let mid = lo + (hi - lo) / 2;
+                order[lo..hi].select_nth_unstable_by(mid - lo, |&a, &b| {
+                    points[a as usize][dim].total_cmp(&points[b as usize][dim])
+                });
+                let left = go(points, order, nodes, lo, mid);
+                let right = go(points, order, nodes, mid, hi);
+                (nodes[id as usize].4, nodes[id as usize].5) = (left, right);
+            }
+            id
+        }
+        let mut order: Vec<u32> = (0..points.len() as u32).collect();
+        let mut nodes = Vec::new();
+        go(points, &mut order, &mut nodes, 0, points.len());
+        (order, nodes)
+    }
+
+    #[test]
+    fn a_large_tree_is_the_tree_a_one_node_at_a_time_build_makes() {
+        // 200k points on a coarse grid: ties on every axis, and a NaN
+        let mut state = 0x853c_49e6_748f_ea9bu64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) % 97) as f64
+        };
+        let mut pts: Vec<[f64; 3]> = (0..200_000).map(|_| [next(), next(), next()]).collect();
+        pts[7][1] = f64::NAN;
+        let tree = KdTree::new(pts.clone(), Sum::Plain);
+        let (order, nodes) = built_one_node_at_a_time(&pts);
+        assert!(
+            pts.len() >= 2 * PARALLEL,
+            "the halves must build in parallel"
+        );
+        assert_eq!(tree.order, order);
+        assert_eq!(tree.nodes.len(), nodes.len());
+        for (a, b) in tree.nodes.iter().zip(&nodes) {
+            let same = |x: &[f64; 3], y: &[f64; 3]| {
+                x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())
+            };
+            assert!(
+                (a.lo, a.hi, a.left, a.right) == (b.0, b.1, b.4, b.5)
+                    && same(&a.bmin, &b.2)
+                    && same(&a.bmax, &b.3),
+                "{a:?} != {b:?}"
+            );
+        }
+    }
 
     #[test]
     fn k_nearest_matches_brute_force_ties_to_the_lowest_index() {

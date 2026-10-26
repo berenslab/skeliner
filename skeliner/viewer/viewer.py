@@ -1356,14 +1356,14 @@ def _create_app(
                 {"ok": False, "error": "No mesh loaded"}, status_code=400
             )
 
-        from skeliner.pre import find_disconnected, find_soma_via_ring_cutoff
+        from skeliner.pre import find_disconnected, find_soma
 
         mesh = mesh_state["mesh"]
         soma = mesh_state.get("soma")
         if soma is None:
             await _log("[skeliner.pre] Detecting soma first...")
             soma = await _run_with_log(
-                find_soma_via_ring_cutoff,
+                find_soma,
                 mesh,
                 organelles=mesh_state.get("organelles"),
                 mesh_stats=mesh_state.get("mesh_stats"),
@@ -1438,7 +1438,7 @@ def _create_app(
             pass
 
         if method == "ring_cutoff":
-            from skeliner.pre import find_soma_via_ring_cutoff as _find
+            from skeliner.pre import find_soma as _find
 
             label_prefix = "soma"
         else:
@@ -1520,7 +1520,7 @@ def _create_app(
                 {"ok": False, "error": "No mesh loaded"}, status_code=400
             )
 
-        from skeliner.pre import find_gaps, find_soma_via_ring_cutoff
+        from skeliner.pre import find_gaps, find_soma
 
         mesh = mesh_state["mesh"]
 
@@ -1529,7 +1529,7 @@ def _create_app(
         if soma is None:
             await _log("[skeliner.pre] Detecting soma first...")
             soma = await _run_with_log(
-                find_soma_via_ring_cutoff,
+                find_soma,
                 mesh,
                 organelles=mesh_state.get("organelles"),
                 mesh_stats=mesh_state.get("mesh_stats"),
@@ -2702,10 +2702,8 @@ def _create_app(
 
         This *is* ``pre.preprocess`` rather than the panel's buttons pressed
         in order by the server, so the viewer and the library cannot drift
-        into two pipelines wearing one name.  It differs from pressing the
-        buttons in one way worth knowing: the soma comes from
-        ``find_soma_via_ring_cutoff``, which is the pipeline's choice, while
-        the Soma button defaults to ``z_contour``.
+        into two pipelines wearing one name.  Its soma comes from
+        ``find_soma``, as the Soma button's does.
 
         Left uncompacted.  ``compact_mesh`` reindexes faces, and annotations,
         the rescue list and every loaded skeleton are all stated in face ids;
@@ -5023,7 +5021,7 @@ def _launch_app(app, *, host: str, port: int, no_browser: bool):
         _active_server = server
         thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
-        print("  Viewer running in background. Call sk.plot.stop_viewer() to stop.")
+        print("  Viewer running in background. Call sk.viewer.stop_viewer() to stop.")
     else:
         uvicorn.run(app, host=host, port=port, log_level="warning")
 

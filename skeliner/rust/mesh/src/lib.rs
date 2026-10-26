@@ -19,7 +19,7 @@ pub mod topology;
 
 use std::fmt;
 
-pub use topology::Topology;
+pub use topology::{Neighbors, Topology};
 
 /// Why a mesh was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -744,8 +744,8 @@ class Soma:
         - ``slices`` — ``(N, 4)`` per-Z data ``(z, cx, cy, void_r)``.
 
         Compatible with the ``nucleus`` parameter of
-        :func:`~skeliner.plot.vis2d.z_section` and
-        :func:`~skeliner.plot.vis2d.diagnose_soma`.
+        :func:`~skeliner.plot.z_section` and
+        :func:`~skeliner.plot.diagnose_soma`.
     """
 
     center: np.ndarray  # (3,)

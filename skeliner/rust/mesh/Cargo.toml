@@ -7,6 +7,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+threads.workspace = true
+rayon.workspace = true
 
 [lints]
 workspace = true

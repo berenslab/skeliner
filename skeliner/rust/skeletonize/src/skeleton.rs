@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use mesh::geometry::{arange, numpy_order, numpy_sum};
 use mesh::graph::WeightedGraph;
 use mesh::spatial::{KdTree, Sum};
+use rayon::prelude::*;
 
 /// A bin: vertex ids in the reference's order.
 pub type Bin = Vec<u32>;
@@ -221,8 +222,6 @@ pub enum BinError {
 /// infinite).
 pub struct Scratch {
     inside: Vec<bool>,
-    mark: Vec<bool>,
-    seen: Vec<bool>,
     dist: Vec<f64>,
 }
 
@@ -230,8 +229,6 @@ impl Scratch {
     pub fn new(n: usize) -> Scratch {
         Scratch {
             inside: vec![false; n],
-            mark: vec![false; n],
-            seen: vec![false; n],
             dist: vec![f64::INFINITY; n],
         }
     }
@@ -317,24 +314,37 @@ fn bin_marked(
         step *= 1.5;
     }
 
+    // each shell's rings, and its pieces left to merge (too small, then not
+    // rings), the shells at once; gathered in shell order
+    let n = g.n_vertices();
+    let per_shell: Vec<(Vec<Bin>, Vec<Bin>)> = threads::install(|| {
+        shells
+            .par_iter()
+            .filter(|shell| !shell.is_empty())
+            .map_init(
+                || (vec![false; n], vec![false; n]),
+                |(mark, seen), shell| {
+                    let mut left = Vec::new();
+                    let mut comps = Vec::new();
+                    for comp in induced_components(g, shell, mark, seen) {
+                        if comp.len() < p.min_shell_vertices {
+                            left.push(comp);
+                        } else {
+                            comps.push(comp);
+                        }
+                    }
+                    let (rings, frags): (Vec<Bin>, Vec<Bin>) =
+                        comps.into_iter().partition(|c| is_ring(g, c, inside));
+                    left.extend(frags);
+                    (rings, left)
+                },
+            )
+            .collect()
+    });
     let mut out: Vec<Vec<Bin>> = Vec::new();
     let mut pending: Vec<Bin> = Vec::new();
-    for shell in shells {
-        if shell.is_empty() {
-            continue;
-        }
-        let mut comps = Vec::new();
-        for comp in induced_components(g, &shell, &mut scratch.mark, &mut scratch.seen) {
-            if comp.len() < p.min_shell_vertices {
-                pending.push(comp);
-            } else {
-                comps.push(comp);
-            }
-        }
-        let (rings, frags): (Vec<Bin>, Vec<Bin>) = comps
-            .into_iter()
-            .partition(|c| is_ring(g, c, &scratch.inside));
-        pending.extend(frags);
+    for (rings, left) in per_shell {
+        pending.extend(left);
         if !rings.is_empty() {
             out.push(rings);
         }

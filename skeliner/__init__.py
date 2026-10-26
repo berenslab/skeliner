@@ -16,17 +16,18 @@ except PackageNotFoundError:
 register_skeleton_methods(dx, getattr(dx, "__skeleton__", None))
 register_skeleton_methods(post, getattr(post, "__skeleton__", None))
 
-# the plotting functions, from `plot` (it imports matplotlib) on first use
+# the figures (`plot` imports matplotlib) and the viewer, on first use
+_SUBMODULES = ("plot", "viewer")
 _PLOTS = {
-    "view3d": ("plot", "view3d"),
-    "plot2d": ("plot.vis2d", "projection"),
-    "plot3v": ("plot.vis2d", "threeviews"),
+    "view3d": ("viewer", "view3d"),
+    "plot2d": ("plot", "projection"),
+    "plot3v": ("plot", "threeviews"),
 }
 
 
 def __getattr__(name: str):
-    if name == "plot":
-        return importlib.import_module(".plot", __name__)
+    if name in _SUBMODULES:
+        return importlib.import_module(f".{name}", __name__)
     if name in _PLOTS:
         module, attr = _PLOTS[name]
         value = getattr(importlib.import_module(f".{module}", __name__), attr)
@@ -36,7 +37,7 @@ def __getattr__(name: str):
 
 
 def __dir__() -> list[str]:
-    return sorted({*globals(), "plot", *_PLOTS})
+    return sorted({*globals(), *_SUBMODULES, *_PLOTS})
 
 
 __all__ = [
@@ -54,6 +55,7 @@ __all__ = [
     "pair",
     "pre",
     "plot",
+    "viewer",
     "preprocess",
     "threads",
     "backend",
