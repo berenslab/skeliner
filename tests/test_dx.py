@@ -884,7 +884,7 @@ def test_distances_on_both_paths():
 
 @pytest.mark.parametrize("mode", ["surface", "centerline"])
 def test_distance_ends_alike_on_both_paths(skel, mode):
-    from ._parity import both
+    from ._parity import assert_parity, both
 
     rng = np.random.default_rng(37)
     lo, hi = skel.nodes.min(0), skel.nodes.max(0)
@@ -892,7 +892,7 @@ def test_distance_ends_alike_on_both_paths(skel, mode):
     allowed = list(range(0, len(skel.nodes), 3))
     for kwargs in ({}, {"allowed_nodes": allowed}, {"allowed_edges": skel.edges[:5]}):
         rust, python = both(dx.distance, skel, points, mode=mode, **kwargs)
-        np.testing.assert_array_equal(rust, python)
+        assert_parity(rust, python)
     # the cached index survives a deep copy (and so pickling)
     copied = copy.deepcopy(skel)
     np.testing.assert_array_equal(

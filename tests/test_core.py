@@ -39,7 +39,7 @@ from skeliner.skeletonize import (
     _surface_graph_of,
 )
 
-from ._parity import assert_parity, both
+from ._parity import EXACT, RTOL, assert_parity, both
 from .test_rust_core import _dirty_mesh
 
 
@@ -1374,7 +1374,16 @@ def test_soma_distances_follow_numpy():
             rust = _rs.skeletonize.merge_near_soma_nodes(*args, float(tol), 0.0, 1e9)
             want = d < -tol
             want[0] = False
-            assert rust[1].tolist() == np.where(want, -1, np.cumsum(~want) - 1).tolist()
+            merged = rust[1] < 0
+            # the nodes kept are numbered in order
+            assert (
+                rust[1].tolist()
+                == np.where(merged, -1, np.cumsum(~merged) - 1).tolist()
+            )
+            # off the reference platform the distances agree to rounding
+            # (RTOL), so a node that close to the cut may go either way
+            sure = EXACT | (np.abs(d + tol) > RTOL * np.abs(d).max())
+            assert merged[sure].tolist() == want[sure].tolist()
 
 
 def test_soma_merge_ends_alike_on_both_paths(reference_mesh):
