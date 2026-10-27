@@ -81,6 +81,26 @@ def test_skeletonize_smoke(reference_mesh):
     _assert_skeleton_valid(skel)
 
 
+def test_a_vertex_off_the_surface_moves_no_seed(reference_mesh):
+    # one vertex more, that no face names or only a face collapsed onto it
+    # names: below the lowest vertex, where the seed is looked for, it makes
+    # the same skeleton as far above it
+    v, f = reference_mesh.vertices, reference_mesh.faces
+    x, y, z = v[np.argmin(v[:, 2])]
+    below, above = z - 10.0, v[:, 2].max() + 10.0
+    collapsed = np.vstack([f, [[len(v)] * 3]])
+    for path in PATHS:
+        with sk.backend(path):
+            for faces in (f, collapsed):
+                for kw in ({}, dict(soma_seed_point=[x, y, below])):
+                    got, want = (
+                        skeletonize(sk.Mesh(np.vstack([v, [x, y, h]]), faces), **kw)
+                        for h in (below, above)
+                    )
+                    assert np.array_equal(got.nodes, want.nodes)
+                    assert np.array_equal(got.edges, want.edges)
+
+
 def test_skeletonize_soma_init_guess_axis_mode(reference_mesh):
     """soma_init_guess='z-min' should behave like the default."""
     skel = skeletonize(

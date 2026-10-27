@@ -930,8 +930,7 @@ class Soma:
 
     @property
     def equiv_radius(self) -> float:
-        """Equivalent radius of the ellipsoid (mean of semi-axes)."""
-        """Sphere radius of equal volume ( (abc)^{1/3} )."""
+        """Radius of the sphere of the ellipsoid's volume, ``(abc)^(1/3)``."""
         a, b, c = self.axes
         return float((a * b * c) ** (1.0 / 3.0))
 

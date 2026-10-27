@@ -207,10 +207,28 @@ def _edges_from_bins(
     )
 
 
+def _lowest_on_surface(mesh: Mesh, score: np.ndarray) -> int:
+    """The vertex of the lowest *score* on the mesh's surface, the first of
+    equals: one that an edge of a face ends at, so not a vertex no face
+    names, nor one only faces collapsed onto it (``[v, v, v]``) name — a
+    vertex off the surface is a one-vertex piece of its own, and a seed
+    there leaves the surface binned from an arbitrary vertex. The lowest of
+    all when no vertex is on the surface."""
+    vid = int(np.argmin(score))
+    faces = np.asarray(mesh.faces)
+    named = faces[np.flatnonzero(faces.ravel() == vid) // 3]
+    if ((named[:, 0] != named[:, 1]) | (named[:, 1] != named[:, 2])).any():
+        return vid
+    on = np.zeros(len(score), dtype=bool)
+    on[faces[(faces[:, 0] != faces[:, 1]) | (faces[:, 1] != faces[:, 2])]] = True
+    return int(np.flatnonzero(on)[np.argmin(score[on])]) if on.any() else vid
+
+
 def _extreme_vertex(mesh: Mesh, axis: str = "z", mode: str = "min") -> int:
     """
-    Return the mesh-vertex index with either the minimal or maximal coordinate
-    along *axis* (“x”, “y” or “z”).
+    Return the index of the vertex on the mesh's surface
+    (:func:`_lowest_on_surface`) with either the minimal or maximal
+    coordinate along *axis* (“x”, “y” or “z”).
 
     Examples
     --------
@@ -219,7 +237,7 @@ def _extreme_vertex(mesh: Mesh, axis: str = "z", mode: str = "min") -> int:
     """
     ax_idx = {"x": 0, "y": 1, "z": 2}[axis.lower()]
     coords = mesh.vertices[:, ax_idx]
-    return int(np.argmin(coords) if mode == "min" else np.argmax(coords))
+    return _lowest_on_surface(mesh, coords if mode == "min" else -coords)
 
 
 def _make_nodes(
@@ -1110,13 +1128,9 @@ def _skeletonize_direct(
 
         # -- pick seed vertex -----------------------------
         if soma_seed_point is not None:
-            seed_vid = int(
-                np.argmin(
-                    np.linalg.norm(
-                        mesh_vertices - np.asarray(soma_seed_point),
-                        axis=1,
-                    )
-                )
+            seed_vid = _lowest_on_surface(
+                mesh,
+                np.linalg.norm(mesh_vertices - np.asarray(soma_seed_point), axis=1),
             )
         else:
             seed_vid = _extreme_vertex(
