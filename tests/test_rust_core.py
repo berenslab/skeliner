@@ -691,6 +691,47 @@ def _hollow_soma(gap_above: float = 1000.0) -> np.ndarray:
     return np.array(pts, dtype=np.float64)
 
 
+def test_merge_coincident_vertices_is_the_same_on_both_paths():
+    # two halves of a ball, the upper one on copies of the vertices it
+    # shares with the lower; a lower face copied across the seam, a lower
+    # face duplicated as the mesh had it, a signed zero, a NaN vertex; and a
+    # second ball touching the first at one vertex on its own copy of it,
+    # with a needle from that copy to the vertex's neighbour
+    ball = trimesh.creation.icosphere(subdivisions=2, radius=1000.0)
+    v = np.round(ball.vertices)
+    f = np.asarray(ball.faces).copy()
+    upper = v[f].mean(axis=1)[:, 2] > 0
+    shared = np.unique(f[upper][np.isin(f[upper], f[~upper])])
+    copy_of = dict(zip(shared.tolist(), range(len(v), len(v) + len(shared))))
+    v = np.vstack([v, v[shared], [[np.nan, 0.0, 0.0]]])
+    f[upper] = np.vectorize(lambda x: copy_of.get(int(x), int(x)))(f[upper])
+    v[shared[0], 0] = 0.0
+    v[copy_of[int(shared[0])], 0] = -0.0
+    lower = np.flatnonzero(~upper)
+    seam = int(lower[np.isin(f[lower], shared).any(axis=1)][0])
+    inner = int(lower[~np.isin(f[lower], shared).any(axis=1)][0])
+    copied = [copy_of.get(int(x), int(x)) for x in f[seam]]
+    touch, neighbour = map(int, f[inner, :2])
+    small = trimesh.creation.icosphere(subdivisions=1, radius=300.0)
+    w = np.round(small.vertices)
+    w += v[touch] - w[0]
+    touching = np.asarray(small.faces) + len(v)
+    apart = np.vstack([touching, [[len(v), len(v), neighbour]]])
+    v = np.vstack([v, w])
+    f = np.vstack([f, apart, [copied], f[inner : inner + 1]])
+    rust, python = both(
+        lambda: sk.dataclass._kernels().mesh.merge_coincident_vertices(v, f)
+    )
+    assert_parity(rust, python)
+    faces, copies, collapsed = rust
+    assert copies == len(shared) and collapsed == 1
+    # the touching ball and the needle keep their vertices
+    assert np.array_equal(faces[-2 - len(apart) : -2], apart)
+    # the face copied across the seam goes; the duplicate the mesh had stays
+    assert np.array_equal(faces[-2], [0, 0, 0])
+    assert np.array_equal(faces[-1], f[inner])
+
+
 class TestZScan:
     def test_is_the_same_on_both_paths_with_and_without_the_hull_pass(self):
         v = _hollow_soma()

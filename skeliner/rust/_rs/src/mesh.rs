@@ -374,6 +374,34 @@ fn face_crosses<'py>(
     Ok(rows_to_array(&out).into_pyarray(py))
 }
 
+/// `merge_coincident_vertices`' output: the faces (None when no vertex is
+/// merged), the vertices merged, the faces collapsed.
+type MergedOut<'py> = (Option<Bound<'py, PyArray2<i64>>>, usize, usize);
+
+/// The faces `(F, 3)` with every vertex replaced by the first vertex at its
+/// position that a seam joins it to (vertices that only touch stay apart),
+/// and each face the merge made a copy of another collapsed to `[0, 0, 0]`
+/// — None when no vertex is merged; with the number of vertices merged and
+/// of faces collapsed.
+#[pyfunction]
+fn merge_coincident_vertices<'py>(
+    py: Python<'py>,
+    vertices: PyReadonlyArray2<'py, f64>,
+    faces: PyReadonlyArray2<'py, i64>,
+) -> PyResult<MergedOut<'py>> {
+    let verts = rows3("V", &vertices)?;
+    let (tris, _) = checked_faces(&faces, Some(verts.len()))?;
+    let Some(m) = py.detach(|| ::mesh::coincident::merge_coincident(&verts, &tris)) else {
+        return Ok((None, 0, 0));
+    };
+    let faces: Vec<[i64; 3]> = m.faces.iter().map(|f| f.map(i64::from)).collect();
+    Ok((
+        Some(rows_to_array(&faces).into_pyarray(py)),
+        m.copies,
+        m.collapsed,
+    ))
+}
+
 /// trimesh's `face_normals` from `crosses` `(F, 3)`: each cross product
 /// over its norm, zero where the norm is not above trimesh's zero.
 #[pyfunction]
@@ -488,6 +516,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mesh_roundtrip, m)?)?;
     m.add_function(wrap_pyfunction!(face_crosses, m)?)?;
     m.add_function(wrap_pyfunction!(face_normals, m)?)?;
+    m.add_function(wrap_pyfunction!(merge_coincident_vertices, m)?)?;
     m.add_function(wrap_pyfunction!(face_areas, m)?)?;
     m.add_function(wrap_pyfunction!(face_centers, m)?)?;
     m.add_function(wrap_pyfunction!(adjacent_faces, m)?)?;

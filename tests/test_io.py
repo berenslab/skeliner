@@ -515,6 +515,69 @@ def test_mesh_readers_read_as_trimesh_on_both_paths(reference_mesh, tmp_path):
     assert len(load_mesh(tmp_path / "loose.obj").vertices) == 3
 
 
+# a seam between two chunks, as CloudVolume stores one: vertices 3, 4, 6
+# copy 1, 2, 0, and the third face copies the first
+SEAM_V = [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0], [0, 0, 0]]
+SEAM_F = [[0, 1, 2], [3, 5, 4], [6, 3, 4]]
+
+
+def test_load_mesh_merges_a_seam(tmp_path):
+    from ._parity import both
+
+    path = tmp_path / "seam.obj"
+    lines = [f"v {x} {y} {z}" for x, y, z in SEAM_V]
+    lines += [f"f {a + 1} {b + 1} {c + 1}" for a, b, c in SEAM_F]
+    path.write_text("\n".join(lines) + "\n")
+    for mesh in both(load_mesh, path):
+        # the copies dropped, the faces in their places, the copied face
+        # collapsed; the two chunks are one piece
+        assert np.array_equal(
+            mesh.vertices, [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]]
+        )
+        assert np.array_equal(mesh.faces, [[0, 1, 2], [1, 3, 2], [0, 0, 0]])
+
+
+def test_a_mesh_remove_fusions_cut_reads_back_as_written(tmp_path):
+    from ._parity import both
+
+    trimesh = pytest.importorskip("trimesh")
+    # two balls sharing one vertex, a bow-tie that remove_fusions cuts into
+    # two vertices at one position: the second ball's antipode of vertex 0
+    # moved onto vertex 0
+    ball = trimesh.creation.icosphere(subdivisions=1, radius=1000.0)
+    b = np.round(ball.vertices)
+    far = int(np.argmin(np.linalg.norm(b + b[0], axis=1)))
+    keep = np.arange(len(b)) != far
+    v = np.vstack([b, (b + 2 * b[0])[keep]])
+    renumber = np.zeros(len(b), dtype=np.int64)
+    renumber[keep] = np.arange(len(b), len(v))
+    f = np.vstack([ball.faces, renumber[np.asarray(ball.faces)]])
+    pinch = int(np.flatnonzero((f == 0).any(axis=1))[0])
+    cut = sk.pre.remove_fusions(sk.Mesh(v, f), fusions=[[pinch]])
+    assert len(cut.vertices) == len(v) + 1
+    assert np.array_equal(cut.vertices[-1], cut.vertices[0])
+    path = tmp_path / "cut.obj"
+    save_mesh(cut, path)
+    for mesh in both(load_mesh, path):
+        assert np.array_equal(mesh.vertices, cut.vertices)
+        assert np.array_equal(mesh.faces, cut.faces)
+
+
+def test_mesh_of_merges_a_seam_keeping_the_vertices():
+    from ._parity import both
+
+    class Chunked:
+        vertices, faces = SEAM_V, SEAM_F
+
+    for mesh in both(sk.Mesh.of, Chunked()):
+        # the caller's vertex ids still name the same points
+        assert np.array_equal(mesh.vertices, SEAM_V)
+        assert np.array_equal(mesh.faces, [[0, 1, 2], [1, 5, 2], [0, 0, 0]])
+    # nothing coincides: the arrays as given
+    plain = sk.Mesh.of(sk.Mesh(SEAM_V[:3], SEAM_F[:1]).to_trimesh())
+    assert np.array_equal(plain.faces, SEAM_F[:1])
+
+
 def test_what_the_readers_do_not_read_goes_to_trimesh(reference_mesh, tmp_path):
     import trimesh
 
@@ -542,10 +605,20 @@ def test_what_the_readers_do_not_read_goes_to_trimesh(reference_mesh, tmp_path):
     for name in [*declined, *others]:
         path = tmp_path / name
         want = trimesh.load_mesh(path, process=False)
+        v, f = np.asarray(want.vertices), np.asarray(want.faces)
+        _, first, inverse = np.unique(v, axis=0, return_index=True, return_inverse=True)
+        if len(first) < len(v):
+            # an STL keeps three vertices of its own per face: coincident
+            # vertices merged into the first at each position, the copies
+            # dropped, the rest renumbered in order
+            kept = np.sort(first)
+            v, f = v[kept], np.searchsorted(kept, first[inverse.reshape(-1)])[f]
         for mesh in both(load_mesh, path):
             assert type(mesh) is sk.Mesh, name
-            assert np.array_equal(mesh.vertices, want.vertices), name
-            assert np.array_equal(mesh.faces, want.faces), name
+            assert np.array_equal(mesh.vertices, v), name
+            assert np.array_equal(mesh.faces, f), name
+    stl = load_mesh(tmp_path / "mesh.stl")
+    assert len(stl.vertices) == len(reference_mesh.vertices)
 
 
 def test_a_ctm_the_reader_does_not_read_goes_to_trimesh(tmp_path):

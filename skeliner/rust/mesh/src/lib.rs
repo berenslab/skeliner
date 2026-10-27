@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod coincident;
 pub mod components;
 pub mod derived;
 pub mod geometry;

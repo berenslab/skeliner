@@ -167,6 +167,89 @@ def mesh_roundtrip(vertices, faces) -> tuple[np.ndarray, np.ndarray]:
     )
 
 
+def seam_joined(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """Each vertex's first vertex at its position that a seam joins it to,
+    itself when none comes before it (positions equal as floats are: −0.0 is
+    0.0, a NaN equals nothing). Two vertices at one position are joined when
+    an edge of each ends at one position too, at one vertex or at two more
+    joined so: a seam is a chain of edges both sides of it repeat. Vertices
+    that only touch stay apart — ``remove_fusions`` cuts a vertex shared by
+    branches that share no edge into such copies, and joining them would
+    fuse the branches again. Edges are those of faces of three vertices; a
+    face naming one vertex twice joins nothing."""
+    from scipy.sparse import coo_array
+    from scipy.sparse.csgraph import connected_components
+
+    n = len(verts)
+    first = np.arange(n, dtype=np.int64)
+    number = np.flatnonzero(~np.isnan(verts).any(axis=1))
+    if len(number):
+        # adding 0.0 turns −0.0 into 0.0; np.unique's rows compare as bytes
+        _, where, inverse = np.unique(
+            verts[number] + 0.0, axis=0, return_index=True, return_inverse=True
+        )
+        first[number] = number[where[inverse.reshape(-1)]]
+    shared = np.zeros(n, dtype=bool)
+    copy = first != np.arange(n)
+    shared[copy] = True
+    shared[first[copy]] = True
+    if not shared.any():
+        return first
+    whole = (
+        (faces[:, 0] != faces[:, 1])
+        & (faces[:, 1] != faces[:, 2])
+        & (faces[:, 2] != faces[:, 0])
+    )
+    ends = faces[whole][:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2)
+    at = first[ends]
+    use = (at[:, 0] != at[:, 1]) & shared[ends].any(axis=1)
+    ends, at = ends[use], at[use]
+    # each edge from its lower position to its higher, keyed by the two
+    flip = at[:, 0] > at[:, 1]
+    ends[flip] = ends[flip, ::-1]
+    at[flip] = at[flip, ::-1]
+    _, edge_of, key = np.unique(at, axis=0, return_index=True, return_inverse=True)
+    there = ends[edge_of[key.reshape(-1)]]
+    graph = coo_array(
+        (np.ones(2 * len(ends)), (ends.ravel(), there.ravel())), shape=(n, n)
+    )
+    _, label = connected_components(graph, directed=False)
+    low = np.full(label.max() + 1, n, dtype=np.int64)
+    np.minimum.at(low, label, np.arange(n))
+    return low[label]
+
+
+def merge_coincident_vertices(vertices, faces) -> tuple[np.ndarray, int, int]:
+    """*faces* with every vertex replaced by the first vertex at its position
+    that a seam joins it to (:func:`seam_joined`), and each face the merge
+    made a copy of another collapsed to ``[0, 0, 0]`` (None when no vertex is
+    merged): ``(faces, copies, collapsed)``, the number of vertices merged
+    into an earlier one and of faces collapsed.
+
+    Of the faces with the same three vertices, those the merge left alone
+    all stay (a duplicate the mesh had already is the fusions' evidence), and
+    when it changed every one of them the first stays.
+    """
+    verts = rows3("V", vertices)
+    faces, _ = checked_faces(faces, len(verts))
+    joined = seam_joined(verts, faces)
+    copies = int((joined != np.arange(len(verts))).sum())
+    if copies == 0:
+        return None, 0, 0
+    merged = joined[faces]
+    changed = (merged != faces).any(axis=1)
+    _, group = np.unique(np.sort(merged, axis=1), axis=0, return_inverse=True)
+    group = group.reshape(-1)
+    face_ids = np.arange(len(faces))
+    first_face = np.full(group.max() + 1, len(faces), dtype=np.int64)
+    np.minimum.at(first_face, group, face_ids)
+    any_unchanged = np.zeros(group.max() + 1, dtype=bool)
+    any_unchanged[group[~changed]] = True
+    collapse = changed & (any_unchanged[group] | (first_face[group] != face_ids))
+    merged[collapse] = 0
+    return merged, copies, int(collapse.sum())
+
+
 def unique_edges(faces: np.ndarray, n_vertices: int) -> np.ndarray:
     """Every distinct edge of *faces* as ``[low, high]``, ordered by ``high``
     and then ``low``: trimesh's ``edges_unique``, which keeps a degenerate

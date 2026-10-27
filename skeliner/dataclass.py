@@ -81,7 +81,13 @@ class Mesh:
     @classmethod
     def of(cls, mesh) -> "Mesh":
         """*mesh* as a :class:`Mesh`: itself when it is one, else a copy of its
-        ``vertices`` and ``faces``."""
+        ``vertices`` and ``faces`` with the copies of a vertex along a seam
+        merged, as :func:`skeliner.io.load_mesh` reads a file — every face
+        names the first vertex at each position that a seam joins it to (a
+        mesh stored in chunks copies the vertices along every seam, which
+        cuts it there; vertices that only touch stay apart), and a face the
+        merge made a copy of another collapses to ``[0, 0, 0]``. Vertices and
+        faces keep their places."""
         if isinstance(mesh, cls):
             return mesh
         try:
@@ -90,7 +96,11 @@ class Mesh:
             raise TypeError(
                 f"a mesh has vertices and faces; {type(mesh).__name__} has not"
             ) from None
-        return cls(vertices, faces)
+        made = cls(vertices, faces)
+        merged = coincident_merged(made._vertices, made._faces)
+        if merged is made._faces:
+            return made
+        return cls._adopt(made._vertices, merged)
 
     def __reduce__(self):
         return (Mesh, (self._vertices, self._faces))
@@ -212,6 +222,13 @@ class Mesh:
         from .io import save_mesh
 
         save_mesh(self, path)
+
+
+def coincident_merged(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """*faces* with the copies of a vertex along a seam merged
+    (:meth:`Mesh.of`); *faces* itself when no vertex is merged."""
+    merged, _, _ = _kernels().mesh.merge_coincident_vertices(vertices, faces)
+    return faces if merged is None else merged
 
 
 def _kernels():

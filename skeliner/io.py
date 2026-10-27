@@ -9,6 +9,7 @@ from ._backend import kernels
 from ._core import _bfs_parents
 from ._state import rebuild_vert2node
 from .dataclass import (
+    coincident_merged,
     Discarded,
     Mesh,
     MeshComponents,
@@ -73,7 +74,17 @@ def _trimesh():
 
 def load_mesh(filepath: str | Path) -> Mesh:
     """Read a mesh file as a :class:`skeliner.Mesh` of the arrays
-    ``trimesh.load_mesh(filepath, process=False)`` reads.
+    ``trimesh.load_mesh(filepath, process=False)`` reads, with the copies of
+    a vertex along a seam merged: a mesh stored in chunks (CloudVolume's
+    multi-resolution meshes, for one) or as separate triangles (STL) copies
+    the vertices along every seam, which cuts it there. Every face names the
+    first vertex at each position that a seam joins it to, the copies are
+    dropped as the readers drop any vertex no face names, and a face the
+    merge made a copy of another collapses to ``[0, 0, 0]``. Vertices that
+    only touch — a seam is a chain of edges both sides of it repeat — stay
+    apart: :func:`skeliner.pre.remove_fusions` leaves a cut so, and a mesh it
+    cleaned reads back as written. Faces keep their places, so face ids into
+    the file stay valid.
 
     OBJ files of plain vertices and triangles, the form EyeWire 2, MICrONS
     and FlyWire meshes come in and skeliner's own pipeline writes, are read
@@ -97,9 +108,26 @@ def load_mesh(filepath: str | Path) -> Mesh:
     if reader is not None:
         found = getattr(kernels.io, reader)(str(filepath))
         if found is not None:
-            vertices, faces = found
-            return Mesh._adopt(vertices, faces)
-    return Mesh.of(_trimesh().load_mesh(filepath, process=False))
+            return _without_copies(*found)
+    read = _trimesh().load_mesh(filepath, process=False)
+    read = Mesh(read.vertices, read.faces)
+    return _without_copies(read.vertices, read.faces)
+
+
+def _without_copies(vertices: np.ndarray, faces: np.ndarray) -> Mesh:
+    """The mesh of a file's arrays with the copies of a vertex along a seam
+    merged and dropped (the vertices the merge left no face naming), the
+    faces renumbered."""
+    merged = coincident_merged(vertices, faces)
+    if merged is faces:
+        return Mesh._adopt(vertices, faces)
+    named = np.zeros(len(vertices), dtype=bool)
+    named[faces.ravel()] = True
+    still = np.zeros(len(vertices), dtype=bool)
+    still[merged.ravel()] = True
+    keep = ~named | still
+    renumbered = np.cumsum(keep) - 1
+    return Mesh._adopt(np.ascontiguousarray(vertices[keep]), renumbered[merged])
 
 
 def save_mesh(mesh, path: str | Path) -> None:
