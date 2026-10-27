@@ -24,6 +24,7 @@ import json
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -187,6 +188,15 @@ def _is_neurites_data(path: Path) -> bool:
         return False
 
 
+def _is_contact_sites(path: Path) -> bool:
+    """Check if an npz file holds contact sites (``save_contact_sites``)."""
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            return "faces_A_data" in data and "faces_B_data" in data
+    except Exception:
+        return False
+
+
 def _is_l2_graph(path: Path) -> bool:
     """Check if an npz file is an L2 graph (not a skeliner skeleton)."""
     with np.load(path, allow_pickle=False) as data:
@@ -338,7 +348,7 @@ def _create_app(
     preload_mesh: Mesh | None = None,
     preload_centroid: np.ndarray | None = None,
     extra_meshes: dict[str, dict[str, Any]] | None = None,
-    contact_state: dict[str, Any] | None = None,
+    contact: dict[str, Any] | None = None,
     mesh_color: list[float] | None = None,
     preload_skeletons: list[tuple[str, Any]] | None = None,
 ):
@@ -417,9 +427,16 @@ def _create_app(
     if extra_meshes is not None:
         extra_mesh_states.update(extra_meshes)
 
-    # Contact-site overlay data (set by view_contacts)
-    _contact_state: dict[str, Any] | None = contact_state
+    # Contact mode (view_contacts): mesh A is mesh_state's mesh, B the extra
+    # mesh "mesh_B", each given or dropped on the page in turn; the sites
+    # between them are given or found once both are in.  `gen` counts the
+    # meshes' changes, so a scan that outlives its meshes is dropped.
+    if contact is not None:
+        contact = {**contact, "session": os.urandom(8).hex(), "gen": 0}
+        contact.update(scanning=0, found=None)
 
+    if preload_centroid is not None:
+        mesh_state["centroid"] = np.asarray(preload_centroid, dtype=np.float32)
     # Pre-load mesh from path or object
     if preload_mesh is not None:
         mesh = Mesh.of(preload_mesh)
@@ -588,6 +605,226 @@ def _create_app(
         await broadcast({"type": "log_end"})
         return result
 
+    # ── Contact mode ──────────────────────────────────────────────────
+
+    def _contact_meshes() -> tuple[Mesh | None, Mesh | None]:
+        b = extra_mesh_states.get("mesh_B")
+        return mesh_state["mesh"], (b["mesh"] if b else None)
+
+    def _contact_overlay_now() -> tuple[dict, dict] | None:
+        """The sites' overlay on the current meshes, or None until both
+        meshes and their sites are in."""
+        a, b = _contact_meshes()
+        if a is None or b is None or contact["sites"] is None:
+            return None
+        return _contact_overlay(
+            a, b, mesh_state["centroid"], contact["sites"], **contact["options"]
+        )
+
+    def _contact_payload() -> dict:
+        """What the page's contact panel shows: the first choices, the two
+        meshes or their empty slots, and the sites' count and kinds."""
+        a, b = _contact_meshes()
+        opts = contact["options"]
+        out = {
+            "sides": {"a": "A", "b": "B", "both": "both"}[opts["sides"].lower()],
+            "boxes": bool(opts["show_aabb"]),
+            "nSites": 0,
+            "session": contact["session"],
+            "scanning": contact["scanning"] > 0,
+            "meshes": [
+                {
+                    "side": side,
+                    "key": key,
+                    "name": contact["names"][side],
+                    "nFaces": None if m is None else len(m.faces),
+                    "loaded": m is not None,
+                }
+                for side, key, m in (("A", "primary", a), ("B", "mesh_B", b))
+            ],
+        }
+        if contact["found"]:
+            found = contact["found"]
+            out.update({k: found[k] for k in ("nSites", "kinds") if k in found})
+        return out
+
+    async def _contact_publish():
+        """Draw the sites on the meshes in (none until both are), and tell
+        the pages what the panel shows."""
+        overlay = _contact_overlay_now()
+        contact["found"] = overlay[1] if overlay else None
+        await _save_annotations(overlay[0] if overlay else {})
+        await broadcast({"type": "contact_state", "payload": _contact_payload()})
+
+    async def _contact_scan():
+        """Find the sites once both meshes are in and none were given; a
+        result whose meshes changed meanwhile is dropped."""
+        a, b = _contact_meshes()
+        if a is None or b is None or contact["sites"] is not None:
+            return
+        from ..pair import scan_contacts
+
+        gen = contact["gen"]
+        contact["scanning"] += 1
+        await broadcast({"type": "contact_state", "payload": _contact_payload()})
+        await _log("Finding the contact sites (sk.pair.scan_contacts) …")
+        t0 = time.perf_counter()
+        try:
+            sites = await _run_with_log(scan_contacts, a, b)
+        finally:
+            contact["scanning"] -= 1
+        if gen == contact["gen"]:
+            contact["sites"] = sites
+            await _log(
+                f"Found {len(sites.faces_A)} contact sites in"
+                f" {time.perf_counter() - t0:.1f} s"
+            )
+
+    def _no_contact_meshes() -> bool:
+        return all(m is None for m in _contact_meshes())
+
+    async def _contact_set_mesh(side: str, mesh: Mesh, name: str):
+        """Put *mesh* in the empty slot *side*.  Sites given before it stay,
+        to be checked once both meshes are in."""
+        contact["gen"] += 1
+        contact["names"][side] = name
+        if _no_contact_meshes():  # the first mesh centres them both
+            mesh_state["centroid"] = np.asarray(mesh.vertices, np.float32).mean(axis=0)
+        buffers = _mesh_to_buffers(mesh, centroid=mesh_state["centroid"])
+        color = contact["colors"][side]
+        if side == "A":
+            _forget_mesh_state()
+            mesh_state.update(mesh=mesh, buffers=buffers, path=name)
+            await broadcast(
+                {"type": "mesh_loaded", "payload": {**buffers, "color": color}}
+            )
+        else:
+            extra_mesh_states["mesh_B"] = {
+                "mesh": mesh,
+                "buffers": buffers,
+                "color": color,
+                "opacity": 1.0,
+            }
+            await broadcast(
+                {
+                    "type": "extra_mesh_loaded",
+                    "payload": {
+                        "name": "mesh_B",
+                        **buffers,
+                        "color": color,
+                        "opacity": 1.0,
+                    },
+                }
+            )
+
+    async def contact_upload(request):
+        """A drop on the contact viewer: each mesh fills the first empty
+        slot, A then B, and a contact-sites file gives the sites (checked
+        against the meshes once both are in, found by the scan otherwise).
+        With both slots full a mesh is refused: remove one first."""
+        if contact is None:
+            return JSONResponse(
+                {"ok": False, "error": "Not a contact viewer"}, status_code=400
+            )
+        try:
+            form = await request.form()
+        except Exception:
+            return JSONResponse(
+                {"ok": False, "error": "Upload interrupted"}, status_code=499
+            )
+        paths: list[Path] = []
+        try:
+            for upload in form.getlist("files"):
+                tmp_path = port_dir / upload.filename
+                tmp_path.write_bytes(await upload.read())
+                paths.append(tmp_path)
+        finally:
+            await form.close()
+        meshes = sorted(
+            p for p in paths if p.suffix.lower() in (".obj", ".ply", ".stl")
+        )
+        site_files = [
+            p for p in paths if p.suffix.lower() == ".npz" and _is_contact_sites(p)
+        ]
+        empty = [s for s, m in zip("AB", _contact_meshes()) if m is None]
+        if len(meshes) > len(empty):
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "Both meshes are loaded: remove one (×) to drop another"
+                    if not empty
+                    else f"Only mesh {empty[0]} is free: drop one mesh",
+                },
+                status_code=400,
+            )
+        results = []
+        loop = asyncio.get_event_loop()
+        for path, side in zip(meshes, empty):
+            mesh = await loop.run_in_executor(None, load_mesh, path)
+            await _contact_set_mesh(side, mesh, path.name)
+            results.append(
+                {"name": path.name, "ok": True, "type": "mesh", "side": side}
+            )
+        for path in site_files:
+            from ..io import load_contact_sites
+
+            contact["sites"] = load_contact_sites(path)
+            results.append({"name": path.name, "ok": True, "type": "sites"})
+        for path in paths:
+            if path not in meshes and path not in site_files:
+                results.append(
+                    {
+                        "name": path.name,
+                        "ok": False,
+                        "error": "Not a mesh or contact sites",
+                    }
+                )
+        a, b = _contact_meshes()
+        if contact["sites"] is not None and a is not None and b is not None:
+            try:
+                _sites_index(a, contact["sites"].faces_A, "A")
+                _sites_index(b, contact["sites"].faces_B, "B")
+            except ValueError as e:
+                contact["sites"] = None
+                results.append({"name": "sites", "ok": False, "error": str(e)})
+        await _contact_scan()
+        await _contact_publish()
+        return JSONResponse({"ok": True, "results": results})
+
+    async def contact_remove(request):
+        """Empty mesh slot A or B; the sites go with it."""
+        side = (await _body_of(request)).get("side")
+        if contact is None or side not in ("A", "B"):
+            return JSONResponse(
+                {"ok": False, "error": "side must be 'A' or 'B'"}, status_code=400
+            )
+        contact["gen"] += 1
+        contact["sites"] = None
+        if side == "A":
+            mesh_state.update(mesh=None, buffers=None, path=None)
+            _forget_mesh_state()
+            await broadcast({"type": "mesh_removed"})
+        else:
+            extra_mesh_states.pop("mesh_B", None)
+            await broadcast(
+                {"type": "extra_mesh_removed", "payload": {"name": "mesh_B"}}
+            )
+        if _no_contact_meshes():
+            mesh_state["centroid"] = np.zeros(3, dtype=np.float32)
+        await _contact_publish()
+        return JSONResponse({"ok": True})
+
+    # the overlay of the meshes and sites given at launch, there when the
+    # first page asks for it
+    if contact is not None:
+        overlay = _contact_overlay_now()
+        if overlay:
+            contact["found"] = overlay[1]
+            annotations_path.write_text(
+                json.dumps(overlay[0], separators=(",", ":")), encoding="utf-8"
+            )
+            _annotations_announced["mtime"] = annotations_path.stat().st_mtime
+
     # ── Routes ────────────────────────────────────────────────────────
 
     async def index(_request):
@@ -622,10 +859,10 @@ def _create_app(
         return JSONResponse(result)
 
     async def get_contact_sites(_request):
-        """Return contact-site overlay data."""
-        if _contact_state is None:
+        """Return the contact panel's state (None outside contact mode)."""
+        if contact is None:
             return JSONResponse(None)
-        return JSONResponse(_contact_state)
+        return JSONResponse(_contact_payload())
 
     async def get_state(_request):
         if state_path.exists():
@@ -4924,6 +5161,8 @@ def _create_app(
             Route("/skeletons", get_skeletons),
             Route("/extra_meshes", get_extra_meshes),
             Route("/contact_sites", get_contact_sites),
+            Route("/contact_upload", contact_upload, methods=["POST"]),
+            Route("/contact_remove", contact_remove, methods=["POST"]),
             Route("/loaded", get_loaded),
             Route("/state", get_state, methods=["GET"]),
             Route("/save_availability", get_save_availability, methods=["GET"]),
@@ -5273,6 +5512,17 @@ _SITE_COLORS = [
 ]
 
 
+def _check_contact_options(sides: str, aabb_mode: str) -> str:
+    """*sides* as the page names it (``"A"``, ``"B"``, ``"both"``), once it
+    and *aabb_mode* are known to be ones the overlay draws."""
+    first = {"a": "A", "b": "B", "both": "both"}.get(str(sides).lower())
+    if first is None:
+        raise ValueError(f"sides must be 'A', 'B' or 'both', not {sides!r}")
+    if aabb_mode not in ("union", "split"):
+        raise ValueError(f"aabb_mode must be 'union' or 'split', not {aabb_mode!r}")
+    return first
+
+
 def _contact_overlay(
     A: Mesh,
     B: Mesh,
@@ -5296,11 +5546,7 @@ def _contact_overlay(
     (``contacts.kind``), else each in turn from a palette; labels name the
     site's side, and its kind whenever it is known.
     """
-    first = {"a": "A", "b": "B", "both": "both"}.get(str(sides).lower())
-    if first is None:
-        raise ValueError(f"sides must be 'A', 'B' or 'both', not {sides!r}")
-    if aabb_mode not in ("union", "split"):
-        raise ValueError(f"aabb_mode must be 'union' or 'split', not {aabb_mode!r}")
+    first = _check_contact_options(sides, aabb_mode)
     n_sites = max(len(contacts.faces_A), len(contacts.faces_B))
     kinds = getattr(contacts, "kind", None)
     kinds = None if kinds is None else [str(k) for k in kinds]
@@ -5398,8 +5644,8 @@ def _sites_index(mesh: Mesh, faces, side: str) -> None:
 
 
 def view_contacts(
-    A: Mesh,
-    B: Mesh,
+    A: Mesh | None = None,
+    B: Mesh | None = None,
     contacts=None,  # ContactSites
     *,
     names: tuple[str, str] = ("A", "B"),
@@ -5418,22 +5664,31 @@ def view_contacts(
 
     *contacts* are the sites to show; without them
     ``skeliner.pair.scan_contacts`` finds them on the two meshes, kinds
-    included. The page's contact panel switches which side's sites are
-    drawn (*sides* is the first choice: ``"A"``, ``"B"`` or ``"both"``),
-    hides kinds of sites and the boxes around them (*show_aabb*: one box
-    around both sides of a site with *aabb_mode* ``"union"``, one per side
-    with ``"split"``), and sets each mesh's colour, opacity and wireframe;
-    *names* label the two meshes there.
+    included. Either mesh may be left out, or both: drop the missing ones on
+    the page, the first into slot A and the next into B, and a sites file
+    saved with ``skeliner.io.save_contact_sites`` too; the sites are found
+    once both meshes are in. The page's contact panel switches which side's
+    sites are drawn (*sides* is the first choice: ``"A"``, ``"B"`` or
+    ``"both"``), hides kinds of sites and the boxes around them
+    (*show_aabb*: one box around both sides of a site with *aabb_mode*
+    ``"union"``, one per side with ``"split"``), sets each mesh's colour,
+    opacity and wireframe, and empties a mesh's slot for another; *names*
+    label the two meshes there.
 
     When the sites have kinds (``skeliner.pair.label_contacts``, done by
     ``scan_contacts``), each site is coloured by its kind and the panel
     lists the kinds with their counts; ``color_by="site"`` colours each site
     in turn instead, as for sites without kinds.
     """
-    A, B = Mesh.of(A), Mesh.of(B)
-    if contacts is None:
-        import time
-
+    _check_contact_options(sides, aabb_mode)
+    A = None if A is None else Mesh.of(A)
+    B = None if B is None else Mesh.of(B)
+    if scale != 1.0:
+        A, B = (
+            None if m is None else Mesh(m.vertices * float(scale), m.faces)
+            for m in (A, B)
+        )
+    if contacts is None and A is not None and B is not None:
         from ..pair import scan_contacts
 
         t0 = time.perf_counter()
@@ -5442,68 +5697,40 @@ def view_contacts(
             f"Found {len(contacts.faces_A)} contact sites in"
             f" {time.perf_counter() - t0:.1f} s"
         )
-    _sites_index(A, contacts.faces_A, "A")
-    _sites_index(B, contacts.faces_B, "B")
+    if contacts is not None and A is not None and B is not None:
+        _sites_index(A, contacts.faces_A, "A")
+        _sites_index(B, contacts.faces_B, "B")
 
-    # Shared centroid from both meshes
-    all_verts = np.concatenate(
-        [A.vertices.astype(np.float32), B.vertices.astype(np.float32)]
-    )
-    centroid = all_verts.mean(axis=0)
-
-    # Scale meshes
-    if scale != 1.0:
-        A = Mesh(A.vertices * float(scale), A.faces)
-        B = Mesh(B.vertices * float(scale), B.faces)
-        centroid = centroid * float(scale)
-
-    # Buffers for B (extra); A renders through the primary mesh_state
-    buf_B = _mesh_to_buffers(B, centroid=centroid)
-
-    extra_meshes = {
-        "mesh_B": {
-            "mesh": B,
-            "buffers": buf_B,
-            "color": list(color_B),
-            "opacity": 1.0,
-        },
-    }
-
-    annotations, contact_state = _contact_overlay(
-        A,
-        B,
-        centroid,
-        contacts,
-        sides=sides,
-        show_aabb=show_aabb,
-        aabb_mode=aabb_mode,
-        color_by=color_by,
-    )
-    contact_state["meshes"] = [
-        {"side": side, "key": key, "name": str(name), "nFaces": len(m.faces)}
-        for side, key, name, m in (
-            ("A", "primary", names[0], A),
-            ("B", "mesh_B", names[1], B),
-        )
-    ]
-    # tells this launch from the last one on the port, whose panel settings
-    # the page keeps for a reload
-    contact_state["session"] = os.urandom(8).hex()
+    # one centre for both meshes, from those given
+    given = [m.vertices.astype(np.float32) for m in (A, B) if m is not None]
+    centroid = np.concatenate(given).mean(axis=0) if given else None
+    extra_meshes = None
+    if B is not None:
+        extra_meshes = {
+            "mesh_B": {
+                "mesh": B,
+                "buffers": _mesh_to_buffers(B, centroid=centroid),
+                "color": list(color_B),
+                "opacity": 1.0,
+            },
+        }
 
     app = _create_app(
         port=port,
         preload_mesh=A,
         preload_centroid=centroid,
         extra_meshes=extra_meshes,
-        contact_state=contact_state,
+        contact={
+            "sites": contacts,
+            "names": {"A": str(names[0]), "B": str(names[1])},
+            "colors": {"A": list(color_A), "B": list(color_B)},
+            "options": {
+                "sides": sides,
+                "show_aabb": show_aabb,
+                "aabb_mode": aabb_mode,
+                "color_by": color_by,
+            },
+        },
         mesh_color=list(color_A),
     )
-
-    # Write contact annotations (after _create_app clears state dir)
-    if annotations:
-        ann_path = _STATE_DIR / str(port) / "annotations.json"
-        ann_path.write_text(
-            json.dumps(annotations, separators=(",", ":")), encoding="utf-8"
-        )
-
     _launch_app(app, host=host, port=port, no_browser=no_browser)

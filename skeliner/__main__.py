@@ -2,7 +2,7 @@
 
 Usage:
     skeliner view [path/to/mesh.obj]
-    skeliner view-contacts A.obj B.obj [sites.npz]
+    skeliner view-contacts [A.obj [B.obj [sites.npz]]]
     python -m skeliner view path/to/mesh.obj
 """
 
@@ -44,11 +44,15 @@ def main():
         description=(
             "Show two meshes and the sites where they touch. Without a sites"
             " file (one saved with sk.io.save_contact_sites, found on these"
-            " two meshes) the sites are found with sk.pair.scan_contacts."
+            " two meshes) the sites are found with sk.pair.scan_contacts. A"
+            " mesh left out, or both, is dropped on the page instead: the first"
+            " into slot A, the next into B."
         ),
     )
-    contacts_parser.add_argument("mesh_a", help="Mesh A (.obj, .ply, etc.)")
-    contacts_parser.add_argument("mesh_b", help="Mesh B")
+    contacts_parser.add_argument(
+        "mesh_a", nargs="?", default=None, help="Mesh A (.obj, .ply, etc.)"
+    )
+    contacts_parser.add_argument("mesh_b", nargs="?", default=None, help="Mesh B")
     contacts_parser.add_argument(
         "sites", nargs="?", default=None, help="Contact sites (.npz) of A and B"
     )
@@ -82,12 +86,15 @@ def main():
         import skeliner as sk
         from skeliner.viewer.viewer import view_contacts
 
-        meshes = [sk.io.load_mesh(p) for p in (args.mesh_a, args.mesh_b)]
+        paths = (args.mesh_a, args.mesh_b)
+        meshes = [None if p is None else sk.io.load_mesh(p) for p in paths]
         sites = sk.io.load_contact_sites(args.sites) if args.sites else None
         view_contacts(
             *meshes,
             sites,
-            names=(_mesh_name(args.mesh_a), _mesh_name(args.mesh_b)),
+            names=tuple(
+                side if p is None else _mesh_name(p) for side, p in zip("AB", paths)
+            ),
             sides=args.sides,
             show_aabb=args.boxes != "none",
             aabb_mode="split" if args.boxes == "split" else "union",

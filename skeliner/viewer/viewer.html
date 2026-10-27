@@ -1104,6 +1104,8 @@
                     contactMode = true;
                     contactInfo = contactData;
                     startContactView(contactData);
+                    document.getElementById("empty-hint").textContent =
+                        "Drop mesh A, then mesh B (.obj, .ply, .stl), and their contact sites (.npz) if you have them";
                     for (const id of ['info', 'controls', 'detect-panel', 'loaded-panel']) {
                         const el = document.getElementById(id);
                         if (el) el.style.display = 'none';
@@ -1449,19 +1451,27 @@
                     if (!files.length) return;
                     const formData = new FormData();
                     for (const file of files) formData.append("files", file);
+                    // A contact viewer fills its two mesh slots in turn.
+                    const url = contactMode ? "/contact_upload" : "/upload_batch";
+                    const failed = [];
                     try {
-                        const resp = await fetch("/upload_batch", { method: "POST", body: formData });
+                        const resp = await fetch(url, { method: "POST", body: formData });
                         const data = await resp.json();
                         if (data.ok) {
                             for (const r of data.results) {
                                 if (r.ok) console.log(`[skeliner] Loaded ${r.type}: ${r.name}`);
-                                else console.error(`[skeliner] Failed ${r.name}: ${r.error}`);
+                                else failed.push(`${r.name}: ${r.error}`);
                             }
                         } else {
-                            console.error(`[skeliner] Upload failed: ${data.error}`);
+                            failed.push(data.error);
                         }
                     } catch (err) {
-                        console.error("[skeliner] Upload error:", err);
+                        failed.push(String(err));
+                    }
+                    for (const f of failed) console.error(`[skeliner] ${f}`);
+                    if (contactMode && failed.length) {
+                        showLogStatus(failed.join(" · "));
+                        fadeLogStatus();
                     }
                 });
             }
@@ -1588,15 +1598,7 @@
 
             // ── Build extra mesh (multi-mesh / contact mode) ────────────────────
             function buildExtraMesh(name, data) {
-                // Remove old version
-                if (extraMeshObjs[name]) {
-                    scene.remove(extraMeshObjs[name].mesh);
-                    scene.remove(extraMeshObjs[name].wire);
-                    extraMeshObjs[name].mesh.geometry.dispose();
-                    extraMeshObjs[name].mesh.material.dispose();
-                    extraMeshObjs[name].wire.material.dispose();
-                    delete extraMeshObjs[name];
-                }
+                removeExtraMesh(name);
 
                 const { nFaces } = data;
                 const color = data.color || [0.55, 0.55, 0.6];
@@ -1652,6 +1654,17 @@
 
                 extraMeshObjs[name] = { mesh: obj, wire, geometry: geo };
                 if (contactMode) applyContactMeshes();
+            }
+
+            function removeExtraMesh(name) {
+                const em = extraMeshObjs[name];
+                if (!em) return;
+                for (const o of [em.mesh, em.wire]) {
+                    scene.remove(o);
+                    o.material.dispose();
+                }
+                em.geometry.dispose();
+                delete extraMeshObjs[name];
             }
 
             // ── Build skeleton ───────────────────────────────────────────────────
@@ -5649,8 +5662,19 @@
                     else if (msg.type === "camera_command") applyCameraCommand(msg.payload);
                     else if (msg.type === "reload") window.location.reload();
                     else if (msg.type === "mesh_loaded") {
+                        // a mesh new to its slot is drawn, whatever the last was
+                        if (contactMode && contactView.meshes.A) contactView.meshes.A.visible = true;
                         buildMesh(msg.payload);
                         updateLoadedPanel();
+                    } else if (msg.type === "extra_mesh_loaded") {
+                        if (contactMode && contactView.meshes.B) contactView.meshes.B.visible = true;
+                        buildExtraMesh(msg.payload.name, msg.payload);
+                        fitCamera();
+                    } else if (msg.type === "extra_mesh_removed") {
+                        removeExtraMesh(msg.payload.name);
+                    } else if (msg.type === "contact_state") {
+                        contactInfo = msg.payload;
+                        if (contactMode) renderContactPanel();
                     } else if (msg.type === "skeleton_loaded") {
                         buildSkeleton(msg.payload);
                     } else if (msg.type === "skeleton_removed") {
@@ -5706,7 +5730,8 @@
                         document.getElementById("nVerts").textContent = "-";
                         document.getElementById("nFaces").textContent = "-";
                         updateLoadedPanel();
-                        if (Object.keys(skelGroups).length === 0)
+                        // the contact panel says when there is nothing left
+                        if (!contactMode && Object.keys(skelGroups).length === 0)
                             document.getElementById("empty-hint").style.display = "block";
                     }
                 };
@@ -5852,15 +5877,36 @@
                 saveContactView();
             }
 
-            // The panel's controls, built once the meshes and the saved
-            // settings are in: each mesh starts as drawn unless this launch
-            // set it already.
+            // The panel's fixed controls, set up once the meshes and the saved
+            // settings are in; what changes with the meshes is
+            // renderContactPanel's.
             function setupContactPanel() {
-                const panel = document.getElementById("contact-panel");
-                panel.style.display = "";
-                for (const info of contactInfo.meshes || []) {
+                document.getElementById("contact-panel").style.display = "";
+                for (const b of document.querySelectorAll("#cpSides button"))
+                    b.addEventListener("click", () => setContactView({ sides: b.dataset.sides }));
+                document
+                    .getElementById("cpBoxes")
+                    .addEventListener("change", (e) => setContactView({ boxes: e.target.checked }));
+                const siteOpacity = document.getElementById("cpSiteOpacity");
+                siteOpacity.value = document.getElementById("annOpacitySlider").value;
+                siteOpacity.addEventListener("input", () => {
+                    // through the annotation slider, so a redraw keeps it
+                    const ann = document.getElementById("annOpacitySlider");
+                    ann.value = siteOpacity.value;
+                    ann.dispatchEvent(new Event("input"));
+                });
+                renderContactPanel();
+            }
+
+            // What the server says is in: the sites' count and kinds, and a
+            // row per mesh slot, with the mesh's controls or a note to drop
+            // one there.  A mesh starts as drawn unless its slot was set
+            // already in this launch.
+            function renderContactPanel() {
+                const slots = contactInfo.meshes || [];
+                for (const info of slots) {
                     const { obj, wire, geo } = contactMeshParts(info.side);
-                    if (!obj || contactView.meshes[info.side]) continue;
+                    if (!info.loaded || !obj || contactView.meshes[info.side]) continue;
                     const c = geo.getAttribute("color");
                     contactView.meshes[info.side] = {
                         visible: obj.visible,
@@ -5871,8 +5917,14 @@
                 }
                 applyContactMeshes();
 
+                const loaded = slots.filter((m) => m.loaded).length;
                 const n = contactInfo.nSites || 0;
-                document.getElementById("cpCount").textContent = `${n} site${n === 1 ? "" : "s"}`;
+                document.getElementById("cpCount").textContent = contactInfo.scanning
+                    ? "finding the sites…"
+                    : loaded < 2
+                      ? `drop ${loaded ? "one more mesh" : "two meshes"}`
+                      : `${n} site${n === 1 ? "" : "s"}`;
+                document.getElementById("empty-hint").style.display = loaded ? "none" : "block";
                 const kinds = document.getElementById("cpKinds");
                 kinds.innerHTML = "";
                 for (const k of contactInfo.kinds || []) {
@@ -5896,25 +5948,11 @@
                     kinds.appendChild(b);
                 }
                 kinds.style.display = (contactInfo.kinds || []).length ? "" : "none";
-                for (const b of document.querySelectorAll("#cpSides button"))
-                    b.addEventListener("click", () => setContactView({ sides: b.dataset.sides }));
-                document
-                    .getElementById("cpBoxes")
-                    .addEventListener("change", (e) => setContactView({ boxes: e.target.checked }));
-                const siteOpacity = document.getElementById("cpSiteOpacity");
-                siteOpacity.value = document.getElementById("annOpacitySlider").value;
-                siteOpacity.addEventListener("input", () => {
-                    // through the annotation slider, so a redraw keeps it
-                    const ann = document.getElementById("annOpacitySlider");
-                    ann.value = siteOpacity.value;
-                    ann.dispatchEvent(new Event("input"));
-                });
 
                 const rows = document.getElementById("cpMeshes");
                 rows.innerHTML = "";
-                for (const info of contactInfo.meshes || []) {
+                for (const info of slots) {
                     const side = info.side;
-                    if (!contactView.meshes[side]) continue;
                     const row = document.createElement("div");
                     row.className = "cp-row";
                     row.dataset.side = side;
@@ -5922,6 +5960,15 @@
                     tag.className = "cp-dim";
                     tag.textContent = `Mesh ${side}`;
                     row.appendChild(tag);
+                    rows.appendChild(row);
+                    if (!info.loaded || !contactView.meshes[side]) {
+                        const note = document.createElement("span");
+                        note.className = "cp-dim";
+                        note.textContent = "drop a mesh";
+                        row.appendChild(note);
+                        continue;
+                    }
+                    row.dataset.loaded = "1";
                     const picker = document.createElement("input");
                     picker.type = "color";
                     picker.className = "hl-color-input";
@@ -5935,6 +5982,14 @@
                     name.textContent = info.name;
                     name.title = `${info.name}, ${info.nFaces.toLocaleString()} faces`;
                     row.appendChild(name);
+                    // a dropped file brings only its name, often mesh.obj for both
+                    const size = document.createElement("span");
+                    size.className = "cp-dim";
+                    size.textContent =
+                        info.nFaces >= 1e6
+                            ? `${(info.nFaces / 1e6).toFixed(2)}M faces`
+                            : `${Math.round(info.nFaces / 1e3)}k faces`;
+                    row.appendChild(size);
                     const eye = document.createElement("button");
                     eye.className = "toggle-vis icon-btn";
                     eye.addEventListener("click", () =>
@@ -5956,11 +6011,24 @@
                         setContactMesh(side, { opacity: parseInt(slider.value) / 100 }),
                     );
                     row.appendChild(slider);
-                    rows.appendChild(row);
+                    const remove = document.createElement("button");
+                    remove.className = "icon-btn";
+                    remove.textContent = "x";
+                    remove.title = `remove mesh ${side}, to drop another in its place`;
+                    remove.addEventListener("click", () => removeContactMesh(side));
+                    row.appendChild(remove);
                 }
                 refreshContactPanel();
                 applyContactVisibility();
                 updateHighlightsPanel();
+            }
+
+            function removeContactMesh(side) {
+                fetch("/contact_remove", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ side }),
+                }).catch(() => {});
             }
 
             // The panel's controls as the settings stand.
@@ -5971,7 +6039,7 @@
                 for (const b of document.querySelectorAll("#cpKinds button"))
                     b.dataset.on = contactView.hiddenKinds.includes(b.dataset.kind) ? "0" : "1";
                 document.getElementById("cpBoxes").checked = contactView.boxes;
-                for (const row of document.querySelectorAll("#cpMeshes .cp-row")) {
+                for (const row of document.querySelectorAll("#cpMeshes .cp-row[data-loaded]")) {
                     const m = contactView.meshes[row.dataset.side];
                     if (!m) continue;
                     if (m.color) row.querySelector('input[type="color"]').value = rgbToHex(m.color);

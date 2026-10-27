@@ -3391,3 +3391,165 @@ def test_view_contacts_without_sites_leaves_them_to_the_scan(
     (_, _, found), kw = called["view_contacts"]
     assert found is None
     assert kw["show_aabb"] is False and kw["sides"] == "A"
+
+
+# ── a contact viewer filled by drag and drop ──────────────────────────
+#
+# A bare ``skeliner view-contacts`` starts with both mesh slots empty; each
+# dropped mesh fills the next, A then B, and the sites are found once both
+# are in — or taken from a dropped sites file.
+
+
+@pytest.fixture
+def empty_contacts(tmp_path, monkeypatch):
+    """An empty contact viewer, its client and a page that records every
+    broadcast."""
+    from starlette.testclient import TestClient
+
+    from skeliner.viewer import viewer as viewer_mod
+
+    monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path / "state", raising=False)
+    launched = {}
+    monkeypatch.setattr(
+        viewer_mod, "_launch_app", lambda app, **_kw: launched.update(app=app)
+    )
+    viewer_mod.view_contacts(port=8920)
+    return TestClient(launched["app"]), _connect_page(launched["app"])
+
+
+@pytest.fixture
+def pair_files(two_kinds, tmp_path):
+    """The two tubes as OBJ files, and the meshes they read back as."""
+    import skeliner as sk
+
+    a, b, _ = two_kinds
+    paths = tmp_path / "cell_a.obj", tmp_path / "cell_b.obj"
+    a.export(paths[0])
+    b.export(paths[1])
+    return paths, tuple(sk.io.load_mesh(p) for p in paths)
+
+
+def _drop(client, *paths):
+    files = [("files", (p.name, p.read_bytes())) for p in paths]
+    return client.post("/contact_upload", files=files)
+
+
+def _slots(client):
+    state = client.get("/contact_sites").json()
+    return [m["loaded"] for m in state["meshes"]], state["nSites"]
+
+
+def test_an_empty_contact_viewer_waits_for_two_meshes(empty_contacts):
+    client, _ = empty_contacts
+    assert _slots(client) == ([False, False], 0)
+    assert client.get("/mesh").json() is None
+    assert client.get("/extra_meshes").json() is None
+
+
+def test_meshes_dropped_one_by_one_fill_a_then_b(empty_contacts, pair_files):
+    from skeliner import pair
+
+    client, page = empty_contacts
+    (path_a, path_b), (a, b) = pair_files
+    assert _drop(client, path_a).json()["results"][0]["side"] == "A"
+    assert _slots(client) == ([True, False], 0)
+    assert _drop(client, path_b).json()["results"][0]["side"] == "B"
+    expected = pair.scan_contacts(a, b)
+    assert _slots(client) == ([True, True], len(expected.faces_A))
+    assert len(expected.faces_A) > 0
+    sent = [m["type"] for m in page.sent]
+    assert sent.index("mesh_loaded") < sent.index("extra_mesh_loaded")
+    highlights = client.get("/annotations").json()["highlights"]
+    assert {h["side"] for h in highlights} == {"A", "B"}
+    names = [m["name"] for m in client.get("/contact_sites").json()["meshes"]]
+    assert names == ["cell_a.obj", "cell_b.obj"]
+
+
+def test_both_meshes_share_the_first_one_s_centre(empty_contacts, pair_files):
+    client, page = empty_contacts
+    (path_a, path_b), (a, _) = pair_files
+    _drop(client, path_a)
+    _drop(client, path_b)
+    a_sent = next(m for m in page.sent if m["type"] == "mesh_loaded")["payload"]
+    b_sent = next(m for m in page.sent if m["type"] == "extra_mesh_loaded")["payload"]
+    assert a_sent["centroid"] == b_sent["centroid"]
+    np.testing.assert_allclose(
+        a_sent["centroid"], np.asarray(a.vertices, np.float32).mean(0), rtol=1e-6
+    )
+
+
+def test_a_full_viewer_takes_a_mesh_once_one_is_removed(empty_contacts, pair_files):
+    client, page = empty_contacts
+    (path_a, path_b), _ = pair_files
+    _drop(client, path_a, path_b)
+    found = _slots(client)[1]
+    refused = _drop(client, path_a)
+    assert refused.status_code == 400 and "remove one" in refused.json()["error"]
+    assert client.post("/contact_remove", json={"side": "B"}).json()["ok"]
+    assert _slots(client) == ([True, False], 0)
+    assert "highlights" not in client.get("/annotations").json()
+    assert {"name": "mesh_B"} in [
+        m["payload"] for m in page.sent if m["type"] == "extra_mesh_removed"
+    ]
+    _drop(client, path_b)
+    assert _slots(client) == ([True, True], found)
+
+
+def test_a_dropped_sites_file_is_used_instead_of_the_scan(
+    empty_contacts, pair_files, tmp_path
+):
+    import skeliner as sk
+
+    client, _ = empty_contacts
+    (path_a, path_b), (a, b) = pair_files
+    one = sk.pair.pick_contacts(sk.pair.scan_contacts(a, b), np.array([True, False]))
+    sk.io.save_contact_sites(one, tmp_path / "one.npz")
+    _drop(client, path_a, path_b, tmp_path / "one.npz")
+    assert _slots(client) == ([True, True], 1)
+
+
+def test_sites_dropped_before_the_second_mesh_wait_for_it(
+    empty_contacts, pair_files, tmp_path
+):
+    import skeliner as sk
+
+    client, _ = empty_contacts
+    (path_a, path_b), (a, b) = pair_files
+    one = sk.pair.pick_contacts(sk.pair.scan_contacts(a, b), np.array([True, False]))
+    sk.io.save_contact_sites(one, tmp_path / "one.npz")
+    _drop(client, path_a, tmp_path / "one.npz")
+    assert _slots(client) == ([True, False], 0)
+    _drop(client, path_b)
+    assert _slots(client) == ([True, True], 1)
+
+
+def test_dropped_sites_of_other_meshes_are_refused(
+    empty_contacts, pair_files, tmp_path
+):
+    import skeliner as sk
+
+    client, _ = empty_contacts
+    (path_a, path_b), (a, b) = pair_files
+    swapped = sk.pair.scan_contacts(b, a)
+    sk.io.save_contact_sites(swapped, tmp_path / "swapped.npz")
+    results = _drop(client, path_a, path_b, tmp_path / "swapped.npz").json()["results"]
+    assert any(not r["ok"] and "other meshes" in r["error"] for r in results)
+    assert _slots(client)[1] == len(sk.pair.scan_contacts(a, b).faces_A)
+
+
+def test_only_a_contact_viewer_takes_contact_drops(tmp_path, monkeypatch):
+    from starlette.testclient import TestClient
+
+    from skeliner.viewer import viewer as viewer_mod
+
+    monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
+    client = TestClient(_create_app(port=8921))
+    assert client.get("/contact_sites").json() is None
+    assert client.post("/contact_remove", json={"side": "A"}).status_code == 400
+
+
+def test_bare_view_contacts_starts_an_empty_viewer(monkeypatch):
+    called = _cli(monkeypatch, "view-contacts")
+    (a, b, sites), kw = called["view_contacts"]
+    assert (a, b, sites) == (None, None, None)
+    assert kw["names"] == ("A", "B")

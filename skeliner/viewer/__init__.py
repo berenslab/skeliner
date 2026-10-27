@@ -34,8 +34,9 @@ def view3d(skels=None, meshes=None, **kwargs):
     return _view3d(skels, meshes, **kwargs)
 
 
-def view_contacts(A, B, contacts=None, **kwargs):
-    """Visualize two meshes with contact-site overlays."""
+def view_contacts(A=None, B=None, contacts=None, **kwargs):
+    """Visualize two meshes with contact-site overlays; a mesh left out is
+    dropped on the page instead."""
     from .viewer import view_contacts as _view_contacts
 
     return _view_contacts(A, B, contacts, **kwargs)
