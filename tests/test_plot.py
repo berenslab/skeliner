@@ -54,10 +54,16 @@ def test_details_with_mesh_none_and_soma_verts_does_not_raise():
 
 
 def test_the_viewer_s_old_names_warn_and_reach_sk_viewer():
-    for name in ("view", "view3d", "view_contacts", "stop_viewer"):
-        with pytest.warns(DeprecationWarning, match=f"sk.viewer.{name}"):
+    renamed = {
+        "view": "start",
+        "view3d": "view3d",
+        "view_contacts": "view_contacts",
+        "stop_viewer": "stop",
+    }
+    for name, new in renamed.items():
+        with pytest.warns(DeprecationWarning, match=rf"sk\.viewer\.{new}\(\)"):
             moved = getattr(sk.plot, name)
-        assert moved is getattr(sk.viewer, name)
+        assert moved is getattr(sk.viewer, new)
     with pytest.warns(DeprecationWarning, match="vis2d"):
         assert sk.plot.vis2d.diagnose_soma is sk.plot.diagnose_soma
     with pytest.raises(AttributeError):

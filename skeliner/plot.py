@@ -2082,18 +2082,24 @@ def diagnose_discarded(
 
 
 # `skeliner.plot` held the web viewer too, and these figures as `vis2d`,
-# until the viewer became `skeliner.viewer`
-_MOVED = ("view", "view3d", "view_contacts", "stop_viewer")
+# until the viewer became `skeliner.viewer`: each old name, its new one
+_MOVED = {
+    "view": "start",
+    "view3d": "view3d",
+    "view_contacts": "view_contacts",
+    "stop_viewer": "stop",
+}
 
 
 def __getattr__(name: str):
     if name in _MOVED:
+        new = _MOVED[name]
         warnings.warn(
-            f"sk.plot.{name}() is deprecated, use sk.viewer.{name}() instead.",
+            f"sk.plot.{name}() is deprecated, use sk.viewer.{new}() instead.",
             DeprecationWarning,
             stacklevel=2,
         )
-        return getattr(importlib.import_module("skeliner.viewer"), name)
+        return getattr(importlib.import_module("skeliner.viewer"), new)
     if name == "vis2d":
         warnings.warn(
             "sk.plot.vis2d is deprecated, its figures are sk.plot's own.",

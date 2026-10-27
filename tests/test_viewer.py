@@ -2936,7 +2936,7 @@ def test_every_function_the_page_calls_is_defined():
         "Number", "String", "Array", "Object", "Set", "Map", "JSON", "Math",
         "Date", "Promise", "Float32Array", "Uint32Array", "Uint8Array",
         "Int32Array", "Error", "Boolean", "URL", "FormData", "Blob", "async",
-        "WebSocket", "encodeURIComponent",
+        "WebSocket", "encodeURIComponent", "Event",
     }  # fmt: skip
     missing = sorted(called - defined - builtins)
     assert not missing, f"called but never defined: {missing}"
@@ -3046,10 +3046,15 @@ def test_contact_sites_are_coloured_and_labelled_by_kind(two_kinds):
     assert sorted(sites.kind.tolist()) == ["crossing", "other"]
     ann, state = _overlay(a, b, sites)
     for h in ann["highlights"]:
-        kind = next(k for k in _KIND_COLORS if f" · {k} " in h["label"])
-        assert h["color"] == _KIND_COLORS[kind]
+        assert h["kind"] == sites.kind[h["site"]]
+        assert h["label"] == f"Site {h['site']}{h['side']} · {h['kind']}"
+        assert h["color"] == _KIND_COLORS[h["kind"]]
     assert [k["kind"] for k in state["kinds"]] == ["crossing", "other"]
     assert [k["count"] for k in state["kinds"]] == [1, 1]
+    assert [k["color"] for k in state["kinds"]] == [
+        _KIND_COLORS["crossing"],
+        _KIND_COLORS["other"],
+    ]
     assert all(" · " in g["label"] for g in ann["edge_groups"])
 
 
@@ -3058,10 +3063,12 @@ def test_colouring_by_site_keeps_the_kinds_in_the_labels(two_kinds):
 
     a, b, sites = two_kinds
     ann, state = _overlay(a, b, sites, color_by="site")
-    colours = {h["label"].split(" ")[1][:-1]: h["color"] for h in ann["highlights"]}
-    assert colours == {"0": _SITE_COLORS[0], "1": _SITE_COLORS[1]}
+    colours = {h["site"]: h["color"] for h in ann["highlights"]}
+    assert colours == {0: _SITE_COLORS[0], 1: _SITE_COLORS[1]}
     assert all(" · " in h["label"] for h in ann["highlights"])
-    assert "kinds" not in state
+    # still listed, for the panel to show or hide each kind, but no key
+    assert [k["kind"] for k in state["kinds"]] == ["crossing", "other"]
+    assert all("color" not in k for k in state["kinds"])
 
 
 def test_sites_without_kinds_look_as_before(two_kinds):
@@ -3076,3 +3083,311 @@ def test_sites_without_kinds_look_as_before(two_kinds):
         tuple(c) for c in _SITE_COLORS
     }
     assert "kinds" not in state and state["nSites"] == 2
+
+
+def test_both_sides_are_sent_whichever_is_shown_first(two_kinds):
+    """The contact panel switches sides in the page, so every side of every
+    site is sent, tagged, and *sides* is only what the page shows first."""
+    a, b, sites = two_kinds
+    for first in ("A", "B", "both"):
+        ann, state = _overlay(a, b, sites, sides=first)
+        assert state["sides"] == first
+        sent = {(h["site"], h["side"], h["meshKey"]) for h in ann["highlights"]}
+        assert sent == {
+            (i, side, key)
+            for i in range(2)
+            for side, key in (("A", "primary"), ("B", "mesh_B"))
+        }
+
+
+def test_a_side_s_highlight_holds_that_mesh_s_faces(two_kinds):
+    a, b, sites = two_kinds
+    ann, _ = _overlay(a, b, sites, sides="A")
+    for h in ann["highlights"]:
+        faces = sites.faces_A if h["side"] == "A" else sites.faces_B
+        assert h["faces"] == np.asarray(faces[h["site"]]).tolist()
+
+
+@pytest.mark.parametrize("mode", ["union", "split"])
+def test_every_box_names_its_site(two_kinds, mode):
+    a, b, sites = two_kinds
+    ann, _ = _overlay(a, b, sites, aabb_mode=mode)
+    boxes = ann["edge_groups"]
+    assert all(g["aabb"] and g["kind"] == sites.kind[g["site"]] for g in boxes)
+    if mode == "union":
+        assert sorted(g["site"] for g in boxes) == [0, 1]
+        assert not any("side" in g for g in boxes)
+    else:
+        assert sorted((g["site"], g["side"]) for g in boxes) == [
+            (0, "A"),
+            (0, "B"),
+            (1, "A"),
+            (1, "B"),
+        ]
+
+
+def test_boxes_are_sent_hidden_rather_than_left_out(two_kinds):
+    a, b, sites = two_kinds
+    ann, state = _overlay(a, b, sites, show_aabb=False)
+    assert state["boxes"] is False and len(ann["edge_groups"]) == 2
+
+
+def test_an_unknown_side_or_box_mode_is_named(two_kinds):
+    a, b, sites = two_kinds
+    with pytest.raises(ValueError, match="sides"):
+        _overlay(a, b, sites, sides="C")
+    with pytest.raises(ValueError, match="aabb_mode"):
+        _overlay(a, b, sites, aabb_mode="none")
+
+
+@pytest.fixture
+def contact_launch(tmp_path, monkeypatch):
+    """``view_contacts`` up to the server it would start: its app, behind a
+    test client."""
+    from starlette.testclient import TestClient
+
+    from skeliner.viewer import viewer as viewer_mod
+
+    monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
+    launched = {}
+    monkeypatch.setattr(
+        viewer_mod, "_launch_app", lambda app, **_kw: launched.update(app=app)
+    )
+
+    def launch(*args, **kwargs):
+        viewer_mod.view_contacts(*args, port=8919, **kwargs)
+        return TestClient(launched["app"])
+
+    return launch
+
+
+def test_the_sites_are_found_when_none_are_given(two_kinds, contact_launch):
+    from skeliner import pair
+
+    a, b, _ = two_kinds
+    expected = pair.scan_contacts(a, b)
+    client = contact_launch(a, b)
+    state = client.get("/contact_sites").json()
+    assert state["nSites"] == len(expected.faces_A) > 0
+    assert sum(k["count"] for k in state["kinds"]) == len(expected.kind)
+    highlights = client.get("/annotations").json()["highlights"]
+    on_a = {h["site"]: h["faces"] for h in highlights if h["side"] == "A"}
+    assert on_a == {
+        i: np.asarray(f).tolist() for i, f in enumerate(expected.faces_A) if len(f)
+    }
+
+
+def test_the_panel_is_told_the_meshes_and_the_launch(two_kinds, contact_launch):
+    a, b, sites = two_kinds
+    first = contact_launch(a, b, sites, names=("cell a", "cell b"))
+    first = first.get("/contact_sites").json()
+    again = contact_launch(a, b, sites).get("/contact_sites").json()
+    assert [(m["side"], m["key"], m["name"], m["nFaces"]) for m in first["meshes"]] == [
+        ("A", "primary", "cell a", len(a.faces)),
+        ("B", "mesh_B", "cell b", len(b.faces)),
+    ]
+    # a reload keeps the panel's settings, a new launch does not
+    assert first["session"] != again["session"]
+
+
+def test_sites_found_on_other_meshes_are_refused(two_kinds, contact_launch):
+    a, b, sites = two_kinds
+    fewer = trimesh.Trimesh(a.vertices, a.faces[:10], process=False)
+    with pytest.raises(ValueError, match="other meshes"):
+        contact_launch(fewer, b, sites)
+
+
+def test_a_b_side_site_is_saved_from_mesh_b(two_kinds, contact_launch):
+    """A highlight's faces number the mesh it is drawn on."""
+    a, b, sites = two_kinds
+    client = contact_launch(a, b, sites)
+    highlights = client.get("/annotations").json()["highlights"]
+    idx = next(i for i, h in enumerate(highlights) if h["side"] == "B")
+    r = client.get(f"/export_annotation_submesh?index={idx}")
+    assert r.status_code == 200
+    faces = np.asarray(highlights[idx]["faces"])
+    used = np.unique(np.asarray(b.faces)[faces])
+    assert r.text.count("\nv ") + r.text.startswith("v ") == len(used)
+
+
+# ── starting and stopping ─────────────────────────────────────────────
+#
+# In a notebook a viewer serves from a thread until it is stopped, so two
+# of them can run side by side on two ports.
+
+
+def test_the_old_names_warn_and_reach_start_and_stop():
+    import skeliner as sk
+
+    for old, new in (("view", "start"), ("stop_viewer", "stop")):
+        with pytest.warns(DeprecationWarning, match=rf"sk\.viewer\.{new}\(\)"):
+            assert getattr(sk.viewer, old) is getattr(sk.viewer, new)
+    with pytest.raises(AttributeError):
+        sk.viewer.no_such_function
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _serving(port: int) -> bool:
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/loaded", timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def _within(cond, seconds: float = 10.0) -> bool:
+    import time
+
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < seconds:
+        if cond():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+@pytest.fixture
+def notebook_viewers(tmp_path, monkeypatch):
+    """``start`` as a notebook calls it: inside a running event loop."""
+    from skeliner.viewer import viewer as viewer_mod
+
+    monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
+
+    def start(*ports):
+        async def cell():
+            for p in ports:
+                viewer_mod.start(port=p, no_browser=True)
+
+        asyncio.run(cell())
+
+    yield start, viewer_mod.stop
+    viewer_mod.stop()
+
+
+def test_a_viewer_on_another_port_leaves_the_first_running(notebook_viewers):
+    start, stop = notebook_viewers
+    first, second = _free_port(), _free_port()
+    start(first)
+    assert _within(lambda: _serving(first))
+    start(second)
+    assert _within(lambda: _serving(second))
+    assert _serving(first)
+
+
+def test_stopping_a_port_stops_that_viewer_only(notebook_viewers):
+    start, stop = notebook_viewers
+    first, second = _free_port(), _free_port()
+    start(first, second)
+    assert _within(lambda: _serving(first) and _serving(second))
+    stop(first)
+    assert _within(lambda: not _serving(first))
+    assert _serving(second)
+    stop()
+    assert _within(lambda: not _serving(second))
+
+
+def test_starting_again_on_a_port_replaces_its_viewer(notebook_viewers):
+    from skeliner.viewer import viewer as viewer_mod
+
+    start, stop = notebook_viewers
+    port = _free_port()
+    start(port)
+    assert _within(lambda: _serving(port))
+    old = viewer_mod._servers[port][0]
+    start(port)
+    assert viewer_mod._servers[port][0] is not old and old.should_exit
+    assert _within(lambda: _serving(port))
+
+
+# ── the command line ──────────────────────────────────────────────────
+
+
+def _cli(monkeypatch, *argv):
+    """``skeliner *argv``, with what it would launch recorded instead."""
+    from skeliner import __main__ as cli
+    from skeliner.viewer import viewer as viewer_mod
+
+    called = {}
+    monkeypatch.setattr(
+        viewer_mod, "start", lambda *a, **kw: called.update(start=(a, kw))
+    )
+    monkeypatch.setattr(
+        viewer_mod,
+        "view_contacts",
+        lambda *a, **kw: called.update(view_contacts=(a, kw)),
+    )
+    monkeypatch.setattr("sys.argv", ["skeliner", *argv])
+    cli.main()
+    return called
+
+
+def test_view_starts_the_viewer_on_the_mesh(monkeypatch):
+    called = _cli(monkeypatch, "view", "cell.obj", "--port", "9123", "--no-browser")
+    args, kw = called["start"]
+    assert args == ("cell.obj",)
+    assert kw == dict(host="127.0.0.1", port=9123, no_browser=True)
+
+
+def test_view_contacts_reads_the_meshes_and_the_sites(two_kinds, tmp_path, monkeypatch):
+    import skeliner as sk
+
+    a, b, sites = two_kinds
+    (tmp_path / "cellA").mkdir()
+    a.export(tmp_path / "cellA" / "mesh.obj")
+    b.export(tmp_path / "B.obj")
+    sk.io.save_contact_sites(sites, tmp_path / "sites.npz")
+    called = _cli(
+        monkeypatch,
+        "view-contacts",
+        str(tmp_path / "cellA" / "mesh.obj"),
+        str(tmp_path / "B.obj"),
+        str(tmp_path / "sites.npz"),
+        "--sides",
+        "both",
+        "--boxes",
+        "split",
+        "--color-by",
+        "site",
+        "--no-browser",
+    )
+    (A, B, found), kw = called["view_contacts"]
+    assert len(A.faces) == len(a.faces) and len(B.faces) == len(b.faces)
+    assert [f.tolist() for f in found.faces_B] == [
+        np.asarray(f).tolist() for f in sites.faces_B
+    ]
+    assert found.kind.tolist() == sites.kind.tolist()
+    assert kw["names"] == ("cellA/mesh.obj", f"{tmp_path.name}/B.obj")
+    assert (kw["sides"], kw["aabb_mode"], kw["show_aabb"], kw["color_by"]) == (
+        "both",
+        "split",
+        True,
+        "site",
+    )
+
+
+def test_view_contacts_without_sites_leaves_them_to_the_scan(
+    two_kinds, tmp_path, monkeypatch
+):
+    a, b, _ = two_kinds
+    a.export(tmp_path / "A.obj")
+    b.export(tmp_path / "B.obj")
+    called = _cli(
+        monkeypatch,
+        "view-contacts",
+        str(tmp_path / "A.obj"),
+        str(tmp_path / "B.obj"),
+        "--boxes",
+        "none",
+    )
+    (_, _, found), kw = called["view_contacts"]
+    assert found is None
+    assert kw["show_aabb"] is False and kw["sides"] == "A"

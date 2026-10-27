@@ -4,6 +4,7 @@ Interactive mesh & skeleton viewer for skeliner.
 Usage:
     skeliner view                        # empty viewer, drag & drop files
     skeliner view path/to/mesh.obj       # pre-load a mesh
+    skeliner view-contacts A.obj B.obj   # two meshes and where they touch
 
 Launches a local web server with a Three.js viewer. Supports:
   - Mesh files: .obj, .ply, .stl (always in nm)
@@ -3301,7 +3302,16 @@ def _create_app(
                 status_code=400,
             )
 
-        mesh = mesh_state["mesh"]
+        # the faces number the mesh the highlight is drawn on
+        key = entry.get("meshKey") or "primary"
+        if key == "primary":
+            mesh = mesh_state["mesh"]
+        elif key in extra_mesh_states:
+            mesh = extra_mesh_states[key]["mesh"]
+        else:
+            return JSONResponse(
+                {"ok": False, "error": f"No mesh {key!r} loaded"}, status_code=400
+            )
         sub = mesh.submesh(faces)
 
         fmt = request.query_params.get("format", "obj")
@@ -4997,22 +5007,26 @@ def _has_running_loop() -> bool:
         return False
 
 
-# Track background server so it can be stopped / replaced
-_active_server = None
+# The viewers running in the background (from a notebook), by port: each
+# server with the thread it runs on.
+_servers: dict[int, tuple[Any, threading.Thread]] = {}
 
 
-def stop_viewer():
-    """Stop the background viewer server (Jupyter only)."""
-    global _active_server
-    if _active_server is not None:
-        _active_server.should_exit = True
-        _active_server = None
+def stop(port: int | None = None) -> None:
+    """Stop the background viewer on *port*, or every one when *port* is
+    ``None``. A viewer started from a script runs in the foreground until
+    it is interrupted, so only a notebook's viewers are here to stop."""
+    for p in list(_servers) if port is None else [port]:
+        found = _servers.pop(p, None)
+        if found is None:
+            continue
+        server, thread = found
+        server.should_exit = True
+        thread.join(timeout=10)
 
 
 def _launch_app(app, *, host: str, port: int, no_browser: bool):
     """Shared launcher: print info, open browser, run uvicorn."""
-    global _active_server
-
     try:
         import uvicorn
     except ImportError:
@@ -5021,10 +5035,8 @@ def _launch_app(app, *, host: str, port: int, no_browser: bool):
             "  pip install uvicorn[standard]"
         )
 
-    # Stop any previous background server on this port
-    if _active_server is not None:
-        _active_server.should_exit = True
-        _active_server = None
+    # this port's viewer gives way to the new one; the others keep running
+    stop(port)
 
     port_dir = _STATE_DIR / str(port)
     url = f"http://{host}:{port}"
@@ -5048,22 +5060,28 @@ def _launch_app(app, *, host: str, port: int, no_browser: bool):
         # Inside Jupyter / IPython — run uvicorn in a daemon thread
         config = uvicorn.Config(app, host=host, port=port, log_level="warning")
         server = uvicorn.Server(config)
-        _active_server = server
         thread = threading.Thread(target=server.run, daemon=True)
+        _servers[port] = (server, thread)
         thread.start()
-        print("  Viewer running in background. Call sk.viewer.stop_viewer() to stop.")
+        print(
+            "  Viewer running in background."
+            f" Call sk.viewer.stop({port}) to stop it, sk.viewer.stop() for all."
+        )
     else:
         uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
-def view(
+def start(
     mesh_path: str | Path | None = None,
     *,
     host: str = "127.0.0.1",
     port: int = 8777,
     no_browser: bool = False,
 ):
-    """Launch the interactive viewer."""
+    """Start the interactive viewer, empty (drop files on it) or with the
+    mesh at *mesh_path*. In a notebook it runs in the background until
+    :func:`stop`; from a script, until interrupted. A viewer already on
+    *port* gives way to it; viewers on other ports keep running."""
     app = _create_app(mesh_path, port=port)
     _launch_app(app, host=host, port=port, no_browser=no_browser)
 
@@ -5269,17 +5287,21 @@ def _contact_overlay(
     """The annotations (face highlights, AABB wireframes) and the contact
     state that :func:`view_contacts` shows for *contacts*.
 
-    Sites are coloured by their kind when *color_by* is ``"kind"`` and the
-    sites have one (``contacts.kind``), else each in turn from a palette;
-    labels name the kind whenever it is known.
+    Both sides' faces are sent whatever *sides* says, each highlight tagged
+    with its ``site``, ``side`` and ``kind`` and each box with its ``site``
+    (and ``side`` when there is one box per side), so the page's contact
+    panel switches sides, kinds and boxes without asking the server again;
+    *sides* and *show_aabb* are what it shows first. Sites are coloured by
+    their kind when *color_by* is ``"kind"`` and the sites have one
+    (``contacts.kind``), else each in turn from a palette; labels name the
+    site's side, and its kind whenever it is known.
     """
-    s = sides.lower()
-    doA = s in ("a", "both")
-    doB = s in ("b", "both")
-    n_sites = max(
-        len(contacts.faces_A) if doA else 0,
-        len(contacts.faces_B) if doB else 0,
-    )
+    first = {"a": "A", "b": "B", "both": "both"}.get(str(sides).lower())
+    if first is None:
+        raise ValueError(f"sides must be 'A', 'B' or 'both', not {sides!r}")
+    if aabb_mode not in ("union", "split"):
+        raise ValueError(f"aabb_mode must be 'union' or 'split', not {aabb_mode!r}")
+    n_sites = max(len(contacts.faces_A), len(contacts.faces_B))
     kinds = getattr(contacts, "kind", None)
     kinds = None if kinds is None else [str(k) for k in kinds]
     by_kind = color_by == "kind" and kinds is not None
@@ -5289,65 +5311,55 @@ def _contact_overlay(
             return _KIND_COLORS.get(kinds[i], _KIND_COLORS["other"])
         return _SITE_COLORS[i % len(_SITE_COLORS)]
 
+    sided = (
+        ("A", A, contacts.faces_A, "primary"),
+        ("B", B, contacts.faces_B, "mesh_B"),
+    )
     highlights = []
     edge_groups = []
     for i in range(n_sites):
         col = colour(i)
+        tags: dict[str, Any] = {"site": i}
+        if kinds is not None:
+            tags["kind"] = kinds[i]
         tag = f" · {kinds[i]}" if kinds is not None else ""
-        bbox_a, bbox_b = None, None
-
-        if doA and i < len(contacts.faces_A):
-            fa = np.asarray(contacts.faces_A[i], np.int64)
-            if fa.size > 0:
-                bbox_a = _bbox_from_faces(A, fa, centroid)
-                side_label = "A" if (doA and doB) else ""
-                highlights.append(
-                    {
-                        "faces": fa.tolist(),
-                        "color": col,
-                        "label": f"Site {i}{side_label}{tag} ({fa.size} faces)",
-                        "meshKey": "primary",
-                    }
-                )
-
-        if doB and i < len(contacts.faces_B):
-            fb = np.asarray(contacts.faces_B[i], np.int64)
-            if fb.size > 0:
-                bbox_b = _bbox_from_faces(B, fb, centroid)
-                side_label = "B" if (doA and doB) else ""
-                highlights.append(
-                    {
-                        "faces": fb.tolist(),
-                        "color": col,
-                        "label": f"Site {i}{side_label}{tag} ({fb.size} faces)",
-                        "meshKey": "mesh_B",
-                    }
-                )
-
-        # AABB wireframe as edge_group
-        if show_aabb:
-            box = None
-            if aabb_mode == "union":
-                box = _bbox_union(bbox_a, bbox_b)
-            elif aabb_mode == "split":
-                for bb in (bbox_a, bbox_b):
-                    if bb is not None:
-                        edge_groups.append(
-                            {
-                                "segments": _bbox_segments(bb),
-                                "color": col,
-                                "label": f"AABB {i}{tag}",
-                            }
-                        )
-                continue  # skip union path
-            if box is not None:
-                edge_groups.append(
-                    {
-                        "segments": _bbox_segments(box),
-                        "color": col,
-                        "label": f"AABB {i}{tag}",
-                    }
-                )
+        boxes = {}
+        for side, mesh, faces, key in sided:
+            f = np.asarray(faces[i] if i < len(faces) else [], np.int64)
+            if f.size == 0:
+                continue
+            boxes[side] = _bbox_from_faces(mesh, f, centroid)
+            highlights.append(
+                {
+                    "faces": f.tolist(),
+                    "color": col,
+                    "label": f"Site {i}{side}{tag}",
+                    "meshKey": key,
+                    "side": side,
+                    **tags,
+                }
+            )
+        if aabb_mode == "split":
+            per_box = [
+                (f"AABB {i}{side}{tag}", box, side) for side, box in boxes.items()
+            ]
+        else:
+            per_box = [
+                (f"AABB {i}{tag}", _bbox_union(boxes.get("A"), boxes.get("B")), None)
+            ]
+        for label, box, side in per_box:
+            if box is None:
+                continue
+            edge_groups.append(
+                {
+                    "segments": _bbox_segments(box),
+                    "color": col,
+                    "label": label,
+                    "aabb": True,
+                    **({"side": side} if side else {}),
+                    **tags,
+                }
+            )
 
     annotations = {}
     if highlights:
@@ -5355,32 +5367,42 @@ def _contact_overlay(
     if edge_groups:
         annotations["edge_groups"] = edge_groups
 
-    contact_state = {
-        "sides": sides,
+    contact_state: dict[str, Any] = {
+        "sides": first,
+        "boxes": bool(show_aabb),
         "nSites": n_sites,
     }
-    if by_kind:
+    if kinds is not None:
         counts: dict[str, int] = {}
         for k in kinds[:n_sites]:
             counts[k] = counts.get(k, 0) + 1
         order = [k for k in _KIND_COLORS if k in counts]
         order += sorted(k for k in counts if k not in _KIND_COLORS)
         contact_state["kinds"] = [
-            {
-                "kind": k,
-                "count": counts[k],
-                "color": _KIND_COLORS.get(k, _KIND_COLORS["other"]),
-            }
+            {"kind": k, "count": counts[k]}
+            | ({"color": _KIND_COLORS.get(k, _KIND_COLORS["other"])} if by_kind else {})
             for k in order
         ]
     return annotations, contact_state
 
 
+def _sites_index(mesh: Mesh, faces, side: str) -> None:
+    """Refuse sites that name faces *mesh* does not have: they were found on
+    another mesh, and drawn here they would light up unrelated faces."""
+    top = max((int(np.max(f)) for f in faces if len(f)), default=-1)
+    if top >= len(mesh.faces):
+        raise ValueError(
+            f"the contact sites name face {top:,} of mesh {side}, which has"
+            f" {len(mesh.faces):,}: they were found on other meshes"
+        )
+
+
 def view_contacts(
     A: Mesh,
     B: Mesh,
-    contacts,  # ContactSites
+    contacts=None,  # ContactSites
     *,
+    names: tuple[str, str] = ("A", "B"),
     scale: float = 1.0,
     color_A: tuple[float, float, float] = (0.82, 0.86, 1.00),
     color_B: tuple[float, float, float] = (1.00, 0.85, 0.85),
@@ -5394,11 +5416,35 @@ def view_contacts(
 ):
     """Visualize two meshes with contact-site overlays in the web viewer.
 
+    *contacts* are the sites to show; without them
+    ``skeliner.pair.scan_contacts`` finds them on the two meshes, kinds
+    included. The page's contact panel switches which side's sites are
+    drawn (*sides* is the first choice: ``"A"``, ``"B"`` or ``"both"``),
+    hides kinds of sites and the boxes around them (*show_aabb*: one box
+    around both sides of a site with *aabb_mode* ``"union"``, one per side
+    with ``"split"``), and sets each mesh's colour, opacity and wireframe;
+    *names* label the two meshes there.
+
     When the sites have kinds (``skeliner.pair.label_contacts``, done by
     ``scan_contacts``), each site is coloured by its kind and the panel
     lists the kinds with their counts; ``color_by="site"`` colours each site
     in turn instead, as for sites without kinds.
     """
+    A, B = Mesh.of(A), Mesh.of(B)
+    if contacts is None:
+        import time
+
+        from ..pair import scan_contacts
+
+        t0 = time.perf_counter()
+        contacts = scan_contacts(A, B)
+        print(
+            f"Found {len(contacts.faces_A)} contact sites in"
+            f" {time.perf_counter() - t0:.1f} s"
+        )
+    _sites_index(A, contacts.faces_A, "A")
+    _sites_index(B, contacts.faces_B, "B")
+
     # Shared centroid from both meshes
     all_verts = np.concatenate(
         [A.vertices.astype(np.float32), B.vertices.astype(np.float32)]
@@ -5406,18 +5452,17 @@ def view_contacts(
     centroid = all_verts.mean(axis=0)
 
     # Scale meshes
-    A_scaled, B_scaled = Mesh.of(A), Mesh.of(B)
     if scale != 1.0:
-        A_scaled = Mesh(A_scaled.vertices * float(scale), A_scaled.faces)
-        B_scaled = Mesh(B_scaled.vertices * float(scale), B_scaled.faces)
+        A = Mesh(A.vertices * float(scale), A.faces)
+        B = Mesh(B.vertices * float(scale), B.faces)
         centroid = centroid * float(scale)
 
     # Buffers for B (extra); A renders through the primary mesh_state
-    buf_B = _mesh_to_buffers(B_scaled, centroid=centroid)
+    buf_B = _mesh_to_buffers(B, centroid=centroid)
 
     extra_meshes = {
         "mesh_B": {
-            "mesh": B_scaled,
+            "mesh": B,
             "buffers": buf_B,
             "color": list(color_B),
             "opacity": 1.0,
@@ -5425,8 +5470,8 @@ def view_contacts(
     }
 
     annotations, contact_state = _contact_overlay(
-        A_scaled,
-        B_scaled,
+        A,
+        B,
         centroid,
         contacts,
         sides=sides,
@@ -5434,10 +5479,20 @@ def view_contacts(
         aabb_mode=aabb_mode,
         color_by=color_by,
     )
+    contact_state["meshes"] = [
+        {"side": side, "key": key, "name": str(name), "nFaces": len(m.faces)}
+        for side, key, name, m in (
+            ("A", "primary", names[0], A),
+            ("B", "mesh_B", names[1], B),
+        )
+    ]
+    # tells this launch from the last one on the port, whose panel settings
+    # the page keeps for a reload
+    contact_state["session"] = os.urandom(8).hex()
 
     app = _create_app(
         port=port,
-        preload_mesh=A_scaled,
+        preload_mesh=A,
         preload_centroid=centroid,
         extra_meshes=extra_meshes,
         contact_state=contact_state,
@@ -5447,6 +5502,8 @@ def view_contacts(
     # Write contact annotations (after _create_app clears state dir)
     if annotations:
         ann_path = _STATE_DIR / str(port) / "annotations.json"
-        ann_path.write_text(json.dumps(annotations), encoding="utf-8")
+        ann_path.write_text(
+            json.dumps(annotations, separators=(",", ":")), encoding="utf-8"
+        )
 
     _launch_app(app, host=host, port=port, no_browser=no_browser)

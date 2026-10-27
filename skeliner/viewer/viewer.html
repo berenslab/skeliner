@@ -319,6 +319,90 @@
                 display: none;
                 z-index: 100;
             }
+            /* Contact mode: one panel for both cells and their sites. */
+            #contact-panel {
+                position: absolute;
+                top: 10px;
+                left: 10px;
+                background: rgba(0, 0, 0, 0.7);
+                padding: 8px 12px;
+                border-radius: 4px;
+                font-size: 12px;
+                line-height: 1.6;
+                max-width: 440px;
+                z-index: 10;
+            }
+            #contact-panel .cp-head {
+                color: #adf;
+                font-weight: bold;
+            }
+            #contact-panel .cp-dim {
+                color: #888;
+                font-weight: normal;
+            }
+            #contact-panel .cp-row {
+                display: flex;
+                align-items: center;
+                flex-wrap: wrap;
+                gap: 6px;
+                margin-top: 4px;
+            }
+            #contact-panel .cp-row > .cp-dim:first-child {
+                min-width: 84px;
+            }
+            #contact-panel button:not(.icon-btn) {
+                background: #2a2a3e;
+                color: #ccc;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 1px 8px;
+                font-size: 11px;
+                font-family: monospace;
+                cursor: pointer;
+            }
+            #contact-panel button:not(.icon-btn):hover {
+                background: #3a3a52;
+                border-color: #7af;
+            }
+            #contact-panel button[data-on="1"] {
+                background: #3a2a4a;
+                border-color: #d98cd9;
+                color: #fff;
+            }
+            #contact-panel button.cp-kind[data-on="0"] {
+                opacity: 0.4;
+            }
+            #contact-panel .cp-seg {
+                display: inline-flex;
+            }
+            #contact-panel .cp-seg button:not(:first-child) {
+                margin-left: -1px;
+                border-top-left-radius: 0;
+                border-bottom-left-radius: 0;
+            }
+            #contact-panel .cp-seg button:not(:last-child) {
+                border-top-right-radius: 0;
+                border-bottom-right-radius: 0;
+            }
+            #contact-panel input[type="range"] {
+                width: 90px;
+                vertical-align: middle;
+            }
+            #contact-panel label {
+                cursor: pointer;
+            }
+            #contact-panel .cp-name {
+                color: #adf;
+                max-width: 200px;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            #contact-panel .cp-keys {
+                margin-top: 6px;
+                color: #666;
+                font-size: 11px;
+            }
             #empty-hint {
                 position: absolute;
                 top: 50%;
@@ -339,17 +423,27 @@
         <div id="lasso-rect"></div>
         <div id="lockIndicator" style="display:none;position:fixed;top:10px;left:50%;transform:translateX(-50%);background:rgba(200,50,50,0.7);color:#fff;padding:4px 12px;border-radius:4px;font-size:12px;font-family:monospace;z-index:100;cursor:pointer;" onclick="this.style.display='none'">Camera Locked (L to unlock) x</div>
 
-        <div id="contact-info" style="display:none;position:absolute;top:10px;left:10px;color:#ccc;font-size:12px;font-family:monospace;background:rgba(0,0,0,0.6);padding:8px 12px;border-radius:4px;pointer-events:none;z-index:10">
-            <div style="color:#adf;font-weight:bold;margin-bottom:4px">Contact Sites</div>
-            <div><span class="label">Sites: </span><span id="contactNSites">-</span></div>
-            <div><span class="label">Side: </span><span id="contactSide">-</span></div>
-            <div id="contactKinds" style="margin-top:4px"></div>
-            <div style="margin-top:6px;color:#888;font-size:11px">
-              <div>A &mdash; toggle mesh A</div>
-              <div>B &mdash; toggle mesh B</div>
-              <div>H &mdash; toggle this panel</div>
-              <div>R &mdash; reset camera</div>
+        <!-- Contact mode (view_contacts): two cells and the sites where they
+             touch.  The server sends both sides of every site, so these
+             controls change only what is drawn and listed. -->
+        <div id="contact-panel" style="display: none">
+            <div class="cp-head">Contact sites <span id="cpCount" class="cp-dim"></span></div>
+            <div id="cpKinds" class="cp-row"></div>
+            <div class="cp-row">
+                <span class="cp-dim">Sites on</span>
+                <span id="cpSides" class="cp-seg">
+                    <button data-sides="A" title="the sites' faces on mesh A">A</button>
+                    <button data-sides="B" title="the sites' faces on mesh B">B</button>
+                    <button data-sides="both" title="the sites' faces on both meshes">both</button>
+                </span>
+                <label title="a box around each site"><input type="checkbox" id="cpBoxes" /> boxes</label>
             </div>
+            <div class="cp-row">
+                <span class="cp-dim">Site opacity</span>
+                <input type="range" id="cpSiteOpacity" min="0" max="100" value="90" title="the sites' opacity" />
+            </div>
+            <div id="cpMeshes"></div>
+            <div class="cp-keys">A / B: show or hide a mesh · H: panels · X / Y / Z: view along an axis · R: from the other side</div>
         </div>
 
         <div id="info">
@@ -904,7 +998,7 @@
             let manualHighlightMesh = null;
 
             // ── Extra meshes ────────────────────────────────────────────────
-            let extraMeshObjs = {};   // name → {mesh, wireframe, geometry}
+            let extraMeshObjs = {};   // name → {mesh, wire, geometry}
 
             // ── Transform (edit mesh) state ─────────────────────────────────
             let transformMode = null;         // 'translate' | 'rotate' | null
@@ -1005,35 +1099,14 @@
                 const contactResp = await fetch("/contact_sites");
                 const contactData = await contactResp.json();
                 if (contactData) {
+                    // The single-cell panels give way to the contact panel,
+                    // set up once the saved settings below are restored.
                     contactMode = true;
-                    // Switch to contact mode UI: hide single-mesh panels
+                    contactInfo = contactData;
+                    startContactView(contactData);
                     for (const id of ['info', 'controls', 'detect-panel', 'loaded-panel']) {
                         const el = document.getElementById(id);
                         if (el) el.style.display = 'none';
-                    }
-                    const cp = document.getElementById('contact-info');
-                    if (cp) {
-                        cp.style.display = '';
-                        document.getElementById('contactNSites').textContent = contactData.nSites || '?';
-                        document.getElementById('contactSide').textContent = contactData.sides || '?';
-                        // one swatch per kind of site, when the sites have kinds
-                        const kindsEl = document.getElementById('contactKinds');
-                        kindsEl.innerHTML = '';
-                        for (const k of contactData.kinds || []) {
-                            const row = document.createElement('div');
-                            const swatch = document.createElement('span');
-                            const rgb = k.color.map((c) => Math.round(c * 255)).join(',');
-                            swatch.style.cssText = `display:inline-block;width:10px;height:10px;margin-right:6px;background:rgb(${rgb})`;
-                            row.appendChild(swatch);
-                            row.appendChild(document.createTextNode(`${k.kind}: ${k.count}`));
-                            kindsEl.appendChild(row);
-                        }
-                    }
-                    // Load contact annotations immediately (don't wait for file watcher)
-                    const annResp = await fetch("/annotations");
-                    const annData = await annResp.json();
-                    if (annData && (annData.highlights || annData.edge_groups)) {
-                        applyAnnotations(annData);
                     }
                 }
 
@@ -1214,13 +1287,7 @@
                     const savedUI = JSON.parse(localStorage.getItem('skeliner_ui'));
                     if (savedUI) {
                         document.getElementById('opacitySlider').value = savedUI.opacity;
-                        if (meshObj) {
-                            const v = savedUI.opacity / 100;
-                            meshObj.material.opacity = v;
-                            meshObj.material.transparent = v < 1.0;
-                            meshObj.material.depthWrite = v >= 1.0;
-                            meshObj.material.needsUpdate = true;
-                        }
+                        if (meshObj) setMeshOpacity(meshObj, savedUI.opacity / 100);
                         document.getElementById('annOpacitySlider').value = savedUI.annOpacity;
                         document.getElementById('wireToggle').checked = savedUI.wireframe;
                         if (wireframeObj) wireframeObj.visible = savedUI.wireframe;
@@ -1232,10 +1299,12 @@
                         }
                     }
                 } catch (e) {}
-                // Restore cached camera (after fitCamera)
+                if (contactMode) setupContactPanel();
+                // Restore cached camera (after fitCamera); a new pair on this
+                // port keeps the view fitCamera gave it
                 try {
                     const savedCam = JSON.parse(localStorage.getItem('skeliner_camera'));
-                    if (savedCam) {
+                    if (savedCam && (!contactMode || contactViewKept)) {
                         camera.position.fromArray(savedCam.position);
                         controls.target.fromArray(savedCam.target);
                         if (savedCam.up) camera.up.fromArray(savedCam.up);
@@ -1499,6 +1568,7 @@
                 );
                 wireframeObj.visible = document.getElementById("wireToggle").checked;
                 scene.add(wireframeObj);
+                if (contactMode) applyContactMeshes();
 
                 if (!data.keepCamera) fitCamera();
                 if (data.keepCamera && !data.facesRenumbered) {
@@ -1521,8 +1591,10 @@
                 // Remove old version
                 if (extraMeshObjs[name]) {
                     scene.remove(extraMeshObjs[name].mesh);
+                    scene.remove(extraMeshObjs[name].wire);
                     extraMeshObjs[name].mesh.geometry.dispose();
                     extraMeshObjs[name].mesh.material.dispose();
+                    extraMeshObjs[name].wire.material.dispose();
                     delete extraMeshObjs[name];
                 }
 
@@ -1564,8 +1636,22 @@
                 });
                 const obj = new THREE.Mesh(geo, meshMat);
                 scene.add(obj);
+                // its wireframe, drawn like the primary mesh's, off at first
+                const wire = new THREE.Mesh(
+                    geo,
+                    new THREE.MeshBasicMaterial({
+                        wireframe: true,
+                        color: 0x333333,
+                        transparent: true,
+                        opacity: 0.15,
+                        clippingPlanes: [clipPlane],
+                    }),
+                );
+                wire.visible = false;
+                scene.add(wire);
 
-                extraMeshObjs[name] = { mesh: obj, geometry: geo };
+                extraMeshObjs[name] = { mesh: obj, wire, geometry: geo };
+                if (contactMode) applyContactMeshes();
             }
 
             // ── Build skeleton ───────────────────────────────────────────────────
@@ -1848,13 +1934,7 @@
                     }
                 });
                 document.getElementById("opacitySlider").addEventListener("input", (e) => {
-                    const val = parseInt(e.target.value) / 100;
-                    if (meshObj) {
-                        meshObj.material.transparent = val < 1.0;
-                        meshObj.material.opacity = val;
-                        meshObj.material.depthWrite = val >= 1.0;
-                        meshObj.material.needsUpdate = true;
-                    }
+                    if (meshObj) setMeshOpacity(meshObj, parseInt(e.target.value) / 100);
                 });
                 document.getElementById("annOpacitySlider").addEventListener("input", (e) => {
                     const val = parseInt(e.target.value) / 100;
@@ -2020,8 +2100,12 @@
                 const faceIndex = hits[0].faceIndex;
 
                 if (!currentAnnotations || !currentAnnotations.highlights) return;
-                const faceSets = currentAnnotations.highlights.map(
-                    (g) => new Set(g.faces || [])
+                // face ids of the mesh clicked: a highlight on another mesh
+                // (contact mode's B) numbers that mesh's faces
+                const faceSets = currentAnnotations.highlights.map((g) =>
+                    (g.meshKey && g.meshKey !== "primary") || contactHides(g)
+                        ? new Set()
+                        : new Set(g.faces || []),
                 );
                 for (let i = 0; i < faceSets.length; i++) {
                     if (!faceSets[i].has(faceIndex)) continue;
@@ -4664,7 +4748,7 @@
                     const targets = [];
                     if (meshObj && meshObj.visible) targets.push(meshObj);
                     for (const em of Object.values(extraMeshObjs)) {
-                        if (em && em.mesh) targets.push(em.mesh);
+                        if (em && em.mesh && em.mesh.visible) targets.push(em.mesh);
                     }
                     // Skeleton nodes are recentre targets in their own right.
                     // Without them, hiding the mesh to see a junction — the
@@ -4778,7 +4862,8 @@
                 const hidden = [];
                 currentAnnotations.highlights.forEach((g, i) => {
                     const m = annotationMeshes[i] || hlEllipsoids[i];
-                    if (m && !m.visible) hidden.push(g.label || "");
+                    // a group the contact panel hides is not hidden by its row
+                    if (m && !m.visible && !contactHides(g)) hidden.push(g.label || "");
                 });
                 localStorage.setItem('skeliner_annHidden', JSON.stringify(hidden));
             }
@@ -4794,10 +4879,12 @@
                 annotationsHidden = false;
                 setToggleVisIcon(document.getElementById("hlHideAll"), true, "All");
                 currentAnnotations = annotations;
-                updateHighlightsPanel();
                 resetScope();
                 refreshRescueRow();
-                if (!annotations) return;
+                if (!annotations) {
+                    updateHighlightsPanel();
+                    return;
+                }
                 let hiddenLabels = [];
                 try {
                     hiddenLabels = JSON.parse(localStorage.getItem('skeliner_annHidden')) || [];
@@ -4969,6 +5056,9 @@
                         markerMeshes.push(m);
                     }
                 }
+                if (contactMode) applyContactVisibility();
+                // listed once drawn, so each row's eye shows what its mesh does
+                updateHighlightsPanel();
             }
 
             // Announcements can come in quick succession (a reset, then the
@@ -5194,7 +5284,7 @@
                 if (hasHighlights) {
                     currentAnnotations.highlights.forEach((group, idx) => {
                         const n = (group.faces || []).length;
-                        if (n === 0) return;
+                        if (n === 0 || contactHides(group)) return;
                         const color = group.color || [1, 0, 0];
                         const label = group.label || `Group ${idx}`;
                         const div = document.createElement("div");
@@ -5366,7 +5456,7 @@
                 if (hasEdgeGroups) {
                     currentAnnotations.edge_groups.forEach((group, idx) => {
                         const segs = group.segments || [];
-                        if (segs.length === 0) return;
+                        if (segs.length === 0 || contactHides(group)) return;
                         const color = group.color || [1, 1, 1];
                         const label = group.label || `Edges ${idx}`;
                         const div = document.createElement("div");
@@ -5491,6 +5581,10 @@
                 const vis = !annotationsHidden;
                 for (const m of [...annotationMeshes, ...markerMeshes, ...edgeGroupMeshes])
                     if (m) m.visible = vis;
+                // every row now hidden or shown alike, and remembered so
+                _saveAnnVisibility();
+                // what the contact panel hides stays hidden
+                if (contactMode) applyContactVisibility();
                 // Sync individual toggle buttons
                 document.querySelectorAll("#hlList button.toggle-vis").forEach((btn) => {
                     setToggleVisIcon(btn, vis);
@@ -5624,20 +5718,267 @@
             }
 
             const UI_PANELS = ['info', 'controls', 'detect-panel', 'selection-info', 'loaded-panel'];
+            const CONTACT_PANELS = ['contact-panel', 'selection-info'];
             let panelsVisible = true;
-            let contactMode = false;
             function togglePanels() {
-              if (contactMode) {
-                const cp = document.getElementById('contact-info');
-                if (cp) cp.style.display = cp.style.display === 'none' ? '' : 'none';
-                return;
-              }
               panelsVisible = !panelsVisible;
               const display = panelsVisible ? '' : 'none';
-              for (const id of UI_PANELS) {
+              for (const id of contactMode ? CONTACT_PANELS : UI_PANELS) {
                 const el = document.getElementById(id);
                 if (el) el.style.display = display;
               }
+            }
+
+            // ── Contact mode ─────────────────────────────────────────────────
+            // view_contacts: two cells and the sites where they touch.  The
+            // server sends both sides of every site, each highlight tagged
+            // with its site, side and kind and each box with its site (and
+            // side, one box per side), so the panel's choices change only
+            // what is drawn and listed.  Mesh A is the page's own mesh, B the
+            // extra mesh `mesh_B`.
+            let contactMode = false;
+            let contactInfo = null; // what /contact_sites said
+            let contactView = { sides: "A", hiddenKinds: [], boxes: true, meshes: {} };
+            let contactViewKept = false; // the settings are this launch's own
+            const CONTACT_VIEW_KEY = "skeliner_contactView";
+
+            // A reload keeps the panel's settings; a new launch on this port
+            // starts from what view_contacts was called with.
+            function startContactView(info) {
+                contactView = {
+                    sides: info.sides || "A",
+                    hiddenKinds: [],
+                    boxes: info.boxes !== false,
+                    meshes: {},
+                };
+                try {
+                    const saved = JSON.parse(localStorage.getItem(CONTACT_VIEW_KEY));
+                    if (saved && info.session && saved.session === info.session) {
+                        delete saved.session;
+                        contactView = { ...contactView, ...saved };
+                        contactViewKept = true;
+                    }
+                } catch (e) {}
+            }
+
+            function saveContactView() {
+                try {
+                    localStorage.setItem(
+                        CONTACT_VIEW_KEY,
+                        JSON.stringify({ session: contactInfo.session, ...contactView }),
+                    );
+                } catch (e) {}
+            }
+
+            function sideShown(side) {
+                return contactView.sides === "both" || contactView.sides === side;
+            }
+
+            // Whether the panel keeps overlay group `g` off the screen and
+            // out of the list.  A group without a site is not the panel's.
+            function contactHides(g) {
+                if (!contactMode || !g || g.site == null) return false;
+                if (g.kind != null && contactView.hiddenKinds.includes(g.kind)) return true;
+                if (!g.aabb) return !!g.side && !sideShown(g.side);
+                if (!contactView.boxes) return true;
+                if (g.side) return !sideShown(g.side);
+                // a box around both sides goes with whichever side is shown
+                const hls = (currentAnnotations && currentAnnotations.highlights) || [];
+                return !hls.some((h) => h.site === g.site && h.side && sideShown(h.side));
+            }
+
+            // What is drawn: a group the panel lets through shows unless its
+            // own row hid it (a highlight's row remembers that by label) or
+            // "All" is off.
+            function applyContactVisibility() {
+                if (!currentAnnotations) return;
+                let hiddenLabels = [];
+                try {
+                    hiddenLabels = JSON.parse(localStorage.getItem("skeliner_annHidden")) || [];
+                } catch (e) {}
+                (currentAnnotations.highlights || []).forEach((g, i) => {
+                    const vis =
+                        !annotationsHidden && !contactHides(g) && !hiddenLabels.includes(g.label || "");
+                    for (const m of [annotationMeshes[i], hlEllipsoids[i]]) if (m) m.visible = vis;
+                });
+                (currentAnnotations.edge_groups || []).forEach((g, i) => {
+                    if (edgeGroupMeshes[i]) edgeGroupMeshes[i].visible = !annotationsHidden && !contactHides(g);
+                });
+            }
+
+            function setContactView(change) {
+                Object.assign(contactView, change);
+                applyContactVisibility();
+                updateHighlightsPanel();
+                refreshContactPanel();
+                saveContactView();
+            }
+
+            function contactMeshParts(side) {
+                if (side === "A") return { obj: meshObj, wire: wireframeObj, geo: meshGeometry };
+                const em = extraMeshObjs.mesh_B;
+                return em ? { obj: em.mesh, wire: em.wire, geo: em.geometry } : {};
+            }
+
+            function setMeshOpacity(obj, val) {
+                obj.material.transparent = val < 1.0;
+                obj.material.opacity = val;
+                obj.material.depthWrite = val >= 1.0;
+                obj.material.needsUpdate = true;
+            }
+
+            function setMeshColour(geo, c) {
+                const cols = geo.getAttribute("color");
+                for (let i = 0; i < cols.count; i++) cols.setXYZ(i, c[0], c[1], c[2]);
+                cols.needsUpdate = true;
+            }
+
+            // Each mesh's settings onto what draws it, after a (re)build too.
+            function applyContactMeshes() {
+                for (const [side, m] of Object.entries(contactView.meshes)) {
+                    const { obj, wire, geo } = contactMeshParts(side);
+                    if (!obj) continue;
+                    obj.visible = m.visible;
+                    setMeshOpacity(obj, m.opacity);
+                    if (wire) wire.visible = m.visible && m.wire;
+                    if (m.color && geo) setMeshColour(geo, m.color);
+                }
+            }
+
+            function setContactMesh(side, change) {
+                Object.assign(contactView.meshes[side], change);
+                applyContactMeshes();
+                refreshContactPanel();
+                saveContactView();
+            }
+
+            // The panel's controls, built once the meshes and the saved
+            // settings are in: each mesh starts as drawn unless this launch
+            // set it already.
+            function setupContactPanel() {
+                const panel = document.getElementById("contact-panel");
+                panel.style.display = "";
+                for (const info of contactInfo.meshes || []) {
+                    const { obj, wire, geo } = contactMeshParts(info.side);
+                    if (!obj || contactView.meshes[info.side]) continue;
+                    const c = geo.getAttribute("color");
+                    contactView.meshes[info.side] = {
+                        visible: obj.visible,
+                        opacity: obj.material.opacity,
+                        wire: !!(wire && wire.visible),
+                        color: c.count ? [c.getX(0), c.getY(0), c.getZ(0)] : null,
+                    };
+                }
+                applyContactMeshes();
+
+                const n = contactInfo.nSites || 0;
+                document.getElementById("cpCount").textContent = `${n} site${n === 1 ? "" : "s"}`;
+                const kinds = document.getElementById("cpKinds");
+                kinds.innerHTML = "";
+                for (const k of contactInfo.kinds || []) {
+                    const b = document.createElement("button");
+                    b.className = "cp-kind";
+                    b.dataset.kind = k.kind;
+                    if (k.color) {
+                        const sw = document.createElement("span");
+                        sw.className = "chip-swatch";
+                        sw.style.background = `rgb(${k.color.map((v) => Math.round(v * 255)).join(",")})`;
+                        b.appendChild(sw);
+                    }
+                    b.appendChild(document.createTextNode(`${k.kind} ${k.count}`));
+                    b.title = `show or hide the ${k.kind} sites`;
+                    b.addEventListener("click", () => {
+                        const hidden = contactView.hiddenKinds.includes(k.kind)
+                            ? contactView.hiddenKinds.filter((x) => x !== k.kind)
+                            : [...contactView.hiddenKinds, k.kind];
+                        setContactView({ hiddenKinds: hidden });
+                    });
+                    kinds.appendChild(b);
+                }
+                kinds.style.display = (contactInfo.kinds || []).length ? "" : "none";
+                for (const b of document.querySelectorAll("#cpSides button"))
+                    b.addEventListener("click", () => setContactView({ sides: b.dataset.sides }));
+                document
+                    .getElementById("cpBoxes")
+                    .addEventListener("change", (e) => setContactView({ boxes: e.target.checked }));
+                const siteOpacity = document.getElementById("cpSiteOpacity");
+                siteOpacity.value = document.getElementById("annOpacitySlider").value;
+                siteOpacity.addEventListener("input", () => {
+                    // through the annotation slider, so a redraw keeps it
+                    const ann = document.getElementById("annOpacitySlider");
+                    ann.value = siteOpacity.value;
+                    ann.dispatchEvent(new Event("input"));
+                });
+
+                const rows = document.getElementById("cpMeshes");
+                rows.innerHTML = "";
+                for (const info of contactInfo.meshes || []) {
+                    const side = info.side;
+                    if (!contactView.meshes[side]) continue;
+                    const row = document.createElement("div");
+                    row.className = "cp-row";
+                    row.dataset.side = side;
+                    const tag = document.createElement("span");
+                    tag.className = "cp-dim";
+                    tag.textContent = `Mesh ${side}`;
+                    row.appendChild(tag);
+                    const picker = document.createElement("input");
+                    picker.type = "color";
+                    picker.className = "hl-color-input";
+                    picker.title = `mesh ${side}'s colour`;
+                    picker.addEventListener("input", () =>
+                        setContactMesh(side, { color: hexToRgb01(picker.value) }),
+                    );
+                    row.appendChild(picker);
+                    const name = document.createElement("span");
+                    name.className = "cp-name";
+                    name.textContent = info.name;
+                    name.title = `${info.name}, ${info.nFaces.toLocaleString()} faces`;
+                    row.appendChild(name);
+                    const eye = document.createElement("button");
+                    eye.className = "toggle-vis icon-btn";
+                    eye.addEventListener("click", () =>
+                        setContactMesh(side, { visible: !contactView.meshes[side].visible }),
+                    );
+                    row.appendChild(eye);
+                    const wireLabel = document.createElement("label");
+                    const wireBox = document.createElement("input");
+                    wireBox.type = "checkbox";
+                    wireBox.addEventListener("change", () => setContactMesh(side, { wire: wireBox.checked }));
+                    wireLabel.append(wireBox, " wire");
+                    row.appendChild(wireLabel);
+                    const slider = document.createElement("input");
+                    slider.type = "range";
+                    slider.min = "0";
+                    slider.max = "100";
+                    slider.title = `mesh ${side}'s opacity`;
+                    slider.addEventListener("input", () =>
+                        setContactMesh(side, { opacity: parseInt(slider.value) / 100 }),
+                    );
+                    row.appendChild(slider);
+                    rows.appendChild(row);
+                }
+                refreshContactPanel();
+                applyContactVisibility();
+                updateHighlightsPanel();
+            }
+
+            // The panel's controls as the settings stand.
+            function refreshContactPanel() {
+                if (!contactMode) return;
+                for (const b of document.querySelectorAll("#cpSides button"))
+                    b.dataset.on = b.dataset.sides === contactView.sides ? "1" : "0";
+                for (const b of document.querySelectorAll("#cpKinds button"))
+                    b.dataset.on = contactView.hiddenKinds.includes(b.dataset.kind) ? "0" : "1";
+                document.getElementById("cpBoxes").checked = contactView.boxes;
+                for (const row of document.querySelectorAll("#cpMeshes .cp-row")) {
+                    const m = contactView.meshes[row.dataset.side];
+                    if (!m) continue;
+                    if (m.color) row.querySelector('input[type="color"]').value = rgbToHex(m.color);
+                    setToggleVisIcon(row.querySelector("button.toggle-vis"), m.visible);
+                    row.querySelector('input[type="checkbox"]').checked = m.wire;
+                    row.querySelector('input[type="range"]').value = Math.round(m.opacity * 100);
+                }
             }
 
             let cameraLocked = false;
@@ -5682,6 +6023,11 @@
               if (transformMode) return; // block other keys during transform
 
               // [a]/[b] toggle mesh A (primary) / B (first extra mesh)
+              if (contactMode && contactView.meshes[e.key.toUpperCase()]) {
+                  const side = e.key.toUpperCase();
+                  setContactMesh(side, { visible: !contactView.meshes[side].visible });
+                  return;
+              }
               if (e.key === 'a' || e.key === 'A') {
                   if (meshObj) {
                       meshObj.visible = !meshObj.visible;
