@@ -3749,8 +3749,9 @@ def break_up_classify(
     the usable faces that are neither soma nor organelle, largest first, and
     the kind of each — :data:`PIECE_TRAPPED` when only organelle faces
     connect it to its mesh component's body, :data:`PIECE_SOMA` when more
-    than half its outer edges meet soma faces (only with a soma), else
-    :data:`PIECE_CANDIDATE`.  Claimed pieces are never trapped or soma."""
+    than half its outer edges meet soma faces and it has no more faces than
+    the soma (only with a soma), else :data:`PIECE_CANDIDATE`.  Claimed
+    pieces are never trapped or soma."""
     faces, _ = checked_faces(faces, n_vertices)
     nF = len(faces)
     flags = {}
@@ -3813,6 +3814,7 @@ def break_up_classify(
     # Still needed below, to count how much of each component's boundary
     # is soma.  That is the only remaining use of the edge map.
     ef_all = build_edge_to_faces(faces, usable)
+    soma_size = int(np.count_nonzero(usable & soma_face))
 
     kinds = np.zeros(len(components), dtype=np.uint8)
     for k, comp in enumerate(components):
@@ -3825,8 +3827,9 @@ def break_up_classify(
             kinds[k] = PIECE_TRAPPED
             continue
 
-        # Boundary analysis for soma detection (skipped without a soma)
-        if has_soma and not claimed_piece:
+        # Boundary analysis for soma detection (skipped without a soma); a
+        # piece bigger than the soma is not a patch of it find_soma missed
+        if has_soma and not claimed_piece and len(comp) <= soma_size:
             comp_set = set(comp.tolist())
             n_soma = 0
             n_total = 0

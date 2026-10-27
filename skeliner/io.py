@@ -1,5 +1,6 @@
 import json
 import re
+import warnings
 from pathlib import Path
 from typing import Iterable, List
 
@@ -138,6 +139,14 @@ def save_mesh(mesh, path: str | Path) -> None:
     writes a plain mesh, and to every other format (ply, stl, glb, ...)
     through trimesh, which must then be installed. A mesh with an
     ``export`` of its own — a ``trimesh.Trimesh`` — writes itself.
+
+    An OBJ keeps every vertex, but :func:`load_mesh` reads back only the
+    vertices a face names, as trimesh reads OBJ, and numbers the rest on: a
+    mesh the ``remove_*`` stages left vertices no face names (``preprocess``
+    without ``compact=True``) reads back with other vertex ids, and vertex
+    ids saved beside it — a soma's ``verts`` — would name other vertices.
+    Writing such a mesh to OBJ warns; :func:`skeliner.pre.compact_mesh` it
+    first, with its components, when vertex ids are saved beside it.
     """
     path = Path(path)
     if not isinstance(mesh, Mesh) and hasattr(mesh, "export"):
@@ -145,6 +154,16 @@ def save_mesh(mesh, path: str | Path) -> None:
         return
     mesh = Mesh.of(mesh)
     if path.suffix.lower() == ".obj":
+        named = np.zeros(len(mesh.vertices), dtype=bool)
+        named[mesh.faces.ravel()] = True
+        if not named.all():
+            warnings.warn(
+                f"{path}: {int((~named).sum()):,} vertices no face names are"
+                " written but not read back, so the vertex ids from"
+                f" {int(np.argmin(named)):,} on change when the file is read;"
+                " compact the mesh first when vertex ids are saved beside it",
+                stacklevel=2,
+            )
         kernels.io.write_obj(str(path), mesh.vertices, mesh.faces)
     else:
         mesh.to_trimesh().export(str(path))
@@ -1136,7 +1155,6 @@ def load_contact_sites_npz(path: str | Path):
 
 def _deprecated_alias(old_name: str, new_func):
     import functools
-    import warnings
 
     @functools.wraps(new_func)
     def wrapper(*args, **kwargs):

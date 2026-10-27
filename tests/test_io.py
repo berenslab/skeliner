@@ -8,6 +8,7 @@ IO round-trip smoke tests.
 """
 
 import json
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -563,6 +564,19 @@ def test_a_mesh_remove_fusions_cut_reads_back_as_written(tmp_path):
         assert np.array_equal(mesh.faces, cut.faces)
 
 
+def test_saving_a_vertex_no_face_names_warns(tmp_path):
+    import warnings
+
+    loose = sk.Mesh([[0, 0, 0], [9, 9, 9], [1, 0, 0], [0, 1, 0]], [[0, 2, 3]])
+    with pytest.warns(UserWarning, match="vertex ids from 1 on change"):
+        save_mesh(loose, tmp_path / "loose.obj")
+    # what the warning is about: the vertex is not read back
+    assert len(load_mesh(tmp_path / "loose.obj").vertices) == 3
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        save_mesh(sk.Mesh(SEAM_V[:3], SEAM_F[:1]), tmp_path / "tight.obj")
+
+
 def test_mesh_of_merges_a_seam_keeping_the_vertices():
     from ._parity import both
 
@@ -873,7 +887,9 @@ def test_obj_is_written_as_trimesh_writes_it_on_both_paths(reference_mesh, tmp_p
         for path in ("rust", "python"):
             with sk.backend(path):
                 out = tmp_path / f"{name}_save_{path}.obj"
-                sk.io.save_mesh(mesh, out)
+                # the odd mesh's vertices past the faces are not read back
+                with pytest.warns(UserWarning) if name == "odd" else nullcontext():
+                    sk.io.save_mesh(mesh, out)
                 assert out.read_bytes() == want.read_bytes()
     back = load_mesh(tmp_path / "reference_save_rust.obj")
     assert np.array_equal(back.faces, reference_mesh.faces)

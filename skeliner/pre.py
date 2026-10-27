@@ -1702,7 +1702,8 @@ def break_up_mesh(
 
     - **missed organelle** — not reachable from the main mesh body
       without crossing organelle faces (topologically trapped).
-    - **missed soma** — reachable, but boundary is mostly soma faces.
+    - **missed soma** — reachable, its boundary mostly soma faces, and no
+      bigger than the soma.
     - **neurite** — reachable, large enough to be a real branch.
     - **discarded** — reachable, but too small (below auto threshold).
 
@@ -1718,7 +1719,10 @@ def break_up_mesh(
     component reaches.  A process leaving the soma is capped at its far
     end, so the junction is nearly all the boundary it has, and a real
     dendritic stub can score well over 0.5 — which is what *rescued* is
-    for.
+    for.  A component with more faces than the soma is never absorbed: a
+    patch of the soma ``find_soma`` missed is smaller than the soma, while
+    on an organelle-free cell (fly neurons) the whole arbor can be one
+    component that scores as soma.
 
     When ``soma`` is ``None`` (no soma in this mesh — e.g. a fragment
     or a non-somal cell type), the soma face mask is empty, the
@@ -1920,8 +1924,9 @@ def _break_up_pieces(
     faces that are neither soma nor organelle, largest first, and the kind
     of each — :data:`_PIECE_TRAPPED` when only organelle faces connect it to
     its mesh component's body, :data:`_PIECE_SOMA` when more than half its
-    outer edges meet soma faces (only with a soma), else
-    :data:`_PIECE_CANDIDATE`.  Claimed pieces are never trapped or soma.
+    outer edges meet soma faces and it has no more faces than the soma
+    (only with a soma), else :data:`_PIECE_CANDIDATE`.  Claimed pieces are
+    never trapped or soma.
     """
     return kernels.pre.break_up_classify(
         np.asarray(faces, dtype=np.int64),

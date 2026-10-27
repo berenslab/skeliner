@@ -1350,6 +1350,22 @@ def _ball_with_stub():
     return mesh, Soma.fit(mesh.vertices[sv], verts=sv), org
 
 
+def _ball_with_arbor(subdivisions):
+    """:func:`_ball_with_stub`'s shape with a longer process, cut into more
+    faces the more it is subdivided: fewer than the soma has at 0, more at
+    2. Its boundary is soma faces all round either way."""
+    ball = trimesh.creation.icosphere(subdivisions=2, radius=100.0)
+    arbor = trimesh.creation.cylinder(radius=12.0, height=400.0, sections=24)
+    for _ in range(subdivisions):
+        arbor = arbor.subdivide()
+    arbor.apply_translation([0.0, 0.0, 290.0])
+    mesh = _combine([ball, arbor])
+    z = np.zeros(len(mesh.faces), dtype=bool)
+    org = Organelles(pocket=z.copy(), isolated=z.copy(), expanded=z.copy())
+    sv = np.flatnonzero(np.linalg.norm(mesh.vertices, axis=1) <= 105.0)
+    return mesh, Soma.fit(mesh.vertices[sv], verts=sv), org
+
+
 def _tube_cut_by_an_organelle_band():
     """A tube ringed by organelle faces all the way round.
 
@@ -1396,6 +1412,23 @@ class TestSomaAbsorption:
         assert len(absorbed.soma.verts) > len(kept.soma.verts)
         assert len(kept.soma.verts) == len(soma.verts)
         assert kept.soma.equiv_radius < absorbed.soma.equiv_radius
+
+    def test_a_piece_bigger_than_the_soma_is_never_absorbed(self):
+        # an organelle-free arbor all one piece reads as soma by its boundary
+        # at any length; its size against the soma's decides
+        for subdivisions, absorbed in ((0, True), (2, False)):
+            mesh, soma, org = _ball_with_arbor(subdivisions)
+            (piece,) = _arbor_pieces(mesh, soma, org)
+            faces = np.asarray(mesh.faces)
+            soma_faces = pre._usable_face_mask(mesh) & pre.soma_face_mask(
+                faces, soma.verts
+            )
+            assert bool(len(piece) > soma_faces.sum()) != absorbed
+            c = pre.break_up_mesh(mesh, soma, org)
+            assert (len(c.neurites) == 0) == absorbed
+            if not absorbed:
+                assert np.array_equal(np.sort(c.neurites[0]), np.sort(piece))
+                assert np.array_equal(c.soma.verts, soma.verts)
 
     def test_a_full_organelle_band_traps_what_is_behind_it(self):
         mesh, org = _tube_cut_by_an_organelle_band()

@@ -12,7 +12,8 @@ pub enum Piece {
     Candidate = 0,
     /// Reachable from its component's body only across organelle faces.
     Trapped = 1,
-    /// More than half its outer edges are shared with soma faces.
+    /// More than half its outer edges are shared with soma faces, and it
+    /// has no more faces than the soma.
     Soma = 2,
 }
 
@@ -32,6 +33,10 @@ pub struct BreakUpMesh<'a> {
 /// The pieces of the usable faces that are neither soma nor organelle,
 /// largest first (ties by lowest face), each with its kind.  The soma test
 /// is skipped without a soma, and claimed pieces are never trapped or soma.
+/// Nor is a piece with more faces than the soma: a piece `find_soma` missed
+/// is a patch of the soma's surface, while a neurite leaving the soma
+/// reads as soma by its boundary at any length (its far end is capped), so
+/// an organelle-free arbor all one piece would be taken whole.
 pub fn classify(m: &BreakUpMesh<'_>, has_soma: bool) -> (Vec<Vec<u32>>, Vec<Piece>) {
     let nf = m.faces.len();
     let pick = |keep: &dyn Fn(usize) -> bool| -> Vec<u32> {
@@ -85,6 +90,7 @@ pub fn classify(m: &BreakUpMesh<'_>, has_soma: bool) -> (Vec<Vec<u32>>, Vec<Piec
         return (components, Vec::new());
     }
     let topo = Topology::new(m.faces, m.n_vertices);
+    let soma_size = (0..nf).filter(|&f| m.usable[f] && m.soma_face[f]).count();
     let mut in_comp = vec![false; nf];
     let kinds = components
         .iter()
@@ -93,7 +99,7 @@ pub fn classify(m: &BreakUpMesh<'_>, has_soma: bool) -> (Vec<Vec<u32>>, Vec<Piec
             if !claimed && !comp.iter().any(|&f| reachable[f as usize]) {
                 return Piece::Trapped;
             }
-            if !has_soma || claimed {
+            if !has_soma || claimed || comp.len() > soma_size {
                 return Piece::Candidate;
             }
             for &f in comp {
@@ -200,13 +206,16 @@ mod tests {
         let (comps, k) = kinds(0..4, 8..10, None, true);
         assert_eq!(comps, vec![vec![4, 5, 6, 7], vec![10, 11, 12, 13]]);
         assert_eq!(k, vec![Piece::Candidate, Piece::Trapped]);
-        // without the organelle the one piece touches only soma
-        let (comps, k) = kinds(0..4, 0..0, None, true);
+        // quads 0-3 soma, no organelle: the one piece, quads 4-6, touches
+        // only soma
+        let (comps, k) = kinds(0..8, 0..0, None, true);
         assert_eq!(comps.len(), 1);
         assert_eq!(k, vec![Piece::Soma]);
         // a claim or no soma keeps it a candidate
-        assert_eq!(kinds(0..4, 0..0, Some(5), true).1, vec![Piece::Candidate]);
-        assert_eq!(kinds(0..4, 0..0, None, false).1, vec![Piece::Candidate]);
+        assert_eq!(kinds(0..8, 0..0, Some(9), true).1, vec![Piece::Candidate]);
+        assert_eq!(kinds(0..8, 0..0, None, false).1, vec![Piece::Candidate]);
+        // and so does more faces than the soma: quads 2-6 on quads 0-1
+        assert_eq!(kinds(0..4, 0..0, None, true).1, vec![Piece::Candidate]);
         // a claim also keeps a trapped piece
         assert_eq!(
             kinds(0..4, 8..10, Some(11), true).1,

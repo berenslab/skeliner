@@ -939,6 +939,18 @@ class TestBreakUpMesh:
         # the stranded tip is trapped unless a claim releases it
         assert found[0] > 0 and found[2] == 0
 
+    def test_a_piece_bigger_than_the_soma_stays_on_both_paths(self):
+        from .test_pre import _ball_with_arbor
+
+        for subdivisions in (0, 2):
+            mesh, soma, org = _ball_with_arbor(subdivisions)
+            rust, python = both(pre.break_up_mesh, mesh, soma, org)
+            for part in ("neurites", "discarded"):
+                assert_parity(
+                    getattr(rust, part).components, getattr(python, part).components
+                )
+            assert_parity(rust.soma.verts, python.soma.verts)
+
 
 def _capped_tube_x(x_open, x_cap, side, *, turn=0.0, n=48):
     """A tube along x, open at *x_open*, ending in a flat disk at *x_cap*
