@@ -1408,9 +1408,6 @@ fn find_soma_ring_cutoff<'py>(
     let found = ::pre::soma::ring_cutoff(&mesh, &nuc, call).map_err(|e| match e {
         SomaError::Fit(err) => err,
         SomaError::NoRings => PyValueError::new_err("attempt to get argmax of an empty sequence"),
-        SomaError::NoExtents => pyo3::exceptions::PyIndexError::new_err(
-            "index -1 is out of bounds for axis 0 with size 0",
-        ),
     })?;
     let verts_out = Array1::from_iter(found.verts.iter().map(|&v| i64::from(v))).into_pyarray(py);
     Ok((found.fit, verts_out, found.cutoff, found.max_ring))

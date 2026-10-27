@@ -5207,8 +5207,8 @@ def preprocess(
 def find_nucleus_center(
     mesh: Mesh,
     *,
-    grid_res: float = 200.0,
-    z_tol: float = 150.0,
+    grid_res: float | None = None,
+    z_tol: float | None = None,
     max_shift: float = 3000.0,
     min_void_r: float = 500.0,
     verbose: bool = False,
@@ -5243,12 +5243,17 @@ def find_nucleus_center(
     ----------
     mesh : Mesh
         Input neuron mesh (any cell type).
-    grid_res : float
-        2D rasterization cell size in nm.  200 nm works well: fine
-        enough to resolve the nucleus void (~2 000–3 000 nm radius),
-        coarse enough that vertex gaps inside the soma surface close.
-    z_tol : float
+    grid_res : float or None
+        2D rasterization cell size in nm.  It must be fine enough to
+        resolve the nucleus void (~2 000–3 000 nm radius) and coarse
+        enough that the gaps between the soma surface's vertices close.
+        ``None`` (default) takes the mesh's median edge length, at least
+        200 nm — which is 200 nm on full-resolution meshes (edges of
+        ~105 nm) and on a vertex cloud without faces; a coarser mesh
+        needs a coarser grid.
+    z_tol : float or None
         Half-width of the Z slab for collecting vertices at each level.
+        ``None`` (default) takes 0.75 × the median edge, at least 150 nm.
     max_shift : float
         Maximum XY displacement (nm) between consecutive Z-levels for
         a void to be considered part of the same chain.
@@ -5273,10 +5278,18 @@ def find_nucleus_center(
     _p = "[find_nucleus_center]"
 
     verts = np.asarray(mesh.vertices, dtype=np.float64)
+    if grid_res is None or z_tol is None:
+        # a vertex cloud has no edges to measure: full resolution's settings
+        edge = _median_edge(mesh) if len(mesh.faces) else 0.0
+        grid_res = max(200.0, edge) if grid_res is None else grid_res
+        z_tol = max(150.0, 0.75 * edge) if z_tol is None else z_tol
     if verbose:
         z_unique = np.unique(verts[:, 2])
         n_levels = int((z_unique.max() - z_unique.min()) / 210)
-        print(f"{_p} {len(verts):,} vertices, ~{n_levels} Z-levels")
+        print(
+            f"{_p} {len(verts):,} vertices, ~{n_levels} Z-levels,"
+            f" grid {grid_res:.0f} nm, slab ±{z_tol:.0f} nm"
+        )
 
     raw, best, center = _z_scan(verts, grid_res, z_tol, min_void_r, max_shift)
 

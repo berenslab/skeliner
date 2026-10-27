@@ -793,6 +793,31 @@ class TestRescueSize:
         assert pre._rescue_size(labels, counts, fa, fb) == smaller
 
 
+# ── find_nucleus_center ───────────────────────────────
+
+
+class TestFindNucleusCenter:
+    def test_grid_and_slab_follow_the_mesh(self):
+        # a hollow 3 um ball on 450 nm edges, like hemibrain's meshes: on a
+        # 200 nm grid its outline stays open and a short void near its
+        # bottom wins; on the median edge's grid the whole hollow is found
+        ball = trimesh.creation.icosphere(subdivisions=3, radius=3000.0)
+        assert pre._median_edge(ball) > 400.0
+        found = pre.find_nucleus_center(ball)
+        assert np.abs(found["center"]).max() < 200.0
+        assert len(found["slices"]) > 20
+        fixed = pre.find_nucleus_center(ball, grid_res=200.0, z_tol=150.0)
+        assert fixed is None or np.abs(fixed["center"]).max() > 1000.0
+
+    def test_full_resolution_keeps_200_and_150(self):
+        ball = trimesh.creation.icosphere(subdivisions=5, radius=3000.0)
+        assert pre._median_edge(ball) < 200.0
+        found = pre.find_nucleus_center(ball)
+        fixed = pre.find_nucleus_center(ball, grid_res=200.0, z_tol=150.0)
+        assert np.array_equal(found["center"], fixed["center"])
+        assert np.array_equal(found["slices"], fixed["slices"])
+
+
 # ── find_soma ─────────────────────────────────────────
 
 

@@ -720,11 +720,12 @@ class TestZScan:
 
 def _revolved(profile, spacing=180.0):
     """A surface of revolution about z through ``(r, z)`` rings of vertices
-    about *spacing* apart, consecutive rings zipped by angle; open at both
-    ends, with integer coordinates like CAVE's."""
+    about *spacing* apart (``(r, z, n)``: rings of *n*), consecutive rings
+    zipped by angle; open at both ends, with integer coordinates like
+    CAVE's."""
     verts, rings = [], []
-    for r, z in profile:
-        n = max(8, int(round(2 * np.pi * r / spacing)))
+    for r, z, *n in profile:
+        n = n[0] if n else max(8, int(round(2 * np.pi * r / spacing)))
         a = np.arange(n) * (2 * np.pi / n)
         rings.append(list(range(len(verts), len(verts) + n)))
         verts.extend(np.column_stack([r * np.cos(a), r * np.sin(a), np.full(n, z)]))
@@ -785,6 +786,19 @@ def _soma_cell():
     return mesh, org
 
 
+def _stubbed_soma():
+    """A coarse 3 um soma, rings 600 nm apart, with a three-sided stub to
+    z = 9 um: the vertices past a fit hugging the body are the stub's neck,
+    fewer than the 20 its stub pruning measures."""
+    prof = [
+        (max(np.sqrt(max(3000.0**2 - z**2, 0.0)), 300.0), z, 12)
+        for z in np.arange(-3000.0, 3000.0, 600.0)
+    ]
+    prof += [(450.0, z, 3) for z in np.arange(3000.0, 9001.0, 600.0)]
+    v, f = _revolved(prof)
+    return trimesh.Trimesh(v, f, process=False)
+
+
 class TestFindSomaViaRingCutoff:
     def test_is_the_same_on_both_paths(self, monkeypatch):
         from skeliner.dataclass import Soma
@@ -821,6 +835,35 @@ class TestFindSomaViaRingCutoff:
         # every cross-section's hollow is under the 500 nm void minimum
         mesh = trimesh.creation.icosphere(subdivisions=3, radius=300.0)
         assert pre.find_soma(mesh) is None
+
+    def test_no_stub_large_enough_to_prune(self, monkeypatch):
+        # a hemibrain soma's piece did this: the only vertices past the
+        # first fit are a neck under 20, and the stub pruning took the
+        # percentile of no pieces (IndexError on both paths)
+        from skeliner.dataclass import Soma
+
+        mesh = _stubbed_soma()
+        nucleus = {
+            "center": np.zeros(3),
+            "z_range": (-1000.0, 1000.0),
+            "peak_r": 2000.0,
+            "slices": np.zeros((0, 4)),
+        }
+        monkeypatch.setattr(pre, "find_nucleus_center", lambda _mesh: nucleus)
+        monkeypatch.setattr(
+            Soma,
+            "fit",
+            classmethod(
+                lambda _cls, _pts, verts=None: Soma.from_sphere(
+                    np.zeros(3), 3100.0, verts=verts
+                )
+            ),
+        )
+        rust, python = both(pre.find_soma, mesh)
+        assert_parity(rust.verts, python.verts)
+        z = mesh.vertices[rust.verts][:, 2]
+        # nothing pruned: the neck stays, the stub past the dilation does not
+        assert (z > 3100.0).sum() > 0 and z.max() < mesh.vertices[:, 2].max()
 
 
 class TestBreakUpMesh:

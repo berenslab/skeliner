@@ -101,9 +101,6 @@ pub enum SomaError<E> {
     Fit(E),
     /// No ring past the seeds: numpy's argmax of an empty slice.
     NoRings,
-    /// No outside component to take the percentile of: numpy's
-    /// percentile of an empty array.
-    NoExtents,
 }
 
 /// Vertex adjacency of the soma's component, as the reference's
@@ -740,18 +737,21 @@ fn prune<E>(
                 .filter(|&p| out.size(p) >= 20)
                 .collect();
             let mut ext: Vec<f64> = comps.iter().map(|&p| reach[p as usize]).collect();
-            let ext_thresh = 2.0 * percentile25(&mut ext).ok_or(SomaError::NoExtents)?;
-            let mut far = vec![false; nv];
-            for &p in &comps {
-                if reach[p as usize] > ext_thresh {
-                    pruned = true;
-                    far[p as usize] = true;
+            // no outside piece of 20 vertices or more: nothing to prune
+            if let Some(q1) = percentile25(&mut ext) {
+                let ext_thresh = 2.0 * q1;
+                let mut far = vec![false; nv];
+                for &p in &comps {
+                    if reach[p as usize] > ext_thresh {
+                        pruned = true;
+                        far[p as usize] = true;
+                    }
                 }
-            }
-            if pruned {
-                for &v in &outside_soma {
-                    if far[out.roots[v as usize] as usize] {
-                        soma_set.remove(v);
+                if pruned {
+                    for &v in &outside_soma {
+                        if far[out.roots[v as usize] as usize] {
+                            soma_set.remove(v);
+                        }
                     }
                 }
             }

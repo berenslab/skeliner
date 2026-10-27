@@ -4304,13 +4304,15 @@ def find_soma_ring_cutoff(
                     [e for _, _, e in outside_comps],
                     dtype=np.float64,
                 )
-                q1 = float(np.percentile(all_ext, 25))
-                ext_thresh = 2.0 * q1
+                # no outside piece of 20 vertices or more: nothing to prune
+                if len(all_ext):
+                    q1 = float(np.percentile(all_ext, 25))
+                    ext_thresh = 2.0 * q1
 
-                for comp, borders, ext in outside_comps:
-                    if ext > ext_thresh:
-                        neurite_prune.update(comp)
-                        n_tubes += 1
+                    for comp, borders, ext in outside_comps:
+                        if ext > ext_thresh:
+                            neurite_prune.update(comp)
+                            n_tubes += 1
 
             if neurite_prune:
                 soma_set -= neurite_prune
