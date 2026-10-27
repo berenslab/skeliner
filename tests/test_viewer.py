@@ -5,9 +5,11 @@ the WebSocket, which is the only sign a long-running step is moving.
 """
 
 import asyncio
+import base64
 import contextlib
 import copy
 import io
+import json
 import threading
 
 import numpy as np
@@ -2622,6 +2624,339 @@ def test_an_unknown_diagnostic_is_named_rather_than_crashing(bin_client):
     r = client.post("/diagnose", json={"name": name, "kind": "nonesuch"})
     assert r.status_code == 400
     assert "nonesuch" in r.json()["error"]
+
+
+# ── what a page is sent for the mesh ──────────────────────────────────
+
+
+class _Page:
+    """A connected tab that records every broadcast instead of drawing it."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send_text(self, data):
+        self.sent.append(json.loads(data))
+
+    def meshes(self):
+        return [m["payload"] for m in self.sent if m["type"] == "mesh_loaded"]
+
+
+def _connect_page(app):
+    for route in app.routes:
+        fn = getattr(route, "endpoint", None)
+        names = getattr(getattr(fn, "__code__", None), "co_freevars", ())
+        if "connected_clients" in names:
+            page = _Page()
+            cell = fn.__closure__[names.index("connected_clients")]
+            cell.cell_contents.append(page)
+            return page
+    raise AssertionError("could not reach connected_clients")
+
+
+@pytest.fixture
+def mesh_client(tmp_path, monkeypatch):
+    """A viewer with a mesh far from the origin, so centring is visible."""
+    from starlette.testclient import TestClient
+
+    from skeliner.viewer import viewer as viewer_mod
+
+    monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
+    mesh = trimesh.creation.icosphere(subdivisions=3, radius=100.0)
+    mesh.apply_translation([480_000.0, -310_000.0, 205_000.0])
+    with TestClient(_create_app(preload_mesh=mesh, port=8918)) as client:
+        yield client, mesh
+
+
+_TRIANGLE = [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]]
+_EDITS = {
+    "remove": [("/remove_selected", {"faces": [0, 1, 2]})],
+    "edit vertices": [
+        ("/edit_vertices", {"faceEdits": [{"face": 0, "verts": _TRIANGLE}]})
+    ],
+    "undo": [("/remove_selected", {"faces": [0, 1, 2]}), ("/undo", None)],
+    "compact": [("/compact_mesh", None)],
+}
+
+
+@pytest.mark.parametrize("steps", _EDITS.values(), ids=_EDITS.keys())
+def test_only_the_page_that_edited_keeps_its_camera(mesh_client, steps):
+    """A page opened after an edit has no view to keep: told to keep one, it
+    never frames the mesh and is left looking at nothing."""
+    client, _ = mesh_client
+    page = _connect_page(client.app)
+    for route, body in steps:
+        r = client.post(route, json=body) if body else client.post(route)
+        assert r.status_code == 200, r.text
+
+    assert page.meshes()[-1]["keepCamera"] is True
+    assert "keepCamera" not in client.get("/mesh").json()
+
+
+def test_the_page_is_sent_the_mesh_exactly(mesh_client):
+    """Packed little-endian float32 vertices, centroid-relative, and uint32
+    faces — the layout ``meshArrays`` views them in."""
+    client, mesh = mesh_client
+    body = client.get("/mesh").json()
+    verts = np.frombuffer(base64.b64decode(body["vertices"]), dtype="<f4")
+    faces = np.frombuffer(base64.b64decode(body["faces"]), dtype="<u4")
+
+    v32 = np.asarray(mesh.vertices, dtype=np.float32)
+    assert body["nVertices"] == len(v32) and body["nFaces"] == len(mesh.faces)
+    np.testing.assert_array_equal(body["centroid"], v32.mean(axis=0))
+    np.testing.assert_array_equal(verts.reshape(-1, 3), v32 - v32.mean(axis=0))
+    np.testing.assert_array_equal(faces.reshape(-1, 3), mesh.faces)
+
+
+def _wait_for(cond, timeout=3.0):
+    import time
+
+    deadline = time.monotonic() + timeout
+    while not cond():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.02)
+
+
+def test_a_page_hears_of_an_annotation_change_once(mesh_client, tmp_path):
+    """The page fetches on the server's own announcement; the file watcher,
+    there for other programs' writes, must not resend the file as well —
+    each delivery rebuilds every overlay."""
+    import time
+
+    client, _ = mesh_client
+    page = _connect_page(client.app)
+    _wait_for(lambda: any(m["type"] == "annotations" for m in page.sent))
+    page.sent.clear()
+
+    marks = {"highlights": [{"faces": [0, 1, 2], "color": [1, 0, 0], "label": "x"}]}
+    upload = {"file": ("marks.json", json.dumps(marks).encode())}
+    assert client.post("/upload", files=upload).json()["ok"]
+    time.sleep(1.1)  # two of the watcher's looks at the file
+    kinds = [m["type"] for m in page.sent]
+    assert kinds.count("annotations_updated") == 1
+    assert "annotations" not in kinds
+
+    other = {"markers": [{"position": [0, 0, 0], "label": "from elsewhere"}]}
+    (tmp_path / "8918" / "annotations.json").write_text(json.dumps(other))
+    _wait_for(lambda: any(m["type"] == "annotations" for m in page.sent))
+    sent = [m for m in page.sent if m["type"] == "annotations"]
+    assert sent[-1]["payload"] == other
+
+
+# ── what a mesh leaves behind ─────────────────────────────────────────
+#
+# Everything found on a mesh names its faces.  Kept past the mesh, it lands
+# on whichever comes next: a cached detection is removed at its own face ids,
+# a soma's wireframe floats over another cell.
+
+
+_SENTINEL_CACHES = (
+    "fusion_clusters",
+    "disconnected",
+    "gap_clusters",
+    "hole_loops",
+    "parallel_patches",
+    "fragment_mask",
+    "pending_reassignment",
+)
+
+
+def _plant_caches(client):
+    state = _mesh_state_of(client.app)
+    for key in _SENTINEL_CACHES:
+        state[key] = ["from the previous mesh"]
+    return state
+
+
+def test_a_new_cell_starts_without_the_last_ones_detections(mesh_client, tmp_path):
+    client, _ = mesh_client
+    assert client.post("/remove_selected", json={"faces": [0, 1, 2]}).json()["ok"]
+    state = _plant_caches(client)
+
+    other = trimesh.creation.icosphere(subdivisions=2, radius=70.0)
+    path = tmp_path / "other.obj"
+    other.export(path)
+    upload = {"file": ("other.obj", path.read_bytes())}
+    assert client.post("/upload", files=upload).json()["ok"]
+
+    for key in _SENTINEL_CACHES:
+        assert state[key] is None, f"{key} survived a new mesh"
+    assert client.post("/undo").status_code == 400, "undo restored the old cell"
+
+
+def test_removing_the_mesh_takes_what_was_found_on_it(mesh_client, tmp_path):
+    client, _ = mesh_client
+    page = _connect_page(client.app)
+    marks = {"highlights": [{"faces": [0, 1, 2], "color": [1, 0, 0], "label": "x"}]}
+    client.post("/update_annotations", json=marks)
+    assert client.post("/remove_selected", json={"faces": [5]}).json()["ok"]
+    state = _plant_caches(client)
+    page.sent.clear()
+
+    assert client.post("/remove", json={"type": "mesh"}).json()["ok"]
+
+    assert client.get("/annotations").json() == {}
+    assert "annotations_updated" in [m["type"] for m in page.sent]
+    for key in _SENTINEL_CACHES:
+        assert state[key] is None, f"{key} outlived its mesh"
+    assert client.post("/undo").status_code == 400
+    state_file = json.loads((tmp_path / "8918" / "state.json").read_text())
+    assert "mesh" not in state_file
+
+
+def test_compacting_keeps_every_centroid_relative_position(mesh_client):
+    """Markers, wireframes and skeletons are all stored about the centroid;
+    recentring on the vertices a compaction keeps would move the mesh out
+    from under each of them."""
+    client, mesh = mesh_client
+    before = client.get("/mesh").json()
+    marks = {
+        "markers": [{"position": [10.0, 20.0, 30.0], "label": "here"}],
+        "ellipsoids": [{"center": [1.0, 2.0, 3.0], "axes": [5, 5, 5], "label": "e"}],
+    }
+    client.post("/update_annotations", json=marks)
+    # A removal leaves vertices only the compaction then drops, which moves
+    # their mean: the case where recentring would show.
+    removed = list(range(0, len(mesh.faces), 3))
+    assert client.post("/remove_selected", json={"faces": removed}).json()["ok"]
+    page = _connect_page(client.app)
+
+    assert client.post("/compact_mesh").json()["ok"]
+
+    after = client.get("/mesh").json()
+    assert after["centroid"] == before["centroid"]
+    assert after["nFaces"] < before["nFaces"]
+    ann = client.get("/annotations").json()
+    assert ann["markers"] == marks["markers"]
+    assert ann["ellipsoids"] == marks["ellipsoids"]
+    assert page.meshes()[-1].get("facesRenumbered") is True
+
+
+def test_undo_brings_back_the_annotations_of_the_mesh_it_restores(mesh_client):
+    client, _ = mesh_client
+    first = {"highlights": [{"faces": [0, 1, 2, 3], "color": [1, 0, 0], "label": "a"}]}
+    client.post("/update_annotations", json=first)
+    assert client.post("/remove_selected", json={"faces": [0, 1]}).json()["ok"]
+    later = {"highlights": [{"faces": [9], "color": [0, 1, 0], "label": "b"}]}
+    client.post("/update_annotations", json=later)
+
+    assert client.post("/undo").json()["ok"]
+
+    assert client.get("/annotations").json() == first
+
+
+def test_detecting_the_soma_again_replaces_it(mesh_client, monkeypatch):
+    """One soma, one wireframe, tied by label — a second run used to add a
+    second of each, and only one of the wireframes followed its highlight."""
+    from skeliner import pre
+
+    client, mesh = mesh_client
+    vs = np.flatnonzero(mesh.vertices[:, 2] > mesh.vertices[:, 2].mean())
+    soma = Soma.fit(np.asarray(mesh.vertices)[vs], verts=vs)
+    monkeypatch.setattr(pre, "find_soma", lambda *_a, **_k: soma)
+
+    for _ in range(2):
+        r = client.post("/detect_soma", json={"method": "ring_cutoff"})
+        assert r.json()["ok"], r.text
+
+    ann = client.get("/annotations").json()
+    somas = [h for h in ann["highlights"] if h["label"] == "soma"]
+    assert len(somas) == 1 and len(ann["ellipsoids"]) == 1
+    assert ann["ellipsoids"][0]["label"] == "soma"
+    expected = np.flatnonzero(pre.soma_face_mask(mesh.faces, vs))
+    np.testing.assert_array_equal(somas[0]["faces"], expected)
+
+
+def test_a_pages_own_edit_is_announced_with_its_name(mesh_client):
+    """The page that made an edit already shows it; told by name, it skips
+    the fetch every other page makes."""
+    client, _ = mesh_client
+    page = _connect_page(client.app)
+    marks = {"highlights": [{"faces": [0], "color": [1, 0, 0], "label": "mine"}]}
+    client.post("/update_annotations", json=marks, headers={"X-Skeliner-Page": "p1"})
+    told = [m for m in page.sent if m["type"] == "annotations_updated"]
+    assert told and told[-1]["origin"] == "p1"
+
+
+def _page_html():
+    from pathlib import Path
+
+    from skeliner.viewer import viewer as viewer_mod
+
+    return Path(viewer_mod.__file__).with_name("viewer.html").read_text()
+
+
+def test_an_empty_slot_never_stops_the_overlays_updating():
+    """A group with nothing to draw holds a null slot so rows and meshes stay
+    aligned.  Every walk over the slots must step over it: one that did not
+    threw at the top of applyAnnotations, and from then on nothing redrew —
+    a soma wireframe stayed on screen across cells."""
+    import re
+
+    html = _page_html()
+    walks = re.findall(
+        r"for \(const m of (?:annotationMeshes|markerMeshes|edgeGroupMeshes)\)"
+        r"\s*(\{[^}]*\}|[^\n]*)",
+        html,
+    )
+    assert walks
+    for body in walks:
+        assert re.search(r"disposeObj\(m\)|if \(!m\) continue|if \(m\)", body), body
+    dispose = html.split("function disposeObj(m) {")[1].split("}")[0]
+    assert "if (!m) return;" in dispose
+    # Edge groups keep a slot each too, or every later row names the wrong one.
+    assert "if (segs.length === 0) { edgeGroupMeshes.push(null); continue; }" in html
+
+
+def test_every_function_the_page_calls_is_defined():
+    """A call to an undefined function only fails when its line runs, so a
+    page that loads cleanly can still throw on a button — as all four
+    `fetchAnnotations()` calls did."""
+    import re
+
+    html = _page_html()
+    script = html.split('<script type="module">')[1].split("</script>")[0]
+    script = re.sub(r"//[^\n]*|`[^`]*`|\"[^\"\n]*\"|'[^'\n]*'", "", script)
+    called = set(re.findall(r"(?<![\w.$])([A-Za-z_$][\w$]*)\s*\(", script))
+    defined = set(re.findall(r"function\s+([A-Za-z_$][\w$]*)", script))
+    defined |= set(re.findall(r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=", script))
+    defined |= set(re.findall(r"import\s*\{\s*([\w$]+)", script))
+    defined |= set(re.findall(r"([A-Za-z_$][\w$]*)\s*=>", script))
+    for params in re.findall(
+        r"function\s*[\w$]*\s*\(([^)]*)\)|\(([^()]*)\)\s*=>", script
+    ):
+        for p in ",".join(params).split(","):
+            name = p.split("=")[0].strip(" {}[].")
+            if name:
+                defined.add(name)
+    builtins = {
+        "if", "for", "while", "switch", "catch", "return", "typeof", "function",
+        "await", "new", "fetch", "parseInt", "parseFloat", "setTimeout",
+        "clearTimeout", "requestAnimationFrame", "confirm", "atob", "isNaN",
+        "Number", "String", "Array", "Object", "Set", "Map", "JSON", "Math",
+        "Date", "Promise", "Float32Array", "Uint32Array", "Uint8Array",
+        "Int32Array", "Error", "Boolean", "URL", "FormData", "Blob", "async",
+        "WebSocket", "encodeURIComponent",
+    }  # fmt: skip
+    missing = sorted(called - defined - builtins)
+    assert not missing, f"called but never defined: {missing}"
+
+
+def test_every_mesh_builder_unpacks_the_arrays():
+    """Typed-array constructors take a base64 string without complaint and
+    give an empty mesh, so a builder that skips ``meshArrays`` draws nothing."""
+    import re
+    from pathlib import Path
+
+    from skeliner.viewer import viewer as viewer_mod
+
+    html = Path(viewer_mod.__file__).with_name("viewer.html").read_text()
+    builders = re.findall(r"function (build\w*Mesh)\(", html)
+    assert {"buildMesh", "buildExtraMesh"} <= set(builders)
+    for name in builders:
+        body = html.split(f"function {name}(")[1].split("\n            }")[0]
+        assert "meshArrays(data)" in body, f"{name} reads the packed arrays raw"
+        assert not re.search(r"data\.(vertices|faces)\b", body)
 
 
 # ── every annotation channel you can list, you can fly to ─────────────

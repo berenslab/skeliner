@@ -890,13 +890,14 @@
             // ── Globals ──────────────────────────────────────────────────────────
             let scene, camera, renderer, controls;
             let meshObj, wireframeObj, meshGeometry, clipPlane;
-let meshCentroid = [0, 0, 0];
+            let meshCentroid = [0, 0, 0];
             let skelGroups = {}; // keyed by skeleton name
             let ws = null;
             let stateDebounceTimer = null;
             const STATE_DEBOUNCE_MS = 300;
 
             let annotationMeshes = [];
+            let hlEllipsoids = []; // the wireframe tied to highlight i, if any
             let markerMeshes = [];
             let edgeGroupMeshes = [];
             let manualHighlightFaces = new Set();
@@ -1179,11 +1180,13 @@ let meshCentroid = [0, 0, 0];
 
                 connectWebSocket();
 
+                // In the same sequence as fetchAnnotations: an announcement
+                // landing first has the newer file.
+                const initSeq = ++annFetchSeq;
                 fetch("/annotations")
                     .then((r) => r.json())
                     .then((ann) => {
-                        if (ann && (ann.highlights || ann.markers || ann.edges || ann.edge_groups))
-                            applyAnnotations(ann);
+                        if (initSeq === annFetchSeq) applyAnnotations(ann);
                         // Restore button states from existing annotations
                         const allLabels = [
                             ...(ann.highlights || []),
@@ -1395,6 +1398,24 @@ let meshCentroid = [0, 0, 0];
             }
 
             // ── Build mesh ───────────────────────────────────────────────────────
+            function base64Bytes(s) {
+                if (Uint8Array.fromBase64) return Uint8Array.fromBase64(s);
+                const bin = atob(s);
+                const out = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+                return out;
+            }
+
+            // The server packs a mesh's arrays as base64 (`_mesh_to_buffers`).
+            function meshArrays(data) {
+                const v = base64Bytes(data.vertices);
+                const f = base64Bytes(data.faces);
+                return {
+                    verts: new Float32Array(v.buffer, v.byteOffset, data.nVertices * 3),
+                    faces: new Uint32Array(f.buffer, f.byteOffset, data.nFaces * 3),
+                };
+            }
+
             function buildMesh(data) {
                 // Reset chunk grid state
                 chunkGridLoaded = false;
@@ -1416,8 +1437,8 @@ let meshCentroid = [0, 0, 0];
                 }
                 meshGeometry = null;
 
-                const { vertices, faces, nVertices, nFaces, centroid } = data;
-  if (centroid) meshCentroid = centroid;
+                const { nVertices, nFaces, centroid } = data;
+                if (centroid) meshCentroid = centroid;
 
                 document.getElementById("nVerts").textContent = nVertices.toLocaleString();
                 document.getElementById("nFaces").textContent = nFaces.toLocaleString();
@@ -1426,7 +1447,10 @@ let meshCentroid = [0, 0, 0];
                 meshGeometry = new THREE.BufferGeometry();
                 const positions = new Float32Array(nFaces * 9);
                 const colors = new Float32Array(nFaces * 9);
-                const verts = new Float32Array(vertices);
+                const { verts, faces } = meshArrays(data);
+                const savedMeshColor = localStorage.getItem('skeliner_meshColor');
+                const mc = data.color || (savedMeshColor ? hexToRgb01(savedMeshColor) : [0.55, 0.55, 0.6]);
+                const r = mc[0], g = mc[1], bl = mc[2];
 
                 for (let i = 0; i < nFaces; i++) {
                     const a = faces[i * 3],
@@ -1437,9 +1461,6 @@ let meshCentroid = [0, 0, 0];
                         positions[i * 9 + 3 + k] = verts[b * 3 + k];
                         positions[i * 9 + 6 + k] = verts[c * 3 + k];
                     }
-                    const savedMeshColor = localStorage.getItem('skeliner_meshColor');
-                    const mc = data.color || (savedMeshColor ? hexToRgb01(savedMeshColor) : [0.55, 0.55, 0.6]);
-                    const r = mc[0], g = mc[1], bl = mc[2];
                     for (let v = 0; v < 3; v++) {
                         colors[i * 9 + v * 3] = r;
                         colors[i * 9 + v * 3 + 1] = g;
@@ -1480,8 +1501,19 @@ let meshCentroid = [0, 0, 0];
                 scene.add(wireframeObj);
 
                 if (!data.keepCamera) fitCamera();
-                // Rebuild highlights (e.g. after edit_vertices broadcast)
-                if (manualHighlightFaces.size > 0) rebuildManualHighlight();
+                if (data.keepCamera && !data.facesRenumbered) {
+                    // An edit: the same face ids at new positions, so what is
+                    // drawn from them is redrawn there.
+                    if (currentAnnotations) applyAnnotations(currentAnnotations);
+                    if (manualHighlightFaces.size > 0) rebuildManualHighlight();
+                } else {
+                    // Different triangles under the same ids.  The server
+                    // announces the annotations that describe this mesh, so a
+                    // fetch still in flight is dropped rather than drawn here.
+                    annFetchSeq++;
+                    dropFaceState();
+                    applyAnnotations(null);
+                }
             }
 
             // ── Build extra mesh (multi-mesh / contact mode) ────────────────────
@@ -1494,14 +1526,14 @@ let meshCentroid = [0, 0, 0];
                     delete extraMeshObjs[name];
                 }
 
-                const { vertices, faces, nVertices, nFaces } = data;
+                const { nFaces } = data;
                 const color = data.color || [0.55, 0.55, 0.6];
                 const opacity = data.opacity != null ? data.opacity : 1.0;
 
                 const geo = new THREE.BufferGeometry();
                 const positions = new Float32Array(nFaces * 9);
                 const colors = new Float32Array(nFaces * 9);
-                const verts = new Float32Array(vertices);
+                const { verts, faces } = meshArrays(data);
 
                 for (let i = 0; i < nFaces; i++) {
                     const a = faces[i * 3], b = faces[i * 3 + 1], c = faces[i * 3 + 2];
@@ -1545,13 +1577,16 @@ let meshCentroid = [0, 0, 0];
                 const baseColor = savedSkelColor ? hexToRgb01(savedSkelColor) : (data.color || [1.0, 0.4, 0.1]);
 
                 // Remove old version of this skeleton
-                if (skelGroups[name]) {
-                    scene.remove(skelGroups[name].group);
-                    skelGroups[name] = null;
+                const old = skelGroups[name];
+                if (old) {
+                    disposeGroup(old.group);
                     delete skelGroups[name];
                 }
 
                 const { nodes, positions, nNodes, nEdges, edgeRadii, radii } = data;
+                // A rebuilt skeleton names other nodes by the same ids; a
+                // re-send of the same one does not.
+                if (old && !(nodes && sameValues(old.nodes, nodes))) dropNodeSelections(name);
                 if (!nodes || nNodes === 0) return;
 
                 document.getElementById("nNodes").textContent =
@@ -1824,6 +1859,7 @@ let meshCentroid = [0, 0, 0];
                 document.getElementById("annOpacitySlider").addEventListener("input", (e) => {
                     const val = parseInt(e.target.value) / 100;
                     for (const m of annotationMeshes) {
+                        if (!m) continue;
                         m.material.transparent = true;
                         m.material.opacity = val;
                         m.material.needsUpdate = true;
@@ -2293,17 +2329,15 @@ let meshCentroid = [0, 0, 0];
                     updateHighlightsPanel();
                     return;
                 }
-                // The republish rewrites every highlight, so the panel is
-                // refreshed from the server rather than patched here.
-                fetchAnnotations();
+                // The republish rewrites every highlight; the server announces
+                // it, so the panel is refreshed from there rather than patched.
             }
 
             async function runPreprocess() {
-                const data = await _runAction(
+                await _runAction(
                     document.getElementById("preprocessBtn"),
                     () => _postJSON("/preprocess"),
                 );
-                if (data && data.ok) fetchAnnotations();
             }
 
             function _postJSON(url, extra) {
@@ -2315,11 +2349,10 @@ let meshCentroid = [0, 0, 0];
             }
 
             async function runBreakUpMesh() {
-                const data = await _runAction(
+                await _runAction(
                     document.getElementById("breakUpMeshBtn"),
                     () => _postJSON("/break_up_mesh"),
                 );
-                if (data && data.ok) fetchAnnotations();
             }
 
             async function runCompactMesh() {
@@ -2753,7 +2786,6 @@ let meshCentroid = [0, 0, 0];
                 manualHighlightFaces.clear();
                 rebuildManualHighlight();
                 syncManualHighlight();
-                fetchAnnotations();
             }
 
             async function cancelReassign() {
@@ -3079,13 +3111,6 @@ let meshCentroid = [0, 0, 0];
                 refreshEdgeRow();
             }
 
-            /**
-             * Ask which node pairs the surface joins that the tree does not.
-             *
-             * Not optional and not user-initiated: without it a pair cannot be
-             * told from a restore to a graft, and those are different claims.
-             * ~15 ms on a 583-node cell, ~110 ms on an 11k-node one.
-             */
             // ── Diagnostics ──────────────────────────────────────────────────
             // Each entry declares the cuts it exposes.  They are inputs rather
             // than constants because no value here is settled: the corpus can
@@ -3187,6 +3212,13 @@ let meshCentroid = [0, 0, 0];
                 btn.disabled = false;
             }
 
+            /**
+             * Ask which node pairs the surface joins that the tree does not.
+             *
+             * Not optional and not user-initiated: without it a pair cannot be
+             * told from a restore to a graft, and those are different claims.
+             * ~15 ms on a 583-node cell, ~110 ms on an 11k-node one.
+             */
             async function fetchEdgeSupport() {
                 const sname = document.getElementById("binSkelSel").value;
                 if (panelMode !== "skeleton" || !sname) {
@@ -3205,6 +3237,9 @@ let meshCentroid = [0, 0, 0];
                     clearEdgeSupport();
                     return;
                 }
+                // A reply for a layer no longer selected describes other nodes.
+                if (panelMode !== "skeleton" || document.getElementById("binSkelSel").value !== sname)
+                    return;
                 if (!data.ok) {
                     clearEdgeSupport();
                     return;
@@ -3285,7 +3320,9 @@ let meshCentroid = [0, 0, 0];
                     : "Merge";
 
                 move.disabled = !dest || !dest.editable || !share.move.length;
-                move.textContent = share.move.length
+                // Outside Skeleton there is no destination, and every face of a
+                // lasso counts as "theirs".
+                move.textContent = dest && share.move.length
                     ? `Move ${share.move.length.toLocaleString()} faces → node ${dest.node}`
                     : "Move lassoed surface";
 
@@ -3568,6 +3605,8 @@ let meshCentroid = [0, 0, 0];
             }
 
             async function runSkelCancel() {
+                // Nothing this page previewed is waiting on the server.
+                if (!pendingSkelEdit) return;
                 const name = document.getElementById("binSkelSel").value;
                 const body = JSON.stringify({ name });
                 const opts = {
@@ -3693,7 +3732,9 @@ let meshCentroid = [0, 0, 0];
                 a.href = URL.createObjectURL(blob);
                 a.download = fname;
                 a.click();
-                URL.revokeObjectURL(a.href);
+                // The download starts after click() returns; revoked at once,
+                // WebKit can lose it.
+                setTimeout(() => URL.revokeObjectURL(a.href), 60000);
                 return fname;
             }
 
@@ -4267,8 +4308,32 @@ let meshCentroid = [0, 0, 0];
                 }
 
                 posAttr.needsUpdate = true;
-                meshGeometry.computeVertexNormals();
+                updateFaceNormals(meshGeometry, transformFaceIndices);
                 rebuildManualHighlight();
+            }
+
+            // The flat normals computeVertexNormals gives these faces of a
+            // non-indexed geometry, without visiting the rest of the mesh.
+            function updateFaceNormals(geo, faces) {
+                const p = geo.getAttribute("position").array;
+                const normal = geo.getAttribute("normal");
+                const n = normal.array;
+                for (const fi of faces) {
+                    const b = fi * 9;
+                    const ux = p[b + 3] - p[b], uy = p[b + 4] - p[b + 1], uz = p[b + 5] - p[b + 2];
+                    const vx = p[b + 6] - p[b], vy = p[b + 7] - p[b + 1], vz = p[b + 8] - p[b + 2];
+                    let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+                    const len = Math.hypot(nx, ny, nz) || 1;
+                    nx /= len;
+                    ny /= len;
+                    nz /= len;
+                    for (let k = 0; k < 9; k += 3) {
+                        n[b + k] = nx;
+                        n[b + k + 1] = ny;
+                        n[b + k + 2] = nz;
+                    }
+                }
+                normal.needsUpdate = true;
             }
 
             let _suppressNextClick = false;
@@ -4361,7 +4426,7 @@ let meshCentroid = [0, 0, 0];
                 transformFaceIndices = null;
                 transformVertexSet = null;
                 transformAxisConstraint = null;
-                controls.enabled = true;
+                controls.enabled = !cameraLocked;
                 hideTransformStatus();
             }
 
@@ -4462,13 +4527,7 @@ let meshCentroid = [0, 0, 0];
                         color: [1.0, 0.6, 0.0],
                     });
                     applyAnnotations(currentAnnotations);
-                    updateHighlightsPanel();
-                    // Persist to disk
-                    fetch("/update_annotations", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify(currentAnnotations),
-                    }).catch(() => {});
+                    syncAnnotationsToServer();
                     chunkGridLoaded = true;
                     btn.textContent = "Hide Grid";
                     status.textContent = `${data.n_boundaries} boundaries`;
@@ -4526,7 +4585,7 @@ let meshCentroid = [0, 0, 0];
                     if (!dragging) return;
                     dragging = false;
                     rect.style.display = "none";
-                    controls.enabled = true;
+                    controls.enabled = !cameraLocked;
 
                     const x0 = Math.min(startX, e.clientX);
                     const y0 = Math.min(startY, e.clientY);
@@ -4718,35 +4777,31 @@ let meshCentroid = [0, 0, 0];
                 if (!currentAnnotations || !currentAnnotations.highlights) return;
                 const hidden = [];
                 currentAnnotations.highlights.forEach((g, i) => {
-                    if (annotationMeshes[i] && !annotationMeshes[i].visible) hidden.push(g.label || "");
+                    const m = annotationMeshes[i] || hlEllipsoids[i];
+                    if (m && !m.visible) hidden.push(g.label || "");
                 });
                 localStorage.setItem('skeliner_annHidden', JSON.stringify(hidden));
             }
 
             function applyAnnotations(annotations) {
-                for (const m of annotationMeshes) {
-                    scene.remove(m);
-                    m.geometry.dispose();
-                    m.material.dispose();
-                }
+                for (const m of annotationMeshes) disposeObj(m);
                 annotationMeshes = [];
-                for (const m of markerMeshes) {
-                    scene.remove(m);
-                    m.geometry.dispose();
-                    m.material.dispose();
-                }
+                for (const m of markerMeshes) disposeObj(m);
                 markerMeshes = [];
-                for (const m of edgeGroupMeshes) {
-                    scene.remove(m);
-                    m.geometry.dispose();
-                    m.material.dispose();
-                }
+                for (const m of edgeGroupMeshes) disposeObj(m);
                 edgeGroupMeshes = [];
+                hlEllipsoids = [];
+                annotationsHidden = false;
+                setToggleVisIcon(document.getElementById("hlHideAll"), true, "All");
                 currentAnnotations = annotations;
                 updateHighlightsPanel();
                 resetScope();
                 refreshRescueRow();
                 if (!annotations) return;
+                let hiddenLabels = [];
+                try {
+                    hiddenLabels = JSON.parse(localStorage.getItem('skeliner_annHidden')) || [];
+                } catch (e) {}
                 // Face highlights
                 if (annotations.highlights) {
                     for (const group of annotations.highlights) {
@@ -4794,14 +4849,11 @@ let meshCentroid = [0, 0, 0];
                         annotationMeshes.push(hlm);
                     }
                     // Restore cached hide/show state
-                    try {
-                        const hidden = JSON.parse(localStorage.getItem('skeliner_annHidden')) || [];
-                        annotations.highlights.forEach((g, i) => {
-                            if (hidden.includes(g.label || "") && annotationMeshes[i]) {
-                                annotationMeshes[i].visible = false;
-                            }
-                        });
-                    } catch (e) {}
+                    annotations.highlights.forEach((g, i) => {
+                        if (hiddenLabels.includes(g.label || "") && annotationMeshes[i]) {
+                            annotationMeshes[i].visible = false;
+                        }
+                    });
                 }
                 // Markers (spheres at arbitrary positions)
                 if (annotations.markers) {
@@ -4844,7 +4896,7 @@ let meshCentroid = [0, 0, 0];
                 if (annotations.edge_groups) {
                     for (const group of annotations.edge_groups) {
                         const segs = group.segments || [];
-                        if (segs.length === 0) continue;
+                        if (segs.length === 0) { edgeGroupMeshes.push(null); continue; }
                         const color = group.color || [1, 1, 1];
                         const pts = new Float32Array(segs.length * 6);
                         for (let i = 0; i < segs.length; i++) {
@@ -4876,7 +4928,7 @@ let meshCentroid = [0, 0, 0];
                         edgeGroupMeshes.push(line);
                     }
                 }
-                // Ellipsoids (wireframe) — attach to the highlight with matching label
+                // Ellipsoids (wireframe), each tied to the highlight it belongs with
                 if (annotations.ellipsoids) {
                     for (const ell of annotations.ellipsoids) {
                         const c = ell.center || [0, 0, 0];
@@ -4900,17 +4952,47 @@ let meshCentroid = [0, 0, 0];
                             0, 0, 0, 1
                         );
                         m.applyMatrix4(mtx);
+                        m.userData.ell = ell;
                         scene.add(m);
-                        // Link to matching highlight by color so toggle/delete applies to both
-                        const hlIdx = (annotations.highlights || []).findIndex(
-                            h => h.color && h.color[0] === color[0] && h.color[1] === color[1] && h.color[2] === color[2]
-                        );
-                        if (hlIdx >= 0 && annotationMeshes[hlIdx]) {
-                            annotationMeshes[hlIdx]._linkedEllipsoid = m;
+                        // So hiding, recolouring or deleting the highlight takes
+                        // the wireframe along.  The server labels an ellipsoid
+                        // with its highlight's label; older files match by colour.
+                        const hls = annotations.highlights || [];
+                        const hlIdx =
+                            ell.label != null
+                                ? hls.findIndex((h) => h.label === ell.label)
+                                : hls.findIndex((h) => sameColor(h.color, color));
+                        if (hlIdx >= 0 && !hlEllipsoids[hlIdx]) {
+                            hlEllipsoids[hlIdx] = m;
+                            if (hiddenLabels.includes(hls[hlIdx].label || "")) m.visible = false;
                         }
                         markerMeshes.push(m);
                     }
                 }
+            }
+
+            // Announcements can come in quick succession (a reset, then the
+            // components): only the newest fetch may land.
+            let annFetchSeq = 0;
+            async function fetchAnnotations() {
+                const seq = ++annFetchSeq;
+                let ann;
+                try {
+                    ann = await (await fetch("/annotations")).json();
+                } catch (e) {
+                    return;
+                }
+                if (seq === annFetchSeq) applyAnnotations(ann);
+            }
+
+            function sameValues(a, b) {
+                if (a.length !== b.length) return false;
+                for (let i = 0; i < a.length; i++) if (a[i] !== Math.fround(b[i])) return false;
+                return true;
+            }
+
+            function sameColor(a, b) {
+                return !!a && !!b && a[0] === b[0] && a[1] === b[1] && a[2] === b[2];
             }
 
             function rgbToHex(c) {
@@ -4943,13 +5025,63 @@ let meshCentroid = [0, 0, 0];
                 const verb = visible ? "hide" : "show";
                 btn.title = label ? verb + " " + label.toLowerCase() : verb;
             }
+            // Names this page on its own edits, so the announcement that
+            // reaches every page can be skipped by the one that made it.
+            const PAGE_ID = globalThis.crypto && crypto.randomUUID
+                ? crypto.randomUUID()
+                : String(Math.random()).slice(2);
+
             function syncAnnotationsToServer() {
                 if (!currentAnnotations) return;
                 fetch("/update_annotations", {
                     method: "POST",
-                    headers: { "Content-Type": "application/json" },
+                    headers: { "Content-Type": "application/json", "X-Skeliner-Page": PAGE_ID },
                     body: JSON.stringify(currentAnnotations),
                 }).catch(() => {});
+            }
+
+            // A slot in annotationMeshes / markerMeshes / edgeGroupMeshes may be
+            // null: a group with nothing to draw keeps its index, so a panel
+            // row and its mesh share one.
+            function disposeObj(m) {
+                if (!m) return;
+                scene.remove(m);
+                m.geometry.dispose();
+                m.material.dispose();
+            }
+
+            function disposeGroup(group) {
+                scene.remove(group);
+                group.traverse((o) => {
+                    if (o.geometry) o.geometry.dispose();
+                    if (o.material) o.material.dispose();
+                });
+            }
+
+            // Everything the page holds by face id.  Kept across an edit, which
+            // keeps the ids; dropped for a new mesh, a renumbering, a removal.
+            function dropFaceState() {
+                if (transformMode) cleanupTransform();
+                manualHighlightFaces.clear();
+                rebuildManualHighlight();
+                syncManualHighlight();
+                if (reassignOverlays.length) cancelReassign();
+                clearBinSelection();
+            }
+
+            // Node ids belong to one build of one skeleton (`null`: all of them).
+            function dropNodeSelections(skelName = null) {
+                let dropped = false;
+                for (const [key, s] of Object.entries(selectedNodes)) {
+                    if (skelName !== null && s.skelName !== skelName) continue;
+                    disposeObj(s.mesh);
+                    delete selectedNodes[key];
+                    dropped = true;
+                }
+                if (dropped) {
+                    updateNodeSelectionDisplay();
+                    syncNodeSelections();
+                }
             }
 
             function focusOnAnnotation(idx) {
@@ -5034,12 +5166,8 @@ let meshCentroid = [0, 0, 0];
             function removeEdgeGroup(idx) {
                 if (!currentAnnotations || !currentAnnotations.edge_groups) return;
                 currentAnnotations.edge_groups.splice(idx, 1);
-                if (edgeGroupMeshes[idx]) {
-                    scene.remove(edgeGroupMeshes[idx]);
-                    edgeGroupMeshes[idx].geometry.dispose();
-                    edgeGroupMeshes[idx].material.dispose();
-                    edgeGroupMeshes.splice(idx, 1);
-                }
+                disposeObj(edgeGroupMeshes[idx]);
+                edgeGroupMeshes.splice(idx, 1);
                 updateHighlightsPanel();
                 syncAnnotationsToServer();
             }
@@ -5081,10 +5209,12 @@ let meshCentroid = [0, 0, 0];
                         picker.addEventListener("input", () => {
                             const nc = hexToRgb01(picker.value);
                             group.color = nc;
-                            if (annotationMeshes[idx]) {
-                                annotationMeshes[idx].material.color.setRGB(nc[0], nc[1], nc[2]);
-                                annotationMeshes[idx].material.needsUpdate = true;
+                            for (const m of [annotationMeshes[idx], hlEllipsoids[idx]]) {
+                                if (!m) continue;
+                                m.material.color.setRGB(nc[0], nc[1], nc[2]);
+                                m.material.needsUpdate = true;
                             }
+                            if (hlEllipsoids[idx]) hlEllipsoids[idx].userData.ell.color = nc;
                         });
                         picker.addEventListener("change", () => syncAnnotationsToServer());
 
@@ -5114,7 +5244,10 @@ let meshCentroid = [0, 0, 0];
                                     nameNeurite(group.neurite, newName);
                                     return;
                                 }
-                                if (newName) group.label = newName;
+                                if (newName) {
+                                    group.label = newName;
+                                    if (hlEllipsoids[idx]) hlEllipsoids[idx].userData.ell.label = newName;
+                                }
                                 syncAnnotationsToServer();
                                 updateHighlightsPanel();
                             };
@@ -5145,17 +5278,15 @@ let meshCentroid = [0, 0, 0];
 
                         const toggleBtn = document.createElement("button");
                         toggleBtn.className = "toggle-vis icon-btn";
-                        setToggleVisIcon(
-                            toggleBtn,
-                            !(annotationMeshes[idx] && !annotationMeshes[idx].visible),
-                        );
+                        const shown = () => {
+                            const m = annotationMeshes[idx] || hlEllipsoids[idx];
+                            return !m || m.visible;
+                        };
+                        setToggleVisIcon(toggleBtn, shown());
                         toggleBtn.addEventListener("click", () => {
-                            if (!annotationMeshes[idx]) return;
-                            const vis = !annotationMeshes[idx].visible;
-                            annotationMeshes[idx].visible = vis;
-                            if (annotationMeshes[idx]._linkedEllipsoid) {
-                                annotationMeshes[idx]._linkedEllipsoid.visible = vis;
-                            }
+                            const vis = !shown();
+                            for (const m of [annotationMeshes[idx], hlEllipsoids[idx]])
+                                if (m) m.visible = vis;
                             setToggleVisIcon(toggleBtn, vis);
                             _saveAnnVisibility();
                         });
@@ -5327,65 +5458,39 @@ let meshCentroid = [0, 0, 0];
             function removeMarker(idx) {
                 if (!currentAnnotations || !currentAnnotations.markers) return;
                 currentAnnotations.markers.splice(idx, 1);
-                if (markerMeshes[idx]) {
-                    scene.remove(markerMeshes[idx]);
-                    markerMeshes[idx].geometry.dispose();
-                    markerMeshes[idx].material.dispose();
-                    markerMeshes.splice(idx, 1);
-                }
+                disposeObj(markerMeshes[idx]);
+                markerMeshes.splice(idx, 1);
                 updateHighlightsPanel();
-                fetch("/update_annotations", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(currentAnnotations),
-                }).catch(() => {});
+                syncAnnotationsToServer();
             }
 
             function removeAnnotationGroup(idx) {
                 if (!currentAnnotations || !currentAnnotations.highlights) return;
-                const removed = currentAnnotations.highlights[idx];
                 currentAnnotations.highlights.splice(idx, 1);
-                // Remove linked ellipsoid from annotations if color matches
-                if (removed && removed.color && currentAnnotations.ellipsoids) {
-                    const rc = removed.color;
-                    currentAnnotations.ellipsoids = currentAnnotations.ellipsoids.filter(
-                        e => !(e.color && e.color[0] === rc[0] && e.color[1] === rc[1] && e.color[2] === rc[2])
-                    );
+                // Its own wireframe, and no other that happens to share a colour.
+                const linked = hlEllipsoids[idx];
+                if (linked) {
+                    if (currentAnnotations.ellipsoids)
+                        currentAnnotations.ellipsoids = currentAnnotations.ellipsoids.filter(
+                            (e) => e !== linked.userData.ell,
+                        );
+                    disposeObj(linked);
+                    const mi = markerMeshes.indexOf(linked);
+                    if (mi >= 0) markerMeshes.splice(mi, 1);
                 }
-                // Remove from scene (including linked ellipsoid)
-                if (annotationMeshes[idx]) {
-                    const linked = annotationMeshes[idx]._linkedEllipsoid;
-                    if (linked) {
-                        scene.remove(linked);
-                        linked.geometry.dispose();
-                        linked.material.dispose();
-                        const mi = markerMeshes.indexOf(linked);
-                        if (mi >= 0) markerMeshes.splice(mi, 1);
-                    }
-                    scene.remove(annotationMeshes[idx]);
-                    annotationMeshes[idx].geometry.dispose();
-                    annotationMeshes[idx].material.dispose();
-                }
+                hlEllipsoids.splice(idx, 1);
+                disposeObj(annotationMeshes[idx]);
                 annotationMeshes.splice(idx, 1);
                 updateHighlightsPanel();
-                // Sync to server
-                fetch("/update_annotations", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(currentAnnotations),
-                }).catch(() => {});
+                syncAnnotationsToServer();
             }
 
             let annotationsHidden = false;
             function hideAllAnnotations() {
                 annotationsHidden = !annotationsHidden;
                 const vis = !annotationsHidden;
-                for (const m of annotationMeshes) {
-                    m.visible = vis;
-                    if (m._linkedEllipsoid) m._linkedEllipsoid.visible = vis;
-                }
-                for (const m of markerMeshes) m.visible = vis;
-                for (const m of edgeGroupMeshes) m.visible = vis;
+                for (const m of [...annotationMeshes, ...markerMeshes, ...edgeGroupMeshes])
+                    if (m) m.visible = vis;
                 // Sync individual toggle buttons
                 document.querySelectorAll("#hlList button.toggle-vis").forEach((btn) => {
                     setToggleVisIcon(btn, vis);
@@ -5394,34 +5499,11 @@ let meshCentroid = [0, 0, 0];
             }
 
             function clearAllAnnotations() {
-                for (const m of annotationMeshes) {
-                    scene.remove(m);
-                    m.geometry.dispose();
-                    m.material.dispose();
-                }
-                annotationMeshes = [];
-                for (const m of markerMeshes) {
-                    scene.remove(m);
-                    m.geometry.dispose();
-                    m.material.dispose();
-                }
-                markerMeshes = [];
-                for (const m of edgeGroupMeshes) {
-                    scene.remove(m);
-                    m.geometry.dispose();
-                    m.material.dispose();
-                }
-                edgeGroupMeshes = [];
-                currentAnnotations = { highlights: [], markers: [], edge_groups: [] };
+                applyAnnotations({ highlights: [], markers: [], edge_groups: [] });
                 chunkGridLoaded = false;
                 document.getElementById("showGridBtn").textContent = "Show Grid";
                 document.getElementById("gridStatus").textContent = "";
-                updateHighlightsPanel();
-                fetch("/update_annotations", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(currentAnnotations),
-                }).catch(() => {});
+                syncAnnotationsToServer();
             }
 
             function applyCameraCommand(cmd) {
@@ -5468,10 +5550,7 @@ let meshCentroid = [0, 0, 0];
                     setTrack(msg.track);
                     if (msg.type === "annotations") applyAnnotations(msg.payload);
                     else if (msg.type === "annotations_updated") {
-                        fetch("/annotations").then(r => r.json()).then(ann => {
-                            if (ann && (ann.highlights || ann.markers || ann.edges || ann.edge_groups))
-                                applyAnnotations(ann);
-                        }).catch(() => {});
+                        if (msg.origin !== PAGE_ID) fetchAnnotations();
                     }
                     else if (msg.type === "camera_command") applyCameraCommand(msg.payload);
                     else if (msg.type === "reload") window.location.reload();
@@ -5483,18 +5562,25 @@ let meshCentroid = [0, 0, 0];
                     } else if (msg.type === "skeleton_removed") {
                         const sname = msg.payload && msg.payload.name;
                         if (sname && skelGroups[sname]) {
-                            scene.remove(skelGroups[sname].group);
+                            disposeGroup(skelGroups[sname].group);
                             delete skelGroups[sname];
                             const opt = document.querySelector(`#pickTarget option[value="skel:${sname}"]`);
                             if (opt) opt.remove();
+                            dropNodeSelections(sname);
+                            if (document.getElementById("binSkelSel").value === sname)
+                                clearBinSelection();
+                            refreshBinSkelSel();
                         }
                         updateLoadedPanel();
                         refreshSkeletonizeCue();
                         if (Object.keys(skelGroups).length === 0 && !meshObj)
                             document.getElementById("empty-hint").style.display = "block";
                     } else if (msg.type === "all_skeletons_removed") {
-                        for (const sg of Object.values(skelGroups)) scene.remove(sg.group);
+                        for (const sg of Object.values(skelGroups)) disposeGroup(sg.group);
                         for (const k of Object.keys(skelGroups)) delete skelGroups[k];
+                        dropNodeSelections();
+                        clearBinSelection();
+                        refreshBinSkelSel();
                         document
                             .querySelectorAll('#pickTarget option[value^="skel:"]')
                             .forEach((o) => o.remove());
@@ -5519,6 +5605,10 @@ let meshCentroid = [0, 0, 0];
                             wireframeObj = null;
                         }
                         meshGeometry = null;
+                        meshCentroid = [0, 0, 0];
+                        // What was drawn on it, or picked from it, goes too.
+                        dropFaceState();
+                        applyAnnotations(null);
                         document.getElementById("nVerts").textContent = "-";
                         document.getElementById("nFaces").textContent = "-";
                         updateLoadedPanel();
@@ -5593,7 +5683,10 @@ let meshCentroid = [0, 0, 0];
 
               // [a]/[b] toggle mesh A (primary) / B (first extra mesh)
               if (e.key === 'a' || e.key === 'A') {
-                  if (meshObj) meshObj.visible = !meshObj.visible;
+                  if (meshObj) {
+                      meshObj.visible = !meshObj.visible;
+                      setToggleVisIcon(document.getElementById("toggleMesh"), meshObj.visible);
+                  }
                   if (wireframeObj) wireframeObj.visible = meshObj && meshObj.visible && document.getElementById("wireToggle").checked;
                   return;
               }

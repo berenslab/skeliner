@@ -17,6 +17,7 @@ communication with external tools (e.g. Claude).
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import os
@@ -43,15 +44,22 @@ def _ensure_state_dir():
 def _mesh_to_buffers(
     mesh: Mesh, *, centroid: np.ndarray | None = None
 ) -> dict[str, Any]:
+    """The mesh as the page draws it, centroid-relative.
+
+    ``vertices`` and ``faces`` are base64 of little-endian float32 and uint32
+    arrays, which the page views without parsing (``meshArrays``).  As JSON
+    lists a 1.26M-face cell is a 54 MB message that blocks the event loop for
+    0.4 s while it is serialised.
+    """
     verts = np.asarray(mesh.vertices, dtype=np.float32)
-    faces = np.asarray(mesh.faces, dtype=np.int32)
     if centroid is None:
         centroid = verts.mean(axis=0)
-    verts_centered = verts - centroid
+    centred = np.ascontiguousarray(verts - centroid, dtype="<f4")
+    faces = np.ascontiguousarray(mesh.faces, dtype="<u4")
     return {
-        "vertices": verts_centered.ravel().tolist(),
-        "faces": faces.ravel().tolist(),
-        "nVertices": len(verts),
+        "vertices": base64.b64encode(centred).decode("ascii"),
+        "faces": base64.b64encode(faces).decode("ascii"),
+        "nVertices": len(centred),
         "nFaces": len(faces),
         "centroid": centroid.tolist(),
     }
@@ -335,7 +343,7 @@ def _create_app(
 ):
     """Create the Starlette app."""
     from starlette.applications import Starlette
-    from starlette.responses import HTMLResponse, JSONResponse
+    from starlette.responses import HTMLResponse, JSONResponse, Response
     from starlette.routing import Route, WebSocketRoute
     from starlette.websockets import WebSocket
 
@@ -485,7 +493,22 @@ def _create_app(
     state_path.write_text(json.dumps(initial, indent=2), encoding="utf-8")
 
     connected_clients: list[WebSocket] = []
-    _undo_stack: list[Mesh] = []
+    # The mesh_state entries that describe one mesh's faces or vertices.
+    _MESH_KEYED = (
+        "mesh_stats",
+        "organelles",
+        "soma",
+        "neurites",
+        "discarded",
+        "fusion_clusters",
+        "disconnected",
+        "gap_clusters",
+        "hole_loops",
+        "parallel_patches",
+        "fragment_mask",
+        "pending_reassignment",
+    )
+    _undo_stack: list[tuple[Mesh, str]] = []  # (mesh, its annotations.json)
     _UNDO_LIMIT = 10
 
     # ── Broadcast helper ──────────────────────────────────────────────
@@ -504,11 +527,40 @@ def _create_app(
         # track is derived from state anyway.  A message that carries it
         # cannot be the one site that forgot to send it.
         data = json.dumps({**msg, "track": _current_track()})
-        for ws in connected_clients:
+        # A copy: a tab that closes mid-send leaves the list from under us.
+        for ws in list(connected_clients):
             try:
                 await ws.send_text(data)
             except Exception:
                 pass
+
+    # mtime of annotations.json when the pages were last told of it; the file
+    # watcher reports only writes newer than that, i.e. another program's.
+    _annotations_announced = {"mtime": 0.0}
+
+    async def _announce_annotations(origin: str | None = None):
+        """Tell the pages annotations.json changed; each fetches it once.
+
+        ``origin`` is the page whose edit this was, which already shows it.
+        """
+        _annotations_announced["mtime"] = annotations_path.stat().st_mtime
+        msg = {"type": "annotations_updated"}
+        if origin:
+            msg["origin"] = origin
+        await broadcast(msg)
+
+    async def _save_annotations(ann: dict, *, origin: str | None = None):
+        """Write annotations.json and announce it — every server-side write."""
+        annotations_path.write_text(
+            json.dumps(ann, separators=(",", ":")), encoding="utf-8"
+        )
+        await _announce_annotations(origin)
+
+    def _read_annotations() -> dict:
+        try:
+            return json.loads(annotations_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, ValueError):
+            return {}
 
     # ── Log-capturing executor helper ─────────────────────────────────
 
@@ -580,9 +632,11 @@ def _create_app(
         return JSONResponse({})
 
     async def get_annotations(_request):
+        # Sent as written: parsing it only to serialise it again costs 80 ms
+        # on the event loop for a cell's worth of face lists.
         if annotations_path.exists():
-            return JSONResponse(
-                json.loads(annotations_path.read_text(encoding="utf-8"))
+            return Response(
+                annotations_path.read_bytes(), media_type="application/json"
             )
         return JSONResponse({})
 
@@ -639,19 +693,27 @@ def _create_app(
             if old_file.suffix in (".obj", ".ply", ".stl", ".npz", ".swc"):
                 old_file.unlink(missing_ok=True)
         skeleton_states.clear()
-        mesh_state["soma"] = None
-        mesh_state["organelles"] = None
-        mesh_state["mesh_stats"] = None
-        # Set by _publish_components and read by /skeletonize to choose the
-        # track.  Left behind, components belonging to the mesh being
-        # replaced silently send the next skeletonization down the
-        # preprocessing path naming faces that no longer exist.
-        mesh_state["neurites"] = None
-        mesh_state["discarded"] = None
+        _forget_mesh_state()
+        # Not announced: the new mesh's own message clears the pages, and a
+        # fetch set off here would be answered after this batch's components
+        # and draw them on the mesh being replaced.
+        annotations_path.write_text("{}", encoding="utf-8")
+        _annotations_announced["mtime"] = annotations_path.stat().st_mtime
+        await broadcast({"type": "all_skeletons_removed"})
+
+    def _forget_mesh_state():
+        """Drop every result and cache that names the current mesh's faces.
+
+        Each would otherwise be applied to whatever mesh comes next: a cached
+        detection is removed at its own face ids, and components left behind
+        send /skeletonize down the preprocessing track.  The undo stack goes
+        too — it would restore a mesh from another cell.
+        """
+        for key in _MESH_KEYED:
+            mesh_state[key] = None
         mesh_state["rescued"] = np.empty(0, dtype=np.int64)
         mesh_state["released"] = np.empty(0, dtype=np.int64)
-        annotations_path.write_text("{}", encoding="utf-8")
-        await broadcast({"type": "all_skeletons_removed"})
+        _undo_stack.clear()
 
     async def _apply_upload(tmp_path: Path, *, reset: bool = True):
         """Apply one upload that has already been written to ``port_dir``.
@@ -743,9 +805,8 @@ def _create_app(
                         }
                     )
 
-                annotations_path.write_text(json.dumps(ann), encoding="utf-8")
+                await _save_annotations(ann)
                 print(f"Loaded organelle npz: {', '.join(loaded)}")
-                await broadcast({"type": "annotations_updated"})
                 return JSONResponse(
                     {
                         "ok": True,
@@ -822,8 +883,7 @@ def _create_app(
                             "color": [0.9, 0.5, 0.9],
                         }
                     )
-                    annotations_path.write_text(json.dumps(ann), encoding="utf-8")
-                    await broadcast({"type": "annotations_updated"})
+                    await _save_annotations(ann)
 
                 return JSONResponse(
                     {
@@ -868,7 +928,7 @@ def _create_app(
                     # with break_up_mesh and every reassignment — a second
                     # copy here is how a loaded file came back showing
                     # "neurite 0" over components that had been named.
-                    _publish_components(comp)
+                    await _publish_components(comp)
 
                 loaded = []
                 if comp.soma is not None:
@@ -877,7 +937,6 @@ def _create_app(
                 loaded.append(f"{len(comp.neurites)} neurites")
                 loaded.append(f"{len(comp.discarded)} discarded")
                 print(f"Loaded components: {', '.join(loaded)}")
-                await broadcast({"type": "annotations_updated"})
                 return JSONResponse(
                     {
                         "ok": True,
@@ -922,9 +981,8 @@ def _create_app(
                         }
                     )
 
-                annotations_path.write_text(json.dumps(ann), encoding="utf-8")
+                await _save_annotations(ann)
                 print(f"Loaded neurites: {len(neurites)} components")
-                await broadcast({"type": "annotations_updated"})
                 return JSONResponse({"ok": True, "type": "neurites", "name": filename})
 
             elif suffix == ".npz" and _is_l2_graph(tmp_path):
@@ -1038,12 +1096,11 @@ def _create_app(
                     if k != "highlights" and k not in current:
                         current[k] = v
 
-                annotations_path.write_text(json.dumps(current), encoding="utf-8")
+                await _save_annotations(current)
                 print(
                     f"Loaded annotations: {added} new highlights "
                     f"(total {len(current['highlights'])})"
                 )
-                await broadcast({"type": "annotations_updated"})
                 return JSONResponse(
                     {
                         "ok": True,
@@ -1162,8 +1219,14 @@ def _create_app(
             mesh_state["buffers"] = None
             mesh_state["path"] = None
             mesh_state["centroid"] = np.zeros(3, dtype=np.float32)
+            # What was found on the mesh, and drawn over it, goes with it.
+            _forget_mesh_state()
+            current = json.loads(state_path.read_text(encoding="utf-8"))
+            current.pop("mesh", None)
+            state_path.write_text(json.dumps(current, indent=2), encoding="utf-8")
             await _rebroadcast_skeletons()
             await broadcast({"type": "mesh_removed"})
+            await _save_annotations({})
             return JSONResponse({"ok": True})
 
         elif item_type == "skeleton":
@@ -1181,7 +1244,8 @@ def _create_app(
 
     async def update_annotations(request):
         body = await request.json()
-        annotations_path.write_text(json.dumps(body), encoding="utf-8")
+        # The sending page already shows this; the others fetch it.
+        await _save_annotations(body, origin=request.headers.get("x-skeliner-page"))
         return JSONResponse({"ok": True})
 
     async def post_state(request):
@@ -1313,7 +1377,7 @@ def _create_app(
         if "highlights" not in ann:
             ann["highlights"] = []
         ann["highlights"].extend(highlights)
-        annotations_path.write_text(json.dumps(ann), encoding="utf-8")
+        await _save_annotations(ann)
 
         n_faces = sum(len(h["faces"]) for h in highlights)
         return JSONResponse({"ok": True, "nFaces": n_faces})
@@ -1345,7 +1409,7 @@ def _create_app(
                     "label": "fragments",
                 }
             )
-            annotations_path.write_text(json.dumps(ann), encoding="utf-8")
+            await _save_annotations(ann)
 
         return JSONResponse({"ok": True, "nFaces": len(faces)})
 
@@ -1415,7 +1479,7 @@ def _create_app(
                 }
             )
 
-        annotations_path.write_text(json.dumps(ann), encoding="utf-8")
+        await _save_annotations(ann)
         return JSONResponse({"ok": True, "nComponents": len(components)})
 
     async def detect_soma(request):
@@ -1467,20 +1531,22 @@ def _create_app(
 
         mesh_state["soma"] = soma
 
-        # Highlight soma surface vertices via their faces
-        # Include faces where at least 2 of 3 vertices are soma verts
-        soma_vset = set(int(v) for v in soma.verts)
-        soma_faces = [
-            int(fi)
-            for fi in range(len(mesh.faces))
-            if sum(1 for v in mesh.faces[fi] if int(v) in soma_vset) >= 2
-        ]
+        from skeliner.pre import soma_face_mask
 
-        ann = {}
-        if annotations_path.exists():
-            ann = json.loads(annotations_path.read_text(encoding="utf-8"))
-        if "highlights" not in ann:
-            ann["highlights"] = []
+        soma_faces = np.flatnonzero(soma_face_mask(mesh.faces, soma.verts)).tolist()
+
+        # A re-run replaces this method's soma rather than adding a second.
+        ann = _read_annotations()
+        ann["highlights"] = [
+            h for h in ann.get("highlights", []) if h.get("label") != label_prefix
+        ]
+        # An ellipsoid from before they carried a label is matched by colour.
+        ann["ellipsoids"] = [
+            e
+            for e in ann.get("ellipsoids", [])
+            if e.get("label") != label_prefix
+            and not ("label" not in e and e.get("color") == color)
+        ]
         ann["highlights"].append(
             {
                 "faces": soma_faces,
@@ -1488,21 +1554,20 @@ def _create_app(
                 "label": label_prefix,
             }
         )
-
-        # Wireframe ellipsoid (coordinates shifted by mesh centroid)
+        # Wireframe ellipsoid (coordinates shifted by mesh centroid); `label`
+        # names the highlight it belongs with.
         centroid = mesh_state["centroid"]
-        if "ellipsoids" not in ann:
-            ann["ellipsoids"] = []
         ann["ellipsoids"].append(
             {
                 "center": (soma.center - centroid).tolist(),
                 "axes": soma.axes.tolist(),
                 "R": soma.R.tolist(),
                 "color": color,
+                "label": label_prefix,
             }
         )
 
-        annotations_path.write_text(json.dumps(ann), encoding="utf-8")
+        await _save_annotations(ann)
 
         return JSONResponse(
             {
@@ -1582,7 +1647,7 @@ def _create_app(
                 }
             )
 
-        annotations_path.write_text(json.dumps(ann), encoding="utf-8")
+        await _save_annotations(ann)
         return JSONResponse(
             {
                 "ok": True,
@@ -1642,8 +1707,8 @@ def _create_app(
         if ms is not None:
             mesh_state["mesh_stats"] = ms
 
-        _clear_annotations("gap ", "disconnected ")
         await _apply_new_mesh(new_mesh)
+        await _clear_annotations("gap ", "disconnected ")
         mesh_state["gap_clusters"] = None
         # Restore the pre-bridge fusion list (nulled by _apply_new_mesh) so a
         # subsequent remove_fusions uses the same clusters preprocess()
@@ -1817,8 +1882,7 @@ def _create_app(
             total_faces += len(r["faces"])
 
         mesh_state["parallel_patches"] = results
-        annotations_path.write_text(json.dumps(ann), encoding="utf-8")
-        await broadcast({"type": "annotations_updated"})
+        await _save_annotations(ann)
         await _log(
             f"[skeliner.pre] {len(results)} parallel patches, {total_faces} faces"
         )
@@ -1850,27 +1914,21 @@ def _create_app(
             mesh_stats=ms,
         )
 
+        await _apply_new_mesh(new_mesh)
+
         # Clear only annotations whose faces were actually removed
         removed = set(int(i) for i in np.where(np.all(new_mesh.faces == 0, axis=1))[0])
-        if annotations_path.exists():
-            try:
-                ann = json.loads(annotations_path.read_text(encoding="utf-8"))
-                if "highlights" in ann:
-                    ann["highlights"] = [
-                        h
-                        for h in ann["highlights"]
-                        if not (
-                            h.get("label", "").startswith("patch:")
-                            and all(f in removed for f in h.get("faces", []))
-                        )
-                    ]
-                    annotations_path.write_text(
-                        json.dumps(ann, separators=(",", ":")), encoding="utf-8"
-                    )
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-        await _apply_new_mesh(new_mesh)
+        ann = _read_annotations()
+        if "highlights" in ann:
+            ann["highlights"] = [
+                h
+                for h in ann["highlights"]
+                if not (
+                    h.get("label", "").startswith("patch:")
+                    and all(f in removed for f in h.get("faces", []))
+                )
+            ]
+            await _save_annotations(ann)
         n_degen = len(removed)
         await _log(f"Remove parallel: {n_degen:,} faces degenerated")
         return JSONResponse(
@@ -1922,7 +1980,7 @@ def _create_app(
                 }
             )
 
-        annotations_path.write_text(json.dumps(ann), encoding="utf-8")
+        await _save_annotations(ann)
         return JSONResponse(
             {
                 "ok": True,
@@ -1930,14 +1988,9 @@ def _create_app(
             }
         )
 
-    def _clear_annotations(*prefixes: str) -> None:
+    async def _clear_annotations(*prefixes: str) -> None:
         """Remove highlight annotations whose label starts with any prefix."""
-        if not annotations_path.exists():
-            return
-        try:
-            ann = json.loads(annotations_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, ValueError):
-            return
+        ann = _read_annotations()
         if "highlights" not in ann:
             return
         ann["highlights"] = [
@@ -1945,9 +1998,7 @@ def _create_app(
             for h in ann["highlights"]
             if not any(h.get("label", "").startswith(p) for p in prefixes)
         ]
-        annotations_path.write_text(
-            json.dumps(ann, separators=(",", ":")), encoding="utf-8"
-        )
+        await _save_annotations(ann)
 
     def _skel_is_stale(sstate) -> bool:
         """Was this skeleton built from a mesh that is no longer loaded?
@@ -2052,6 +2103,29 @@ def _create_app(
                 }
             )
 
+    async def _broadcast_edited_mesh(*, renumbered: bool = False):
+        """Send the edited mesh to the open pages, which keep their view.
+
+        The flags ride on the message, not on ``mesh_state["buffers"]``: those
+        are what ``/mesh`` sends a page opened later, which has no view yet
+        and has to frame the mesh.  ``renumbered``: face ids no longer name
+        the same triangles, so the page drops what it holds by face id.
+        """
+        payload = {**mesh_state["buffers"], "keepCamera": True}
+        if renumbered:
+            payload["facesRenumbered"] = True
+        await broadcast({"type": "mesh_loaded", "payload": payload})
+
+    def _push_undo(mesh):
+        """Remember a mesh, and the annotations drawn on it, for ``/undo``."""
+        try:
+            ann = annotations_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            ann = "{}"
+        _undo_stack.append((mesh, ann))
+        if len(_undo_stack) > _UNDO_LIMIT:
+            _undo_stack.pop(0)
+
     async def _apply_new_mesh(new_mesh, *, rederived: bool = False):
         """Replace the current mesh with a modified one and broadcast.
 
@@ -2062,9 +2136,7 @@ def _create_app(
         # Save current mesh for undo
         old = mesh_state["mesh"]
         if old is not None:
-            _undo_stack.append(old)
-            if len(_undo_stack) > _UNDO_LIMIT:
-                _undo_stack.pop(0)
+            _push_undo(old)
 
         mesh_state["mesh"] = new_mesh
         # Organelle mask/precompute and soma survive — _rebuild_mesh
@@ -2098,8 +2170,7 @@ def _create_app(
         # Both vertex and face indices are stable — all annotations
         # survive mesh changes without remapping.
 
-        buffers["keepCamera"] = True
-        await broadcast({"type": "mesh_loaded", "payload": buffers})
+        await _broadcast_edited_mesh()
 
         # Re-send skeletons (centroid may have changed)
         await _rebroadcast_skeletons()
@@ -2159,8 +2230,8 @@ def _create_app(
 
         new_mesh = await _run_with_log(_do_remove)
 
-        _clear_annotations("organelle:")
         await _apply_new_mesh(new_mesh)
+        await _clear_annotations("organelle:")
         n_degen = int(np.all(new_mesh.faces == 0, axis=1).sum())
         await _log(f"Remove organelles: {n_before:,} faces, {n_degen:,} degenerated")
         return JSONResponse(
@@ -2192,8 +2263,8 @@ def _create_app(
         )
         n_after = len(new_mesh.faces)
 
-        _clear_annotations("fusion ")
         await _apply_new_mesh(new_mesh)
+        await _clear_annotations("fusion ")
         n_degen = int(np.all(new_mesh.faces == 0, axis=1).sum())
         await _log(f"Remove fusions: {n_degen:,} faces degenerated")
         return JSONResponse(
@@ -2228,8 +2299,8 @@ def _create_app(
 
         new_mesh = await _run_with_log(_do_remove)
 
-        _clear_annotations("fragments ")
         await _apply_new_mesh(new_mesh)
+        await _clear_annotations("fragments ")
         n_degen = int(np.all(new_mesh.faces == 0, axis=1).sum())
         await _log(f"Remove fragments: {n_degen:,} faces degenerated")
         return JSONResponse(
@@ -2264,8 +2335,8 @@ def _create_app(
         )
         n_after = len(new_mesh.faces)
 
-        _clear_annotations("hole ")
         await _apply_new_mesh(new_mesh)
+        await _clear_annotations("hole ")
         await _log(
             f"Fill holes: {n_before:,} → {n_after:,} faces ({n_after - n_before:,} added)"
         )
@@ -2398,8 +2469,7 @@ def _create_app(
         # Component ids shift when one leaves the discarded list, so a
         # preview named against the old numbering no longer means anything.
         mesh_state["pending_reassignment"] = None
-        out = _publish_components(components)
-        await broadcast({"type": "annotations_updated"})
+        out = await _publish_components(components)
 
         await _log(f"Rescued {len(hit)} discarded → neurites ({len(faces):,} faces)")
         return JSONResponse(
@@ -2428,9 +2498,7 @@ def _create_app(
         # Push undo before modifying
         old = mesh_state["mesh"]
         if old is not None:
-            _undo_stack.append(old)
-            if len(_undo_stack) > _UNDO_LIMIT:
-                _undo_stack.pop(0)
+            _push_undo(old)
 
         # Apply edits: each faceEdit has {face: int, verts: [[x,y,z]*3]}
         # The frontend positions are centroid-subtracted, so add centroid back
@@ -2450,10 +2518,8 @@ def _create_app(
 
         # Keep the original centroid
         original_centroid = mesh_state["centroid"]
-        buffers = _mesh_to_buffers(new_mesh, centroid=original_centroid)
-        mesh_state["buffers"] = buffers
-        buffers["keepCamera"] = True
-        await broadcast({"type": "mesh_loaded", "payload": buffers})
+        mesh_state["buffers"] = _mesh_to_buffers(new_mesh, centroid=original_centroid)
+        await _broadcast_edited_mesh()
 
         n_faces_edited = len(face_edits)
         await _log(f"Edit vertices: {n_faces_edited} faces modified")
@@ -2466,16 +2532,20 @@ def _create_app(
             return JSONResponse(
                 {"ok": False, "error": "Nothing to undo"}, status_code=400
             )
-        prev_mesh = _undo_stack.pop()
+        prev_mesh, prev_annotations = _undo_stack.pop()
         # Apply without pushing to undo stack
         mesh_state["mesh"] = prev_mesh
         mesh_state["pending_reassignment"] = None
-        buffers = _mesh_to_buffers(prev_mesh)
-        mesh_state["buffers"] = buffers
-        mesh_state["centroid"] = np.asarray(buffers["centroid"], dtype=np.float32)
-        annotations_path.write_text("{}", encoding="utf-8")
-        buffers["keepCamera"] = True
-        await broadcast({"type": "mesh_loaded", "payload": buffers})
+        mesh_state["buffers"] = _mesh_to_buffers(
+            prev_mesh, centroid=mesh_state["centroid"]
+        )
+        # Faces the edit appended are gone again, so ids picked since may
+        # name nothing.
+        await _broadcast_edited_mesh(renumbered=True)
+        # The annotations as they were on that mesh: the edit cleared what it
+        # removed, and anything drawn since may name the faces it appended.
+        annotations_path.write_text(prev_annotations, encoding="utf-8")
+        await _announce_annotations()
 
         await _rebroadcast_skeletons()
 
@@ -2501,7 +2571,7 @@ def _create_app(
             }
         )
 
-    def _publish_components(result):
+    async def _publish_components(result):
         """Install a MeshComponents into mesh_state and redraw its annotations.
 
         Shared by ``break_up_mesh`` and by committing a reassignment, so the
@@ -2588,12 +2658,14 @@ def _create_app(
                     "axes": new_soma.axes.tolist(),
                     "R": new_soma.R.tolist(),
                     "color": [0.9, 0.5, 0.9],
+                    # the highlight it belongs with, for the page to link
+                    "label": "soma",
                 }
             ]
         else:
             ann["ellipsoids"] = []
 
-        annotations_path.write_text(json.dumps(ann), encoding="utf-8")
+        await _save_annotations(ann)
 
         return {
             "nNeurites": len(result.neurites),
@@ -2636,7 +2708,7 @@ def _create_app(
         # Breaking up redefines the components a pending reassignment was
         # previewed against, so that preview no longer means anything.
         mesh_state["pending_reassignment"] = None
-        return JSONResponse({"ok": True, **_publish_components(result)})
+        return JSONResponse({"ok": True, **(await _publish_components(result))})
 
     async def name_neurite(request):
         """Give one neurite a name, and the SWC code it exports as.
@@ -2684,7 +2756,7 @@ def _create_app(
         except (TypeError, ValueError) as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
-        out = _publish_components(_current_components())
+        out = await _publish_components(_current_components())
         await _log(
             f"neurite {index} is '{label}' (SWC type {neurites.swc_types[index]})"
         )
@@ -2742,7 +2814,7 @@ def _create_app(
         # and removed what they name.
         mesh_state["mesh_stats"] = None
         mesh_state["gap_clusters"] = None
-        out = _publish_components(components)
+        out = await _publish_components(components)
         await _log(
             f"Preprocess: {n_before:,} → {len(new_mesh.faces):,} faces, "
             f"{out['nNeurites']} neurites, {out['nDiscarded']} discarded"
@@ -2872,7 +2944,7 @@ def _create_app(
                 np.asarray(r.selected, dtype=np.int64),
             )
         mesh_state["pending_reassignment"] = None
-        out = _publish_components(components)
+        out = await _publish_components(components)
         await _log(f"Applied: {r.summary}")
         return JSONResponse({"ok": True, **out})
 
@@ -2927,44 +2999,25 @@ def _create_app(
 
         clean, components, vert_map, face_map = await _run_with_log(_run)
 
-        # Compute new centroid and the delta from old
-        old_centroid = mesh_state["centroid"].copy()
-        buffers = _mesh_to_buffers(clean)
-        new_centroid = np.asarray(buffers["centroid"], dtype=np.float32)
-        delta = (old_centroid - new_centroid).tolist()
+        # Drawn about the session's centroid like every other edit, so every
+        # centroid-relative position (markers, ellipsoids, skeletons) still
+        # holds and the page keeps its view.
+        buffers = _mesh_to_buffers(clean, centroid=mesh_state["centroid"])
 
-        # Remap annotations
-        if annotations_path.exists():
-            ann = json.loads(annotations_path.read_text(encoding="utf-8"))
-
-            # Remap face-indexed highlights
-            if "highlights" in ann:
-                new_highlights = []
-                for h in ann["highlights"]:
-                    old_faces = np.array(h.get("faces", []), dtype=np.int64)
-                    valid = old_faces < n_faces_before
-                    mapped = face_map[old_faces[valid]]
-                    new_faces = mapped[mapped >= 0].tolist()
-                    if new_faces:
-                        h = dict(h)
-                        h["faces"] = new_faces
-                        new_highlights.append(h)
-                ann["highlights"] = new_highlights
-
-            # Shift ellipsoid centers by centroid delta
-            for ell in ann.get("ellipsoids", []):
-                c = ell["center"]
-                ell["center"] = [c[0] + delta[0], c[1] + delta[1], c[2] + delta[2]]
-
-            # Shift edge group segments by centroid delta
-            for eg in ann.get("edge_groups", []):
-                for seg in eg.get("segments", []):
-                    for pt in seg:
-                        pt[0] += delta[0]
-                        pt[1] += delta[1]
-                        pt[2] += delta[2]
-
-            annotations_path.write_text(json.dumps(ann), encoding="utf-8")
+        # Only the face ids change: remap the highlights.
+        ann = _read_annotations()
+        if "highlights" in ann:
+            new_highlights = []
+            for h in ann["highlights"]:
+                old_faces = np.array(h.get("faces", []), dtype=np.int64)
+                valid = old_faces < n_faces_before
+                mapped = face_map[old_faces[valid]]
+                new_faces = mapped[mapped >= 0].tolist()
+                if new_faces:
+                    h = dict(h)
+                    h["faces"] = new_faces
+                    new_highlights.append(h)
+            ann["highlights"] = new_highlights
 
         # Update state — compact is destructive, clear all cached face-indexed data
         mesh_state["mesh"] = clean
@@ -2989,10 +3042,9 @@ def _create_app(
         mesh_state["pending_reassignment"] = None
 
         mesh_state["buffers"] = buffers
-        mesh_state["centroid"] = new_centroid
-        buffers["keepCamera"] = True
-        await broadcast({"type": "mesh_loaded", "payload": buffers})
-        await broadcast({"type": "annotations_updated"})
+        await _broadcast_edited_mesh(renumbered=True)
+        # After the mesh, so the page draws them on the triangles they name.
+        await _save_annotations(ann)
 
         # Re-send skeletons
         await _rebroadcast_skeletons()
@@ -3014,8 +3066,6 @@ def _create_app(
     async def export_mesh(request):
         """Export the current mesh as a downloadable file."""
         import tempfile
-
-        from starlette.responses import Response
 
         from skeliner.io import save_mesh
 
@@ -3044,8 +3094,6 @@ def _create_app(
         """Save organelle masks (pocket, isolated, expanded)."""
         import tempfile
 
-        from starlette.responses import Response
-
         from skeliner.io import save_organelles_npz
 
         org = mesh_state.get("organelles")
@@ -3070,8 +3118,6 @@ def _create_app(
     async def export_mesh_stats(request):
         """Save the cached MeshStats as a standalone NPZ."""
         import tempfile
-
-        from starlette.responses import Response
 
         from skeliner.io import save_mesh_stats_npz
 
@@ -3098,8 +3144,6 @@ def _create_app(
         """Export the cached soma as a downloadable NPZ file."""
         import tempfile
 
-        from starlette.responses import Response
-
         soma = mesh_state.get("soma")
         if soma is None:
             return JSONResponse(
@@ -3123,8 +3167,6 @@ def _create_app(
     async def export_components(request):
         """Export MeshComponents (soma + organelles + neurites + discarded)."""
         import tempfile
-
-        from starlette.responses import Response
 
         from skeliner.dataclass import Discarded, MeshComponents, Neurites
         from skeliner.io import save_components_npz
@@ -3162,8 +3204,6 @@ def _create_app(
         """Export neurite face arrays as NPZ."""
         import tempfile
 
-        from starlette.responses import Response
-
         from skeliner.io import save_neurites_npz
 
         neurites = mesh_state.get("neurites")
@@ -3189,8 +3229,6 @@ def _create_app(
         """Export discarded fragment face arrays as NPZ."""
         import tempfile
 
-        from starlette.responses import Response
-
         from skeliner.io import save_discarded_npz
 
         discarded = mesh_state.get("discarded")
@@ -3215,8 +3253,6 @@ def _create_app(
 
     async def export_annotations(request):
         """Export annotations as a downloadable JSON file."""
-        from starlette.responses import Response
-
         if not annotations_path.exists():
             return JSONResponse(
                 {"ok": False, "error": "No annotations"}, status_code=400
@@ -3234,8 +3270,6 @@ def _create_app(
     async def export_annotation_submesh(request):
         """Export a single highlight annotation as an OBJ submesh."""
         import tempfile
-
-        from starlette.responses import Response
 
         from skeliner.io import save_mesh
 
@@ -3293,8 +3327,6 @@ def _create_app(
     async def export_skeleton(request):
         """Export a skeleton as a downloadable SWC or NPZ file."""
         import tempfile
-
-        from starlette.responses import Response
 
         name = request.query_params.get("name")
         fmt = request.query_params.get("format", "swc")
@@ -3392,7 +3424,7 @@ def _create_app(
         if "edge_groups" not in ann:
             ann["edge_groups"] = []
         ann["edge_groups"].extend(edge_groups)
-        annotations_path.write_text(json.dumps(ann), encoding="utf-8")
+        await _save_annotations(ann)
         return JSONResponse({"ok": True, "nHoles": n_holes})
 
     async def run_skeletonize(request):
@@ -4395,8 +4427,7 @@ def _create_app(
         ann["edge_groups"] = [
             g for g in ann.get("edge_groups", []) if g.get("dx") != kind
         ] + groups
-        annotations_path.write_text(json.dumps(ann), encoding="utf-8")
-        await broadcast({"type": "annotations_updated"})
+        await _save_annotations(ann)
 
         await _log(f"[skeliner.dx] {label}: {len(markers)} candidate(s) on '{name}'")
         return JSONResponse(
@@ -4817,7 +4848,7 @@ def _create_app(
                             "label": p.get("label", "selection"),
                         }
                     )
-                    annotations_path.write_text(json.dumps(ann), encoding="utf-8")
+                    await _save_annotations(ann)
         except Exception:
             pass
         finally:
@@ -4828,15 +4859,14 @@ def _create_app(
     html_path = Path(__file__).parent / "viewer.html"
 
     async def file_watcher():
-        last_ann_mtime = 0.0
         last_cam_mtime = 0.0
         last_html_mtime = html_path.stat().st_mtime if html_path.exists() else 0.0
         while True:
             await asyncio.sleep(0.5)
             try:
                 mtime = annotations_path.stat().st_mtime
-                if mtime > last_ann_mtime:
-                    last_ann_mtime = mtime
+                if mtime > _annotations_announced["mtime"]:
+                    _annotations_announced["mtime"] = mtime
                     content = annotations_path.read_text(encoding="utf-8")
                     await broadcast(
                         {
