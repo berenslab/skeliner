@@ -19,6 +19,7 @@ from .mesh import (
     rows3,
     Topology,
 )
+from .post import _RAY_CHUNK
 
 
 def sever_cost(sel: set[int], face_adj: dict[int, set[int]], budget: int) -> int:
@@ -1180,6 +1181,8 @@ def pocket_organelles(
     topology: Topology,
     svd_rows,
     *,
+    centers,
+    normals,
     grow_threshold: float = 0.1,
     bridge_threshold: float = 0.3,
     max_hole_size: int = 500,
@@ -1200,7 +1203,11 @@ def pocket_organelles(
     3. Bridging: flood-fill from pocket boundary using the relaxed
        ``bridge_threshold`` to cross narrow positive-dot barriers.
     4. Hole filling: small non-pocket clusters mostly enclosed by pocket
-       faces are filled in.
+       faces are filled in, if they are a fold's inside: no bigger than the
+       pocket they touch, or, bigger (the nucleus behind a narrow rim),
+       lying inside the cell (:class:`_Inside`, from *centers* and
+       *normals*).  A neurite's end ringed by a fold at its base is bigger
+       than the fold and faces out of the cell.
 
     Only regions behind a mouth get detected — curved surfaces without a
     mouth are correctly excluded.
@@ -1306,6 +1313,8 @@ def pocket_organelles(
     non_pocket_idx = set(np.where(non_pocket_main)[0].tolist())
     np_visited: set[int] = set()
     hole_count = 0
+    wall_of, wall_size = _mask_components(pocket, adj)
+    inside = _Inside(vertices, faces, centers, normals)
 
     for fi in non_pocket_idx:
         if fi in np_visited:
@@ -1346,7 +1355,11 @@ def pocket_organelles(
             and len(cluster) > len(adj_pocket_faces)
         ):
             continue
-        if (is_small and enclosure >= hole_enclosure_ratio) or is_entrapped:
+        around = np.unique(wall_of[sorted(adj_pocket_faces)])
+        wrapped = len(cluster) <= int(wall_size[around].sum())
+        if ((is_small and enclosure >= hole_enclosure_ratio) or is_entrapped) and (
+            wrapped or inside.holds(cluster)
+        ):
             for c in cluster:
                 pocket[c] = True
             hole_count += len(cluster)
@@ -1393,6 +1406,88 @@ def pocket_organelles(
     counts["n_rejected"] = n_rejected
 
     return pocket, counts
+
+
+def _mask_components(
+    mask: np.ndarray, adj: dict[int, set[int]]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Each face's component among the faces *mask* marks, joined by *adj*
+    (-1 outside), and each component's size."""
+    label = np.full(len(mask), -1, dtype=np.intp)
+    sizes: list[int] = []
+    for start in np.flatnonzero(mask):
+        if label[start] >= 0:
+            continue
+        k = len(sizes)
+        label[start] = k
+        size = 0
+        queue = deque([int(start)])
+        while queue:
+            f = queue.popleft()
+            size += 1
+            for g in adj.get(f, ()):
+                if mask[g] and label[g] < 0:
+                    label[g] = k
+                    queue.append(g)
+        sizes.append(size)
+    return label, np.asarray(sizes, dtype=np.intp)
+
+
+class _Inside:
+    """Whether a piece of the surface lies inside the cell: more than half
+    its faces look into it, the ray from a face's centre along its normal
+    (out of the cell's material) meeting another face, with trimesh's
+    ``ray_triangle`` test.  A fold's back wall and the nucleus face into
+    the cell; a neurite's surface faces out of it.  A piece reaching the
+    mesh's open edges — where the volume cut the cell, or a hole — counts
+    as inside: its rays may leave through the opening, which says nothing
+    of the membrane.  The faces' tree and open edges are found on first
+    use."""
+
+    def __init__(self, vertices, faces, centers, normals):
+        self._faces = np.asarray(faces, dtype=np.int64)
+        self._tris = np.asarray(vertices, dtype=np.float64)[self._faces]
+        self._centers = np.asarray(centers, dtype=np.float64)
+        self._normals = np.asarray(normals, dtype=np.float64)
+        self._tree = None
+        self._open = None
+
+    def holds(self, piece) -> bool:
+        """Does the piece of faces *piece* lie inside the cell?"""
+        import trimesh
+
+        if self._tree is None:
+            self._tree = trimesh.triangles.bounds_tree(self._tris)
+            # a face is on the open boundary if one of its edges is named by
+            # no other face (a vertex repeated makes no edge)
+            f = self._faces
+            e = np.sort(
+                np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]), axis=1
+            )
+            owner = np.tile(np.arange(len(f)), 3)
+            real = e[:, 0] != e[:, 1]
+            e, owner = e[real], owner[real]
+            _, inv, count = np.unique(
+                e, axis=0, return_inverse=True, return_counts=True
+            )
+            self._open = np.zeros(len(f), dtype=bool)
+            self._open[owner[count[inv.ravel()] == 1]] = True
+        piece = np.asarray(sorted(piece), dtype=np.intp)
+        if self._open[piece].any():
+            return True
+        looking_in = 0
+        for lo in range(0, len(piece), _RAY_CHUNK):
+            part = piece[lo : lo + _RAY_CHUNK]
+            tri, ray, _ = trimesh.ray.ray_triangle.ray_triangle_id(
+                self._tris,
+                self._centers[part],
+                self._normals[part],
+                triangles_normal=self._normals,
+                tree=self._tree,
+                multiple_hits=True,
+            )
+            looking_in += len(np.unique(ray[tri != part[ray]]))
+        return 2 * looking_in > len(piece)
 
 
 def isolated_organelles(
@@ -1470,15 +1565,29 @@ def isolated_organelles(
 
 
 def enclosure_pass(
-    adjacency, np_mask, pocket, min_cluster_size: int
+    adjacency,
+    np_mask,
+    pocket,
+    min_cluster_size: int,
+    *,
+    vertices,
+    faces,
+    centers,
+    normals,
 ) -> tuple[np.ndarray, int]:
     """Claim for *pocket* every organelle interior joined to the surface
     through a narrow neck: each subtree of *np_mask*'s faces hanging off an
-    articulation face, whose boundary is at least 90% pocket and whose size
-    is between *min_cluster_size* and the pocket's.  A single-pass Tarjan
-    over *np_mask*'s faces (CSR from trimesh's manifold face *adjacency*)
-    tracks each subtree's size and boundary inline: ``(pocket with the
-    claimed faces, how many were added)``."""
+    articulation face, whose boundary is at least 90% pocket, whose size is
+    between *min_cluster_size* and the pocket's, and which is an organelle's
+    inside: no bigger than the pocket it touches (the pocket's components
+    along its boundary), or, bigger — the nucleus behind a narrow rim —
+    still lying inside the cell (:class:`_Inside`, from *vertices*,
+    *faces*, *centers* and *normals*).  A neurite's end beyond a neck ringed
+    by pocket, or a bulb around a fold, is bigger than that pocket and faces
+    out of the cell.  A single-pass Tarjan over *np_mask*'s faces (CSR from
+    trimesh's manifold face *adjacency*) tracks each subtree's size and
+    boundary inline: ``(pocket with the claimed faces, how many were
+    added)``."""
     _np_mask = np.asarray(np_mask, dtype=bool)
     pocket = np.array(pocket, dtype=bool)
     if len(_np_mask) != len(pocket):
@@ -1511,6 +1620,27 @@ def enclosure_pass(
         _pocket_b = _cross_b & pocket[_fa[:, 0]]
         if _pocket_b.any():
             np.add.at(_pbnd, _fa[_pocket_b, 1], 1)
+
+    # The pocket's components over the same adjacency, and the pocket faces
+    # each candidate face borders
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    _pp = _fa[pocket[_fa[:, 0]] & pocket[_fa[:, 1]]]
+    _plab = connected_components(
+        coo_matrix(
+            (np.ones(len(_pp), dtype=np.int8), (_pp[:, 0], _pp[:, 1])),
+            shape=(nF, nF),
+        ),
+        directed=False,
+    )[1]
+    _psize = np.bincount(_plab[pocket], minlength=nF)
+    _walls = np.concatenate(
+        [
+            _fa[_np_mask[_fa[:, 0]] & pocket[_fa[:, 1]]],
+            _fa[_np_mask[_fa[:, 1]] & pocket[_fa[:, 0]]][:, ::-1],
+        ]
+    )
 
     # Build CSR adjacency for non-pocket faces
     _edges = np.empty((len(_pairs) * 2, 2), dtype=np.int64)
@@ -1581,7 +1711,9 @@ def enclosure_pass(
                     ):
                         _to_claim.append((int(u), int(_disc[u])))
 
-    # Collect subtree faces for each claim via BFS
+    # Collect subtree faces for each claim via BFS, and take them if they
+    # are no bigger than the pocket they touch or lie inside the cell
+    inside = _Inside(vertices, faces, centers, normals)
     for _u, _d_u in _to_claim:
         _q = deque([_u])
         _vis: set[int] = set()
@@ -1590,15 +1722,20 @@ def enclosure_pass(
             if c in _vis:
                 continue
             _vis.add(c)
-            if not pocket[c]:
-                pocket[c] = True
-                enclosed_count += 1
             s = int(_off[c])
             e = int(_off[c + 1])
             for i in range(s, e):
                 nb = int(_dst[i])
                 if nb not in _vis and _disc[nb] >= _d_u:
                     _q.append(nb)
+        _sub = np.fromiter(_vis, dtype=np.int64)
+        _around = np.unique(_plab[_walls[np.isin(_walls[:, 0], _sub), 1]])
+        if len(_sub) > int(_psize[_around].sum()) and not inside.holds(_vis):
+            continue
+        for c in sorted(_vis):
+            if not pocket[c]:
+                pocket[c] = True
+                enclosed_count += 1
     return pocket, enclosed_count
 
 
@@ -1669,6 +1806,8 @@ def find_organelles(
         structural_mask,
         Topology(faces, len(vertices)),
         svd_rows,
+        centers=centers,
+        normals=normals,
         min_cluster_size=min_cluster_size,
         non_main_mask=non_main_mask,
     )
@@ -1677,7 +1816,14 @@ def find_organelles(
     #       through a narrow neck (articulation face).
     np_mask = structural_mask & ~pocket & ~isolated
     pocket, enclosed_count = enclosure_pass(
-        adjacency, np_mask, pocket, min_cluster_size
+        adjacency,
+        np_mask,
+        pocket,
+        min_cluster_size,
+        vertices=vertices,
+        faces=faces,
+        centers=centers,
+        normals=normals,
     )
 
     report = {

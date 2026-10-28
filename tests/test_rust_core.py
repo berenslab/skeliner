@@ -600,7 +600,12 @@ class TestFindOrganelles:
                 areas = np.asarray(mesh.area_faces, dtype=np.float64)
                 main = st.main_face_mask
                 non_main = ~main & (st.face_comp >= 0)
+                geometry = {
+                    "centers": np.asarray(mesh.triangles_center, dtype=np.float64),
+                    "normals": np.asarray(mesh.face_normals, dtype=np.float64),
+                }
                 for kwargs in ({}, {"non_main_mask": non_main, "max_hole_size": 50}):
+                    kwargs = {**kwargs, **geometry}
                     args = (faces, verts, areas, st.outward_dots, main)
                     tail = (pre._svd_rows,)
                     rust = _rs.pre.pocket_organelles(
@@ -644,11 +649,83 @@ class TestFindOrganelles:
             calls.append((len(x), full_matrices))
             raise RuntimeError("no SVD here")
 
-        for fn in (_rs.pre.pocket_mouths, _rs.pre.pocket_organelles):
+        geometry = {
+            "centers": np.asarray(mesh.triangles_center, dtype=np.float64),
+            "normals": np.asarray(mesh.face_normals, dtype=np.float64),
+        }
+        for fn, kwargs in (
+            (_rs.pre.pocket_mouths, {}),
+            (_rs.pre.pocket_organelles, geometry),
+        ):
             calls.clear()
             with pytest.raises(RuntimeError, match="no SVD here"):
-                fn(*args, st.main_face_mask, topology, svd_fails)
+                fn(*args, st.main_face_mask, topology, svd_fails, **kwargs)
             assert len(calls) == 1  # no call back after the first failure
+
+    def test_a_hole_bigger_than_its_fold_and_outside_the_cell_is_left(self):
+        """A hole walled in by pocket is a fold's inside if it is no bigger
+        than the pocket it touches, or lies inside the cell.  A soma's
+        neurite whose base is ringed by a fold (inward dots on a band of
+        it) keeps a long tip out of the pocket — bigger than the fold, its
+        faces looking out of the cell — while a tip smaller than the fold is
+        filled, and so are the folds inside the flask's chamber; on both
+        paths."""
+        from skeliner.python import mesh as python_mesh
+        from skeliner.python import pre as python_pre
+
+        def on_both_paths(mesh, dots, main):
+            faces = np.asarray(mesh.faces, dtype=np.int64)
+            verts = np.asarray(mesh.vertices, dtype=np.float64)
+            args = (faces, verts, np.asarray(mesh.area_faces), dots, main)
+            geometry = {
+                "centers": np.asarray(mesh.triangles_center, dtype=np.float64),
+                "normals": np.asarray(mesh.face_normals, dtype=np.float64),
+            }
+            rust = _rs.pre.pocket_organelles(
+                *args, _rs.mesh.Topology(faces, len(verts)), pre._svd_rows, **geometry
+            )
+            python = python_pre.pocket_organelles(
+                *args,
+                python_mesh.Topology(faces, len(verts)),
+                pre._svd_rows,
+                **geometry,
+            )
+            assert_parity(rust, python)
+            return rust
+
+        for tip_rings, filled in ((40, False), (5, True)):
+            angles = np.linspace(-np.pi / 2 + 0.05, np.pi / 2 - np.arcsin(0.05), 120)
+            prof = [(6000.0 * np.cos(a), 6000.0 * np.sin(a)) for a in angles]
+            z0 = prof[-1][1]
+            prof += [(300.0, z0 + 150.0 * k) for k in range(1, 17 + tip_rings)]
+            verts, faces = _revolved(prof)
+            # the tip closed, as a neurite's end is: a fan to the axis
+            top = np.flatnonzero(verts[:, 2] == verts[:, 2].max())
+            ring = top[np.argsort(np.arctan2(verts[top, 1], verts[top, 0]))]
+            apex = [[0.0, 0.0, verts[:, 2].max() + 150.0]]
+            fan = np.column_stack(
+                [ring, np.roll(ring, -1), np.full(len(ring), len(verts))]
+            )
+            mesh = trimesh.Trimesh(
+                np.vstack([verts, apex]), np.vstack([faces, fan]), process=False
+            )
+            if mesh.face_normals[-1][2] < 0:
+                faces = np.vstack([faces, fan[:, ::-1]])
+                mesh = trimesh.Trimesh(mesh.vertices, faces, process=False)
+            assert mesh.is_winding_consistent and mesh.face_normals[-1][2] > 0
+            z = mesh.triangles_center[:, 2]
+            band = (z > z0 + 300.0) & (z < z0 + 2400.0)
+            tip = z > z0 + 2400.0
+            dots = np.where(band, -0.5, 0.5)
+            pocket, _ = on_both_paths(mesh, dots, np.ones(len(z), dtype=bool))
+            assert pocket[band].all()
+            assert pocket[tip].all() if filled else not pocket[tip].any()
+            # walled in, and small or under 5% of the mesh: once a hole
+            assert tip.sum() < 0.05 * len(z)
+        flask = _flask()
+        st = pre.compute_mesh_stats(flask, None)
+        _, counts = on_both_paths(flask, st.outward_dots, st.main_face_mask)
+        assert counts["n_holes"] > 0
 
     def test_the_enclosure_pass_is_the_same_on_both_paths(
         self, dirty_mesh, reference_mesh
@@ -670,8 +747,14 @@ class TestFindOrganelles:
                 np_mask = rng.random(n) < frac
                 pocket = ~np_mask & (rng.random(n) < 0.95)
                 args = (adjacency, np_mask, pocket, min_size)
-                rust = _rs.pre.enclosure_pass(*args)
-                assert_parity(rust, python_pre.enclosure_pass(*args))
+                geometry = {
+                    "vertices": np.asarray(mesh.vertices, dtype=np.float64),
+                    "faces": np.asarray(mesh.faces, dtype=np.int64),
+                    "centers": np.asarray(mesh.triangles_center, dtype=np.float64),
+                    "normals": np.asarray(mesh.face_normals, dtype=np.float64),
+                }
+                rust = _rs.pre.enclosure_pass(*args, **geometry)
+                assert_parity(rust, python_pre.enclosure_pass(*args, **geometry))
                 added_total += rust[1]
         assert added_total > 50
 

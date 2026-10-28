@@ -601,8 +601,9 @@ fn pocket_mouths<'py>(
 #[pyfunction]
 #[pyo3(signature = (
     faces, vertices, areas, outward_dots, main_face_mask, topology, svd_rows,
-    *, grow_threshold=0.1, bridge_threshold=0.3, max_hole_size=500, hole_enclosure_ratio=0.5,
-    min_pocket_size=5, min_fold_ratio=3.0, min_cluster_size=5, non_main_mask=None,
+    *, centers, normals, grow_threshold=0.1, bridge_threshold=0.3, max_hole_size=500,
+    hole_enclosure_ratio=0.5, min_pocket_size=5, min_fold_ratio=3.0, min_cluster_size=5,
+    non_main_mask=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn pocket_organelles<'py>(
@@ -614,6 +615,8 @@ fn pocket_organelles<'py>(
     main_face_mask: numpy::PyReadonlyArray1<'py, bool>,
     topology: PyRef<'py, crate::mesh::PyTopology>,
     svd_rows: Bound<'py, PyAny>,
+    centers: PyReadonlyArray2<'py, f64>,
+    normals: PyReadonlyArray2<'py, f64>,
     grow_threshold: f64,
     bridge_threshold: f64,
     max_hole_size: usize,
@@ -643,18 +646,32 @@ fn pocket_organelles<'py>(
         min_fold_ratio,
         min_cluster_size,
     };
-    // the pocket kernels read no centres or normals
+    let (centers, normals) = (rows3("F", &centers)?, rows3("F", &normals)?);
+    if centers.len() != tris.len() || normals.len() != tris.len() {
+        return Err(PyValueError::new_err(
+            "centers and normals need one row per face",
+        ));
+    }
     let surface = ::pre::organelles::Surface {
         topo,
         faces: &tris,
         verts: &verts,
-        centers: &[],
-        normals: &[],
+        centers: &centers,
+        normals: &normals,
         areas: &areas,
         dots: &dots,
     };
+    let inside = ::pre::organelles::Inside::new(&verts, &tris, &centers, &normals);
+    let holds = |piece: &[u32]| inside.holds(piece);
     let found = svd.run(py, || {
-        ::pre::organelles::pocket_organelles(&surface, &main, non_main.as_deref(), &params, &svd)
+        ::pre::organelles::pocket_organelles(
+            &surface,
+            &main,
+            non_main.as_deref(),
+            &params,
+            &svd,
+            &holds,
+        )
     })?;
     let report = counts(
         py,
@@ -865,19 +882,37 @@ fn find_organelles<'py>(
 
 /// `find_organelles`' enclosure pass on arrays: `(pocket, n_added)`.
 ///
-/// `adjacency` is trimesh's `face_adjacency`, in its order.
+/// `adjacency` is trimesh's `face_adjacency`, in its order; `vertices`,
+/// `faces`, `centers` and `normals` tell whether a subtree lies inside the
+/// cell.
 #[pyfunction]
+#[pyo3(signature = (
+    adjacency, np_mask, pocket, min_cluster_size, *, vertices, faces, centers, normals,
+))]
+#[allow(clippy::too_many_arguments)]
 fn enclosure_pass<'py>(
     py: Python<'py>,
     adjacency: PyReadonlyArray2<'py, i64>,
     np_mask: numpy::PyReadonlyArray1<'py, bool>,
     pocket: numpy::PyReadonlyArray1<'py, bool>,
     min_cluster_size: usize,
+    vertices: PyReadonlyArray2<'py, f64>,
+    faces: PyReadonlyArray2<'py, i64>,
+    centers: PyReadonlyArray2<'py, f64>,
+    normals: PyReadonlyArray2<'py, f64>,
 ) -> PyResult<(Bound<'py, PyArray1<bool>>, usize)> {
     let np_mask = np_mask.as_array().to_vec();
     let pocket = pocket.as_array().to_vec();
     if np_mask.len() != pocket.len() {
         return Err(PyValueError::new_err("np_mask and pocket differ in length"));
+    }
+    let verts = rows3("V", &vertices)?;
+    let (tris, _) = checked_faces(&faces, Some(verts.len()))?;
+    let (centers, normals) = (rows3("F", &centers)?, rows3("F", &normals)?);
+    if [tris.len(), centers.len(), normals.len()] != [np_mask.len(); 3] {
+        return Err(PyValueError::new_err(
+            "faces, centers and normals need one row per face of the masks",
+        ));
     }
     let pairs = adjacency.as_array();
     if pairs.ncols() != 2 {
@@ -895,8 +930,10 @@ fn enclosure_pass<'py>(
             }
         })
         .collect::<PyResult<_>>()?;
+    let inside = ::pre::organelles::Inside::new(&verts, &tris, &centers, &normals);
+    let holds = |piece: &[u32]| inside.holds(piece);
     let (new, added) = py.detach(|| {
-        ::pre::organelles::enclosure_pass(&np_mask, &adjacency, &pocket, min_cluster_size)
+        ::pre::organelles::enclosure_pass(&np_mask, &adjacency, &pocket, min_cluster_size, &holds)
     });
     Ok((Array1::from(new).into_pyarray(py), added))
 }

@@ -5,14 +5,20 @@
 /// `np_mask` marks the candidate faces; `adjacency` is trimesh's manifold
 /// face adjacency, in its order, which fixes the depth-first order.  A
 /// subtree hanging off an articulation face is claimed when its boundary
-/// has some edge, at least 90% of it pocket, and its size is between
-/// `min_cluster_size` and the pocket's.  Returns the pocket with the
-/// claimed faces added, and how many were added.
+/// has some edge, at least 90% of it pocket, its size is between
+/// `min_cluster_size` and the pocket's, and it is an organelle's inside:
+/// no bigger than the pocket it touches (the pocket's components along its
+/// boundary), or, bigger — the nucleus behind a narrow rim — still lying
+/// inside the cell, as `inside` tells ([`Inside`]).  A neurite's end beyond
+/// a neck ringed by pocket, or a bulb around a fold, is bigger than that
+/// pocket and faces out of the cell.  Returns the pocket with the claimed
+/// faces added, and how many were added.
 pub fn enclosure_pass(
     np_mask: &[bool],
     adjacency: &[[u32; 2]],
     pocket: &[bool],
     min_cluster_size: usize,
+    inside: &(dyn Fn(&[u32]) -> bool + Sync),
 ) -> (Vec<bool>, usize) {
     let n = np_mask.len();
     let mut new_pocket = pocket.to_vec();
@@ -20,10 +26,14 @@ pub fn enclosure_pass(
         return (new_pocket, 0);
     }
 
-    // Boundary edges per candidate face, total and towards pocket.
+    // Boundary edges per candidate face, total and towards pocket; the
+    // pocket's components over the same adjacency, and the pocket faces
+    // each candidate face borders.
     let mut tbnd = vec![0i64; n];
     let mut pbnd = vec![0i64; n];
     let mut pairs: Vec<[u32; 2]> = Vec::new();
+    let joined = LowestRootSets::new(n);
+    let mut walls: Vec<[u32; 2]> = Vec::new();
     for &[a, b] in adjacency {
         let (ia, ib) = (a as usize, b as usize);
         match (np_mask[ia], np_mask[ib]) {
@@ -38,7 +48,20 @@ pub fn enclosure_pass(
             }
             (false, false) => {}
         }
+        if pocket[ia] && pocket[ib] {
+            joined.join(a, b);
+        } else if np_mask[ia] && pocket[ib] {
+            walls.push([a, b]);
+        } else if np_mask[ib] && pocket[ia] {
+            walls.push([b, a]);
+        }
     }
+    let mut pocket_size = vec![0usize; n];
+    for f in (0..n).filter(|&f| pocket[f]) {
+        pocket_size[joined.root(f as u32) as usize] += 1;
+    }
+    walls.sort_unstable();
+    let wall_start = |f: usize| walls.partition_point(|w| (w[0] as usize) < f);
 
     // CSR over both directions: each face's targets in the order of the
     // edge list (pairs as given, then reversed).
@@ -121,26 +144,42 @@ pub fn enclosure_pass(
         }
     }
 
-    // Each claim is the subtree discovered from its face onwards.
+    // Each claim is the subtree discovered from its face onwards, taken if
+    // it is no bigger than the pocket it touches or lies inside the cell.
     let mut added = 0usize;
     let mut stamp = vec![usize::MAX; n];
     let mut queue = std::collections::VecDeque::new();
     for (k, &(u, du)) in claims.iter().enumerate() {
+        let mut subtree: Vec<u32> = Vec::new();
         queue.push_back(u);
         while let Some(c) = queue.pop_front() {
             if stamp[c] == k {
                 continue;
             }
             stamp[c] = k;
-            if !new_pocket[c] {
-                new_pocket[c] = true;
-                added += 1;
-            }
+            subtree.push(c as u32);
             for &nb in &dst[off[c]..off[c + 1]] {
                 let nb = nb as usize;
                 if stamp[nb] != k && disc[nb] >= du {
                     queue.push_back(nb);
                 }
+            }
+        }
+        let mut around: Vec<u32> = subtree
+            .iter()
+            .flat_map(|&c| &walls[wall_start(c as usize)..wall_start(c as usize + 1)])
+            .map(|w| joined.root(w[1]))
+            .collect();
+        around.sort_unstable();
+        around.dedup();
+        let wrap: usize = around.iter().map(|&r| pocket_size[r as usize]).sum();
+        if subtree.len() > wrap && !inside(&subtree) {
+            continue;
+        }
+        for c in subtree {
+            if !new_pocket[c as usize] {
+                new_pocket[c as usize] = true;
+                added += 1;
             }
         }
     }
@@ -150,6 +189,10 @@ pub fn enclosure_pass(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn yes(_: &[u32]) -> bool {
+        true
+    }
 
     /// Faces on a path 0-1-2-3-4 hang a bag {5, 6} off face 2 through the
     /// single link 2-5, and the bag's only other neighbours are pocket.
@@ -172,7 +215,7 @@ mod tests {
     #[test]
     fn a_pocket_walled_bag_behind_a_neck_is_claimed() {
         let (np, adjacency, pocket) = bag();
-        let (new, added) = enclosure_pass(&np, &adjacency, &pocket, 2);
+        let (new, added) = enclosure_pass(&np, &adjacency, &pocket, 2, &yes);
         assert_eq!(added, 2);
         assert!(new[5] && new[6]);
         assert!(!new[0] && !new[2]);
@@ -181,7 +224,7 @@ mod tests {
     #[test]
     fn a_bag_smaller_than_min_cluster_size_is_left() {
         let (np, adjacency, pocket) = bag();
-        let (new, added) = enclosure_pass(&np, &adjacency, &pocket, 3);
+        let (new, added) = enclosure_pass(&np, &adjacency, &pocket, 3, &yes);
         assert_eq!(added, 0);
         assert_eq!(new, pocket);
     }
@@ -190,7 +233,7 @@ mod tests {
     fn a_bag_mostly_walled_by_non_pocket_is_left() {
         let (np, adjacency, mut pocket) = bag();
         pocket[8] = false; // half the bag's boundary is now ordinary surface
-        let (_, added) = enclosure_pass(&np, &adjacency, &pocket, 1);
+        let (_, added) = enclosure_pass(&np, &adjacency, &pocket, 1, &yes);
         assert_eq!(added, 0);
     }
 
@@ -202,31 +245,206 @@ mod tests {
         let (np, mut adjacency, mut pocket) = bag();
         pocket[8] = false;
         *adjacency.last_mut().unwrap() = [6, 7];
-        let (_, added) = enclosure_pass(&np, &adjacency, &pocket, 2);
+        let (_, added) = enclosure_pass(&np, &adjacency, &pocket, 2, &yes);
         assert_eq!(added, 0);
         pocket[8] = true;
         *adjacency.last_mut().unwrap() = [6, 8];
-        assert_eq!(enclosure_pass(&np, &adjacency, &pocket, 2).1, 2);
+        assert_eq!(enclosure_pass(&np, &adjacency, &pocket, 2, &yes).1, 2);
     }
 
     #[test]
     fn no_candidates_changes_nothing() {
         let (_, adjacency, pocket) = bag();
-        let (new, added) = enclosure_pass(&[false; 9], &adjacency, &pocket, 1);
+        let (new, added) = enclosure_pass(&[false; 9], &adjacency, &pocket, 1, &yes);
         assert_eq!((new, added), (pocket, 0));
+    }
+
+    #[test]
+    fn a_bag_bigger_than_the_pocket_it_touches_is_claimed_only_inside_the_cell() {
+        // The bag {5, 6} touches pocket face 7 alone; faces 9 and 10 are
+        // pocket elsewhere, so the cell's pocket (3) outweighs the bag (2)
+        // while the pocket it touches (1) does not: claimed only if it lies
+        // inside the cell (a nucleus behind a narrow rim), and whatever the
+        // inside test says once 7 joins 9 and 10.
+        let (mut np, mut adjacency, mut pocket) = bag();
+        np.extend([false, false]);
+        pocket.extend([true, true]);
+        pocket[8] = false;
+        *adjacency.last_mut().unwrap() = [6, 7];
+        adjacency.push([9, 10]);
+        let no = |_: &[u32]| false;
+        assert_eq!(enclosure_pass(&np, &adjacency, &pocket, 2, &no).1, 0);
+        assert_eq!(enclosure_pass(&np, &adjacency, &pocket, 2, &yes).1, 2);
+        adjacency.push([7, 9]);
+        assert_eq!(enclosure_pass(&np, &adjacency, &pocket, 2, &no).1, 2);
+    }
+
+    /// An octahedron about the origin, its faces wound outward.
+    fn octahedron() -> (Vec<[f64; 3]>, Vec<[u32; 3]>) {
+        let v = vec![
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+        ];
+        let f = vec![
+            [0, 2, 4],
+            [2, 1, 4],
+            [1, 3, 4],
+            [3, 0, 4],
+            [2, 0, 5],
+            [1, 2, 5],
+            [3, 1, 5],
+            [0, 3, 5],
+        ];
+        (v, f)
+    }
+
+    fn centres_and_normals(v: &[[f64; 3]], f: &[[u32; 3]]) -> (Vec<[f64; 3]>, Vec<[f64; 3]>) {
+        f.iter()
+            .map(|t| {
+                let [a, b, c] = t.map(|i| v[i as usize]);
+                let centre = [0, 1, 2].map(|k| (a[k] + b[k] + c[k]) / 3.0);
+                let (e, g) = (
+                    [0, 1, 2].map(|k| b[k] - a[k]),
+                    [0, 1, 2].map(|k| c[k] - a[k]),
+                );
+                let n = [
+                    e[1] * g[2] - e[2] * g[1],
+                    e[2] * g[0] - e[0] * g[2],
+                    e[0] * g[1] - e[1] * g[0],
+                ];
+                let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                (centre, n.map(|x| x / len))
+            })
+            .unzip()
+    }
+
+    #[test]
+    fn a_piece_reaching_an_opening_counts_as_inside() {
+        // the octahedron without its first face: the three faces on the
+        // hole are not judged by their rays, the four away from it are
+        let (v, mut f) = octahedron();
+        f.remove(0);
+        let (c, n) = centres_and_normals(&v, &f);
+        let inside = Inside::new(&v, &f, &c, &n);
+        let on_hole: Vec<u32> = (0..7)
+            .filter(|&k| {
+                let t = f[k as usize];
+                [0u32, 2, 4].iter().filter(|v| t.contains(v)).count() == 2
+            })
+            .collect();
+        assert_eq!(on_hole.len(), 3);
+        assert!(inside.holds(&on_hole));
+        let away: Vec<u32> = (0..7).filter(|k| !on_hole.contains(k)).collect();
+        assert!(!inside.holds(&away));
+    }
+
+    #[test]
+    fn faces_looking_out_of_the_cell_are_not_inside_it() {
+        // wound outward, each face's ray leaves; wound inward (the inside
+        // of a cavity), each one's ray meets the opposite face
+        let (v, f) = octahedron();
+        let (c, n) = centres_and_normals(&v, &f);
+        let all: Vec<u32> = (0..8).collect();
+        assert!(!Inside::new(&v, &f, &c, &n).holds(&all));
+        let inward: Vec<[u32; 3]> = f.iter().map(|&[a, b, c]| [a, c, b]).collect();
+        let (c, n) = centres_and_normals(&v, &inward);
+        assert!(Inside::new(&v, &inward, &c, &n).holds(&all));
     }
 }
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use mesh::Topology;
 use mesh::components::LowestRootSets;
 use mesh::geometry::numpy_sum;
+use mesh::ray::TriangleBvh;
 use mesh::spatial::{KdTree, Sum};
 use rayon::prelude::*;
 
 use crate::fits::{Svd, centred, hull_area_on};
+
+/// Whether a piece of the surface lies inside the cell: more than half its
+/// faces look into it, the ray from a face's centre along its normal (out
+/// of the cell's material) meeting another face, with trimesh's
+/// `ray_triangle` test.  A fold's back wall and the nucleus face into the
+/// cell; a neurite's surface faces out of it.  A piece reaching the mesh's
+/// open edges — where the volume cut the cell, or a hole — counts as
+/// inside: its rays may leave through the opening, which says nothing of
+/// the membrane.  The faces' tree and open edges are found on first use.
+pub struct Inside<'a> {
+    verts: &'a [[f64; 3]],
+    faces: &'a [[u32; 3]],
+    centers: &'a [[f64; 3]],
+    normals: &'a [[f64; 3]],
+    probe: OnceLock<(TriangleBvh, Vec<bool>)>,
+}
+
+impl<'a> Inside<'a> {
+    pub fn new(
+        verts: &'a [[f64; 3]],
+        faces: &'a [[u32; 3]],
+        centers: &'a [[f64; 3]],
+        normals: &'a [[f64; 3]],
+    ) -> Self {
+        Inside {
+            verts,
+            faces,
+            centers,
+            normals,
+            probe: OnceLock::new(),
+        }
+    }
+
+    /// Does the piece of faces `piece` lie inside the cell?
+    pub fn holds(&self, piece: &[u32]) -> bool {
+        let (bvh, open) = self.probe.get_or_init(|| {
+            let tris = self
+                .faces
+                .iter()
+                .map(|f| f.map(|v| self.verts[v as usize]))
+                .collect();
+            // a face is on the open boundary if one of its edges is named
+            // by no other face (a vertex repeated makes no edge)
+            let mut edges: Vec<(u32, u32, u32)> = self
+                .faces
+                .iter()
+                .enumerate()
+                .flat_map(|(f, t)| {
+                    [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])]
+                        .into_iter()
+                        .filter(|(a, b)| a != b)
+                        .map(move |(a, b)| (a.min(b), a.max(b), f as u32))
+                })
+                .collect();
+            edges.sort_unstable();
+            let mut open = vec![false; self.faces.len()];
+            for run in edges.chunk_by(|x, y| (x.0, x.1) == (y.0, y.1)) {
+                if let [(_, _, f)] = run {
+                    open[*f as usize] = true;
+                }
+            }
+            (TriangleBvh::new(tris, self.normals.to_vec()), open)
+        });
+        if piece.iter().any(|&f| open[f as usize]) {
+            return true;
+        }
+        let looking_in = piece
+            .iter()
+            .filter(|&&f| {
+                let f = f as usize;
+                bvh.first_hit(self.centers[f], self.normals[f], f64::NEG_INFINITY, Some(f))
+                    .is_some()
+            })
+            .count();
+        2 * looking_in > piece.len()
+    }
+}
 
 /// The arrays organelle detection reads about a mesh.
 pub struct Surface<'a> {
@@ -729,13 +947,16 @@ pub struct Pockets {
 }
 
 /// `skeliner.pre.find_pocket_organelles` with the mouths, main mask and
-/// non-main mask given.
+/// non-main mask given; a hole bigger than the pocket it touches is filled
+/// only if `inside` holds it (it lies inside the cell, as [`Inside`]
+/// tells).
 pub fn pocket_organelles(
     s: &Surface<'_>,
     main_mask: &[bool],
     non_main: Option<&[bool]>,
     params: &PocketParams,
     svd: &dyn Svd,
+    inside: &(dyn Fn(&[u32]) -> bool + Sync),
 ) -> Pockets {
     let n = s.faces.len();
     let mouths = pocket_mouths(s, main_mask, non_main, params, svd);
@@ -818,12 +1039,21 @@ pub fn pocket_organelles(
     });
     out.n_bridged = pocket.iter().filter(|&&p| p).count() - out.n_initial;
 
-    // Phase 2: fill holes — non-pocket clusters mostly enclosed by pocket.
-    // A hole's neighbours are pocket or off the main mask, never another
-    // hole, so filling one leaves the others as they were.
+    // Phase 2: fill holes — non-pocket clusters mostly enclosed by pocket
+    // that are a fold's inside: no bigger than the pocket they touch, or,
+    // bigger (the nucleus behind a narrow rim), lying inside the cell.  A
+    // neurite's end ringed by a fold at its base is bigger than the fold
+    // and faces out of the cell.  A hole's neighbours are pocket or off the
+    // main mask, never another hole, so filling one leaves the others as
+    // they were.
     let open: Vec<bool> = (0..n).map(|f| main_mask[f] && !pocket[f]).collect();
     let holes = components_where_unordered(s, |f| open[f]);
     let walled_in: &[bool] = pocket;
+    let wall_of = threads::install(|| lowest_faces(s, walled_in));
+    let mut wall_size = vec![0usize; n];
+    for &r in wall_of.iter().filter(|&&r| r != u32::MAX) {
+        wall_size[r as usize] += 1;
+    }
     let filled: Vec<bool> = threads::install(|| {
         holes
             .par_iter()
@@ -857,7 +1087,12 @@ pub fn pocket_organelles(
                 if non_main.is_some_and(|m| m[cluster[0] as usize]) && cluster.len() > walls.len() {
                     return false;
                 }
-                (small && enclosure >= params.hole_enclosure_ratio) || entrapped
+                let mut around: Vec<u32> = walls.iter().map(|&g| wall_of[g as usize]).collect();
+                around.sort_unstable();
+                around.dedup();
+                let wrap: usize = around.iter().map(|&r| wall_size[r as usize]).sum();
+                ((small && enclosure >= params.hole_enclosure_ratio) || entrapped)
+                    && (cluster.len() <= wrap || inside(cluster))
             })
             .collect()
     });
@@ -940,12 +1175,19 @@ pub fn find_organelles(
         min_cluster_size,
         ..PocketParams::default()
     };
-    let pockets = pocket_organelles(s, &structural, Some(&non_main), &params, svd);
+    let inside = Inside::new(s.verts, s.faces, s.centers, s.normals);
+    let holds = |piece: &[u32]| inside.holds(piece);
+    let pockets = pocket_organelles(s, &structural, Some(&non_main), &params, svd, &holds);
     let candidates: Vec<bool> = (0..s.faces.len())
         .map(|f| structural[f] && !pockets.mask[f] && !isolated.mask[f])
         .collect();
-    let (pocket, n_enclosed) =
-        enclosure_pass(&candidates, adjacency, &pockets.mask, min_cluster_size);
+    let (pocket, n_enclosed) = enclosure_pass(
+        &candidates,
+        adjacency,
+        &pockets.mask,
+        min_cluster_size,
+        &holds,
+    );
     Organelles {
         pocket,
         isolated,

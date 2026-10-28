@@ -4002,7 +4002,10 @@ def find_pocket_organelles(
     4. Bridging: flood-fill from pocket boundary using the relaxed
        ``bridge_threshold`` to cross narrow positive-dot barriers.
     5. Hole filling: small non-pocket clusters mostly enclosed by pocket
-       faces are filled in.
+       faces are filled in, if they lie inside the cell — more than half
+       their faces look into it, the ray along a face's normal meeting
+       another face: a fold's inside faces into the cell, while a neurite's
+       end ringed by a fold at its base faces out of it.
 
     Only regions behind a mouth get detected — curved surfaces without a
     mouth are correctly excluded.
@@ -4066,6 +4069,8 @@ def find_pocket_organelles(
         np.asarray(main_face_mask, dtype=bool),
         kernels.mesh.Topology(faces, len(mesh.vertices)),
         _svd_rows,
+        centers=np.asarray(mesh.triangles_center, dtype=np.float64),
+        normals=np.asarray(mesh.face_normals, dtype=np.float64),
         grow_threshold=grow_threshold,
         bridge_threshold=bridge_threshold,
         max_hole_size=max_hole_size,
