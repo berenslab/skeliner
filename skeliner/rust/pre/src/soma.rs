@@ -385,6 +385,9 @@ struct Current {
     index: usize,
     n_fits: usize,
     verts: Vec<u32>,
+    /// A neurite the first absorption round would have taken was kept out
+    /// of the soma: the exits are eroded as after a pruned tube.
+    held_out: bool,
 }
 
 impl Current {
@@ -459,7 +462,29 @@ fn assign_soma_verts<E>(
             .collect()
     });
     let pieces = g.pieces_of(&outside, |_, _| true);
-    let mut left = pieces.list.clone();
+    let neurite = stands_out(m, g, e, &soma_set, &pieces);
+    // the pieces the first round would have absorbed, neurites with them
+    let first: Vec<u32> = pieces
+        .list
+        .iter()
+        .copied()
+        .filter(|&p| pieces.size(p) < soma_set.len)
+        .collect();
+    let first_thresh = if first.len() >= 2 {
+        let sizes: Vec<f64> = first.iter().map(|&p| pieces.size(p) as f64).collect();
+        otsu_threshold(&sizes).0
+    } else {
+        0.0
+    };
+    cur.held_out = first
+        .iter()
+        .any(|&p| neurite[p as usize] && pieces.size(p) as f64 <= first_thresh);
+    let mut left: Vec<u32> = pieces
+        .list
+        .iter()
+        .copied()
+        .filter(|&p| !neurite[p as usize])
+        .collect();
     let mut absorb = vec![false; nv];
     let mut soma_len = soma_set.len;
     for _ in 0..10 {
@@ -499,6 +524,75 @@ fn assign_soma_verts<E>(
         soma_set.insert(v);
     }
     cur.refit(soma_set.sorted(), fit)
+}
+
+/// Which of the `pieces` outside the soma stand out of it like a neurite,
+/// by name: never a pocket of its surface, as `break_up_mesh` never absorbs
+/// one.  Its farthest vertex beyond the ellipsoid `e` — radially, from the
+/// centre — lies past half the ellipsoid's equivalent radius and three
+/// times its junction's radius, the mean distance from their centroid of
+/// its vertices next to the soma.
+fn stands_out(
+    m: &SomaMesh<'_>,
+    g: &Graph,
+    e: &Ellipsoid,
+    soma: &Set,
+    pieces: &Pieces,
+) -> Vec<bool> {
+    let nv = m.verts.len();
+    let axes = [0, 1, 2].map(|k| {
+        1.0 / (e.w[0][k] * e.w[0][k] + e.w[1][k] * e.w[1][k] + e.w[2][k] * e.w[2][k]).sqrt()
+    });
+    let equiv = (axes[0] * axes[1] * axes[2]).powf(1.0 / 3.0);
+    let mut reach = vec![f64::NEG_INFINITY; nv];
+    let mut rim: Vec<(u32, u32)> = Vec::new();
+    for v in 0..nv as u32 {
+        let r = pieces.roots[v as usize];
+        if r == NONE {
+            continue;
+        }
+        let x = &m.verts[v as usize];
+        let d = [x[0] - e.center[0], x[1] - e.center[1], x[2] - e.center[2]];
+        let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        let rho = e.rho2(x).sqrt();
+        let beyond = if rho > 1.0 {
+            dist * (1.0 - 1.0 / rho)
+        } else {
+            0.0
+        };
+        if beyond > reach[r as usize] {
+            reach[r as usize] = beyond;
+        }
+        if g.nbrs(v).iter().any(|&u| soma.has(u)) {
+            rim.push((r, v));
+        }
+    }
+    rim.sort_unstable();
+    let mut out = vec![false; nv];
+    let mut has_rim = vec![false; nv];
+    for run in rim.chunk_by(|a, b| a.0 == b.0) {
+        let r = run[0].0 as usize;
+        has_rim[r] = true;
+        let pts: Vec<[f64; 3]> = run.iter().map(|&(_, v)| m.verts[v as usize]).collect();
+        let n = pts.len() as f64;
+        let centre =
+            [0, 1, 2].map(|k| numpy_sum(&pts.iter().map(|p| p[k]).collect::<Vec<_>>()) / n);
+        let dists: Vec<f64> = pts
+            .iter()
+            .map(|p| {
+                let d = [p[0] - centre[0], p[1] - centre[1], p[2] - centre[2]];
+                (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+            })
+            .collect();
+        let junction = numpy_sum(&dists) / n;
+        out[r] = reach[r] > 0.5 * equiv && reach[r] > 3.0 * junction;
+    }
+    for &p in &pieces.list {
+        if !has_rim[p as usize] {
+            out[p as usize] = reach[p as usize] > 0.5 * equiv;
+        }
+    }
+    out
 }
 
 /// `find_soma` from the nucleus on: everything but the
@@ -637,6 +731,7 @@ pub fn ring_cutoff<E>(
         index: 0,
         n_fits: 1,
         verts: Vec::new(),
+        held_out: false,
     };
     assign_soma_verts(m, &g, &mut cur, &mut fit)?;
     prune(m, &g, &initial.ellipsoid, &mut cur, &mut fit)?;
@@ -768,7 +863,7 @@ fn prune<E>(
         .map(|v| g.is_key[v as usize] && !soma_set.has(v))
         .collect();
     let mut exit = Set::empty(nv);
-    if pruned && non_soma.iter().any(|&b| b) {
+    if (pruned || cur.held_out) && non_soma.iter().any(|&b| b) {
         for v in soma_set.sorted() {
             if g.is_key[v as usize] && g.nbrs(v).iter().any(|&nv| non_soma[nv as usize]) {
                 exit.insert(v);

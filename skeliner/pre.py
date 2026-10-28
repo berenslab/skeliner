@@ -1752,7 +1752,9 @@ def break_up_mesh(
 
     The discard threshold is auto-inferred: components are sorted by
     size descending; once the cumulative face count reaches 95% of
-    the total, the remaining components are discarded.
+    the total, the remaining components are discarded — but for those
+    at least a quarter the size of the smallest kept, as a neuron with
+    many primary dendrites has several of a size.
 
     The soma test is a *boundary* test: it measures what fraction of a
     component's outer edges are shared with soma faces, not how far the
@@ -1907,6 +1909,9 @@ def break_up_mesh(
         soma.nucleus = prev_nucleus
 
     # --- auto-threshold: keep components covering 95% of total faces ---
+    # and any as big as a quarter of the smallest of those: a neuron with
+    # many primary dendrites, one piece each once the soma is cut out, has
+    # several of a size, and the 95% cut otherwise lands among them
     neurite_candidates.sort(key=len, reverse=True)
     total_faces = sum(len(c) for c in neurite_candidates)
     cumsum = 0
@@ -1916,6 +1921,12 @@ def break_up_mesh(
         if cumsum >= total_faces * 0.95:
             split_idx = i + 1
             break
+    if 0 < split_idx < len(neurite_candidates):
+        floor = len(neurite_candidates[split_idx - 1]) / 4
+        while split_idx < len(neurite_candidates) and (
+            len(neurite_candidates[split_idx]) >= floor
+        ):
+            split_idx += 1
 
     neurites = neurite_candidates[:split_idx]
     discarded = neurite_candidates[split_idx:]
@@ -5207,12 +5218,13 @@ def preprocess(
     Pipeline order:
 
       1. find_parallel_patches → remove_parallel_patches
-      2. find_organelles (unless *organelles* is False)
-      3. find_soma
-      4. find_fusions → find_disconnected → find_gaps
-      5. remove_gaps → remove_fusions
-      6. break_up_mesh
-      7. compact_mesh (optional)
+      2. compute_mesh_stats
+      3. find_organelles (unless *organelles* is False)
+      4. find_soma
+      5. find_fusions → find_disconnected → find_gaps
+      6. remove_gaps → remove_fusions
+      7. break_up_mesh
+      8. compact_mesh (optional)
 
     Each ``find_*`` step is skipped if it returns nothing.
 
@@ -5226,13 +5238,13 @@ def preprocess(
         of the cell, so it is not run and no face is an organelle.
     rescued : array-like of int, optional
         Face ids the caller has declared arbor, passed through to
-        :func:`break_up_mesh` in step 6.  The neurite/discarded split is
+        :func:`break_up_mesh` in step 7.  The neurite/discarded split is
         re-derived from scratch here, so an override that is not fed back
         in is undone by the run.
     released : array-like of int, optional
-        Lasso-drawn arbor claims, likewise passed through to step 6.
+        Lasso-drawn arbor claims, likewise passed through to step 7.
     claim_min_faces : int, default 0
-        Passed to :func:`break_up_mesh` in step 6.
+        Passed to :func:`break_up_mesh` in step 7.
     compact : bool, default False
         If True, run :func:`compact_mesh` as a final step to drop
         unreferenced vertices and degenerate faces.  This invalidates
@@ -5264,22 +5276,24 @@ def preprocess(
         if patches:
             mesh = remove_parallel_patches(mesh, patches=patches)
 
-    # 2. Organelles (also yields mesh_stats for downstream stages)
+    # 2. Mesh stats — outward dots and components, which the later steps
+    #    read whether or not organelles are looked for
+    with _timed("↳  mesh stats", verbose=verbose):
+        mesh_stats = compute_mesh_stats(mesh)
+
+    # 3. Organelles
     with _timed("↳  find organelles", verbose=verbose) as log:
         if organelles:
-            org, mesh_stats = find_organelles(mesh, return_mesh_stats=True)
+            org = find_organelles(mesh, mesh_stats=mesh_stats)
             log(
                 f"pocket={int(org.pocket.sum()):,}, "
                 f"isolated={int(org.isolated.sum()):,}"
             )
         else:
-            org, mesh_stats = (
-                Organelles.empty(len(mesh.faces)),
-                compute_mesh_stats(mesh),
-            )
+            org = Organelles.empty(len(mesh.faces))
             log("none: organelles=False")
 
-    # 3. Soma
+    # 4. Soma
     with _timed("↳  find soma", verbose=verbose) as log:
         soma = find_soma(mesh, organelles=org, mesh_stats=mesh_stats)
         if soma is not None:
@@ -5287,7 +5301,7 @@ def preprocess(
         else:
             log("no soma detected")
 
-    # 4. Fusions → disconnected → gaps
+    # 5. Fusions → disconnected → gaps
     with _timed("↳  find fusions", verbose=verbose) as log:
         fusions = find_fusions(mesh, mesh_stats=mesh_stats)
         log(f"{len(fusions)} fusions")
@@ -5314,12 +5328,12 @@ def preprocess(
         if gaps:
             mesh = remove_gaps(mesh, gaps=gaps, mesh_stats=mesh_stats)
 
-    # 5. Fusions
+    # 6. Fusions
     with _timed("↳  remove fusions", verbose=verbose):
         if fusions:
             mesh = remove_fusions(mesh, fusions=fusions, mesh_stats=mesh_stats)
 
-    # 6. Break up mesh
+    # 7. Break up mesh
     with _timed("↳  break up mesh", verbose=verbose) as log:
         components = break_up_mesh(
             mesh,
@@ -5331,7 +5345,7 @@ def preprocess(
         )
         log(f"{len(components.neurites)} neurites")
 
-    # 7. Compact (optional — remaps everything in MeshComponents)
+    # 8. Compact (optional — remaps everything in MeshComponents)
     if compact:
         with _timed("↳  compact mesh", verbose=verbose):
             mesh, components = compact_mesh(mesh, components=components)

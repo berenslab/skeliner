@@ -1546,6 +1546,29 @@ def _tube_with_speck():
     return mesh, org
 
 
+def test_pieces_the_size_of_a_kept_neurite_are_neurites():
+    """One big piece and ten of a size: the 95% cut would land among the
+    ten and drop two of them; all ten are neurites, the speck is not."""
+    big = _cylinder_at(50.0, 1000.0, 0.0, 64).subdivide().subdivide().subdivide()
+    small = []
+    for k in range(10):
+        t = _cylinder_at(50.0, 300.0, 0.0, 8).subdivide().subdivide()
+        t.apply_translation([400.0 * (k + 1), 0.0, 0.0])
+        small.append(t)
+    speck = trimesh.creation.box(extents=[8.0, 8.0, 8.0])
+    speck.apply_translation([0.0, 600.0, 0.0])
+    mesh = _combine([big, *small, speck])
+    sizes = sorted([len(big.faces)] + [len(t.faces) for t in small], reverse=True)
+    covered = np.cumsum(sizes) >= 0.95 * (sum(sizes) + len(speck.faces))
+    assert int(np.argmax(covered)) + 1 < len(sizes), "the 95% cut must fall among them"
+    z = np.zeros(len(mesh.faces), dtype=bool)
+    c = pre.break_up_mesh(
+        mesh, None, Organelles(pocket=z, isolated=z.copy(), expanded=z.copy())
+    )
+    assert len(c.neurites) == 11
+    assert [len(d) for d in c.discarded] == [len(speck.faces)]
+
+
 class TestRescued:
     def test_the_speck_is_discarded_without_an_override(self):
         mesh, org = _tube_with_speck()

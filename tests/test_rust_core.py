@@ -1060,6 +1060,40 @@ def _soma_cell():
     return mesh, org
 
 
+def _star_soma(lengths=(4000.0, 5000.0, 6000.0, 7000.0, 9000.0, 12000.0)):
+    """A 3 um soma with a thin prism dendrite out of each of six faces round
+    its equator, one per length, extruded a soma edge a step, each with
+    fewer vertices than the soma: ``(mesh, dendrite vertices)``."""
+    ico = trimesh.creation.icosphere(subdivisions=5, radius=3000.0)
+    step = float(ico.edges_unique_length.mean())
+    verts = [list(v) for v in ico.vertices]
+    faces = [list(f) for f in ico.faces]
+    centres, normals = ico.triangles_center, ico.face_normals
+    taken, dendrite = set(), []
+    for k, length in enumerate(lengths):
+        a = 2 * np.pi * k / len(lengths)
+        want = np.array([np.cos(a), np.sin(a), 0.0])
+        order = np.argsort(-(normals @ want) + 10 * np.abs(centres[:, 2]) / 3000.0)
+        f = next(int(i) for i in order if int(i) not in taken)
+        taken.add(f)
+        base = list(faces[f])
+        ring = base
+        for k_step in range(1, int(length / step) + 1):
+            new = []
+            for v in base:
+                verts.append(list(ico.vertices[v] + normals[f] * step * k_step))
+                new.append(len(verts) - 1)
+            dendrite.extend(new)
+            for i in range(3):
+                a0, b0, a1, b1 = ring[i], ring[(i + 1) % 3], new[i], new[(i + 1) % 3]
+                faces += [[a0, b0, b1], [a0, b1, a1]]
+            ring = new
+        faces.append(ring)
+    faces = [fa for i, fa in enumerate(faces) if i not in taken]
+    mesh = trimesh.Trimesh(np.asarray(verts), np.asarray(faces), process=False)
+    return mesh, np.asarray(dendrite)
+
+
 def _stubbed_soma():
     """A coarse 3 um soma, rings 600 nm apart, with a three-sided stub to
     z = 9 um: the vertices past a fit hugging the body are the stub's neck,
@@ -1074,6 +1108,18 @@ def _stubbed_soma():
 
 
 class TestFindSomaViaRingCutoff:
+    def test_dendrites_smaller_than_the_soma_stay_out_of_it(self):
+        """Each dendrite is smaller than the soma and stands out of it like
+        a neurite: none is taken as a pocket of its surface, nor any after
+        the soma has grown by one; on both paths."""
+        mesh, dendrite = _star_soma()
+        assert mesh.is_winding_consistent and mesh.is_watertight
+        rust, python = both(pre.find_soma, mesh, organelles=None)
+        assert_parity(rust.verts, python.verts)
+        far = dendrite[np.linalg.norm(mesh.vertices[dendrite], axis=1) > 1.6 * 3000.0]
+        assert len(far) > 0.5 * len(dendrite)
+        assert not np.isin(far, rust.verts).any()
+
     def test_is_the_same_on_both_paths(self, monkeypatch):
         from skeliner.dataclass import Soma
 

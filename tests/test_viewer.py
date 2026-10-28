@@ -807,6 +807,35 @@ def test_preprocess_refuses_without_a_mesh(rescue_client):
     assert "No mesh loaded" in r.json()["error"]
 
 
+def test_remove_parallel_counts_only_the_faces_it_removes(tmp_path, monkeypatch):
+    """Faces the load already collapsed to [0, 0, 0] — seam copies of a
+    chunked mesh — are not this step's."""
+    from starlette.testclient import TestClient
+
+    from skeliner import pre
+    from skeliner.viewer import viewer as viewer_mod
+
+    from .test_rust_core import _sandwich
+
+    monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
+    sandwich = _sandwich()
+    patches = pre.find_parallel_patches(sandwich, boundaries={0: np.array([0])})
+    faces = np.asarray(sandwich.faces).copy()
+    in_patch = {int(f) for p in patches for f in p["faces"]}
+    collapsed = next(f for f in range(len(faces)) if f not in in_patch)
+    faces[collapsed] = 0
+    mesh = trimesh.Trimesh(sandwich.vertices, faces, process=False)
+    app = _create_app(preload_mesh=mesh, port=8915)
+    with TestClient(app) as client:
+        state = _mesh_state_of(app)
+        state["mesh"] = mesh
+        state["parallel_patches"] = patches
+        r = client.post("/remove_parallel_patches")
+        assert r.status_code == 200, r.text
+        zeroed = np.all(np.asarray(state["mesh"].faces) == 0, axis=1)
+        assert zeroed[collapsed] and r.json()["facesRemoved"] == zeroed.sum() - 1 > 0
+
+
 def test_the_override_is_recorded_as_face_ids(rescue_client):
     client, state, speck = rescue_client
     assert len(state["rescued"]) == 0

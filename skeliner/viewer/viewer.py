@@ -2156,8 +2156,11 @@ def _create_app(
 
         await _apply_new_mesh(new_mesh)
 
-        # Clear only annotations whose faces were actually removed
-        removed = set(int(i) for i in np.where(np.all(new_mesh.faces == 0, axis=1))[0])
+        # Clear only annotations whose faces were actually removed: those this
+        # step zeroed, not the seam copies the load already collapsed
+        zeroed = np.all(np.asarray(new_mesh.faces) == 0, axis=1)
+        zeroed[:n_before] &= ~np.all(np.asarray(mesh.faces) == 0, axis=1)
+        removed = set(int(i) for i in np.flatnonzero(zeroed))
         ann = _read_annotations()
         if "highlights" in ann:
             ann["highlights"] = [

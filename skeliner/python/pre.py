@@ -4224,6 +4224,43 @@ class _Fitted:
         return (self.body(x) ** 2).sum(axis=-1) <= 1.0
 
 
+def _stands_out(verts, adj, fit: _Fitted, soma_set: set[int], comps) -> list[bool]:
+    """Which of the pieces *comps* outside the soma stand out of it like a
+    neurite: never a pocket of its surface, as ``break_up_mesh`` never
+    absorbs one.  Its farthest vertex beyond the ellipsoid *fit* —
+    radially, from the centre — lies past half the ellipsoid's equivalent
+    radius and three times its junction's radius, the mean distance from
+    their centroid of its vertices next to the soma."""
+    import math
+
+    w = fit.w
+    axes = [
+        1.0 / math.sqrt(w[0][k] * w[0][k] + w[1][k] * w[1][k] + w[2][k] * w[2][k])
+        for k in range(3)
+    ]
+    equiv = (axes[0] * axes[1] * axes[2]) ** (1.0 / 3.0)
+    out = []
+    for comp in comps:
+        ids = np.asarray(sorted(comp), dtype=np.intp)
+        x = verts[ids]
+        d = x - fit.center
+        dist = np.sqrt((d * d).sum(axis=1))
+        rho = np.sqrt((fit.body(x) ** 2).sum(axis=1))
+        beyond = np.where(rho > 1.0, dist * (1.0 - 1.0 / rho), 0.0)
+        reach = float(beyond.max())
+        rim = [int(v) for v in ids if any(u in soma_set for u in adj.get(int(v), ()))]
+        if not rim:
+            out.append(reach > 0.5 * equiv)
+            continue
+        pts = verts[np.asarray(rim, dtype=np.intp)]
+        n = len(rim)
+        centre = np.array([np.ascontiguousarray(pts[:, k]).sum() / n for k in range(3)])
+        e = pts - centre
+        junction = np.sqrt((e * e).sum(axis=1)).sum() / n
+        out.append(reach > 0.5 * equiv and reach > 3.0 * junction)
+    return out
+
+
 def _assign_soma_verts(
     faces: np.ndarray,
     verts: np.ndarray,
@@ -4236,7 +4273,9 @@ def _assign_soma_verts(
     """Assign the vertices of the component *main_fi* (vertex adjacency
     *adj*) to the ellipsoid *soma*: containment, edge-dilation, pocket
     absorption, and disconnected-component absorption; then
-    ``refit(soma, ids)`` the ellipsoid to the final vertex set."""
+    ``refit(soma, ids)`` the ellipsoid to the final vertex set:
+    ``(fit, held_out)``, *held_out* whether a piece standing out like a
+    neurite, one the first round would have absorbed, was kept out of it."""
     # Containment: main-component vertices inside the ellipsoid
     all_main_verts = np.unique(faces[main_fi])
     inside = soma.contains(verts[all_main_verts])
@@ -4272,8 +4311,42 @@ def _assign_soma_verts(
     # (large, preserve) from pockets (small surface artifacts, absorb)
     # using Otsu on trapped component sizes.
     all_main_set = set(all_main_verts.tolist())
+    # pieces standing out like a neurite are never pockets
+    outside = all_main_set - soma_set
+    pieces: list[list[int]] = []
+    seen: set[int] = set()
+    for start in sorted(outside):
+        if start in seen:
+            continue
+        piece, queue = [], deque([start])
+        seen.add(start)
+        while queue:
+            v = queue.popleft()
+            piece.append(v)
+            for nv in adj.get(v, ()):
+                if nv in outside and nv not in seen:
+                    seen.add(nv)
+                    queue.append(nv)
+        pieces.append(piece)
+    neurite_verts: set[int] = set()
+    is_neurite = _stands_out(verts, adj, soma, soma_set, pieces)
+    for piece, out in zip(pieces, is_neurite):
+        if out:
+            neurite_verts.update(piece)
+    # the pieces the first round would have absorbed, neurites with them
+    first = [
+        (piece, out)
+        for piece, out in zip(pieces, is_neurite)
+        if len(piece) < len(soma_set)
+    ]
+    first_thresh = (
+        otsu_threshold(np.array([len(p) for p, _ in first], dtype=np.float64))[0]
+        if len(first) >= 2
+        else 0.0
+    )
+    held_out = any(out and len(piece) <= first_thresh for piece, out in first)
     for _iteration in range(10):
-        outside = all_main_set - soma_set
+        outside = all_main_set - soma_set - neurite_verts
         visited: set[int] = set()
         trapped_comps: list[list[int]] = []
         for start in outside:
@@ -4325,7 +4398,7 @@ def _assign_soma_verts(
         soma_set.update(non_main_verts[inside_non_main].tolist())
 
     # Refit ellipsoid to the final vertex set.
-    return refit(soma, np.fromiter(sorted(soma_set), dtype=np.intp))
+    return refit(soma, np.fromiter(sorted(soma_set), dtype=np.intp)), held_out
 
 
 def find_soma_ring_cutoff(
@@ -4517,7 +4590,7 @@ def find_soma_ring_cutoff(
 
     initial_soma = _fit(bfs_verts_arr, False)
 
-    soma = _assign_soma_verts(
+    soma, held_out = _assign_soma_verts(
         faces, verts, avg_edge, initial_soma, soma_fi, adj, _refit
     )
 
@@ -4651,9 +4724,10 @@ def find_soma_ring_cutoff(
         non_soma = all_comp_set - soma_set
 
         # Find soma boundary verts adjacent to non-soma.
-        # Only erode when step 6a pruned neurite chains.
+        # Only erode when step 6a pruned neurite chains, or a neurite the
+        # first absorption round would have taken was kept out of it.
         exit_verts: set[int] = set()
-        if neurite_prune and non_soma:
+        if (neurite_prune or held_out) and non_soma:
             for v in soma_set & comp_vert_set:
                 for nv in adj.get(v, []):
                     if nv in non_soma:
