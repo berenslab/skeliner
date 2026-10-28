@@ -555,6 +555,14 @@
                     >
                         Run
                     </button>
+                    <!-- Not remembered across loads: a pipeline switch left
+                         off from another dataset would change every run. -->
+                    <label
+                        style="margin-left: 6px; color: #888"
+                        title="Off for meshes that trace no organelles (hemibrain's): Run does not look for them, and no face is an organelle."
+                    >
+                        <input type="checkbox" id="runOrganelles" checked /> organelles
+                    </label>
                 </div>
             </div>
 
@@ -2431,9 +2439,10 @@
             }
 
             async function runPreprocess() {
+                const organelles = document.getElementById("runOrganelles").checked;
                 await _runAction(
                     document.getElementById("preprocessBtn"),
-                    () => _postJSON("/preprocess"),
+                    () => _postJSON("/preprocess", { organelles }),
                 );
             }
 

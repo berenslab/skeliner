@@ -1688,6 +1688,26 @@ class TestRescued:
         assert len(kept.discarded) == 0
         assert len(kept.neurites) == 2
 
+    def test_preprocess_without_organelles_takes_none_out(self):
+        """For a mesh that traces none: the surface find_organelles would
+        call one is left to the split into neurites and discards."""
+        mesh = _sphere_with_internal()
+        _, found = pre.preprocess(mesh)
+        assert found.organelles.mask.sum() > 0, "fixture must have an organelle"
+
+        _, none = pre.preprocess(mesh, organelles=False)
+        assert not none.organelles.mask.any()
+        pieces = [*none.neurites, *none.discarded]
+        assert sum(len(p) for p in pieces) == len(mesh.faces)
+
+    def test_break_up_mesh_takes_none_for_no_organelles(self):
+        mesh, soma, _ = _ball_with_stub()
+        given = pre.break_up_mesh(mesh, soma, None)
+        empty = pre.break_up_mesh(mesh, soma, Organelles.empty(len(mesh.faces)))
+        assert not given.organelles.mask.any()
+        assert [len(x) for x in given.neurites] == [len(x) for x in empty.neurites]
+        assert np.array_equal(given.soma.verts, empty.soma.verts)
+
 
 # ── Smoke test on real data ──────────────────────────────────────────
 

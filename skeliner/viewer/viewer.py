@@ -2921,12 +2921,8 @@ def _create_app(
                 {"ok": False, "error": "No mesh loaded"}, status_code=400
             )
         soma = mesh_state.get("soma")
+        # none detected is none there: a mesh that traces no organelles
         org = mesh_state.get("organelles")
-        if org is None:
-            return JSONResponse(
-                {"ok": False, "error": "Run organelle detection first"},
-                status_code=400,
-            )
 
         from skeliner.pre import break_up_mesh
 
@@ -3031,7 +3027,8 @@ def _create_app(
 
         mesh = mesh_state["mesh"]
         n_before = len(mesh.faces)
-        floor = _claim_floor(await _body_of(request))
+        body = await _body_of(request)
+        floor = _claim_floor(body)
 
         # An override the user has already made is input to this run, not a
         # casualty of it — break_up_mesh re-derives the neurite/discarded
@@ -3039,6 +3036,7 @@ def _create_app(
         new_mesh, components = await _run_with_log(
             preprocess,
             mesh,
+            organelles=bool(body.get("organelles", True)),
             rescued=mesh_state["rescued"],
             released=mesh_state["released"],
             claim_min_faces=floor,

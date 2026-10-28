@@ -899,6 +899,14 @@ class TestFindSomaViaRingCutoff:
         inner = np.unique(np.asarray(mesh.faces)[org.isolated])
         assert not np.isin(soma.verts, inner).any()
 
+    def test_with_none_given_none_is_left_out(self):
+        """None is a mesh that traces no organelles, not a request to
+        look for them: the organelle inside the soma stays in it."""
+        mesh, org = _soma_cell()
+        inner = np.unique(np.asarray(mesh.faces)[org.isolated])
+        for soma in both(pre.find_soma, mesh):
+            assert np.isin(inner, soma.verts).all()
+
     def test_no_nucleus(self):
         # every cross-section's hollow is under the 500 nm void minimum
         mesh = trimesh.creation.icosphere(subdivisions=3, radius=300.0)

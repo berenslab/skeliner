@@ -378,6 +378,13 @@ class Organelles:
         if self.manual is None:
             self.manual = np.zeros(len(self.pocket), dtype=bool)
 
+    @classmethod
+    def empty(cls, n_faces: int) -> "Organelles":
+        """No organelle faces: a mesh that traces none (hemibrain's,
+        EyeWire 1's), where what :func:`~skeliner.pre.find_organelles`
+        flags is not one."""
+        return cls(*(np.zeros(n_faces, dtype=bool) for _ in range(3)))
+
     @property
     def mask(self) -> np.ndarray:
         """Combined bool mask (pocket | isolated | expanded | manual)."""

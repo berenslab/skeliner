@@ -769,6 +769,36 @@ def test_preprocess_leaves_the_mesh_uncompacted(rescue_client):
     assert len(state["mesh"].faces) == n_before
 
 
+def test_preprocess_runs_without_organelles_when_asked(rescue_client, monkeypatch):
+    """The Run button's switch, for meshes that trace none."""
+    from skeliner import pre
+
+    client, state, _ = rescue_client
+    seen = {}
+    run = pre.preprocess
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(pre, "preprocess", spy)
+    assert client.post("/preprocess", json={"organelles": False}).status_code == 200
+    assert seen["organelles"] is False
+    assert not state["organelles"].mask.any()
+    assert client.post("/preprocess").status_code == 200
+    assert seen["organelles"] is True
+
+
+def test_break_runs_without_detected_organelles(rescue_client):
+    """None detected is none there, not a step left out."""
+    client, state, _ = rescue_client
+    state["organelles"] = None
+    r = client.post("/break_up_mesh")
+    assert r.status_code == 200, r.text
+    assert r.json()["nDiscarded"] == 1
+    assert not state["organelles"].mask.any()
+
+
 def test_preprocess_refuses_without_a_mesh(rescue_client):
     client, state, _ = rescue_client
     state["mesh"] = None

@@ -1478,8 +1478,9 @@ def find_soma(
     mesh : Mesh
         Input mesh (before organelle removal).
     organelles : Organelles or None
-        Pre-computed organelles from :func:`find_organelles`.  If
-        provided, organelle detection is skipped.
+        From :func:`find_organelles`: the organelles the soma leaves out.
+        None for none — a mesh that traces no organelles, such as
+        hemibrain's; they are not looked for here.
     verbose : bool, default False
         Print summary.
     mesh_stats : MeshStats or None
@@ -1510,10 +1511,6 @@ def find_soma(
             print(f"[skeliner.pre] Soma: no nucleus found ({dt:.1f}s)")
         return None
     center = nuc["center"]
-
-    # ── 1b. Organelle mask (for excluding from final soma) ──────
-    if organelles is None:
-        organelles = find_organelles(mesh)
 
     soma, cutoff, max_ring = _ring_cutoff_soma(mesh, nuc, labels, main, organelles)
     if len(soma.verts) < 4:
@@ -1552,7 +1549,7 @@ def _ring_cutoff_soma(
     nuc: dict,
     labels: np.ndarray,
     main: int,
-    organelles: Organelles,
+    organelles: Organelles | None,
 ) -> tuple["Soma", int, int]:
     """The soma :func:`find_soma` grows from nucleus *nuc*:
     ``(soma, cutoff ring, last ring)``.
@@ -1576,6 +1573,8 @@ def _ring_cutoff_soma(
     faces = np.asarray(mesh.faces, dtype=np.int64)
     labels = np.asarray(labels, dtype=np.int64)
     seeds = np.asarray(nuc.get("soma_seed_vi", []), dtype=np.int64)
+    if organelles is None:
+        organelles = Organelles.empty(len(faces))
     k, soma_verts, cutoff, max_ring = kernels.pre.find_soma_ring_cutoff(
         faces,
         verts,
@@ -1729,7 +1728,7 @@ def _build_org_output(
 def break_up_mesh(
     mesh: Mesh,
     soma: Soma | None,
-    organelles: Organelles,
+    organelles: Organelles | None = None,
     *,
     rescued=None,
     released=None,
@@ -1783,8 +1782,10 @@ def break_up_mesh(
     soma : Soma or None
         From :func:`find_soma` (must have ``.verts``).
         Pass ``None`` if the mesh has no soma.
-    organelles : Organelles
-        From :func:`find_organelles`.
+    organelles : Organelles or None
+        From :func:`find_organelles`; None for a mesh that traces no
+        organelles (hemibrain's, EyeWire 1's): nothing is cut out as one,
+        and with nothing to be trapped behind, no piece is trapped.
     rescued : array-like of int, optional
         Face ids the user has declared arbor, naming a component they
         had in hand.  Any component carrying one is a neurite: not
@@ -1835,6 +1836,8 @@ def break_up_mesh(
     released_face = _face_claim(released)
     claimed_face = rescued_face | released_face
 
+    if organelles is None:
+        organelles = Organelles.empty(nF)
     # Mesh-mutating steps (e.g. remove_gaps) may have appended faces
     # since find_organelles ran. The new faces are stitch geometry, never
     # organelle membrane — pad with False so the masks align with `nF`.
@@ -5162,6 +5165,7 @@ def compact_mesh(
 def preprocess(
     mesh: Mesh,
     *,
+    organelles: bool = True,
     rescued=None,
     released=None,
     claim_min_faces: int = 0,
@@ -5173,7 +5177,7 @@ def preprocess(
     Pipeline order:
 
       1. find_parallel_patches → remove_parallel_patches
-      2. find_organelles
+      2. find_organelles (unless *organelles* is False)
       3. find_soma
       4. find_fusions → find_disconnected → find_gaps
       5. remove_gaps → remove_fusions
@@ -5186,6 +5190,10 @@ def preprocess(
     ----------
     mesh : Mesh
         Input mesh.
+    organelles : bool, default True
+        False for a mesh that traces no organelles (hemibrain's): what
+        :func:`find_organelles` would flag there is fragments and patches
+        of the cell, so it is not run and no face is an organelle.
     rescued : array-like of int, optional
         Face ids the caller has declared arbor, passed through to
         :func:`break_up_mesh` in step 6.  The neurite/discarded split is
@@ -5228,8 +5236,18 @@ def preprocess(
 
     # 2. Organelles (also yields mesh_stats for downstream stages)
     with _timed("↳  find organelles", verbose=verbose) as log:
-        org, mesh_stats = find_organelles(mesh, return_mesh_stats=True)
-        log(f"pocket={int(org.pocket.sum()):,}, isolated={int(org.isolated.sum()):,}")
+        if organelles:
+            org, mesh_stats = find_organelles(mesh, return_mesh_stats=True)
+            log(
+                f"pocket={int(org.pocket.sum()):,}, "
+                f"isolated={int(org.isolated.sum()):,}"
+            )
+        else:
+            org, mesh_stats = (
+                Organelles.empty(len(mesh.faces)),
+                compute_mesh_stats(mesh),
+            )
+            log("none: organelles=False")
 
     # 3. Soma
     with _timed("↳  find soma", verbose=verbose) as log:
