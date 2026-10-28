@@ -388,6 +388,9 @@ struct Current {
     /// A neurite the first absorption round would have taken was kept out
     /// of the soma: the exits are eroded as after a pruned tube.
     held_out: bool,
+    /// The vertices of the pieces outside the soma reaching out past three
+    /// times their junction's radius: tubes, their bases in it stubs.
+    tube: Vec<bool>,
 }
 
 impl Current {
@@ -462,7 +465,7 @@ fn assign_soma_verts<E>(
             .collect()
     });
     let pieces = g.pieces_of(&outside, |_, _| true);
-    let neurite = stands_out(m, g, e, &soma_set, &pieces);
+    let (neurite, tube) = stands_out(m, g, e, &soma_set, &pieces);
     // the pieces the first round would have absorbed, neurites with them
     let first: Vec<u32> = pieces
         .list
@@ -479,6 +482,9 @@ fn assign_soma_verts<E>(
     cur.held_out = first
         .iter()
         .any(|&p| neurite[p as usize] && pieces.size(p) as f64 <= first_thresh);
+    cur.tube = (0..nv)
+        .map(|v| pieces.roots[v] != NONE && tube[pieces.roots[v] as usize])
+        .collect();
     let mut left: Vec<u32> = pieces
         .list
         .iter()
@@ -531,14 +537,15 @@ fn assign_soma_verts<E>(
 /// one.  Its farthest vertex beyond the ellipsoid `e` — radially, from the
 /// centre — lies past half the ellipsoid's equivalent radius and three
 /// times its junction's radius, the mean distance from their centroid of
-/// its vertices next to the soma.
+/// its vertices next to the soma.  With them, which are tubes: past three
+/// times the junction's radius, however short of half the radius.
 fn stands_out(
     m: &SomaMesh<'_>,
     g: &Graph,
     e: &Ellipsoid,
     soma: &Set,
     pieces: &Pieces,
-) -> Vec<bool> {
+) -> (Vec<bool>, Vec<bool>) {
     let nv = m.verts.len();
     let axes = [0, 1, 2].map(|k| {
         1.0 / (e.w[0][k] * e.w[0][k] + e.w[1][k] * e.w[1][k] + e.w[2][k] * e.w[2][k]).sqrt()
@@ -569,6 +576,7 @@ fn stands_out(
     }
     rim.sort_unstable();
     let mut out = vec![false; nv];
+    let mut tube = vec![false; nv];
     let mut has_rim = vec![false; nv];
     for run in rim.chunk_by(|a, b| a.0 == b.0) {
         let r = run[0].0 as usize;
@@ -585,14 +593,15 @@ fn stands_out(
             })
             .collect();
         let junction = numpy_sum(&dists) / n;
-        out[r] = reach[r] > 0.5 * equiv && reach[r] > 3.0 * junction;
+        tube[r] = reach[r] > 3.0 * junction;
+        out[r] = reach[r] > 0.5 * equiv && tube[r];
     }
     for &p in &pieces.list {
         if !has_rim[p as usize] {
             out[p as usize] = reach[p as usize] > 0.5 * equiv;
         }
     }
-    out
+    (out, tube)
 }
 
 /// `find_soma` from the nucleus on: everything but the
@@ -732,6 +741,7 @@ pub fn ring_cutoff<E>(
         n_fits: 1,
         verts: Vec::new(),
         held_out: false,
+        tube: Vec::new(),
     };
     assign_soma_verts(m, &g, &mut cur, &mut fit)?;
     prune(m, &g, &initial.ellipsoid, &mut cur, &mut fit)?;
@@ -794,6 +804,7 @@ fn prune<E>(
 
     // 6a: tubes reaching far past the ellipsoid, on the side of a neurite
     let mut pruned = false;
+    let mut cut = vec![false; nv];
     if !outside_soma.is_empty() {
         let non_soma: Vec<bool> = threads::install(|| {
             (0..nv as u32)
@@ -846,6 +857,7 @@ fn prune<E>(
                     for &v in &outside_soma {
                         if far[out.roots[v as usize] as usize] {
                             soma_set.remove(v);
+                            cut[v as usize] = true;
                         }
                     }
                 }
@@ -853,19 +865,23 @@ fn prune<E>(
         }
     }
 
-    // 6b: erode each neurite exit inward until its ring widens or branches
+    // 6b: erode each neurite exit inward until its ring widens.  An exit
+    // is the soma's edge onto a tube left outside it or cut off by 6a:
+    // walking in from the rim of a bulge or an organelle left outside
+    // would cut a ring of the soma round it.
     let non_comp_soma: Vec<u32> = soma_set
         .sorted()
         .into_iter()
         .filter(|&v| !g.is_key[v as usize])
         .collect();
-    let non_soma: Vec<bool> = (0..nv as u32)
-        .map(|v| g.is_key[v as usize] && !soma_set.has(v))
-        .collect();
     let mut exit = Set::empty(nv);
-    if (pruned || cur.held_out) && non_soma.iter().any(|&b| b) {
+    if pruned || cur.held_out {
         for v in soma_set.sorted() {
-            if g.is_key[v as usize] && g.nbrs(v).iter().any(|&nv| non_soma[nv as usize]) {
+            if g.is_key[v as usize]
+                && g.nbrs(v)
+                    .iter()
+                    .any(|&u| !soma_set.has(u) && (cur.tube[u as usize] || cut[u as usize]))
+            {
                 exit.insert(v);
             }
         }
@@ -880,8 +896,6 @@ fn prune<E>(
         let mut all_stub = Set::empty(nv);
         let mut global_visited = vec![false; nv];
         let mut visited = vec![false; nv];
-        let mut in_ring = vec![false; nv];
-        let mut seen_ring = vec![false; nv];
         for cluster in clusters {
             let mut touched: Vec<u32> = cluster.clone();
             for &v in &cluster {
@@ -903,24 +917,10 @@ fn prune<E>(
                         }
                     }
                 }
+                // the ring doubling from the exit is the soma's body; not a
+                // branch: dendrites leaving close together share a trunk,
+                // which is not soma either
                 if next.is_empty() || next.len() > 2 * first {
-                    break;
-                }
-                // stop at a real branch: two or more pieces each a quarter
-                for &v in &next {
-                    in_ring[v as usize] = true;
-                }
-                let quarter = next.len() as f64 * 0.25;
-                let big = g
-                    .pieces(&next, &in_ring, &mut seen_ring)
-                    .iter()
-                    .filter(|c| c.len() as f64 >= quarter)
-                    .count();
-                for &v in &next {
-                    in_ring[v as usize] = false;
-                    seen_ring[v as usize] = false;
-                }
-                if big >= 2 {
                     break;
                 }
                 stub.extend_from_slice(&next);

@@ -1094,6 +1094,21 @@ def _star_soma(lengths=(4000.0, 5000.0, 6000.0, 7000.0, 9000.0, 12000.0)):
     return mesh, np.asarray(dendrite)
 
 
+def _domed_soma():
+    """`_star_soma` with one 4 um dendrite and, opposite it, a dome rising
+    2.4 um over 35° of the soma: ``(mesh, dendrite vertices, dome
+    vertices)``."""
+    mesh, dendrite = _star_soma(lengths=(4000.0,))
+    v = np.array(mesh.vertices)
+    n = len(v) - len(dendrite)
+    theta = np.arccos(np.clip(-v[:n, 0] / np.linalg.norm(v[:n], axis=1), -1.0, 1.0))
+    width = np.radians(35.0)
+    lift = np.where(theta < width, 0.8 * np.cos(np.pi * theta / (2 * width)) ** 2, 0.0)
+    v[:n] *= (1.0 + lift)[:, None]
+    mesh = trimesh.Trimesh(v, np.asarray(mesh.faces), process=False)
+    return mesh, dendrite, np.flatnonzero(theta < width)
+
+
 def _stubbed_soma():
     """A coarse 3 um soma, rings 600 nm apart, with a three-sided stub to
     z = 9 um: the vertices past a fit hugging the body are the stub's neck,
@@ -1119,6 +1134,20 @@ class TestFindSomaViaRingCutoff:
         far = dendrite[np.linalg.norm(mesh.vertices[dendrite], axis=1) > 1.6 * 3000.0]
         assert len(far) > 0.5 * len(dendrite)
         assert not np.isin(far, rust.verts).any()
+
+    def test_the_stub_erodes_from_the_neurite_exit_alone_on_both_paths(self):
+        """The dendrite is held out, so the exits erode; the dome's top, a
+        pocket left outside the soma, is no neurite exit: walking in from
+        its rim would cut a ring of the soma down the dome's flanks."""
+        mesh, dendrite, dome = _domed_soma()
+        assert mesh.is_winding_consistent and mesh.is_watertight
+        rust, python = both(pre.find_soma, mesh, organelles=None)
+        assert_parity(rust.verts, python.verts)
+        # the dendrite's stub eroded, the dome's top outside the soma
+        assert not np.isin(dendrite, rust.verts).any()
+        assert not np.isin(dome, rust.verts).all()
+        rise = np.linalg.norm(mesh.vertices[dome], axis=1) - 3000.0
+        assert np.isin(dome[rise < 1200.0], rust.verts).all()
 
     def test_is_the_same_on_both_paths(self, monkeypatch):
         from skeliner.dataclass import Soma
