@@ -1702,8 +1702,8 @@ def break_up_mesh(
 
     - **missed organelle** — not reachable from the main mesh body
       without crossing organelle faces (topologically trapped).
-    - **missed soma** — reachable, its boundary mostly soma faces, and no
-      bigger than the soma.
+    - **missed soma** — reachable, its boundary mostly soma faces, no
+      bigger than the soma, and not standing out of it like a neurite.
     - **neurite** — reachable, large enough to be a real branch.
     - **discarded** — reachable, but too small (below auto threshold).
 
@@ -1722,7 +1722,13 @@ def break_up_mesh(
     for.  A component with more faces than the soma is never absorbed: a
     patch of the soma ``find_soma`` missed is smaller than the soma, while
     on an organelle-free cell (fly neurons) the whole arbor can be one
-    component that scores as soma.
+    component that scores as soma.  Nor is one that stands out of the soma
+    like a neurite: by more than half the soma's radius beyond its
+    ellipsoid, and by more than three times the radius of its junction with
+    the soma faces (the mean distance of the junction's vertices from their
+    centroid).  A patch of the soma lies on it; a neurite's stump
+    reaches out further than it is wide.  A stump shorter than that — a
+    truncated axon, a tiny branch — is absorbed as before.
 
     When ``soma`` is ``None`` (no soma in this mesh — e.g. a fragment
     or a non-somal cell type), the soma face mask is empty, the
@@ -1813,6 +1819,10 @@ def break_up_mesh(
         claimed_face,
         soma is not None,
     )
+    if soma is not None:
+        kinds = _neurites_left_out(
+            components, kinds, faces, verts, soma, usable & soma_face
+        )
     if len(components) == 0:
         org_out = _build_org_output(organelles, organelles.mask)
         return MeshComponents(
@@ -1909,6 +1919,53 @@ def break_up_mesh(
 
 # Keep old name as alias
 break_at_soma = break_up_mesh
+
+# A soma piece standing out of the soma's ellipsoid this far, in its radii,
+# and this many times further than the radius of its junction with the soma,
+# is a neurite: a patch of the soma find_soma missed lies on the soma, a stub
+# of a neurite stands out of it further than it is wide.  Soma.fit's √5
+# envelope sits ~1.3× out from the surface, so half its radius past it is a
+# stump about the soma's own radius long.
+_NEURITE_REACH = 0.5
+_NEURITE_ASPECT = 3.0
+
+
+def _neurites_left_out(components, kinds, faces, verts, soma, soma_faces):
+    """*kinds* with every soma piece that stands out of the soma like a
+    neurite a candidate again (:data:`_NEURITE_REACH`,
+    :data:`_NEURITE_ASPECT`): its farthest vertex outside the soma's
+    ellipsoid by more than half the soma's equivalent radius, and by more
+    than three times the radius of its junction — the mean distance from
+    their centroid of the vertices of the edges it shares with the soma
+    faces, which is a ring's radius however the ring is triangulated."""
+    soma_ids = np.flatnonzero(np.asarray(kinds) == _PIECE_SOMA)
+    if len(soma_ids) == 0:
+        return kinds
+    kinds = np.array(kinds)
+    width = len(verts) + 1
+
+    def edges(fs):
+        e = np.sort(
+            np.concatenate([fs[:, [0, 1]], fs[:, [1, 2]], fs[:, [2, 0]]]), axis=1
+        )
+        return e, e[:, 0] * width + e[:, 1]
+
+    soma_keys = np.unique(edges(faces[soma_faces])[1])
+    for k in soma_ids:
+        comp = faces[components[k]]
+        reach = float(soma.distance_to_surface(verts[np.unique(comp)]).max())
+        if reach <= _NEURITE_REACH * soma.equiv_radius:
+            continue
+        e, keys = edges(comp)
+        ring = verts[np.unique(e[np.isin(keys, soma_keys)])]
+        junction = (
+            np.linalg.norm(ring - ring.mean(axis=0), axis=1).mean()
+            if len(ring)
+            else 0.0
+        )
+        if reach > _NEURITE_ASPECT * junction:
+            kinds[k] = _PIECE_CANDIDATE
+    return kinds
 
 
 # What :func:`_break_up_pieces` makes of a piece.

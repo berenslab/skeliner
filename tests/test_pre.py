@@ -1333,16 +1333,19 @@ class TestPreviewReassignment:
 # threshold, absorption into the soma, and organelle trapping.
 
 
-def _ball_with_stub():
-    """A soma-sized ball with a short process standing on it.
+def _ball_with_stub(height=40.0):
+    """A soma-sized ball with a process *height* long standing on it.
 
     The process's far end is a closed cap, so the junction with the ball
     is nearly all the boundary it has and the absorption rule reads it as
-    soma — the shape that sends a real dendritic stub into the soma.
+    soma.  At the default it ends inside the soma's fitted ellipsoid — a
+    truncated stump, absorbed; at 160 it stands out of the soma like a
+    neurite and stays one.
     """
     ball = trimesh.creation.icosphere(subdivisions=4, radius=100.0)
-    stub = trimesh.creation.cylinder(radius=12.0, height=160.0, sections=24)
-    stub.apply_translation([0.0, 0.0, 170.0])
+    stub = trimesh.creation.cylinder(radius=12.0, height=height, sections=24)
+    stub = stub.subdivide().subdivide()
+    stub.apply_translation([0.0, 0.0, 90.0 + height / 2])
     mesh = _combine([ball, stub])
     z = np.zeros(len(mesh.faces), dtype=bool)
     org = Organelles(pocket=z.copy(), isolated=z.copy(), expanded=z.copy())
@@ -1353,7 +1356,8 @@ def _ball_with_stub():
 def _ball_with_arbor(subdivisions):
     """:func:`_ball_with_stub`'s shape with a longer process, cut into more
     faces the more it is subdivided: fewer than the soma has at 0, more at
-    2. Its boundary is soma faces all round either way."""
+    2. Its boundary is soma faces all round either way — for the kernel's
+    size test; ``break_up_mesh`` leaves it out by its shape at both."""
     ball = trimesh.creation.icosphere(subdivisions=2, radius=100.0)
     arbor = trimesh.creation.cylinder(radius=12.0, height=400.0, sections=24)
     for _ in range(subdivisions):
@@ -1377,6 +1381,25 @@ def _tube_cut_by_an_organelle_band():
     band = (cz > 100) & (cz < 190)
     z = np.zeros(len(mesh.faces), dtype=bool)
     return mesh, Organelles(pocket=band, isolated=z.copy(), expanded=z.copy())
+
+
+def _kernel_kinds(mesh, soma, org):
+    """What the kernel makes of :func:`_arbor_pieces`, before
+    ``break_up_mesh``'s shape test."""
+    faces = np.asarray(mesh.faces)
+    usable = pre._usable_face_mask(mesh)
+    soma_face = pre.soma_face_mask(faces, None if soma is None else soma.verts)
+    claimed = np.zeros(len(faces), dtype=bool)
+    _, kinds = pre._break_up_pieces(
+        faces,
+        len(mesh.vertices),
+        usable,
+        org.mask,
+        soma_face,
+        claimed,
+        soma is not None,
+    )
+    return list(kinds)
 
 
 def _arbor_pieces(mesh, soma, org):
@@ -1404,18 +1427,19 @@ class TestSomaAbsorption:
 
     def test_absorbing_it_grows_the_soma_around_it(self):
         # Absorption is not a relabel: the verts join soma.verts and the
-        # ellipsoid is re-fit, so a wrong absorption also inflates the soma.
+        # ellipsoid is re-fit, so a wrong absorption also reshapes the soma —
+        # stretched towards the stump.
         mesh, soma, org = _ball_with_stub()
         stub = _arbor_pieces(mesh, soma, org)[0]
         absorbed = pre.break_up_mesh(mesh, soma, org)
         kept = pre.break_up_mesh(mesh, soma, org, rescued=stub[:1])
         assert len(absorbed.soma.verts) > len(kept.soma.verts)
         assert len(kept.soma.verts) == len(soma.verts)
-        assert kept.soma.equiv_radius < absorbed.soma.equiv_radius
+        assert kept.soma.axes[0] < absorbed.soma.axes[0]
 
     def test_a_piece_bigger_than_the_soma_is_never_absorbed(self):
         # an organelle-free arbor all one piece reads as soma by its boundary
-        # at any length; its size against the soma's decides
+        # at any length; to the kernel, its size against the soma's decides
         for subdivisions, absorbed in ((0, True), (2, False)):
             mesh, soma, org = _ball_with_arbor(subdivisions)
             (piece,) = _arbor_pieces(mesh, soma, org)
@@ -1424,10 +1448,20 @@ class TestSomaAbsorption:
                 faces, soma.verts
             )
             assert bool(len(piece) > soma_faces.sum()) != absorbed
+            kind = pre._PIECE_SOMA if absorbed else pre._PIECE_CANDIDATE
+            assert _kernel_kinds(mesh, soma, org) == [kind]
+
+    def test_a_process_standing_out_like_a_neurite_is_not_absorbed(self):
+        # one process, a stump's length and a neurite's: both read as soma
+        # by their boundary; how far it stands out of the soma decides
+        for height, absorbed in ((40.0, True), (160.0, False)):
+            mesh, soma, org = _ball_with_stub(height)
+            (stub,) = _arbor_pieces(mesh, soma, org)
+            assert _kernel_kinds(mesh, soma, org) == [pre._PIECE_SOMA]
             c = pre.break_up_mesh(mesh, soma, org)
             assert (len(c.neurites) == 0) == absorbed
             if not absorbed:
-                assert np.array_equal(np.sort(c.neurites[0]), np.sort(piece))
+                assert np.array_equal(np.sort(c.neurites[0]), np.sort(stub))
                 assert np.array_equal(c.soma.verts, soma.verts)
 
     def test_a_full_organelle_band_traps_what_is_behind_it(self):

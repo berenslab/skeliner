@@ -76,8 +76,10 @@ fn fan_is_split(t: &Topology, fan: &[u32]) -> bool {
 /// edge-connected seed cluster grows by rings of neighbours (zero-area faces
 /// dropped); from the third ring on, once two manifold components of at
 /// least `min_branch_size` faces appear, the faces where the two largest
-/// meet are one fusion.  Fans that fall apart around a vertex are fusions
-/// too, after the grown ones.
+/// meet across an edge are one fusion — none when no edge joins them: two
+/// pieces sharing only a vertex and a face that bridges them can be one
+/// branch's own neck as well as two branches touching.  Fans that fall apart
+/// around a vertex are fusions too, after the grown ones.
 pub fn find_nonmanifold_fusions(
     t: &Topology,
     faces: &[[u32; 3]],
@@ -209,7 +211,9 @@ fn fusions_of(
                         }
                     }
                 }
-                result.push(boundary.into_iter().collect());
+                if !boundary.is_empty() {
+                    result.push(boundary.into_iter().collect());
+                }
                 break;
             }
         }
@@ -335,6 +339,27 @@ mod tests {
     /// sharing an edge with the first.
     fn bowtie() -> Vec<[u32; 3]> {
         vec![[0, 1, 2], [2, 3, 4], [0, 2, 5]]
+    }
+
+    #[test]
+    fn pieces_sharing_only_a_bridging_face_are_no_fusion() {
+        // fans 0-2 and 3-5 share only vertex 0; face 6, a seed, bridges them
+        // along the edges 0-2 and 0-6, each of three faces: no edge joins
+        // the two pieces, so nothing to cut — and no empty cluster
+        let faces = vec![
+            [0, 1, 2],
+            [0, 2, 3],
+            [0, 3, 4],
+            [0, 5, 6],
+            [0, 6, 7],
+            [0, 7, 8],
+            [0, 2, 6],
+        ];
+        let t = Topology::new(&faces, 9);
+        let mut dots = [1.0; 7];
+        dots[6] = -1.0;
+        let fusions = find_nonmanifold_fusions(&t, &faces, &[1.0; 7], &dots, 20, 2);
+        assert!(fusions.is_empty());
     }
 
     #[test]

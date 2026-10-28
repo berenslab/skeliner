@@ -360,6 +360,33 @@ class TestFusions:
             found += len(rust)
         assert found > 5
 
+    def test_two_pieces_only_a_face_bridges_are_no_fusion_on_both_paths(self):
+        # two balls sharing one vertex, and one face from a vertex next to it
+        # on each: no edge joins the balls, only the face bridges them — as a
+        # branch's own neck does too, so nothing is cut, and no empty cluster
+        # (the reference's, and both paths' until 2026-10-27) is left
+        ball = trimesh.creation.icosphere(subdivisions=1, radius=1000.0)
+        b = np.round(ball.vertices)
+        far = int(np.argmin(np.linalg.norm(b + b[0], axis=1)))
+        keep = np.arange(len(b)) != far
+        v = np.vstack([b, (b + 2 * b[0])[keep]])
+        renumber = np.zeros(len(b), dtype=np.int64)
+        renumber[keep] = np.arange(len(b), len(v))
+        first = np.asarray(ball.faces)
+        second = renumber[first]
+        a = int(next(x for x in first[(first == 0).any(axis=1)][0] if x))
+        c = int(next(x for x in second[(second == 0).any(axis=1)][0] if x))
+        faces = np.vstack([first, second, [[0, a, c]]])
+        dots = np.ones(len(faces))
+        dots[-1] = -1.0  # the bridge faces inward, a seed
+        areas = np.asarray(sk.Mesh(v, faces).area_faces)
+        rust, python = both(
+            lambda: sk.dataclass._kernels().pre.find_nonmanifold_fusions(
+                faces, len(v), areas, dots, 20, 5
+            )
+        )
+        assert rust == python == []
+
     def test_splitting_fans_is_the_same_on_both_paths(self, dirty_mesh, reference_mesh):
         rng = np.random.default_rng(23)
         split = 0
@@ -940,16 +967,24 @@ class TestBreakUpMesh:
         assert found[0] > 0 and found[2] == 0
 
     def test_a_piece_bigger_than_the_soma_stays_on_both_paths(self):
-        from .test_pre import _ball_with_arbor
+        from .test_pre import _ball_with_arbor, _ball_with_stub, _kernel_kinds
 
-        for subdivisions in (0, 2):
-            mesh, soma, org = _ball_with_arbor(subdivisions)
+        kinds = []
+        for mesh, soma, org in [
+            *(_ball_with_arbor(k) for k in (0, 2)),
+            *(_ball_with_stub(h) for h in (40.0, 160.0)),
+        ]:
+            rust, python = both(_kernel_kinds, mesh, soma, org)
+            assert rust == python
+            kinds += rust
             rust, python = both(pre.break_up_mesh, mesh, soma, org)
             for part in ("neurites", "discarded"):
                 assert_parity(
                     getattr(rust, part).components, getattr(python, part).components
                 )
             assert_parity(rust.soma.verts, python.soma.verts)
+        # the size test is the kernel's: the arbor bigger than the soma only
+        assert kinds == [pre._PIECE_SOMA, pre._PIECE_CANDIDATE] + [pre._PIECE_SOMA] * 2
 
 
 def _capped_tube_x(x_open, x_cap, side, *, turn=0.0, n=48):

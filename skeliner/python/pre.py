@@ -575,8 +575,10 @@ def find_nonmanifold_fusions(
 ) -> list[list[int]]:
     """Fusion clusters, as face lists: around faces that point inward at a
     non-manifold edge or duplicate another, the boundary between the two
-    largest manifold pieces a few rings of growth split them into; and every
-    vertex whose fan of faces falls apart.  With *sort*, largest first."""
+    largest manifold pieces a few rings of growth split them into — none
+    when no edge joins them (two pieces sharing a vertex and a bridging face
+    can be one branch's own neck); and every vertex whose fan of faces falls
+    apart.  With *sort*, largest first."""
     faces_arr, n_verts = checked_faces(faces, n_vertices)
     areas = np.asarray(areas, dtype=np.float64)
     outward_dots = np.asarray(outward_dots, dtype=np.float64)
@@ -742,7 +744,8 @@ def find_nonmanifold_fusions(
                         if nfi in branch1:
                             fusion_boundary.add(fi)
                             fusion_boundary.add(nfi)
-                result_clusters.append(sorted(fusion_boundary))
+                if fusion_boundary:
+                    result_clusters.append(sorted(fusion_boundary))
                 break
 
     result_clusters.extend(fan_vertex_clusters)
