@@ -662,8 +662,10 @@ fn dist(a: V3, b: V3) -> f64 {
 }
 
 /// `_zip_vertex_loops`: a triangle strip between two vertex sequences,
-/// the shorter bridge first at each step, over every start offset and
-/// both windings of `lb`; the cheapest strip wins.
+/// the shorter bridge first at each step, over every start offset of `lb`;
+/// the cheapest strip wins.  The strip runs `la` forward and `lb`
+/// backward, so the loops come oriented: each against the faces it rims
+/// that the strip should wind with.
 fn zip_vertex_loops(
     la: &[u32],
     lb: &[u32],
@@ -710,26 +712,44 @@ fn zip_vertex_loops(
         (cost, tris)
     };
     let mut best: Option<(f64, Vec<[u32; 3]>)> = None;
-    for reverse in [false, true] {
-        let base: Vec<u32> = if reverse {
-            lb.iter().rev().copied().collect()
-        } else {
-            lb.to_vec()
-        };
-        let shifts = if closed_b { n } else { 1 };
-        for shift in 0..shifts {
-            let shifted: Vec<u32> = base[shift..]
-                .iter()
-                .chain(&base[..shift])
-                .copied()
-                .collect();
-            let (cost, tris) = walk(&shifted);
-            if best.as_ref().is_none_or(|(c, _)| cost < *c) {
-                best = Some((cost, tris));
-            }
+    let shifts = if closed_b { n } else { 1 };
+    for shift in 0..shifts {
+        let shifted: Vec<u32> = lb[shift..].iter().chain(&lb[..shift]).copied().collect();
+        let (cost, tris) = walk(&shifted);
+        if best.as_ref().is_none_or(|(c, _)| cost < *c) {
+            best = Some((cost, tris));
         }
     }
     best.map(|(_, t)| t).unwrap_or_default()
+}
+
+/// Whether the faces left along `lp`'s edges run it forward (`lp[i]` to
+/// `lp[i + 1]`) more often than backward.
+fn runs_forward(
+    lp: &[u32],
+    closed: bool,
+    topo: &Topology,
+    gone: &[bool],
+    orig: &[[u32; 3]],
+) -> bool {
+    let n = lp.len();
+    let steps = if closed { n } else { n - 1 };
+    let (mut forward, mut backward) = (0usize, 0usize);
+    for i in 0..steps {
+        let (a, b) = (lp[i], lp[(i + 1) % n]);
+        let Some(e) = topo.edge_id(a, b) else {
+            continue;
+        };
+        for &f in topo.edge_faces(e).iter().filter(|&&f| !gone[f as usize]) {
+            let t = orig[f as usize];
+            if (0..3).any(|k| t[k] == a && t[(k + 1) % 3] == b) {
+                forward += 1;
+            } else {
+                backward += 1;
+            }
+        }
+    }
+    forward > backward
 }
 
 /// `_stitch_mode_b`: per `(axis, bval)` group of patches with Mode B faces,
@@ -808,6 +828,17 @@ fn stitch_mode_b(
         if up.is_empty() || dn.is_empty() {
             continue;
         }
+        // the strip runs an up rim forward and a down rim backward, and
+        // must wind as the faces it joins: those run an up rim backward and
+        // a down rim forward
+        let orient = |(mut lp, closed): (Vec<u32>, bool), forward: bool| {
+            if runs_forward(&lp, closed, topo, gone, orig) != forward {
+                lp.reverse();
+            }
+            (lp, closed)
+        };
+        let up: Vec<(Vec<u32>, bool)> = up.into_iter().map(|l| orient(l, false)).collect();
+        let dn: Vec<(Vec<u32>, bool)> = dn.into_iter().map(|l| orient(l, true)).collect();
         let [pa, pb] = perp(axis);
         let info = |lp: &[u32]| {
             let mut s = [0.0f64; 3];

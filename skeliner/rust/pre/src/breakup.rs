@@ -4,13 +4,18 @@
 use mesh::Topology;
 use mesh::components::listed_face_components;
 
+use crate::organelles::Inside;
+
 /// What [`classify`] makes of a piece.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Piece {
     /// A neurite, or a discard if it is too small.
     Candidate = 0,
-    /// Reachable from its component's body only across organelle faces.
+    /// Reachable from its component's body only across organelle faces,
+    /// and an organelle's inside: no bigger than the organelles walling it,
+    /// or looking into the cell.  A neurite cut off by a ring of folds at
+    /// its base is bigger and looks out of it.
     Trapped = 1,
     /// More than half its outer edges are shared with soma faces, and it
     /// has no more faces than the soma.
@@ -28,6 +33,11 @@ pub struct BreakUpMesh<'a> {
     pub soma_face: &'a [bool],
     /// Named by the user as arbor.
     pub claimed: &'a [bool],
+    /// The corners, and per face its centre and normal, for the rays that
+    /// tell a piece inside the cell from one looking out of it.
+    pub verts: &'a [[f64; 3]],
+    pub centers: &'a [[f64; 3]],
+    pub normals: &'a [[f64; 3]],
 }
 
 /// The pieces of the usable faces that are neither soma nor organelle,
@@ -91,13 +101,33 @@ pub fn classify(m: &BreakUpMesh<'_>, has_soma: bool) -> (Vec<Vec<u32>>, Vec<Piec
     }
     let topo = Topology::new(m.faces, m.n_vertices);
     let soma_size = (0..nf).filter(|&f| m.usable[f] && m.soma_face[f]).count();
+    // the organelles' pieces, which a cut-off piece is weighed against
+    let org_comps = listed_face_components(m.faces, &pick(&|f| m.usable[f] && m.organelle[f]));
+    let mut org_of = vec![u32::MAX; nf];
+    for (k, oc) in org_comps.iter().enumerate() {
+        for &f in oc {
+            org_of[f as usize] = k as u32;
+        }
+    }
+    let inside = Inside::new(m.verts, m.faces, m.centers, m.normals);
     let mut in_comp = vec![false; nf];
     let kinds = components
         .iter()
         .map(|comp| {
             let claimed = comp.iter().any(|&f| m.claimed[f as usize]);
             if !claimed && !comp.iter().any(|&f| reachable[f as usize]) {
-                return Piece::Trapped;
+                let mut around: Vec<u32> = comp
+                    .iter()
+                    .flat_map(|&f| topo.face_neighbors(f as usize))
+                    .map(|g| org_of[g as usize])
+                    .filter(|&k| k != u32::MAX)
+                    .collect();
+                around.sort_unstable();
+                around.dedup();
+                let wrap: usize = around.iter().map(|&k| org_comps[k as usize].len()).sum();
+                if comp.len() <= wrap || inside.holds(comp) {
+                    return Piece::Trapped;
+                }
             }
             if !has_soma || claimed || comp.len() > soma_size {
                 return Piece::Candidate;
@@ -175,13 +205,52 @@ mod tests {
         f
     }
 
-    fn kinds(
+    /// The strip's corners laid flat, or rolled into a tube whose faces
+    /// look at its axis (the inside of a cavity).
+    fn corners(n: usize, rolled: bool) -> Vec<[f64; 3]> {
+        (0..=n)
+            .flat_map(|k| {
+                let (x, y) = if rolled {
+                    let a = 2.0 * std::f64::consts::PI * k as f64 / n as f64;
+                    (a.cos(), a.sin())
+                } else {
+                    (k as f64, 0.0)
+                };
+                [[x, y, 0.0], [x, y + f64::from(!rolled), f64::from(rolled)]]
+            })
+            .collect()
+    }
+
+    fn centres_and_normals(v: &[[f64; 3]], f: &[[u32; 3]]) -> (Vec<[f64; 3]>, Vec<[f64; 3]>) {
+        f.iter()
+            .map(|t| {
+                let [a, b, c] = t.map(|i| v[i as usize]);
+                let centre = [0, 1, 2].map(|i| (a[i] + b[i] + c[i]) / 3.0);
+                let (u, w) = (
+                    [0, 1, 2].map(|i| b[i] - a[i]),
+                    [0, 1, 2].map(|i| c[i] - a[i]),
+                );
+                let x = [
+                    u[1] * w[2] - u[2] * w[1],
+                    u[2] * w[0] - u[0] * w[2],
+                    u[0] * w[1] - u[1] * w[0],
+                ];
+                let len = (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt();
+                (centre, x.map(|c| c / len))
+            })
+            .unzip()
+    }
+
+    fn kinds_on(
+        rolled: bool,
         soma: std::ops::Range<usize>,
         organelle: std::ops::Range<usize>,
         claimed: Option<usize>,
         has_soma: bool,
     ) -> (Vec<Vec<u32>>, Vec<Piece>) {
         let faces = strip(7);
+        let verts = corners(7, rolled);
+        let (centers, normals) = centres_and_normals(&verts, &faces);
         let nf = faces.len();
         let flags =
             |r: &std::ops::Range<usize>| -> Vec<bool> { (0..nf).map(|f| r.contains(&f)).collect() };
@@ -189,23 +258,35 @@ mod tests {
         let (soma_face, organelle, usable) = (flags(&soma), flags(&organelle), vec![true; nf]);
         let m = BreakUpMesh {
             faces: &faces,
-            n_vertices: 16,
+            n_vertices: verts.len(),
             usable: &usable,
             organelle: &organelle,
             soma_face: &soma_face,
             claimed: &claimed,
+            verts: &verts,
+            centers: &centers,
+            normals: &normals,
         };
         classify(&m, has_soma)
     }
 
+    fn kinds(
+        soma: std::ops::Range<usize>,
+        organelle: std::ops::Range<usize>,
+        claimed: Option<usize>,
+        has_soma: bool,
+    ) -> (Vec<Vec<u32>>, Vec<Piece>) {
+        kinds_on(false, soma, organelle, claimed, has_soma)
+    }
+
     #[test]
     fn pieces_behind_organelles_are_trapped_and_soma_bound_ones_are_soma() {
-        // quads 0-1 soma; quad 4 organelle splits quads 2-3 from 5-6.  The
-        // near piece touches one soma face and one organelle face: half,
-        // not more.
-        let (comps, k) = kinds(0..4, 8..10, None, true);
-        assert_eq!(comps, vec![vec![4, 5, 6, 7], vec![10, 11, 12, 13]]);
-        assert_eq!(k, vec![Piece::Candidate, Piece::Trapped]);
+        // quads 0-1 soma; quads 3-4 organelle split quad 2 from quads 5-6,
+        // which are no bigger than the organelle.  The near piece touches
+        // one soma face and one organelle face: half, not more.
+        let (comps, k) = kinds(0..4, 6..10, None, true);
+        assert_eq!(comps, vec![vec![10, 11, 12, 13], vec![4, 5]]);
+        assert_eq!(k, vec![Piece::Trapped, Piece::Candidate]);
         // quads 0-3 soma, no organelle: the one piece, quads 4-6, touches
         // only soma
         let (comps, k) = kinds(0..8, 0..0, None, true);
@@ -218,8 +299,20 @@ mod tests {
         assert_eq!(kinds(0..4, 0..0, None, true).1, vec![Piece::Candidate]);
         // a claim also keeps a trapped piece
         assert_eq!(
-            kinds(0..4, 8..10, Some(11), true).1,
+            kinds(0..4, 6..10, Some(11), true).1,
             vec![Piece::Candidate, Piece::Candidate]
         );
+    }
+
+    #[test]
+    fn a_piece_bigger_than_its_walls_is_trapped_only_inside_the_cell() {
+        // quad 4 alone organelle: quads 5-6 behind it are bigger.  Laid
+        // flat they look out, a neurite cut off; rolled into a cavity they
+        // look in, the organelle's inside
+        let (comps, k) = kinds_on(false, 0..4, 8..10, None, true);
+        assert_eq!(comps, vec![vec![4, 5, 6, 7], vec![10, 11, 12, 13]]);
+        assert_eq!(k, vec![Piece::Candidate, Piece::Candidate]);
+        let (_, k) = kinds_on(true, 0..4, 8..10, None, true);
+        assert_eq!(k[1], Piece::Trapped);
     }
 }

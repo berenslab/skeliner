@@ -1856,12 +1856,14 @@ def break_up_mesh(
 
     components, kinds = _break_up_pieces(
         faces,
-        len(verts),
+        verts,
         usable,
         organelles.mask,
         soma_face,
         claimed_face,
         soma is not None,
+        centers=mesh.triangles_center,
+        normals=mesh.face_normals,
     )
     if soma is not None:
         kinds = _neurites_left_out(
@@ -2019,24 +2021,39 @@ _PIECE_SOMA = _py_pre.PIECE_SOMA
 
 
 def _break_up_pieces(
-    faces, n_vertices, usable, organelle, soma_face, claimed_face, has_soma
+    faces,
+    vertices,
+    usable,
+    organelle,
+    soma_face,
+    claimed_face,
+    has_soma,
+    *,
+    centers,
+    normals,
 ) -> tuple[list[np.ndarray], np.ndarray]:
     """The pieces :func:`break_up_mesh` classifies: components of the usable
     faces that are neither soma nor organelle, largest first, and the kind
     of each — :data:`_PIECE_TRAPPED` when only organelle faces connect it to
-    its mesh component's body, :data:`_PIECE_SOMA` when more than half its
-    outer edges meet soma faces and it has no more faces than the soma
-    (only with a soma), else :data:`_PIECE_CANDIDATE`.  Claimed pieces are
-    never trapped or soma.
+    its mesh component's body and it is an organelle's inside: no bigger
+    than the organelles walling it, or more than half its faces looking into
+    the cell (a neurite cut off by a ring of folds is bigger and looks out);
+    :data:`_PIECE_SOMA` when more than half its outer edges meet soma faces
+    and it has no more faces than the soma (only with a soma); else
+    :data:`_PIECE_CANDIDATE`.  Claimed pieces are never trapped or soma.
     """
+    vertices = np.asarray(vertices, dtype=np.float64)
     return kernels.pre.break_up_classify(
         np.asarray(faces, dtype=np.int64),
-        int(n_vertices),
+        len(vertices),
         np.asarray(usable, dtype=bool),
         np.asarray(organelle, dtype=bool),
         np.asarray(soma_face, dtype=bool),
         np.asarray(claimed_face, dtype=bool),
         bool(has_soma),
+        vertices=vertices,
+        centers=np.asarray(centers, dtype=np.float64),
+        normals=np.asarray(normals, dtype=np.float64),
     )
 
 
@@ -4006,6 +4023,10 @@ def find_pocket_organelles(
        their faces look into it, the ray along a face's normal meeting
        another face: a fold's inside faces into the cell, while a neurite's
        end ringed by a fold at its base faces out of it.
+    6. Shallow dips dropped: a pocket with less than *min_fold_ratio*
+       times the area of the faces ringing it, unless more than half its
+       faces look into the cell — a small fold does, a dip in the outer
+       membrane looks out.
 
     Only regions behind a mouth get detected — curved surfaces without a
     mouth are correctly excluded.
@@ -4173,7 +4194,9 @@ def find_organelles(
     non-overlapping masks:
 
     * **pocket** — membrane folds connected to the neuron surface,
-      detected via gradient-based mouth finding + flood-fill.
+      detected via gradient-based mouth finding + flood-fill, then grown
+      on across every face that looks into the cell (its normal ray meets
+      another face), which the outer membrane, looking out, stops.
     * **isolated** — entire vertex-disconnected components whose
       mean outward dot is negative (fully enclosed fragments).
 
@@ -4249,7 +4272,7 @@ def find_organelles(
             f"{rep['n_via_dots']:,} by dots, "
             f"{rep['n_via_geometry']:,} by geometry)"
         )
-        n_pocket = int(pocket.sum()) - enclosed_count
+        n_pocket = int(pocket.sum()) - enclosed_count - rep["n_grown"]
         print(
             f"[skeliner.pre] Pocket organelles: "
             f"{n_pocket:,} faces from {rep['n_mouths']} mouths "
@@ -4269,6 +4292,8 @@ def find_organelles(
             parts.append(f"{n_structural} structural components")
         if enclosed_count:
             parts.append(f"enclosed +{enclosed_count:,}")
+        if rep["n_grown"]:
+            parts.append(f"grown +{rep['n_grown']:,}")
         print(f"[skeliner.pre] find_organelles: {', '.join(parts)} ({dt_total:.1f}s)")
 
     org = Organelles(

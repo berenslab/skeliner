@@ -662,7 +662,6 @@ fn pocket_organelles<'py>(
         dots: &dots,
     };
     let inside = ::pre::organelles::Inside::new(&verts, &tris, &centers, &normals);
-    let holds = |piece: &[u32]| inside.holds(piece);
     let found = svd.run(py, || {
         ::pre::organelles::pocket_organelles(
             &surface,
@@ -670,7 +669,7 @@ fn pocket_organelles<'py>(
             non_main.as_deref(),
             &params,
             &svd,
-            &holds,
+            &inside,
         )
     })?;
     let report = counts(
@@ -860,6 +859,7 @@ fn find_organelles<'py>(
     for (k, v) in [
         ("n_structural", found.n_structural),
         ("n_enclosed", found.n_enclosed),
+        ("n_grown", found.n_grown),
         ("n_internal", iso.n_internal),
         ("n_internal_faces", iso.n_internal_faces),
         ("n_kept", iso.n_kept),
@@ -936,6 +936,35 @@ fn enclosure_pass<'py>(
         ::pre::organelles::enclosure_pass(&np_mask, &adjacency, &pocket, min_cluster_size, &holds)
     });
     Ok((Array1::from(new).into_pyarray(py), added))
+}
+
+/// `find_organelles`' last step on arrays: the faces reached from `seeds`
+/// across faces that look into the cell (a face's normal ray meets another
+/// face), over the faces' edge adjacency.
+#[pyfunction]
+fn grow_into_cell<'py>(
+    py: Python<'py>,
+    faces: PyReadonlyArray2<'py, i64>,
+    vertices: PyReadonlyArray2<'py, f64>,
+    centers: PyReadonlyArray2<'py, f64>,
+    normals: PyReadonlyArray2<'py, f64>,
+    seeds: numpy::PyReadonlyArray1<'py, bool>,
+) -> PyResult<Bound<'py, PyArray1<bool>>> {
+    let verts = rows3("V", &vertices)?;
+    let (tris, _) = checked_faces(&faces, Some(verts.len()))?;
+    let (centers, normals) = (rows3("F", &centers)?, rows3("F", &normals)?);
+    let seeds = seeds.as_array().to_vec();
+    if [centers.len(), normals.len(), seeds.len()] != [tris.len(); 3] {
+        return Err(PyValueError::new_err(
+            "centers, normals and seeds need one row per face",
+        ));
+    }
+    let grown = py.detach(|| {
+        let topo = ::mesh::Topology::new(&tris, verts.len());
+        let inside = ::pre::organelles::Inside::new(&verts, &tris, &centers, &normals);
+        ::pre::organelles::grow_into_cell(&topo, &seeds, &inside)
+    });
+    Ok(Array1::from(grown).into_pyarray(py))
 }
 
 /// One gap as `skeliner.pre.find_gaps` returns it.
@@ -1317,8 +1346,14 @@ type PiecesOut<'py> = (Vec<Bound<'py, PyArray1<i64>>>, Bound<'py, PyArray1<u8>>)
 
 /// `skeliner.pre.break_up_mesh`'s pieces: the usable faces that are
 /// neither soma nor organelle, by component, largest first, each with its
-/// kind (0 candidate, 1 trapped behind organelles, 2 soma).
+/// kind (0 candidate, 1 trapped behind organelles, 2 soma).  `vertices`,
+/// `centers` and `normals` cast the rays that tell a piece walled in by
+/// organelles inside the cell from a neurite cut off by them.
 #[pyfunction]
+#[pyo3(signature = (
+    faces, n_vertices, usable, organelle, soma_face, claimed, has_soma,
+    *, vertices, centers, normals,
+))]
 #[allow(clippy::too_many_arguments)]
 fn break_up_classify<'py>(
     py: Python<'py>,
@@ -1329,8 +1364,23 @@ fn break_up_classify<'py>(
     soma_face: numpy::PyReadonlyArray1<'py, bool>,
     claimed: numpy::PyReadonlyArray1<'py, bool>,
     has_soma: bool,
+    vertices: PyReadonlyArray2<'py, f64>,
+    centers: PyReadonlyArray2<'py, f64>,
+    normals: PyReadonlyArray2<'py, f64>,
 ) -> PyResult<PiecesOut<'py>> {
     let (tris, n) = checked_faces(&faces, Some(n_vertices))?;
+    let verts = rows3("V", &vertices)?;
+    if verts.len() != n {
+        return Err(PyValueError::new_err(
+            "vertices need one row per vertex, n_vertices of them",
+        ));
+    }
+    let (centers, normals) = (rows3("F", &centers)?, rows3("F", &normals)?);
+    if centers.len() != tris.len() || normals.len() != tris.len() {
+        return Err(PyValueError::new_err(
+            "centers and normals need one row per face",
+        ));
+    }
     let flags = |name: &str, a: &numpy::PyReadonlyArray1<'py, bool>| -> PyResult<Vec<bool>> {
         let v = a.as_array().to_vec();
         if v.len() != tris.len() {
@@ -1352,6 +1402,9 @@ fn break_up_classify<'py>(
             organelle: &organelle,
             soma_face: &soma_face,
             claimed: &claimed,
+            verts: &verts,
+            centers: &centers,
+            normals: &normals,
         };
         ::pre::breakup::classify(&m, has_soma)
     });
@@ -1576,6 +1629,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pocket_mouths, m)?)?;
     m.add_function(wrap_pyfunction!(pocket_organelles, m)?)?;
     m.add_function(wrap_pyfunction!(enclosure_pass, m)?)?;
+    m.add_function(wrap_pyfunction!(grow_into_cell, m)?)?;
     m.add_function(wrap_pyfunction!(find_gaps, m)?)?;
     m.add_function(wrap_pyfunction!(filter_small_clusters, m)?)?;
     m.add_function(wrap_pyfunction!(find_parallel_patches, m)?)?;

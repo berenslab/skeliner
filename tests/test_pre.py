@@ -1409,15 +1409,17 @@ def _ball_with_arbor(subdivisions):
     return mesh, Soma.fit(mesh.vertices[sv], verts=sv), org
 
 
-def _tube_cut_by_an_organelle_band():
-    """A tube ringed by organelle faces all the way round.
+def _tube_cut_by_an_organelle_band(lo=0.0, hi=450.0):
+    """A capped tube ringed by organelle faces all the way round, for z in
+    (*lo*, *hi*); by default four rows of the side, no smaller than the cap
+    they strand.
 
     A partial band leaves a way past and does not trap anything, so the
     band has to close for this fixture to be about trapping at all.
     """
     mesh = _subdivided_tube(sections=16, height=1000.0)
     cz = mesh.vertices[mesh.faces].mean(axis=1)[:, 2]
-    band = (cz > 100) & (cz < 190)
+    band = (cz > lo) & (cz < hi)
     z = np.zeros(len(mesh.faces), dtype=bool)
     return mesh, Organelles(pocket=band, isolated=z.copy(), expanded=z.copy())
 
@@ -1431,12 +1433,14 @@ def _kernel_kinds(mesh, soma, org):
     claimed = np.zeros(len(faces), dtype=bool)
     _, kinds = pre._break_up_pieces(
         faces,
-        len(mesh.vertices),
+        mesh.vertices,
         usable,
         org.mask,
         soma_face,
         claimed,
         soma is not None,
+        centers=mesh.triangles_center,
+        normals=mesh.face_normals,
     )
     return list(kinds)
 
@@ -1507,9 +1511,20 @@ class TestSomaAbsorption:
         mesh, org = _tube_cut_by_an_organelle_band()
         pieces = _arbor_pieces(mesh, None, org)
         assert len(pieces) == 2, "the band must close, or nothing is trapped"
+        assert len(pieces[1]) <= int(org.mask.sum())
         c = pre.break_up_mesh(mesh, None, org)
         assert int(c.organelles.expanded.sum()) == len(pieces[1])
         assert len(c.neurites) == 1
+
+    def test_a_neurite_cut_off_by_a_thin_band_is_no_organelle(self):
+        # one row of the side strands the rest of the tube: bigger than the
+        # band and looking out of the cell, a neurite, not a fold's inside
+        mesh, org = _tube_cut_by_an_organelle_band(100.0, 190.0)
+        pieces = _arbor_pieces(mesh, None, org)
+        assert len(pieces) == 2 and len(pieces[1]) > int(org.mask.sum())
+        c = pre.break_up_mesh(mesh, None, org)
+        assert int(c.organelles.expanded.sum()) == 0
+        assert sorted(len(x) for x in c.neurites) == sorted(len(x) for x in pieces)
 
 
 # ── rescuing a discarded fragment ────────────────────────────────────

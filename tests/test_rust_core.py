@@ -727,6 +727,68 @@ class TestFindOrganelles:
         _, counts = on_both_paths(flask, st.outward_dots, st.main_face_mask)
         assert counts["n_holes"] > 0
 
+    def test_a_small_pocket_looking_into_the_cell_is_no_dip(self):
+        """A pocket with less than 3x the area of the faces ringing it is
+        dropped as a dip in the outer membrane, unless its faces look into
+        the cell, as a small fold's do.  A pit and a bump of one size on a
+        soma, both flagged by their dots and both that small: the pit is
+        kept, the bump, looking out, is not; on both paths."""
+        from skeliner.python import mesh as python_mesh
+        from skeliner.python import pre as python_pre
+
+        for step, kept in ((-150.0, True), (150.0, False)):
+            angles = np.linspace(-np.pi / 2 + 0.05, np.pi / 2 - np.arcsin(0.05), 40)
+            prof = [(3000.0 * np.cos(a), 3000.0 * np.sin(a)) for a in angles]
+            z0 = prof[-1][1]
+            prof.append((150.0, z0 + step))
+            verts, faces = _revolved(prof)
+            # its end closed by a fan to the axis
+            ring = np.arange(len(verts) - 8, len(verts))
+            assert np.ptp(verts[ring, 2]) == 0
+            ring = ring[np.argsort(np.arctan2(verts[ring, 1], verts[ring, 0]))]
+            apex = [[0.0, 0.0, verts[ring[0], 2] + step / 2]]
+            fan = np.column_stack([ring, np.roll(ring, -1), np.full(8, len(verts))])
+            verts = np.vstack([verts, apex])
+            mesh = trimesh.Trimesh(verts, np.vstack([faces, fan]), process=False)
+            if not mesh.is_winding_consistent:
+                mesh = trimesh.Trimesh(
+                    verts, np.vstack([faces, fan[:, ::-1]]), process=False
+                )
+            if mesh.face_normals[np.argmin(mesh.triangles_center[:, 2]), 2] > 0:
+                mesh = trimesh.Trimesh(verts, mesh.faces[:, ::-1], process=False)
+            assert mesh.is_winding_consistent
+            c = mesh.triangles_center
+            tube = (np.hypot(c[:, 0], c[:, 1]) < 160.0) & ((c[:, 2] - z0) * step > 0)
+            dots = np.where(tube, -0.5, 0.5)
+            faces64 = np.asarray(mesh.faces, dtype=np.int64)
+            verts64 = np.asarray(mesh.vertices, dtype=np.float64)
+            main = np.ones(len(c), dtype=bool)
+            args = (faces64, verts64, np.asarray(mesh.area_faces), dots, main)
+            geometry = {
+                "centers": np.asarray(c, dtype=np.float64),
+                "normals": np.asarray(mesh.face_normals, dtype=np.float64),
+            }
+            rust = _rs.pre.pocket_organelles(
+                *args,
+                _rs.mesh.Topology(faces64, len(verts64)),
+                pre._svd_rows,
+                **geometry,
+            )
+            python = python_pre.pocket_organelles(
+                *args,
+                python_mesh.Topology(faces64, len(verts64)),
+                pre._svd_rows,
+                **geometry,
+            )
+            assert_parity(rust, python)
+            pocket = rust[0]
+            # small: under 3x the area of the faces ringing it
+            adj = np.asarray(mesh.face_adjacency)
+            rim = np.unique(adj[tube[adj[:, 0]] != tube[adj[:, 1]]])
+            rim = rim[~tube[rim]]
+            assert mesh.area_faces[tube].sum() < 3 * mesh.area_faces[rim].sum()
+            assert pocket[tube].all() if kept else not pocket.any()
+
     def test_the_enclosure_pass_is_the_same_on_both_paths(
         self, dirty_mesh, reference_mesh
     ):
@@ -757,6 +819,67 @@ class TestFindOrganelles:
                 assert_parity(rust, python_pre.enclosure_pass(*args, **geometry))
                 added_total += rust[1]
         assert added_total > 50
+
+    def test_the_growth_into_the_cell_is_the_same_on_both_paths(self):
+        """From a band of the flask's chamber the organelle grows over the
+        fold, chamber and neck, and stops at the outer membrane; from the
+        outer membrane it does not grow; on both paths."""
+        from skeliner.python import pre as python_pre
+
+        mesh = _flask()
+        c = np.asarray(mesh.triangles_center, dtype=np.float64)
+        normals = np.asarray(mesh.face_normals, dtype=np.float64)
+        # the fold looks at the axis or the chamber's centre, the outer
+        # membrane away from the origin
+        fold = np.einsum("ij,ij->i", normals, c) < 0
+        args = (
+            np.asarray(mesh.faces, dtype=np.int64),
+            np.asarray(mesh.vertices, dtype=np.float64),
+            c,
+            normals,
+        )
+        band = fold & (np.abs(c[:, 2] - np.median(c[fold, 2])) < 300.0)
+        outer = ~fold & (c[:, 2] < -2500.0)
+        assert 0 < band.sum() < 0.3 * fold.sum() and outer.any()
+        for seeds in (band, outer):
+            rust = _rs.pre.grow_into_cell(*args, seeds)
+            assert_parity(rust, python_pre.grow_into_cell(*args, seeds))
+            assert rust[seeds].all() and not (rust & ~fold & ~seeds).any()
+        assert _rs.pre.grow_into_cell(*args, band)[fold].mean() > 0.99
+        assert np.array_equal(_rs.pre.grow_into_cell(*args, outer), outer)
+
+    def test_a_fold_grows_on_past_where_its_dots_stop(self):
+        """The flask's chamber, its lower half's outward dots made positive,
+        stops the flood short; the growth across faces looking into the cell
+        takes the rest of the fold and none of the outer membrane, on both
+        paths."""
+        from skeliner.python import pre as python_pre
+
+        mesh = _flask()
+        c = np.asarray(mesh.triangles_center, dtype=np.float64)
+        normals = np.asarray(mesh.face_normals, dtype=np.float64)
+        fold = np.einsum("ij,ij->i", normals, c) < 0
+        dots = np.asarray(pre.compute_mesh_stats(mesh, None).outward_dots).copy()
+        lower = fold & (c[:, 2] < np.median(c[fold, 2]))
+        dots[lower] = np.abs(dots[lower])
+        args = (
+            np.asarray(mesh.vertices, dtype=np.float64),
+            np.asarray(mesh.faces, dtype=np.int64),
+            c,
+            normals,
+            np.asarray(mesh.area_faces, dtype=np.float64),
+            dots,
+            np.zeros(len(c), dtype=np.int64),
+            0,
+            np.asarray(mesh.face_adjacency, dtype=np.int64),
+            pre._svd_rows,
+            5,
+        )
+        rust = _rs.pre.find_organelles(*args)
+        assert_parity(rust, python_pre.find_organelles(*args))
+        pocket, _, report = rust
+        assert report["n_grown"] > lower.sum()
+        assert pocket[fold].mean() > 0.99 and not pocket[~fold].any()
 
 
 class TestFindDisconnected:
@@ -1027,17 +1150,19 @@ class TestFindSomaViaRingCutoff:
 
 class TestBreakUpMesh:
     @staticmethod
-    def _cut(mesh, org):
-        """An organelle band around the upper neurite, which strands its tip
-        behind organelle faces."""
+    def _cut(mesh, org, lo, hi):
+        """An organelle band around the upper neurite for z in (*lo*, *hi*),
+        which strands its tip behind organelle faces."""
         z = mesh.triangles_center[:, 2]
-        band = (z > 9000) & (z < 9400)
+        band = (z > lo) & (z < hi)
         org.isolated[band] = True
         return int(band.sum())
 
     def test_the_stranded_tip_is_trapped_unless_rescued_on_both_paths(self):
         mesh, org = _soma_cell()
-        assert self._cut(mesh, org) > 0
+        # a wide band, the tip past it smaller: the band's inside
+        band = self._cut(mesh, org, 12000, 14700)
+        assert 0 < (mesh.triangles_center[:, 2] > 14700).sum() <= band
         soma = pre.find_soma(mesh, organelles=org)
         found = []
         for kwargs in (
@@ -1056,6 +1181,22 @@ class TestBreakUpMesh:
                 found.append(int(comps.organelles.expanded.sum()))
         # the stranded tip is trapped unless a claim releases it
         assert found[0] > 0 and found[2] == 0
+
+    def test_a_neurite_cut_off_by_a_thin_band_stays_on_both_paths(self):
+        mesh, org = _soma_cell()
+        # a thin band strands 5.6 um of neurite, bigger than it and looking
+        # out of the cell
+        band = self._cut(mesh, org, 9000, 9400)
+        assert (mesh.triangles_center[:, 2] > 9400).sum() > band > 0
+        soma = pre.find_soma(mesh, organelles=org)
+        for s in (soma, None):
+            comps, python = both(pre.break_up_mesh, mesh, s, org)
+            for part in ("neurites", "discarded"):
+                assert_parity(
+                    getattr(comps, part).components, getattr(python, part).components
+                )
+            assert_parity(comps.organelles.expanded, python.organelles.expanded)
+            assert not comps.organelles.expanded.any()
 
     def test_a_piece_bigger_than_the_soma_stays_on_both_paths(self):
         from .test_pre import _ball_with_arbor, _ball_with_stub, _kernel_kinds
@@ -1156,6 +1297,12 @@ class TestParallelPatches:
         labels, _ = pre._face_edge_components(out)
         assert len(set(labels.tolist()) - {-2}) == 1
         assert len(out.faces) > len(mesh.faces)
+        # wound as the tubes are: no edge run twice the same way, the zip's
+        # included
+        f = np.asarray(out.faces)
+        f = f[(f[:, 0] != f[:, 1]) & (f[:, 1] != f[:, 2]) & (f[:, 0] != f[:, 2])]
+        runs = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]])
+        assert len(np.unique(runs, axis=0)) == len(runs)
 
 
 class TestPythonPath:

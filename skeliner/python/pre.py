@@ -1370,7 +1370,9 @@ def pocket_organelles(
 
     # Post-validate: reject pocket components that are just surface dips.
     # A real pocket has much more surface area than its adjacent non-pocket
-    # faces (the "cap").  A shallow dip has pocket_area ≈ cap_area.
+    # faces (the "cap"), or looks into the cell: a small fold does, a dip in
+    # the outer membrane looks out of it.  A shallow dip has pocket_area ≈
+    # cap_area.
     area_arr = np.asarray(areas)
     pocket_idx = set(np.where(pocket)[0].tolist())
     pocket_visited: set[int] = set()
@@ -1399,7 +1401,8 @@ def pocket_organelles(
 
         pocket_area = float(area_arr[np.sort(comp)].sum())
         cap_area = float(area_arr[sorted(cap_faces)].sum()) if cap_faces else 0.0
-        if cap_area <= 0 or pocket_area / cap_area < min_fold_ratio:
+        shallow = cap_area <= 0 or pocket_area / cap_area < min_fold_ratio
+        if shallow and not inside.holds(comp):
             for fi in comp:
                 pocket[fi] = False
             n_rejected += 1
@@ -1433,61 +1436,156 @@ def _mask_components(
     return label, np.asarray(sizes, dtype=np.intp)
 
 
+#: How far a ray travels before an opening's fan counts, in mesh units: a
+#: face lying in an opening's plane does not look through it.
+FAN_CLEARANCE = 1e-6
+
+
 class _Inside:
     """Whether a piece of the surface lies inside the cell: more than half
     its faces look into it, the ray from a face's centre along its normal
     (out of the cell's material) meeting another face, with trimesh's
     ``ray_triangle`` test.  A fold's back wall and the nucleus face into
-    the cell; a neurite's surface faces out of it.  A piece reaching the
-    mesh's open edges — where the volume cut the cell, or a hole — counts
-    as inside: its rays may leave through the opening, which says nothing
-    of the membrane.  The faces' tree and open edges are found on first
-    use."""
+    the cell; a neurite's surface faces out of it.  Each opening of the
+    mesh — where the volume cut the cell, or a hole — is closed by a fan
+    for the rays: one leaving through it meets the cell's continuation
+    there, which the mesh lacks, while a neurite's outer membrane by a cut
+    still looks out (:data:`FAN_CLEARANCE`).  The faces' tree and the fans'
+    are built on first use."""
 
     def __init__(self, vertices, faces, centers, normals):
+        self._verts = np.asarray(vertices, dtype=np.float64)
         self._faces = np.asarray(faces, dtype=np.int64)
-        self._tris = np.asarray(vertices, dtype=np.float64)[self._faces]
+        self._tris = self._verts[self._faces]
         self._centers = np.asarray(centers, dtype=np.float64)
         self._normals = np.asarray(normals, dtype=np.float64)
         self._tree = None
-        self._open = None
+        self._fans = None
 
-    def holds(self, piece) -> bool:
-        """Does the piece of faces *piece* lie inside the cell?"""
+    def _probe(self) -> None:
+        """Build the faces' tree, and the tree of a fan to its centroid over
+        each loop of open edges (an edge named by one face; a vertex
+        repeated makes no edge), once."""
+        import math
+
         import trimesh
 
-        if self._tree is None:
-            self._tree = trimesh.triangles.bounds_tree(self._tris)
-            # a face is on the open boundary if one of its edges is named by
-            # no other face (a vertex repeated makes no edge)
-            f = self._faces
-            e = np.sort(
-                np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]), axis=1
-            )
-            owner = np.tile(np.arange(len(f)), 3)
-            real = e[:, 0] != e[:, 1]
-            e, owner = e[real], owner[real]
-            _, inv, count = np.unique(
-                e, axis=0, return_inverse=True, return_counts=True
-            )
-            self._open = np.zeros(len(f), dtype=bool)
-            self._open[owner[count[inv.ravel()] == 1]] = True
-        piece = np.asarray(sorted(piece), dtype=np.intp)
-        if self._open[piece].any():
-            return True
-        looking_in = 0
-        for lo in range(0, len(piece), _RAY_CHUNK):
-            part = piece[lo : lo + _RAY_CHUNK]
+        if self._tree is not None:
+            return
+        self._tree = trimesh.triangles.bounds_tree(self._tris)
+        f = self._faces
+        e = np.sort(np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]), axis=1)
+        e = e[e[:, 0] != e[:, 1]]
+        keys, count = np.unique(e, axis=0, return_counts=True)
+        open_edges = [(int(a), int(b)) for a, b in keys[count == 1]]
+        fans, fan_normals = [], []
+        for lp, closed in trace_edge_loops(open_edges):
+            pts = [tuple(float(x) for x in self._verts[v]) for v in lp]
+            s0 = s1 = s2 = 0.0
+            for p0, p1, p2 in pts:
+                s0 += p0
+                s1 += p1
+                s2 += p2
+            centre = (s0 / len(pts), s1 / len(pts), s2 / len(pts))
+            for i in range(len(pts) if closed else len(pts) - 1):
+                a, b = pts[i], pts[(i + 1) % len(pts)]
+                u = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+                w = (centre[0] - a[0], centre[1] - a[1], centre[2] - a[2])
+                n = (
+                    u[1] * w[2] - u[2] * w[1],
+                    u[2] * w[0] - u[0] * w[2],
+                    u[0] * w[1] - u[1] * w[0],
+                )
+                length = math.sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2])
+                fans.append((a, b, centre))
+                fan_normals.append(
+                    tuple(x / length for x in n) if length > 0 else (0.0, 0.0, 0.0)
+                )
+        if fans:
+            self._fans = np.asarray(fans, dtype=np.float64)
+            self._fan_normals = np.asarray(fan_normals, dtype=np.float64)
+            self._fan_tree = trimesh.triangles.bounds_tree(self._fans)
+
+    def looks_in(self, faces) -> np.ndarray:
+        """Per face of *faces*: does its normal ray meet another face, or an
+        opening's fan?"""
+        import trimesh
+
+        self._probe()
+        faces = np.asarray(faces, dtype=np.intp)
+        out = np.zeros(len(faces), dtype=bool)
+        for lo in range(0, len(faces), _RAY_CHUNK):
+            part = faces[lo : lo + _RAY_CHUNK]
+            origins, dirs = self._centers[part], self._normals[part]
             tri, ray, _ = trimesh.ray.ray_triangle.ray_triangle_id(
                 self._tris,
-                self._centers[part],
-                self._normals[part],
+                origins,
+                dirs,
                 triangles_normal=self._normals,
                 tree=self._tree,
                 multiple_hits=True,
             )
-            looking_in += len(np.unique(ray[tri != part[ray]]))
-        return 2 * looking_in > len(piece)
+            out[lo + ray[tri != part[ray]]] = True
+            if self._fans is not None:
+                _, ray, loc = trimesh.ray.ray_triangle.ray_triangle_id(
+                    self._fans,
+                    origins,
+                    dirs,
+                    triangles_normal=self._fan_normals,
+                    tree=self._fan_tree,
+                    multiple_hits=True,
+                )
+                if len(ray):
+                    far = ((loc - origins[ray]) * dirs[ray]).sum(axis=1) > FAN_CLEARANCE
+                    out[lo + ray[far]] = True
+        return out
+
+    def holds(self, piece) -> bool:
+        """Does the piece of faces *piece* lie inside the cell: do more than
+        half its faces look into it?"""
+        piece = np.asarray(sorted(piece), dtype=np.intp)
+        return 2 * int(self.looks_in(piece).sum()) > len(piece)
+
+
+def _grow_into_cell(
+    adj: dict[int, set[int]], seeds: np.ndarray, inside: _Inside
+) -> np.ndarray:
+    """The faces reached from *seeds* across faces that look into the cell,
+    over the edge adjacency *adj*; only the faces next to the growth are
+    cast a ray, each once, a ring at a time."""
+    grown = np.asarray(seeds, dtype=bool).copy()
+    # judged faces, grown or not: whether a face looks in never changes
+    seen = grown.copy()
+    front = np.flatnonzero(grown)
+    while len(front):
+        ring = []
+        for f in front.tolist():
+            for g in adj.get(f, ()):
+                if not seen[g]:
+                    seen[g] = True
+                    ring.append(g)
+        ring = np.asarray(ring, dtype=np.intp)
+        front = ring[inside.looks_in(ring)]
+        grown[front] = True
+    return grown
+
+
+def grow_into_cell(faces, vertices, centers, normals, seeds) -> np.ndarray:
+    """``find_organelles``' last step on arrays: the faces reached from
+    *seeds* across faces that look into the cell (a face's normal ray meets
+    another face), over the faces' edge adjacency."""
+    vertices = rows3("V", vertices)
+    faces, _ = checked_faces(faces, len(vertices))
+    centers = rows3("F", centers)
+    normals = rows3("F", normals)
+    seeds = np.asarray(seeds, dtype=bool)
+    if not len(centers) == len(normals) == len(seeds) == len(faces):
+        raise ValueError("centers, normals and seeds need one row per face")
+    return _grow_into_cell(
+        Topology(faces, len(vertices)).face_adjacency(),
+        seeds,
+        _Inside(vertices, faces, centers, normals),
+    )
 
 
 def isolated_organelles(
@@ -1755,7 +1853,8 @@ def find_organelles(
     """Organelle membranes, given the mesh stats: ``(pocket, isolated,
     report)``.  Isolated fragments first; then pockets on every structural
     component (one with at least *min_cluster_size* faces not isolated);
-    then the organelle interiors behind a narrow neck.  *report* holds the
+    then the organelle interiors behind a narrow neck; then the pockets
+    grown on across the faces that look into the cell.  *report* holds the
     counts each step found."""
     vertices = rows3("V", vertices)
     faces, _ = checked_faces(faces, len(vertices))
@@ -1798,13 +1897,14 @@ def find_organelles(
             non_main_mask[face_comp == ci] = True
 
     # ── 3. Pocket detection on all structural components ────────────
+    topo = Topology(faces, len(vertices))
     pocket, pocket_counts = pocket_organelles(
         faces,
         vertices,
         areas,
         outward_dots,
         structural_mask,
-        Topology(faces, len(vertices)),
+        topo,
         svd_rows,
         centers=centers,
         normals=normals,
@@ -1826,9 +1926,19 @@ def find_organelles(
         normals=normals,
     )
 
+    # ── 5. The membrane goes on into the cell past where the outward dots
+    #       stopped the flood; the outer membrane, looking out, stops it.
+    found = pocket | isolated
+    grown = _grow_into_cell(
+        topo.face_adjacency(), found, _Inside(vertices, faces, centers, normals)
+    )
+    n_grown = int((grown & ~found).sum())
+    pocket = grown & ~isolated
+
     report = {
         "n_structural": len(structural_comps),
         "n_enclosed": enclosed_count,
+        "n_grown": n_grown,
         **iso_counts,
         **pocket_counts,
     }
@@ -3491,10 +3601,12 @@ def zip_vertex_loops(
     triangle, so the result is manifold by construction (no fans, no
     duplicate edges).
 
-    Before walking, this tries every starting offset and both winding
-    orders on ``loop_b`` and picks the alignment that minimises the
-    sum of bridge-edge lengths.  This is O((m + n) * n) which is fine
-    for small rim loops.
+    Before walking, this tries every starting offset on ``loop_b`` and
+    picks the alignment that minimises the sum of bridge-edge lengths.
+    This is O((m + n) * n) which is fine for small rim loops.  The strip
+    runs ``loop_a`` forward and ``loop_b`` backward, so the loops come
+    oriented: each against the faces it rims that the strip should wind
+    with.
     """
     m = len(loop_a)
     n = len(loop_b)
@@ -3535,17 +3647,14 @@ def zip_vertex_loops(
         return cost, tris
 
     best: tuple[float, list[tuple[int, int, int]]] | None = None
-    # Try both winding directions and all starting offsets on loop_b
-    # (for closed loops).  For open chains, only offset 0 is valid.
-    reverse_options = [False, True]
-    shift_options = range(n) if closed_b else [0]
-    for reverse in reverse_options:
-        base = list(loop_b[::-1] if reverse else loop_b)
-        for shift in shift_options:
-            shifted = base[shift:] + base[:shift]
-            cost, tris = walk(shifted)
-            if best is None or cost < best[0]:
-                best = (cost, tris)
+    # Every starting offset on loop_b (for closed loops); for open chains
+    # only offset 0 is valid.
+    base = list(loop_b)
+    for shift in range(n) if closed_b else [0]:
+        shifted = base[shift:] + base[:shift]
+        cost, tris = walk(shifted)
+        if best is None or cost < best[0]:
+            best = (cost, tris)
 
     return best[1] if best is not None else []
 
@@ -3648,6 +3757,29 @@ def stitch_mode_b(verts, faces, orig_faces, mode_b_faces, patches) -> np.ndarray
         ]
         if not up_traces or not dn_traces:
             continue
+
+        # The strip runs an up rim forward and a down rim backward, and must
+        # wind as the faces it joins: those run an up rim backward and a
+        # down rim forward.
+        def runs_forward(lp, closed):
+            n = len(lp)
+            forward = backward = 0
+            for i in range(n if closed else n - 1):
+                a, b = lp[i], lp[(i + 1) % n]
+                for fi in surv_ef.get((min(a, b), max(a, b)), ()):
+                    t = faces[fi]
+                    if any(t[k] == a and t[(k + 1) % 3] == b for k in range(3)):
+                        forward += 1
+                    else:
+                        backward += 1
+            return forward > backward
+
+        def orient(trace, forward):
+            lp, c = trace
+            return (lp[::-1] if runs_forward(lp, c) != forward else lp, c)
+
+        up_traces = [orient(t, False) for t in up_traces]
+        dn_traces = [orient(t, True) for t in dn_traces]
 
         # Pair loops greedily by centroid distance — largest loops first.
         # Perpendicular plane of the sandwich axis for bbox overlap check.
@@ -3892,17 +4024,37 @@ PIECE_CANDIDATE, PIECE_TRAPPED, PIECE_SOMA = 0, 1, 2
 
 
 def break_up_classify(
-    faces, n_vertices: int, usable, organelle, soma_face, claimed, has_soma: bool
+    faces,
+    n_vertices: int,
+    usable,
+    organelle,
+    soma_face,
+    claimed,
+    has_soma: bool,
+    *,
+    vertices,
+    centers,
+    normals,
 ) -> tuple[list[np.ndarray], np.ndarray]:
     """The pieces ``skeliner.pre.break_up_mesh`` classifies: components of
     the usable faces that are neither soma nor organelle, largest first, and
     the kind of each — :data:`PIECE_TRAPPED` when only organelle faces
-    connect it to its mesh component's body, :data:`PIECE_SOMA` when more
-    than half its outer edges meet soma faces and it has no more faces than
-    the soma (only with a soma), else :data:`PIECE_CANDIDATE`.  Claimed
-    pieces are never trapped or soma."""
+    connect it to its mesh component's body and it is an organelle's
+    inside: no bigger than the organelles walling it, or more than half its
+    faces looking into the cell; :data:`PIECE_SOMA` when more than half its
+    outer edges meet soma faces and it has no more faces than the soma
+    (only with a soma), else :data:`PIECE_CANDIDATE`.  Claimed pieces are
+    never trapped or soma.  *vertices*, *centers* and *normals* cast the
+    rays."""
     faces, _ = checked_faces(faces, n_vertices)
+    vertices = rows3("V", vertices)
+    if len(vertices) != n_vertices:
+        raise ValueError("vertices need one row per vertex, n_vertices of them")
+    centers = rows3("F", centers)
+    normals = rows3("F", normals)
     nF = len(faces)
+    if len(centers) != nF or len(normals) != nF:
+        raise ValueError("centers and normals need one row per face")
     flags = {}
     for name, a in [
         ("usable", usable),
@@ -3964,6 +4116,12 @@ def break_up_classify(
     # is soma.  That is the only remaining use of the edge map.
     ef_all = build_edge_to_faces(faces, usable)
     soma_size = int(np.count_nonzero(usable & soma_face))
+    # the organelles' pieces, which a cut-off piece is weighed against
+    org_comps = face_components(faces, np.where(usable & organelle)[0])
+    org_of = np.full(nF, -1, dtype=np.intp)
+    for k, oc in enumerate(org_comps):
+        org_of[oc] = k
+    inside = _Inside(vertices, faces, centers, normals)
 
     kinds = np.zeros(len(components), dtype=np.uint8)
     for k, comp in enumerate(components):
@@ -3973,8 +4131,20 @@ def break_up_classify(
         in_main = reachable[comp].any()
 
         if not in_main and not claimed_piece:
-            kinds[k] = PIECE_TRAPPED
-            continue
+            # walled in by organelles: their inside if no bigger than them,
+            # or looking into the cell
+            around = set()
+            for fi in comp:
+                face = faces[fi]
+                for i in range(3):
+                    a, b = int(face[i]), int(face[(i + 1) % 3])
+                    for nb in ef_all.get((min(a, b), max(a, b)), ()):
+                        if org_of[nb] >= 0:
+                            around.add(int(org_of[nb]))
+            wrap = sum(len(org_comps[j]) for j in around)
+            if len(comp) <= wrap or inside.holds(comp):
+                kinds[k] = PIECE_TRAPPED
+                continue
 
         # Boundary analysis for soma detection (skipped without a soma); a
         # piece bigger than the soma is not a patch of it find_soma missed

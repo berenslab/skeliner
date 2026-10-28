@@ -323,11 +323,17 @@ mod tests {
     }
 
     #[test]
-    fn a_piece_reaching_an_opening_counts_as_inside() {
-        // the octahedron without its first face: the three faces on the
-        // hole are not judged by their rays, the four away from it are
+    fn an_opening_is_closed_for_the_rays() {
+        // the octahedron without its first face.  Wound inward (a cavity),
+        // the face across from the hole looks through it at the cell's
+        // continuation there: every face looks in.  Wound outward, the
+        // faces on the hole look away from it: out
         let (v, mut f) = octahedron();
         f.remove(0);
+        let inward: Vec<[u32; 3]> = f.iter().map(|&[a, b, c]| [a, c, b]).collect();
+        let (c, n) = centres_and_normals(&v, &inward);
+        let inside = Inside::new(&v, &inward, &c, &n);
+        assert!((0..7).all(|k| inside.looks_in(k)));
         let (c, n) = centres_and_normals(&v, &f);
         let inside = Inside::new(&v, &f, &c, &n);
         let on_hole: Vec<u32> = (0..7)
@@ -337,9 +343,27 @@ mod tests {
             })
             .collect();
         assert_eq!(on_hole.len(), 3);
-        assert!(inside.holds(&on_hole));
-        let away: Vec<u32> = (0..7).filter(|k| !on_hole.contains(k)).collect();
-        assert!(!inside.holds(&away));
+        assert!(!inside.holds(&on_hole));
+    }
+
+    #[test]
+    fn the_growth_goes_on_across_faces_looking_into_the_cell() {
+        // the octahedron wound inward (the inside of a cavity): every face
+        // looks in, so one seed reaches all; wound outward, none is reached
+        let (v, f) = octahedron();
+        let inward: Vec<[u32; 3]> = f.iter().map(|&[a, b, c]| [a, c, b]).collect();
+        let mut seeds = vec![false; 8];
+        seeds[0] = true;
+        for (faces, all) in [(&inward, true), (&f, false)] {
+            let (c, n) = centres_and_normals(&v, faces);
+            let topo = Topology::new(faces, v.len());
+            let grown = grow_into_cell(&topo, &seeds, &Inside::new(&v, faces, &c, &n));
+            assert!(grown[0]);
+            assert_eq!(
+                grown.iter().filter(|&&g| g).count(),
+                if all { 8 } else { 1 }
+            );
+        }
     }
 
     #[test]
@@ -373,17 +397,23 @@ use crate::fits::{Svd, centred, hull_area_on};
 /// faces look into it, the ray from a face's centre along its normal (out
 /// of the cell's material) meeting another face, with trimesh's
 /// `ray_triangle` test.  A fold's back wall and the nucleus face into the
-/// cell; a neurite's surface faces out of it.  A piece reaching the mesh's
-/// open edges — where the volume cut the cell, or a hole — counts as
-/// inside: its rays may leave through the opening, which says nothing of
-/// the membrane.  The faces' tree and open edges are found on first use.
+/// cell; a neurite's surface faces out of it.  Each opening of the mesh —
+/// where the volume cut the cell, or a hole — is closed by a fan for the
+/// rays: one leaving through it meets the cell's continuation there,
+/// which the mesh lacks, while a neurite's outer membrane by a cut still
+/// looks out ([`FAN_CLEARANCE`]).  The faces' tree and the fans' are
+/// built on first use.
 pub struct Inside<'a> {
     verts: &'a [[f64; 3]],
     faces: &'a [[u32; 3]],
     centers: &'a [[f64; 3]],
     normals: &'a [[f64; 3]],
-    probe: OnceLock<(TriangleBvh, Vec<bool>)>,
+    probe: OnceLock<(TriangleBvh, TriangleBvh)>,
 }
+
+/// How far a ray travels before an opening's fan counts, in mesh units: a
+/// face lying in an opening's plane does not look through it.
+pub const FAN_CLEARANCE: f64 = 1e-6;
 
 impl<'a> Inside<'a> {
     pub fn new(
@@ -401,49 +431,123 @@ impl<'a> Inside<'a> {
         }
     }
 
-    /// Does the piece of faces `piece` lie inside the cell?
-    pub fn holds(&self, piece: &[u32]) -> bool {
-        let (bvh, open) = self.probe.get_or_init(|| {
-            let tris = self
+    /// The faces' tree, and the tree of a fan to its centroid over each
+    /// loop of open edges (an edge named by one face; a vertex repeated
+    /// makes no edge).
+    fn probe(&self) -> &(TriangleBvh, TriangleBvh) {
+        self.probe.get_or_init(|| {
+            let tris: Vec<[[f64; 3]; 3]> = self
                 .faces
                 .iter()
                 .map(|f| f.map(|v| self.verts[v as usize]))
                 .collect();
-            // a face is on the open boundary if one of its edges is named
-            // by no other face (a vertex repeated makes no edge)
-            let mut edges: Vec<(u32, u32, u32)> = self
+            let (mut fans, mut fan_normals) = (Vec::new(), Vec::new());
+            let mut edges: Vec<(u32, u32)> = self
                 .faces
                 .iter()
-                .enumerate()
-                .flat_map(|(f, t)| {
+                .flat_map(|t| {
                     [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])]
                         .into_iter()
                         .filter(|(a, b)| a != b)
-                        .map(move |(a, b)| (a.min(b), a.max(b), f as u32))
+                        .map(|(a, b)| (a.min(b), a.max(b)))
                 })
                 .collect();
             edges.sort_unstable();
-            let mut open = vec![false; self.faces.len()];
-            for run in edges.chunk_by(|x, y| (x.0, x.1) == (y.0, y.1)) {
-                if let [(_, _, f)] = run {
-                    open[*f as usize] = true;
+            let open: Vec<(u32, u32)> = edges
+                .chunk_by(|x, y| x == y)
+                .filter(|run| run.len() == 1)
+                .map(|run| run[0])
+                .collect();
+            for (lp, closed) in crate::patches::trace_edge_loops(&open) {
+                let pts: Vec<[f64; 3]> = lp.iter().map(|&v| self.verts[v as usize]).collect();
+                let mut sum = [0.0f64; 3];
+                for p in &pts {
+                    for k in 0..3 {
+                        sum[k] += p[k];
+                    }
+                }
+                let centre = sum.map(|x| x / pts.len() as f64);
+                let steps = if closed { pts.len() } else { pts.len() - 1 };
+                for i in 0..steps {
+                    let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+                    let (u, w) = (
+                        [0, 1, 2].map(|k| b[k] - a[k]),
+                        [0, 1, 2].map(|k| centre[k] - a[k]),
+                    );
+                    let n = [
+                        u[1] * w[2] - u[2] * w[1],
+                        u[2] * w[0] - u[0] * w[2],
+                        u[0] * w[1] - u[1] * w[0],
+                    ];
+                    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                    fans.push([a, b, centre]);
+                    fan_normals.push(if len > 0.0 {
+                        n.map(|x| x / len)
+                    } else {
+                        [0.0; 3]
+                    });
                 }
             }
-            (TriangleBvh::new(tris, self.normals.to_vec()), open)
-        });
-        if piece.iter().any(|&f| open[f as usize]) {
-            return true;
-        }
-        let looking_in = piece
-            .iter()
-            .filter(|&&f| {
-                let f = f as usize;
-                bvh.first_hit(self.centers[f], self.normals[f], f64::NEG_INFINITY, Some(f))
-                    .is_some()
-            })
-            .count();
+            (
+                TriangleBvh::new(tris, self.normals.to_vec()),
+                TriangleBvh::new(fans, fan_normals),
+            )
+        })
+    }
+
+    /// Does face `f` look into the cell: does its normal ray meet another
+    /// face, or an opening's fan?
+    pub fn looks_in(&self, f: usize) -> bool {
+        let (faces, fans) = self.probe();
+        let (o, d) = (self.centers[f], self.normals[f]);
+        faces.first_hit(o, d, f64::NEG_INFINITY, Some(f)).is_some()
+            || fans.first_hit(o, d, FAN_CLEARANCE, None).is_some()
+    }
+
+    /// Does the piece of faces `piece` lie inside the cell: do more than
+    /// half its faces look into it?
+    pub fn holds(&self, piece: &[u32]) -> bool {
+        let looking_in = piece.iter().filter(|&&f| self.looks_in(f as usize)).count();
         2 * looking_in > piece.len()
     }
+}
+
+/// The faces reached from `seeds` across faces that look into the cell
+/// ([`Inside::looks_in`]), over `topo`'s edge adjacency: an organelle's
+/// membrane goes on into the cell past where its outward dots stopped the
+/// flood, and the outer membrane, looking out, stops it.  Only the faces
+/// next to the growth are cast a ray, each once, a ring at a time.
+pub fn grow_into_cell(topo: &Topology, seeds: &[bool], inside: &Inside<'_>) -> Vec<bool> {
+    let mut grown = seeds.to_vec();
+    // judged faces, grown or not: whether a face looks in never changes
+    let mut seen = seeds.to_vec();
+    let mut front: Vec<usize> = (0..seeds.len()).filter(|&f| seeds[f]).collect();
+    if !front.is_empty() {
+        // the tree is built here, not by the pool's first ray
+        inside.probe();
+    }
+    while !front.is_empty() {
+        let mut ring = Vec::new();
+        for &f in &front {
+            for g in topo.face_neighbors(f) {
+                let g = g as usize;
+                if !seen[g] {
+                    seen[g] = true;
+                    ring.push(g);
+                }
+            }
+        }
+        let looks = threads::map(&ring, |&g| inside.looks_in(g));
+        front = ring
+            .into_iter()
+            .zip(looks)
+            .filter_map(|(g, l)| l.then_some(g))
+            .collect();
+        for &g in &front {
+            grown[g] = true;
+        }
+    }
+    grown
 }
 
 /// The arrays organelle detection reads about a mesh.
@@ -948,15 +1052,15 @@ pub struct Pockets {
 
 /// `skeliner.pre.find_pocket_organelles` with the mouths, main mask and
 /// non-main mask given; a hole bigger than the pocket it touches is filled
-/// only if `inside` holds it (it lies inside the cell, as [`Inside`]
-/// tells).
+/// only if `inside` holds it (it lies inside the cell), and a shallow
+/// pocket is dropped only if its faces look out of the cell.
 pub fn pocket_organelles(
     s: &Surface<'_>,
     main_mask: &[bool],
     non_main: Option<&[bool]>,
     params: &PocketParams,
     svd: &dyn Svd,
-    inside: &(dyn Fn(&[u32]) -> bool + Sync),
+    inside: &Inside<'_>,
 ) -> Pockets {
     let n = s.faces.len();
     let mouths = pocket_mouths(s, main_mask, non_main, params, svd);
@@ -1092,7 +1196,7 @@ pub fn pocket_organelles(
                 around.dedup();
                 let wrap: usize = around.iter().map(|&r| wall_size[r as usize]).sum();
                 ((small && enclosure >= params.hole_enclosure_ratio) || entrapped)
-                    && (cluster.len() <= wrap || inside(cluster))
+                    && (cluster.len() <= wrap || inside.holds(cluster))
             })
             .collect()
     });
@@ -1104,7 +1208,8 @@ pub fn pocket_organelles(
     }
 
     // Drop small clusters, then reject shallow dips: a pocket must have
-    // much more area than the faces capping it.
+    // much more area than the faces capping it, or look into the cell — a
+    // small fold does, a dip in the outer membrane looks out of it.
     let kept = mesh::components::keep_large_clusters(s.faces, pocket, params.min_cluster_size);
     *pocket = kept;
     let flagged = pocket.clone();
@@ -1125,7 +1230,8 @@ pub fn pocket_organelles(
                 } else {
                     area_of(s, &cap)
                 };
-                cap_area <= 0.0 || pocket_area / cap_area < params.min_fold_ratio
+                (cap_area <= 0.0 || pocket_area / cap_area < params.min_fold_ratio)
+                    && !inside.holds(comp)
             })
             .collect()
     });
@@ -1148,11 +1254,13 @@ pub struct Organelles {
     pub pockets: Pockets,
     pub n_structural: usize,
     pub n_enclosed: usize,
+    pub n_grown: usize,
 }
 
 /// `skeliner.pre.find_organelles` given the mesh stats: isolated organelles,
 /// then pockets on every structural component at once, then the enclosure
-/// pass over trimesh's manifold `adjacency`.
+/// pass over trimesh's manifold `adjacency`, then the pockets grown on
+/// across the faces that look into the cell ([`grow_into_cell`]).
 pub fn find_organelles(
     s: &Surface<'_>,
     face_comp: &[i64],
@@ -1177,7 +1285,7 @@ pub fn find_organelles(
     };
     let inside = Inside::new(s.verts, s.faces, s.centers, s.normals);
     let holds = |piece: &[u32]| inside.holds(piece);
-    let pockets = pocket_organelles(s, &structural, Some(&non_main), &params, svd, &holds);
+    let pockets = pocket_organelles(s, &structural, Some(&non_main), &params, svd, &inside);
     let candidates: Vec<bool> = (0..s.faces.len())
         .map(|f| structural[f] && !pockets.mask[f] && !isolated.mask[f])
         .collect();
@@ -1188,11 +1296,20 @@ pub fn find_organelles(
         min_cluster_size,
         &holds,
     );
+    let found: Vec<bool> = (0..pocket.len())
+        .map(|f| pocket[f] || isolated.mask[f])
+        .collect();
+    let grown = grow_into_cell(s.topo, &found, &inside);
+    let n_grown = grown.iter().zip(&found).filter(|&(&g, &f)| g && !f).count();
+    let pocket = (0..pocket.len())
+        .map(|f| grown[f] && !isolated.mask[f])
+        .collect();
     Organelles {
         pocket,
         isolated,
         pockets,
         n_structural,
         n_enclosed,
+        n_grown,
     }
 }
