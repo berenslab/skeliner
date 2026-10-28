@@ -417,7 +417,7 @@
     </head>
     <body>
         <div id="canvas-container"></div>
-        <div id="empty-hint">Drop mesh (.obj, .ply) or skeleton (.swc, .npz) here</div>
+        <div id="empty-hint">Drop mesh (.obj, .ply, .stl, .ctm) or skeleton (.swc, .npz) here</div>
         <div id="drop-overlay">Drop file to load</div>
         <div id="log-status" style="display:none;position:absolute;bottom:14px;left:50%;background:rgba(0,0,0,0.7);color:#aaa;padding:6px 12px;border-radius:4px;font-size:11px;font-family:monospace;z-index:200;white-space:nowrap;pointer-events:none;transition:opacity 0.3s;max-width:40%;overflow:hidden;text-overflow:ellipsis"></div>
         <div id="lasso-rect"></div>
@@ -1105,7 +1105,7 @@
                     contactInfo = contactData;
                     startContactView(contactData);
                     document.getElementById("empty-hint").textContent =
-                        "Drop mesh A, then mesh B (.obj, .ply, .stl), and their contact sites (.npz) if you have them";
+                        "Drop mesh A, then mesh B (.obj, .ply, .stl, .ctm), and their contact sites (.npz) if you have them";
                     for (const id of ['info', 'controls', 'detect-panel', 'loaded-panel']) {
                         const el = document.getElementById(id);
                         if (el) el.style.display = 'none';

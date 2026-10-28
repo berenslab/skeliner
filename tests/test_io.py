@@ -715,7 +715,8 @@ def _ctm_file(method: str, vertices, faces) -> tuple[bytes, np.ndarray, np.ndarr
         return head + body, v.astype(np.float64), f
     if method == "MG1":
         body = b"INDX" + _ctm_block(_ctm_index_deltas(f))
-        body += b"VERT" + _ctm_block(v.view(np.uint32))
+        # one run of 3 × n floats, each vertex's x, y and z in turn
+        body += b"VERT" + _ctm_block(v.view(np.uint32).reshape(-1, 1))
         return head + body, v.astype(np.float64), f
     # MG2: each vertex on a 4 x 4 x 4 grid, in steps of the precision from
     # its cell's corner; vertices sorted by cell, x a delta within one
@@ -764,9 +765,11 @@ def test_eyewire_ctm_reads_on_both_paths(tmp_path, method):
     # the same triangles; MG2's corners within half its precision (0.5)
     tol = 0.25 + 1e-4 if method == "MG2" else 1e-4
     assert np.abs(rust[0][rust[1]] - vertices[sphere.faces]).max() <= tol
+    # EyeWire 1 stores (z, x, y); the mesh is (x, y, z), still facing out
     for mesh in both(load_mesh, path):
-        assert np.array_equal(mesh.vertices, want_v)
+        assert np.array_equal(mesh.vertices, want_v[:, [1, 2, 0]])
         assert np.array_equal(mesh.faces, want_f)
+        assert mesh.to_trimesh().volume > 0
 
 
 def test_eyewire_ctm_refuses_the_same_broken_files_on_both_paths(tmp_path):

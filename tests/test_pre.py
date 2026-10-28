@@ -827,6 +827,19 @@ class TestFindSoma:
         soma = pre.find_soma(mesh)
         assert soma is None
 
+    def test_a_soma_only_organelle_faces_hold_is_none(self):
+        """Every vertex it claims is let go, and an ellipsoid holding no
+        vertex is no soma."""
+        ball = trimesh.creation.icosphere(subdivisions=3, radius=3000.0)
+        n = len(ball.faces)
+        assert len(pre.find_soma(ball).verts) > 4
+        every = Organelles(
+            pocket=np.ones(n, bool),
+            isolated=np.zeros(n, bool),
+            expanded=np.zeros(n, bool),
+        )
+        assert both(pre.find_soma, ball, organelles=every) == (None, None)
+
 
 @pytest.mark.parametrize(
     "name, instead",

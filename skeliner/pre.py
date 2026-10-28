@@ -1486,8 +1486,9 @@ def find_soma(
     Returns
     -------
     Soma or None
-        Fitted ellipsoidal soma, or *None* if no nucleus is found or
-        too few indicators exist.
+        Fitted ellipsoidal soma, or *None* if no nucleus is found, too
+        few indicators exist, or fewer than four of the vertices it claims
+        lie on anything but organelle faces.
     """
     if verbose:
         print("[skeliner.pre] Finding soma …")
@@ -1512,6 +1513,12 @@ def find_soma(
         organelles = find_organelles(mesh)
 
     soma, cutoff, max_ring = _ring_cutoff_soma(mesh, nuc, labels, main, organelles)
+    if len(soma.verts) < 4:
+        # it let go of what it claimed: only organelle faces held those
+        if verbose:
+            dt = time.perf_counter() - _t0
+            print(f"[skeliner.pre] Soma: none off the organelles ({dt:.1f}s)")
+        return None
 
     if verbose:
         dt = time.perf_counter() - _t0

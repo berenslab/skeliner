@@ -220,7 +220,9 @@ def read_ctm(path) -> tuple[np.ndarray, np.ndarray] | None:
         f.section(b"INDX")
         tris = _restore_indices(f.packed(n_triangles, 3))
         f.section(b"VERT")
-        verts = np.ascontiguousarray(f.packed(n_vertices, 3)).view(np.float32)
+        # one run of 3 × n floats, each vertex's x, y and z in turn
+        words = np.ascontiguousarray(f.packed(3 * n_vertices, 1))
+        verts = words.view(np.float32).reshape(-1, 3)
     elif method == b"MG2\x00":
         f.section(b"MG2H")
         precision = f.f32()

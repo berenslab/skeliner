@@ -99,7 +99,9 @@ def load_mesh(filepath: str | Path) -> Mesh:
     (https://drive.google.com/file/d/1-qmE1sEL3AIGpNfi0w50MEOgm2WIF4_1/view),
     which trimesh cannot read without ``python-openctm`` (x86-64 and Python
     3.11 at most): OpenCTM v5 with RAW, MG1 or MG2 compression, vertices and
-    triangles only, no normals, UV maps or attribute maps.
+    triangles only, no normals, UV maps or attribute maps. Those files store
+    each vertex as (z, x, y), the retina's depth first; it is read as
+    (x, y, z), the depth in z as in the other data.
     """
     filepath = Path(filepath)
 
@@ -109,7 +111,11 @@ def load_mesh(filepath: str | Path) -> Mesh:
     if reader is not None:
         found = getattr(kernels.io, reader)(str(filepath))
         if found is not None:
-            return _without_copies(*found)
+            vertices, faces = found
+            if reader == "read_ctm":
+                # (z, x, y) to (x, y, z): a rotation, so the faces keep facing out
+                vertices = np.ascontiguousarray(vertices[:, [1, 2, 0]])
+            return _without_copies(vertices, faces)
     read = _trimesh().load_mesh(filepath, process=False)
     read = Mesh(read.vertices, read.faces)
     return _without_copies(read.vertices, read.faces)

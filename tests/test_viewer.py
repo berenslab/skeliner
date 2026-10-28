@@ -1973,6 +1973,32 @@ def test_a_new_mesh_clears_the_components_that_chose_the_track(drop_client, drop
     assert not _neurite_labels(drop_client)
 
 
+def test_an_eyewire_ctm_drop_is_a_mesh_its_components_follow(
+    drop_client, drop_files, tmp_path
+):
+    """EyeWire 1's meshes come as OpenCTM; one dropped with its components
+    is applied first, as an OBJ is, though ``components.npz`` sorts ahead of
+    ``mesh.ctm``."""
+    import skeliner as sk
+
+    from .test_io import _ctm_file
+
+    mesh_path, comp_path, _ = drop_files
+    mesh = sk.io.load_mesh(mesh_path)
+    ctm_path = tmp_path / "mesh.ctm"
+    ctm_path.write_bytes(_ctm_file("RAW", mesh.vertices, mesh.faces)[0])
+
+    r = drop_client.post("/upload_batch", files=_as_batch(comp_path, ctm_path))
+    assert r.status_code == 200, r.text
+    results = r.json()["results"]
+    assert [(x["name"], x["ok"]) for x in results] == [
+        ("mesh.ctm", True),
+        ("components.npz", True),
+    ]
+    assert drop_client.get("/loaded").json()["mesh"]["nFaces"] == len(mesh.faces)
+    assert _neurite_labels(drop_client)
+
+
 # ── a mesh edit invalidates the components ────────────────────────────
 #
 # `break_up_mesh` runs once the mesh is settled, so a components split and a
@@ -3476,6 +3502,24 @@ def test_both_meshes_share_the_first_one_s_centre(empty_contacts, pair_files):
     np.testing.assert_allclose(
         a_sent["centroid"], np.asarray(a.vertices, np.float32).mean(0), rtol=1e-6
     )
+
+
+def test_eyewire_ctm_meshes_fill_the_slots_as_obj_ones_do(
+    empty_contacts, pair_files, tmp_path
+):
+    from .test_io import _ctm_file
+
+    client, _ = empty_contacts
+    _, meshes = pair_files
+    paths = tmp_path / "cell_a.ctm", tmp_path / "cell_b.ctm"
+    for path, mesh in zip(paths, meshes):
+        path.write_bytes(_ctm_file("RAW", mesh.vertices, mesh.faces)[0])
+    results = _drop(client, *paths).json()["results"]
+    assert [(x["name"], x["side"]) for x in results] == [
+        ("cell_a.ctm", "A"),
+        ("cell_b.ctm", "B"),
+    ]
+    assert _slots(client)[0] == [True, True]
 
 
 def test_a_full_viewer_takes_a_mesh_once_one_is_removed(empty_contacts, pair_files):

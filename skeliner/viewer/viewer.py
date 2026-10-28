@@ -7,7 +7,7 @@ Usage:
     skeliner view-contacts A.obj B.obj   # two meshes and where they touch
 
 Launches a local web server with a Three.js viewer. Supports:
-  - Mesh files: .obj, .ply, .stl (always in nm)
+  - Mesh files: .obj, .ply, .stl and EyeWire 1's .ctm (always in nm)
   - Skeleton files: .swc (always in µm → converted to nm),
                     .npz (unit from metadata)
 
@@ -215,11 +215,15 @@ _TIER_MESH_DERIVED = 1
 _TIER_SKELETON = 2
 _TIER_ANNOTATION = 3
 
+#: The files a drop reads as a mesh, with :func:`skeliner.io.load_mesh`;
+#: ``.ctm`` is EyeWire 1's format.
+_MESH_SUFFIXES = (".obj", ".ply", ".stl", ".ctm")
+
 
 def _upload_tier(path: Path) -> int:
     """Which tier *path* belongs to; lower tiers are applied first."""
     suffix = path.suffix.lower()
-    if suffix in (".obj", ".ply", ".stl"):
+    if suffix in _MESH_SUFFIXES:
         return _TIER_MESH
     if suffix == ".swc":
         return _TIER_SKELETON
@@ -740,9 +744,7 @@ def _create_app(
                 paths.append(tmp_path)
         finally:
             await form.close()
-        meshes = sorted(
-            p for p in paths if p.suffix.lower() in (".obj", ".ply", ".stl")
-        )
+        meshes = sorted(p for p in paths if p.suffix.lower() in _MESH_SUFFIXES)
         site_files = [
             p for p in paths if p.suffix.lower() == ".npz" and _is_contact_sites(p)
         ]
@@ -928,7 +930,7 @@ def _create_app(
         for old_file in port_dir.iterdir():
             if old_file in keep:
                 continue
-            if old_file.suffix in (".obj", ".ply", ".stl", ".npz", ".swc"):
+            if old_file.suffix.lower() in (*_MESH_SUFFIXES, ".npz", ".swc"):
                 old_file.unlink(missing_ok=True)
         skeleton_states.clear()
         _forget_mesh_state()
@@ -965,7 +967,7 @@ def _create_app(
         suffix = tmp_path.suffix.lower()
 
         try:
-            if suffix in (".obj", ".ply", ".stl"):
+            if suffix in _MESH_SUFFIXES:
                 mesh = load_mesh(tmp_path)
                 print(
                     f"Uploaded mesh: {len(mesh.vertices):,} verts, {len(mesh.faces):,} faces"

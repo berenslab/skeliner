@@ -324,7 +324,8 @@ pub fn read_ctm<E>(
             f.section(b"INDX")?;
             let triangles = restore_indices(&f.packed(n_triangles, 3, unlzma)?);
             f.section(b"VERT")?;
-            let words = f.packed(n_vertices, 3, unlzma)?;
+            // one run of 3 × n floats, each vertex's x, y and z in turn
+            let words = f.packed(3 * n_vertices, 1, unlzma)?;
             let vertices = words
                 .as_chunks::<3>()
                 .0
@@ -544,7 +545,7 @@ mod tests {
         mg1.extend(block(&planes(&index_deltas(&TRIS), 4, 3)));
         mg1.extend_from_slice(b"VERT");
         let bits: Vec<u32> = verts.iter().flatten().map(|c| c.to_bits()).collect();
-        mg1.extend(block(&planes(&bits, 4, 3)));
+        mg1.extend(block(&planes(&bits, 12, 1)));
         assert_eq!(read_ctm(&mg1, &mut unchanged), Ok(Some(want)));
         // the block's size is checked, and an unpacking error comes back
         let mut wrong = |_: &[u8], p: &[u8], _: usize| Ok::<_, ()>(p[1..].to_vec());
