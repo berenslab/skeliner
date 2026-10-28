@@ -1454,8 +1454,11 @@ def find_soma(
     1. The nucleus (:func:`find_nucleus_center`): its void in the mesh's
        Z-slices gives the centre, the nucleus' height, and the seeds — the
        soma surface's vertices at the nucleus' middle Z-level.
-    2. Rings: breadth-first over the component most seeds lie on, from the
-       seeds (or from its vertex nearest the centre), one ring per step.
+    2. Rings: breadth-first over the component the seeds' outline lies on
+       — the soma's outer membrane, where the slice also cuts surfaces
+       inside the soma that are not joined to it, as in EyeWire 1's
+       meshes — from its seeds (or from its vertex nearest the centre),
+       one ring per step.
     3. The cutoff: the largest connected piece of each ring grows to a
        peak inside the soma and falls once the rings pass into the
        neurites; the soma ends at the first ring after the peak whose
@@ -1570,12 +1573,15 @@ def _ring_cutoff_soma(
         fits.append(soma)
         return soma.center, soma._W, float(soma.axes.min())
 
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    labels = np.asarray(labels, dtype=np.int64)
+    seeds = np.asarray(nuc.get("soma_seed_vi", []), dtype=np.int64)
     k, soma_verts, cutoff, max_ring = kernels.pre.find_soma_ring_cutoff(
-        np.asarray(mesh.faces, dtype=np.int64),
+        faces,
         verts,
-        np.asarray(labels, dtype=np.int64),
+        labels,
         int(main),
-        np.asarray(nuc.get("soma_seed_vi", []), dtype=np.int64),
+        _outline_seeds(verts, faces, labels, seeds),
         np.asarray(nuc["center"], dtype=np.float64),
         float(nuc["z_range"][1] - nuc["z_range"][0]),
         float(mesh.edges_unique_length.mean()),
@@ -1585,6 +1591,34 @@ def _ring_cutoff_soma(
     soma = fits[k]
     soma.verts = soma_verts
     return soma, cutoff, max_ring
+
+
+def _outline_seeds(
+    verts: np.ndarray, faces: np.ndarray, labels: np.ndarray, seeds: np.ndarray
+) -> np.ndarray:
+    """The *seeds* on the component their XY outline lies on.
+
+    The seeds are a slice through the soma.  Its outline is the outer
+    membrane; most of the seeds can lie inside it, on a surface the
+    membrane encloses without being joined to it, and the rings would
+    then grow over that surface instead.  Each vertex takes its last
+    face's component, as the ring kernel counts them.
+    """
+    if len(seeds) < 3:
+        return seeds
+    from scipy.spatial import ConvexHull, QhullError
+
+    try:
+        rim = ConvexHull(verts[seeds, :2]).vertices
+    except QhullError:
+        return seeds
+    last = np.full(len(verts), -1, dtype=np.int64)
+    last[faces.ravel()] = np.repeat(np.arange(len(faces)), 3)
+    comp = np.where(last[seeds] >= 0, labels[last[seeds]], -1)
+    on_rim = comp[rim][comp[rim] >= 0]
+    if len(on_rim) == 0:
+        return seeds
+    return seeds[comp == np.bincount(on_rim).argmax()]
 
 
 _build_edge_to_faces = _py_pre.build_edge_to_faces

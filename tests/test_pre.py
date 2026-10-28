@@ -840,6 +840,32 @@ class TestFindSoma:
         )
         assert both(pre.find_soma, ball, organelles=every) == (None, None)
 
+    def test_the_rings_grow_on_the_outline_not_on_a_surface_inside_it(self):
+        """A slice whose seeds lie mostly on a surface inside the membrane,
+        not joined to it, as in EyeWire 1's somas: the membrane is the
+        outline, and only its seeds are kept."""
+        from skeliner.dataclass import Mesh
+
+        t = np.linspace(0, 2 * np.pi, 12, endpoint=False)
+        ring = np.concatenate(
+            [np.c_[10 * np.cos(t), 10 * np.sin(t), np.full(12, z)] for z in (0, 1)]
+        )
+        i = np.arange(12)
+        j = (i + 1) % 12
+        band = np.r_[np.c_[i, j, i + 12], np.c_[j, j + 12, i + 12]]
+        g = np.linspace(-2, 2, 7)
+        inside = np.array([(x, y, 0.5) for y in g for x in g])
+        a = (np.arange(6)[:, None] * 7 + np.arange(6)).ravel() + 24
+        patch = np.r_[np.c_[a, a + 1, a + 8], np.c_[a, a + 8, a + 7]]
+        mesh = Mesh(np.r_[ring, inside], np.r_[band, patch])
+        labels, _ = pre._face_edge_components(mesh)
+        faces = np.asarray(mesh.faces)
+        seeds = np.arange(len(mesh.vertices))
+        # two components, the inner one holding most of the seeds
+        assert labels[0] != labels[len(band)] and len(inside) > len(ring)
+        kept = pre._outline_seeds(mesh.vertices, faces, labels, seeds)
+        assert np.array_equal(kept, np.arange(24))
+
 
 @pytest.mark.parametrize(
     "name, instead",
