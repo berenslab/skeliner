@@ -890,9 +890,17 @@ fn prune<E>(
             for &v in &cluster {
                 visited[v as usize] = true;
             }
-            let mut stub: Vec<u32> = cluster.clone();
+            let mut walked: Vec<u32> = cluster.clone();
             let mut ring = cluster.clone();
             let first = cluster.len();
+            // the ring staying doubled from the exit for the exit's radius in
+            // rings (its size over 2π) is the soma's body: a thin dendrite
+            // joining a thicker trunk doubles it only while wrapping round
+            // it.  Not a branch: dendrites leaving close together share a
+            // trunk, which is not soma either
+            let lasting = (first as f64 / std::f64::consts::TAU).ceil() as usize;
+            let mut wide = 0;
+            let mut stub_len = walked.len();
             let mut next: Vec<u32> = Vec::new();
             for _ in 0..200 {
                 next.clear();
@@ -906,17 +914,26 @@ fn prune<E>(
                         }
                     }
                 }
-                // the ring doubling from the exit is the soma's body; not a
-                // branch: dendrites leaving close together share a trunk,
-                // which is not soma either
-                if next.is_empty() || next.len() > 2 * first {
+                if next.is_empty() {
                     break;
                 }
-                stub.extend_from_slice(&next);
+                if next.len() > 2 * first {
+                    wide += 1;
+                    if wide >= lasting {
+                        break;
+                    }
+                } else {
+                    wide = 0;
+                    stub_len = walked.len() + next.len();
+                }
+                walked.extend_from_slice(&next);
                 std::mem::swap(&mut ring, &mut next);
             }
-            if !next.is_empty() {
-                for &v in &stub {
+            // the stub ends where the ring last widened; a walk that runs
+            // out of soma without widening erodes nothing, one that never
+            // stops all it walked
+            if wide > 0 || !next.is_empty() {
+                for &v in &walked[..stub_len] {
                     all_stub.insert(v);
                     global_visited[v as usize] = true;
                 }
@@ -1084,6 +1101,81 @@ mod tests {
         // the strip's stub went, and nothing else
         let lost: Vec<u32> = soma.iter().copied().filter(|&v| !kept.has(v)).collect();
         assert!(!lost.is_empty() && lost.iter().all(|&v| verts[v as usize][0] < -1000.0));
+    }
+
+    /// Two loops of vertices joined by a band of triangles, each vertex of
+    /// either next to one of the other.
+    fn zip(a: &[u32], b: &[u32], faces: &mut Vec<[u32; 3]>) {
+        let (p, q) = (a.len(), b.len());
+        let (mut i, mut j) = (0, 0);
+        while i < p || j < q {
+            if j == q || (i < p && (i + 1) * q <= (j + 1) * p) {
+                faces.push([a[i], a[(i + 1) % p], b[j % q]]);
+                i += 1;
+            } else {
+                faces.push([a[i % p], b[(j + 1) % q], b[j]]);
+                j += 1;
+            }
+        }
+    }
+
+    /// A tube of loops whose sizes are the erosion's rings: a 20-vertex exit
+    /// off a tube left outside, a trunk widening past twice the exit for two
+    /// loops (a thin dendrite wrapping round a thicker one) and narrowing
+    /// again, then the body.  The walk erodes the trunk up to the body.
+    #[test]
+    fn the_stub_erosion_walks_past_a_passing_widening() {
+        let sizes = [20, 20, 20, 20, 20, 45, 45, 30, 30, 30, 30, 30];
+        let body = 10;
+        let mut verts: Vec<[f64; 3]> = Vec::new();
+        let mut loops: Vec<Vec<u32>> = Vec::new();
+        for (k, &m) in sizes.iter().chain(&[80; 10]).enumerate() {
+            let r = m as f64 * 100.0 / std::f64::consts::TAU;
+            let start = verts.len() as u32;
+            for i in 0..m {
+                let a = i as f64 * std::f64::consts::TAU / m as f64;
+                verts.push([r * a.cos(), r * a.sin(), k as f64 * 100.0]);
+            }
+            loops.push((start..start + m as u32).collect());
+        }
+        let mut faces = Vec::new();
+        for pair in loops.windows(2) {
+            zip(&pair[0], &pair[1], &mut faces);
+        }
+        let nv = verts.len();
+        let labels = vec![0i64; faces.len()];
+        let organelle = vec![false; faces.len()];
+        let m = SomaMesh {
+            faces: &faces,
+            verts: &verts,
+            labels: &labels,
+            main: 0,
+            organelle: &organelle,
+            avg_edge: 100.0,
+        };
+        let all: Vec<u32> = (0..faces.len() as u32).collect();
+        let g = Graph::new(&faces, &all, nv);
+        let s = 1.0 / 10_000.0;
+        let wide = Ellipsoid {
+            center: [0.0; 3],
+            w: [[s, 0.0, 0.0], [0.0, s, 0.0], [0.0, 0.0, s]],
+        };
+        // the first loop is the tube outside, the rest soma
+        let mut cur = Current {
+            fit: Fit {
+                ellipsoid: wide,
+                axes_min: 10_000.0,
+            },
+            index: 0,
+            n_fits: 1,
+            verts: (loops[1][0]..nv as u32).collect(),
+            held_out: true,
+            tube: (0..nv).map(|v| v < loops[1][0] as usize).collect(),
+        };
+        prune(&m, &g, &wide, &mut cur, &mut |_, _| Ok::<_, ()>(None)).unwrap();
+        let trunk = loops[1][0]..loops[sizes.len()][0];
+        assert!(cur.verts.iter().all(|v| !trunk.contains(v)));
+        assert_eq!(cur.verts.len(), body * 80);
     }
 
     #[test]

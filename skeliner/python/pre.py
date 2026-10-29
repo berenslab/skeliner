@@ -3,6 +3,7 @@ Rust crate ``pre`` runs them."""
 
 from __future__ import annotations
 
+import math
 from collections import Counter, defaultdict, deque
 
 import numpy as np
@@ -4716,8 +4717,8 @@ def find_soma_ring_cutoff(
         # ── 6b. Per-exit stub erosion ─────────────────────────────
         #        For each neurite exit (cluster of boundary verts),
         #        BFS inward into the soma independently.  Ring widths
-        #        start narrow (tube); stop when the ring widens into
-        #        the soma body (Otsu).  Erode each exit separately so
+        #        start narrow (tube); stop where the ring widens into
+        #        the soma body for good.  Erode each exit separately so
         #        narrow tubes get deep erosion, wide junctions don't.
         comp_vert_set = set(adj.keys())
         non_comp_soma = soma_set - comp_vert_set
@@ -4764,9 +4765,17 @@ def find_soma_ring_cutoff(
 
             for cluster in exit_clusters:
                 visited_er = set(cluster)
-                stub_verts = set(cluster)
+                rings: list[set[int]] = [set(cluster)]
                 current_ring = cluster
-                ring_sizes: list[int] = [len(current_ring)]
+                first = len(cluster)
+                # The ring staying doubled from the entry for the entry's
+                # radius in rings (its size over 2π) is the soma body: a
+                # thin dendrite joining a thicker trunk doubles it only
+                # while wrapping round it.  Not a branch: dendrites leaving
+                # close together share a trunk, which is not soma either.
+                lasting = math.ceil(first / math.tau)
+                wide = 0
+                n_stub = 1  # rings before the ring last widened
 
                 for _depth in range(200):
                     next_ring: set[int] = set()
@@ -4781,18 +4790,20 @@ def find_soma_ring_cutoff(
                                 visited_er.add(nv)
                     if not next_ring:
                         break
-
-                    # Stop when the ring doubles from the entry (the soma
-                    # body).  Not at a branch: dendrites leaving close
-                    # together share a trunk, which is not soma either.
-                    if len(next_ring) > 2 * ring_sizes[0]:
-                        break
-
-                    stub_verts.update(next_ring)
+                    if len(next_ring) > 2 * first:
+                        wide += 1
+                        if wide >= lasting:
+                            break
+                    else:
+                        wide = 0
+                        n_stub = len(rings) + 1
+                    rings.append(next_ring)
                     current_ring = next_ring
-                    ring_sizes.append(len(next_ring))
 
-                if next_ring:  # actually eroded
+                # A walk running out of soma without widening erodes
+                # nothing; one that never stops, all it walked.
+                if wide or next_ring:
+                    stub_verts = set().union(*rings[:n_stub])
                     all_stub.update(stub_verts)
                     global_visited.update(stub_verts)
                     n_exits_eroded += 1
