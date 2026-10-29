@@ -3,8 +3,10 @@
 //! Each Z-level's vertices are rasterised; the largest cluster is the soma
 //! cross-section, and the biggest empty disk enclosed in it is that level's
 //! void.  Consecutive levels whose voids stay put form chains, and the
-//! longest chain is the nucleus.  Levels just past the chain whose soma ring
-//! is broken get a second look inside the convex hull of the chain's end.
+//! longest chain past the void minimum is the nucleus — a minimum the mesh
+//! sets itself unless given ([`void_floor`]).  Levels just past the chain
+//! whose soma ring is broken get a second look inside the convex hull of the
+//! chain's end.
 
 use mesh::geometry::{arange, numpy_sum};
 use mesh::raster::{dilate3, enclosed, fill_holes, label, sq_distance_to};
@@ -19,8 +21,9 @@ pub struct ZParams {
     pub grid_res: f64,
     /// Half-width of a level's slab.
     pub z_tol: f64,
-    /// Smallest void radius a chain accepts.
-    pub min_void_r: f64,
+    /// Smallest void radius a chain accepts; `None` takes it from the mesh
+    /// ([`void_floor`]).
+    pub min_void_r: Option<f64>,
     /// Largest XY shift of the void between chained levels.
     pub max_shift: f64,
 }
@@ -34,6 +37,9 @@ pub struct Level {
     pub cy: f64,
     /// Void radius, 0 when there is none.
     pub void_r: f64,
+    /// The section's radius at the void's centre — the distance to the
+    /// nearest cell outside the filled cluster — 0 when there is no void.
+    pub sec_r: f64,
     /// Cell centres of the void's deep part, row-major.
     pub void_xy: Option<Vec<[f64; 2]>>,
     /// Vertices within `z_tol` of `z`, ascending.
@@ -61,6 +67,8 @@ struct Void {
     cy: f64,
     void_r: f64,
     void_xy: Option<Vec<[f64; 2]>>,
+    /// The peak's cell, row-major.
+    pk: usize,
 }
 
 /// A 2D convex hull's facet equations `(n0, n1, offset)`, inside where
@@ -159,6 +167,7 @@ fn locate_void(s: &Slab, occ_s: &[bool], void: &[bool], grid_res: f64) -> Void {
             cy,
             void_r,
             void_xy: None,
+            pk,
         };
     }
     let (vl, _) = label(&deep, nx, ny);
@@ -184,11 +193,19 @@ fn locate_void(s: &Slab, occ_s: &[bool], void: &[bool], grid_res: f64) -> Void {
         cy,
         void_r,
         void_xy: Some(void_xy),
+        pk,
     }
 }
 
-/// `_z_slice_void`: the void enclosed by the soma cluster `region`.
-fn slice_void(s: &Slab, region: &[bool], grid_res: f64) -> Option<Void> {
+/// Distance from cell `pk` to the nearest cell outside `filled`.
+fn section_radius(filled: &[bool], nx: usize, ny: usize, pk: usize, grid_res: f64) -> f64 {
+    let outside: Vec<bool> = filled.iter().map(|&f| !f).collect();
+    (sq_distance_to(&outside, nx, ny)[pk] as f64).sqrt() * grid_res
+}
+
+/// `_z_slice_void`: the void enclosed by the soma cluster `region`, and the
+/// section's radius at it.
+fn slice_void(s: &Slab, region: &[bool], grid_res: f64) -> Option<(Void, f64)> {
     let (nx, ny) = (s.nx, s.ny);
     let occ_s: Vec<bool> = s.occ.iter().zip(region).map(|(&o, &r)| o && r).collect();
     let filled = fill_holes(region, nx, ny);
@@ -199,17 +216,18 @@ fn slice_void(s: &Slab, region: &[bool], grid_res: f64) -> Option<Void> {
     if !void.iter().any(|&v| v) {
         return None;
     }
-    Some(locate_void(s, &occ_s, &void, grid_res))
+    let v = locate_void(s, &occ_s, &void, grid_res);
+    let sec = section_radius(&filled, nx, ny, v.pk, grid_res);
+    Some((v, sec))
 }
 
-/// Chains of consecutive levels whose voids are big enough and shift less
-/// than `max_shift`; the longest of at least two levels, the first among
-/// equals.
-fn longest_chain(levels: &[Level], p: &ZParams) -> Option<Vec<usize>> {
+/// Chains of two or more consecutive levels with a void of at least
+/// `min_void_r`, each centred less than `max_shift` from the one before.
+fn chains(levels: &[Level], min_void_r: f64, max_shift: f64) -> Vec<Vec<usize>> {
     let mut runs: Vec<Vec<usize>> = Vec::new();
     let mut cur: Vec<usize> = Vec::new();
     for (i, l) in levels.iter().enumerate() {
-        if l.void_r < p.min_void_r || l.cx.is_nan() {
+        if l.void_r < min_void_r || l.cx.is_nan() {
             if !cur.is_empty() {
                 runs.push(std::mem::take(&mut cur));
             }
@@ -217,7 +235,7 @@ fn longest_chain(levels: &[Level], p: &ZParams) -> Option<Vec<usize>> {
         }
         if let Some(&last) = cur.last() {
             let (dx, dy) = (l.cx - levels[last].cx, l.cy - levels[last].cy);
-            if (dx * dx + dy * dy).sqrt() >= p.max_shift {
+            if (dx * dx + dy * dy).sqrt() >= max_shift {
                 runs.push(std::mem::take(&mut cur));
             }
         }
@@ -226,13 +244,67 @@ fn longest_chain(levels: &[Level], p: &ZParams) -> Option<Vec<usize>> {
     if !cur.is_empty() {
         runs.push(cur);
     }
+    runs.retain(|r| r.len() >= 2);
+    runs
+}
+
+/// The longest chain past `min_void_r`, the first among equals.
+fn longest_chain(levels: &[Level], min_void_r: f64, max_shift: f64) -> Option<Vec<usize>> {
     let mut best: Option<Vec<usize>> = None;
-    for r in runs.into_iter().filter(|r| r.len() >= 2) {
+    for r in chains(levels, min_void_r, max_shift) {
         if best.as_ref().is_none_or(|b| r.len() > b.len()) {
             best = Some(r);
         }
     }
     best
+}
+
+/// The biggest void anywhere else in the cell than its body, when the
+/// body's void beats it.  The candidate is the chain of voided levels
+/// holding the cell's biggest void, its peak the first level with that
+/// void; its reach is its widest section's radius past the farthest of its
+/// centres from the peak's, in XY.  The body is every level within that
+/// reach of the peak's void centre, and above or below it, within its XY
+/// reach, every level whose section is still at least half the widest — a
+/// ring doubled from its exit's is the body, as the soma's stub erosion has
+/// it — so a tall soma stays whole and a neurite leaving it straight up or
+/// down counts as elsewhere.  A nucleus is the cell's one void a neurite
+/// cannot hold: the peak must beat the biggest void elsewhere by more than
+/// the grid resolves (a cell: each radius is uncertain by half of one);
+/// `None` when it does not — no nucleus.
+fn void_floor(levels: &[Level], grid_res: f64, max_shift: f64) -> Option<f64> {
+    let peak = |c: &[usize]| c.iter().map(|&i| levels[i].void_r).fold(0.0, f64::max);
+    let mut cand: Option<Vec<usize>> = None;
+    for c in chains(levels, f64::MIN_POSITIVE, max_shift) {
+        if cand.as_ref().is_none_or(|b| peak(&c) > peak(b)) {
+            cand = Some(c);
+        }
+    }
+    let cand = cand?;
+    let top = peak(&cand);
+    let pk = &levels[*cand.iter().find(|&&i| levels[i].void_r == top)?];
+    let (px, py, pz) = (pk.cx, pk.cy, pk.z);
+    let spread = cand
+        .iter()
+        .map(|&i| {
+            let l = &levels[i];
+            ((l.cx - px) * (l.cx - px) + (l.cy - py) * (l.cy - py)).sqrt()
+        })
+        .fold(0.0, f64::max);
+    let widest = cand.iter().map(|&i| levels[i].sec_r).fold(0.0, f64::max);
+    let foot = widest + spread;
+    let other = levels
+        .iter()
+        .filter(|l| {
+            let (dx, dy, dz) = (l.cx - px, l.cy - py, l.z - pz);
+            let flat = (dx * dx + dy * dy).sqrt();
+            let body = (dx * dx + dy * dy + dz * dz).sqrt() <= foot
+                || (flat <= foot && 2.0 * l.sec_r >= widest);
+            l.void_r > 0.0 && !l.cx.is_nan() && !body
+        })
+        .map(|l| l.void_r)
+        .fold(0.0, f64::max);
+    (top - other > grid_res).then_some(other)
 }
 
 /// The scan of one mesh.
@@ -242,12 +314,17 @@ pub struct ZScan {
     has_slab: Vec<bool>,
     /// Indices into `levels` of the nucleus chain.
     pub best: Option<Vec<usize>>,
+    /// The void a level needs to join a chain — given, or a grid cell past
+    /// the biggest void elsewhere in the cell ([`void_floor`]) — or `None`
+    /// when the mesh has no nucleus.
+    pub min_void_r: Option<f64>,
     xy: Vec<[f64; 2]>,
     p: ZParams,
 }
 
 impl ZScan {
-    /// Pass 1: every level on its own, then the longest chain.
+    /// Pass 1: every level on its own, then the void minimum and the
+    /// longest chain past it.
     pub fn new(verts: &[[f64; 3]], p: ZParams) -> ZScan {
         let (mut zmin, mut zmax) = (f64::INFINITY, f64::NEG_INFINITY);
         for v in verts {
@@ -272,6 +349,7 @@ impl ZScan {
                         cx: f64::NAN,
                         cy: f64::NAN,
                         void_r: 0.0,
+                        sec_r: 0.0,
                         void_xy: None,
                         vi,
                         soma_mask: None,
@@ -280,21 +358,28 @@ impl ZScan {
                         return (level, false);
                     };
                     level.soma_mask = Some(slab.cell.iter().map(|&c| region[c]).collect());
-                    if let Some(v) = slice_void(&slab, &region, p.grid_res) {
+                    if let Some((v, sec)) = slice_void(&slab, &region, p.grid_res) {
                         level.cx = v.cx;
                         level.cy = v.cy;
                         level.void_r = v.void_r;
+                        level.sec_r = sec;
                         level.void_xy = v.void_xy;
                     }
                     (level, true)
                 })
                 .unzip()
         });
-        let best = longest_chain(&levels, &p);
+        // the chain's levels beat the void elsewhere by a cell, too
+        let min_void_r = match p.min_void_r {
+            Some(r) => Some(r),
+            None => void_floor(&levels, p.grid_res, p.max_shift).map(|o| o + p.grid_res),
+        };
+        let best = min_void_r.and_then(|r| longest_chain(&levels, r, p.max_shift));
         ZScan {
             levels,
             has_slab,
             best,
+            min_void_r,
             xy,
             p,
         }
@@ -334,20 +419,40 @@ impl ZScan {
     /// that found none, inside `hull_lo` / `hull_hi` (the hulls of the end
     /// levels' soma clusters; `None` skips that side), then the chain again.
     pub fn retry(&mut self, hull_lo: Option<&Hull>, hull_hi: Option<&Hull>) {
-        let Some((lo, _)) = self.chain_ends() else {
+        let (Some((lo, _)), Some(min_void_r)) = (self.chain_ends(), self.min_void_r) else {
             return;
         };
         let p = self.p;
+        // a level whose largest cluster lies outside the chain end's hull
+        // (its centroid, within a cell, as the second look takes clusters)
+        // saw another structure, not a broken soma ring: it is not looked
+        // at again
         let todo: Vec<usize> = self
             .retry_levels()
             .into_iter()
             .filter(|&i| {
                 let l = &self.levels[i];
-                !(l.void_r >= p.min_void_r && !l.cx.is_nan())
+                let hull = if i < lo { hull_lo } else { hull_hi };
+                let ours = match (hull, self.soma_vertices(i)) {
+                    (Some(h), Some(sv)) if !sv.is_empty() => {
+                        let n = sv.len() as f64;
+                        let col = |k: usize| {
+                            numpy_sum(
+                                &sv.iter()
+                                    .map(|&v| self.xy[v as usize][k])
+                                    .collect::<Vec<_>>(),
+                            ) / n
+                        };
+                        let (x, y) = (col(0), col(1));
+                        h.iter().all(|e| x * e[0] + y * e[1] + e[2] <= p.grid_res)
+                    }
+                    _ => true,
+                };
+                !(l.void_r >= min_void_r && !l.cx.is_nan()) && ours
             })
             .collect();
         let (levels, xy) = (&self.levels, &self.xy);
-        let found: Vec<(usize, Void, Vec<bool>)> = threads::install(|| {
+        let found: Vec<(usize, (Void, f64), Vec<bool>)> = threads::install(|| {
             todo.par_iter()
                 .filter_map(|&i| {
                     let hull = if i < lo { hull_lo } else { hull_hi }?;
@@ -357,15 +462,16 @@ impl ZScan {
                 })
                 .collect()
         });
-        for (i, v, mask) in found {
+        for (i, (v, sec), mask) in found {
             let l = &mut self.levels[i];
             l.cx = v.cx;
             l.cy = v.cy;
             l.void_r = v.void_r;
+            l.sec_r = sec;
             l.void_xy = v.void_xy;
             l.soma_mask = Some(mask);
         }
-        if let Some(b) = longest_chain(&self.levels, &p) {
+        if let Some(b) = longest_chain(&self.levels, min_void_r, p.max_shift) {
             self.best = Some(b);
         }
     }
@@ -383,8 +489,9 @@ impl ZScan {
 
 /// The retry on one slab: clusters whose centroid lies inside the hull
 /// (within one cell) form the soma, and the void is sought inside the hull.
-/// Returns the void and the new soma mask over the level's vertices.
-fn hull_guided_void(s: &Slab, hull: &Hull, grid_res: f64) -> Option<(Void, Vec<bool>)> {
+/// Returns the void with the section's radius at it (the hull's), and the
+/// new soma mask over the level's vertices.
+fn hull_guided_void(s: &Slab, hull: &Hull, grid_res: f64) -> Option<((Void, f64), Vec<bool>)> {
     let (nx, ny) = (s.nx, s.ny);
     let centre = |i: f64, j: f64| {
         [
@@ -434,7 +541,9 @@ fn hull_guided_void(s: &Slab, hull: &Hull, grid_res: f64) -> Option<(Void, Vec<b
     if !void.iter().any(|&v| v) {
         return None;
     }
-    Some((locate_void(s, &occ_h, &void, grid_res), mask))
+    let v = locate_void(s, &occ_h, &void, grid_res);
+    let sec = section_radius(&hull_mask, nx, ny, v.pk, grid_res);
+    Some(((v, sec), mask))
 }
 
 #[cfg(test)]
@@ -466,7 +575,7 @@ mod tests {
         let p = ZParams {
             grid_res: 200.0,
             z_tol: 150.0,
-            min_void_r: 500.0,
+            min_void_r: Some(500.0),
             max_shift: 3000.0,
         };
         let scan = ZScan::new(&verts, p);
@@ -475,5 +584,48 @@ mod tests {
         let c = scan.center().unwrap();
         assert!(c[0].abs() < 300.0 && c[1].abs() < 300.0, "{c:?}");
         assert!(scan.levels[best[0]].void_r > 2000.0);
+    }
+
+    /// Hollow rings of radius `r` round `(x, y)`, stacked 100 apart over
+    /// `n` levels from `z`.
+    fn rings(verts: &mut Vec<[f64; 3]>, [x, y, z]: [f64; 3], r: f64, n: usize) {
+        for zi in 0..n {
+            for k in 0..400 {
+                let a = k as f64 * std::f64::consts::TAU / 400.0;
+                for rr in [r, r + 100.0] {
+                    verts.push([x + rr * a.cos(), y + rr * a.sin(), z + zi as f64 * 100.0]);
+                }
+            }
+        }
+    }
+
+    /// The mesh sets the void minimum: a wide hollow standing out of the
+    /// cell's other voids is the nucleus, its chain a grid cell past the
+    /// biggest of them; two alike stand out of nothing.
+    #[test]
+    fn the_void_minimum_is_the_biggest_void_elsewhere() {
+        let p = ZParams {
+            grid_res: 200.0,
+            z_tol: 150.0,
+            min_void_r: None,
+            max_shift: 3000.0,
+        };
+        let (mut body, mut twins) = (Vec::new(), Vec::new());
+        rings(&mut body, [0.0, 0.0, 0.0], 3000.0, 20);
+        rings(&mut body, [20000.0, 0.0, 3000.0], 600.0, 20);
+        let scan = ZScan::new(&body, p);
+        let floor = scan.min_void_r.expect("a nucleus");
+        // a grid cell past the thin hollow's void
+        assert!((700.0..900.0).contains(&floor), "{floor}");
+        let c = scan.center().expect("a chain");
+        assert!(
+            c[0].abs() < 300.0 && c[1].abs() < 300.0 && c[2] < 2000.0,
+            "{c:?}"
+        );
+
+        rings(&mut twins, [0.0, 0.0, 0.0], 600.0, 20);
+        rings(&mut twins, [20000.0, 0.0, 3000.0], 600.0, 20);
+        let scan = ZScan::new(&twins, p);
+        assert!(scan.min_void_r.is_none() && scan.best.is_none());
     }
 }

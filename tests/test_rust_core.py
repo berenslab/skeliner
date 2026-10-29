@@ -970,15 +970,19 @@ class TestZScan:
         v = _hollow_soma()
         assert_parity(*both(pre._z_scan, v))
         assert_parity(*both(pre._z_scan, v, retry_broken=False))
+        assert_parity(*both(pre._z_scan, v, min_void_r=500.0))
+        assert_parity(*both(pre._z_scan, v, min_void_r=500.0, retry_broken=False))
         no_chain = v[np.abs(v[:, 2]) < 200]
         assert_parity(*both(pre._z_scan, no_chain))
         mesh = trimesh.Trimesh(vertices=v, process=False)
         assert_parity(*both(pre.find_nucleus_center, mesh))
 
     def test_the_hull_pass_lengthens_the_chain(self):
+        # past a fixed 500 nm the broken rings find no void: the mesh's own
+        # floor, with nothing else in it, takes their small voids at once
         v = _hollow_soma()
-        both_passes = pre._z_scan(v)
-        first_only = pre._z_scan(v, retry_broken=False)
+        both_passes = pre._z_scan(v, min_void_r=500.0)
+        first_only = pre._z_scan(v, min_void_r=500.0, retry_broken=False)
         # the second pass recovers the broken levels
         assert len(both_passes[1]) > len(first_only[1]) >= 5
 

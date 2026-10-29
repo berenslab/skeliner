@@ -840,24 +840,30 @@ class TestFindNucleusCenter:
         ball = trimesh.creation.icosphere(subdivisions=5, radius=3000.0)
         assert pre._median_edge(ball) < 200.0
         found = pre.find_nucleus_center(ball)
-        fixed = pre.find_nucleus_center(
-            ball, grid_res=200.0, z_tol=150.0, min_void_r=500.0
-        )
+        fixed = pre.find_nucleus_center(ball, grid_res=200.0, z_tol=150.0)
         assert np.array_equal(found["center"], fixed["center"])
         assert np.array_equal(found["slices"], fixed["slices"])
 
-    def test_a_thick_neurites_lumen_on_a_coarse_mesh_is_no_nucleus(self):
-        # a hollow neurite 2.2 um thick lying flat, on ~470 nm edges: its
-        # lumen is a 940 nm void, past 500 nm but two grid cells deep, short
-        # of the 2.5 cells 500 nm is on a 200 nm grid
-        tube = trimesh.creation.cylinder(radius=1100.0, height=15000.0, sections=16)
-        tube = tube.subdivide_to_size(max_edge=500.0)
-        tube.apply_transform(
-            trimesh.transformations.rotation_matrix(np.pi / 2, [0, 1, 0])
-        )
-        assert pre._median_edge(tube) > 400.0
-        assert len(pre.find_nucleus_center(tube, min_void_r=500.0)["slices"]) > 2
-        assert pre.find_nucleus_center(tube) is None
+    def test_a_void_standing_out_of_no_other_is_no_nucleus(self):
+        # two hollow neurites 2.2 um thick lying flat, apart: a fixed 500 nm
+        # passes their lumens, but neither stands out of the other's; a
+        # hollow 3 um ball in place of one stands out of it
+        def tube(y, z):
+            t = trimesh.creation.cylinder(radius=1100.0, height=15000.0, sections=16)
+            t = t.subdivide_to_size(max_edge=500.0)
+            t.apply_transform(
+                trimesh.transformations.rotation_matrix(np.pi / 2, [0, 1, 0])
+            )
+            t.vertices[:, 1:] += [y, z]
+            return t
+
+        twins = trimesh.util.concatenate([tube(0.0, 0.0), tube(20000.0, 8000.0)])
+        assert len(pre.find_nucleus_center(twins, min_void_r=500.0)["slices"]) > 2
+        assert pre.find_nucleus_center(twins) is None
+        ball = trimesh.creation.icosphere(subdivisions=4, radius=3000.0)
+        body = trimesh.util.concatenate([ball, tube(20000.0, 8000.0)])
+        found = pre.find_nucleus_center(body)
+        assert np.abs(found["center"]).max() < 500.0
 
 
 # ── find_soma ─────────────────────────────────────────

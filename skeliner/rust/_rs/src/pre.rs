@@ -1521,12 +1521,13 @@ struct PyZScan {
 #[pymethods]
 impl PyZScan {
     #[new]
+    #[pyo3(signature = (vertices, grid_res, z_tol, min_void_r, max_shift))]
     fn new(
         py: Python<'_>,
         vertices: PyReadonlyArray2<'_, f64>,
         grid_res: f64,
         z_tol: f64,
-        min_void_r: f64,
+        min_void_r: Option<f64>,
         max_shift: f64,
     ) -> PyResult<Self> {
         let verts = rows3("V", &vertices)?;
@@ -1545,6 +1546,12 @@ impl PyZScan {
     #[getter]
     fn best(&self) -> Option<Vec<usize>> {
         self.inner.best.clone()
+    }
+
+    /// The void a level needs to join the chain, or None: no nucleus.
+    #[getter]
+    fn min_void_r(&self) -> Option<f64> {
+        self.inner.min_void_r
     }
 
     /// The chain's first and last level, or None.

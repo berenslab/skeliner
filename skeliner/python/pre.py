@@ -4,6 +4,7 @@ Rust crate ``pre`` runs them."""
 from __future__ import annotations
 
 import math
+import sys
 from collections import Counter, defaultdict, deque
 
 import numpy as np
@@ -4965,7 +4966,8 @@ def z_slice_void(
 class ZScan:
     """The Z-level scan of a mesh's vertices that finds the nucleus: per
     level, the largest cluster of the vertices near it and the void inside
-    that cluster, then the longest chain of levels whose voids line up.
+    that cluster, then the longest chain of levels whose voids line up past
+    the void minimum — given, or the mesh's own (:meth:`_void_floor`).
 
     Construction runs the first pass, each level on its own, and finds the
     chain; :meth:`retry` runs the second, on the levels next to the chain
@@ -4978,15 +4980,19 @@ class ZScan:
         vertices,
         grid_res: float,
         z_tol: float,
-        min_void_r: float,
+        min_void_r: float | None,
         max_shift: float,
     ):
-        from scipy.ndimage import binary_dilation, label
+        from scipy.ndimage import (
+            binary_dilation,
+            binary_fill_holes,
+            distance_transform_edt,
+            label,
+        )
 
         verts = rows3("V", vertices)
         self._verts = verts
         self._grid_res = grid_res
-        self._min_void_r = min_void_r
         self._max_shift = max_shift
 
         z_unique = np.unique(verts[:, 2])
@@ -4998,6 +5004,8 @@ class ZScan:
         #   vert_indices: indices into the vertices near this Z
         #   soma_mask: bool array over vert_indices, True = in soma cluster
         raw: list[tuple] = []
+        # the section's radius at each level's void, 0 without one
+        sec: list[float] = []
         # the grid data, for pass 2: (occ, ix, iy, xy_min, labeled)
         grid_data: list[tuple | None] = []
 
@@ -5009,6 +5017,7 @@ class ZScan:
             cluster = z_slice_cluster(pts, grid_res)
             if cluster is None:
                 raw.append((z, np.nan, np.nan, 0.0, None, vi, None))
+                sec.append(0.0)
                 grid_data.append(None)
                 continue
 
@@ -5024,24 +5033,35 @@ class ZScan:
             void_result = z_slice_void(occ, soma_region, xy_min, grid_res)
             if void_result is None:
                 raw.append((z, np.nan, np.nan, 0.0, None, vi, soma_mask))
+                sec.append(0.0)
             else:
                 cx, cy, void_r, void_xy = void_result
                 raw.append((z, cx, cy, void_r, void_xy, vi, soma_mask))
+                pi = round((cx - xy_min[0] - grid_res / 2) / grid_res)
+                pj = round((cy - xy_min[1] - grid_res / 2) / grid_res)
+                inside = distance_transform_edt(binary_fill_holes(soma_region))
+                sec.append(float(inside[pi, pj]) * grid_res)
 
         self._raw = raw
+        self._sec = sec
         self._grid_data = grid_data
-        self.best = self._chain()
+        if min_void_r is None:
+            floor = self._void_floor()
+            # the chain's levels beat the void elsewhere by a cell, too
+            min_void_r = None if floor is None else floor + grid_res
+        self.min_void_r = min_void_r
+        self.best = None if min_void_r is None else self._chain(min_void_r)
 
-    def _chain(self) -> list[int] | None:
-        """The longest run of two or more consecutive levels with a void of
-        at least ``min_void_r``, each centred within ``max_shift`` of the
-        one before; None when there is none."""
+    def _chains(self, min_void_r: float) -> list[list[int]]:
+        """Runs of two or more consecutive levels with a void of at least
+        *min_void_r*, each centred less than ``max_shift`` from the one
+        before."""
         raw = self._raw
         runs: list[list[int]] = []
         cur: list[int] = []
         for i, entry in enumerate(raw):
             cx, cy, r = entry[1], entry[2], entry[3]
-            if r < self._min_void_r or np.isnan(cx):
+            if r < min_void_r or np.isnan(cx):
                 if cur:
                     runs.append(cur)
                     cur = []
@@ -5057,9 +5077,61 @@ class ZScan:
                     cur = [i]
         if cur:
             runs.append(cur)
+        return [r for r in runs if len(r) >= 2]
 
-        runs = [r for r in runs if len(r) >= 2]
+    def _chain(self, min_void_r: float) -> list[int] | None:
+        """The longest run past *min_void_r*, the first among equals; None
+        when there is none."""
+        runs = self._chains(min_void_r)
         return max(runs, key=len) if runs else None
+
+    def _void_floor(self) -> float | None:
+        """The biggest void anywhere else in the cell than its body, when the
+        body's void beats it.  The candidate is the run of voided levels
+        holding the cell's biggest void, its peak the first level with that
+        void; its reach is its widest section's radius past the farthest of
+        its centres from the peak's, in XY.  The body is every level within
+        that reach of the peak's void centre, and above or below it, within
+        its XY reach, every level whose section is still at least half the
+        widest — a ring doubled from its exit's is the body, as the soma's
+        stub erosion has it — so a tall soma stays whole and a neurite
+        leaving it straight up or down counts as elsewhere.  A nucleus is
+        the cell's one void a neurite cannot hold: the peak must beat the
+        biggest void elsewhere by more than the grid resolves (a cell: each
+        radius is uncertain by half of one); None when it does not — no
+        nucleus."""
+        raw, sec = self._raw, self._sec
+        cand, peak = None, 0.0
+        for run in self._chains(sys.float_info.min):
+            p = max(raw[i][3] for i in run)
+            if cand is None or p > peak:
+                cand, peak = run, p
+        if cand is None:
+            return None
+        pk = next(i for i in cand if raw[i][3] == peak)
+        pz, px, py = raw[pk][0], raw[pk][1], raw[pk][2]
+
+        def off(i):
+            dx, dy = raw[i][1] - px, raw[i][2] - py
+            return math.sqrt(dx * dx + dy * dy)
+
+        widest = max(sec[i] for i in cand)
+        foot = widest + max(off(i) for i in cand)
+
+        def body(i):
+            dx, dy, dz = raw[i][1] - px, raw[i][2] - py, raw[i][0] - pz
+            near = math.sqrt(dx * dx + dy * dy + dz * dz) <= foot
+            return near or (off(i) <= foot and 2.0 * sec[i] >= widest)
+
+        other = max(
+            (
+                raw[i][3]
+                for i in range(len(raw))
+                if raw[i][3] > 0.0 and not np.isnan(raw[i][1]) and not body(i)
+            ),
+            default=0.0,
+        )
+        return other if peak - other > self._grid_res else None
 
     def chain_ends(self) -> tuple[int, int] | None:
         """The chain's first and last level, or None."""
@@ -5106,7 +5178,7 @@ class ZScan:
             if i in best_set:
                 continue
             r_existing = raw[i][3]
-            if r_existing >= self._min_void_r and not np.isnan(raw[i][1]):
+            if r_existing >= self.min_void_r and not np.isnan(raw[i][1]):
                 continue  # already good
 
             gd = grid_data[i]
@@ -5118,6 +5190,18 @@ class ZScan:
             equations = hull_lo if i < chain_lo else hull_hi
             if equations is None:
                 continue
+            # a level whose largest cluster lies outside it (its centroid,
+            # within a cell, as the second look takes clusters) saw another
+            # structure, not a broken soma ring: it is not looked at again
+            vi_i, mask_i = raw[i][5], raw[i][6]
+            if mask_i is not None and mask_i.any():
+                sv = self._verts[vi_i[mask_i]]
+                mx = float(np.sum(sv[:, 0])) / len(sv)
+                my = float(np.sum(sv[:, 1])) / len(sv)
+                if not all(
+                    eq[0] * mx + eq[1] * my + eq[2] <= grid_res for eq in equations
+                ):
+                    continue
 
             # Build hull mask on this level's grid: for each grid cell,
             # test if its centre falls inside the reference convex hull.
@@ -5192,7 +5276,7 @@ class ZScan:
             raw[i] = (z, cx, cy, void_r, void_xy, vi, soma_mask_new)
 
         # Re-run spatial coherence with potentially new void detections
-        chain = self._chain()
+        chain = self._chain(self.min_void_r)
         if chain is not None:
             self.best = chain
 

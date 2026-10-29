@@ -5456,12 +5456,16 @@ def find_nucleus_center(
         Maximum XY displacement (nm) between consecutive Z-levels for
         a void to be considered part of the same chain.
     min_void_r : float or None
-        Minimum void radius (nm) to be considered a candidate.  ``None``
-        (default) takes 2.5 grid cells: on EyeWire 2's 200 nm grid, where
-        it was set and validated, the 500 nm that lies past the gaps between
-        a soma's vertices.  In cells it follows the grid as the grid
-        follows the mesh — at a fixed 500 nm a coarse mesh's grid let the
-        lumen of a thick neurite pass for a nucleus.
+        Minimum void radius (nm) for a Z-level to join the chain.  ``None``
+        (default) takes it from the mesh: a nucleus is the cell's one void
+        no neurite can hold, so the chain holding the cell's biggest void
+        must beat every void elsewhere in the cell — outside its own body,
+        which a neurite leaving it is not — by more than one grid cell (what
+        the grid resolves), and the chain's levels must beat that biggest
+        void elsewhere by a cell too.  A cell whose biggest void does not
+        stand out has no nucleus.  A fixed size cannot do this: EyeWire 2's
+        500 nm let the lumens of hemibrain's and EyeWire 1's thick neurites
+        pass.
     verbose : bool
         Print progress.
 
@@ -5486,8 +5490,6 @@ def find_nucleus_center(
         edge = _median_edge(mesh) if len(mesh.faces) else 0.0
         grid_res = max(200.0, edge) if grid_res is None else grid_res
         z_tol = max(150.0, 0.75 * edge) if z_tol is None else z_tol
-    if min_void_r is None:
-        min_void_r = grid_res * 5.0 / 2.0
     if verbose:
         z_unique = np.unique(verts[:, 2])
         n_levels = int((z_unique.max() - z_unique.min()) / 210)
@@ -5545,7 +5547,7 @@ def _z_scan(
     verts: np.ndarray,
     grid_res: float = 200.0,
     z_tol: float = 150.0,
-    min_void_r: float = 500.0,
+    min_void_r: float | None = None,
     max_shift: float = 3000.0,
     retry_broken: bool = True,
 ) -> tuple[list[tuple], list[int] | None, np.ndarray | None]:
@@ -5553,7 +5555,8 @@ def _z_scan(
 
     Two-pass approach:
 
-    1. Per-Z independent clustering + void detection → find best chain.
+    1. Per-Z independent clustering + void detection → find best chain,
+       past *min_void_r* or, when None, the mesh's own void minimum.
     2. Hull-guided void detection for Z-levels where the soma ring has
        holes (mesh artifacts / missing faces).  The gap breaks the
        4-ray enclosure test, so the void goes undetected.  Pass 2
