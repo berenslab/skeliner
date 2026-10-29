@@ -164,6 +164,30 @@ def _face_edge_components(mesh: Mesh) -> tuple[np.ndarray, int]:
     return kernels.pre.face_edge_components(faces, len(mesh.vertices))
 
 
+def _main_component(
+    mesh: Mesh, labels: np.ndarray, largest: int, soma: "Soma | None"
+) -> int:
+    """The cell's main component: the one its soma lies on, else *largest*.
+
+    A soma need not lie on the largest component — a segmentation can cut
+    it from its arbor, which is then the larger piece.  Its vertices vote
+    with their last face's component, as the ring kernel counts them, so
+    the surfaces it holds inside are outvoted by its membrane; ties go to
+    the lowest label.
+    """
+    if soma is None or soma.verts is None or len(soma.verts) == 0:
+        return int(largest)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    last = np.full(len(mesh.vertices), -1, dtype=np.int64)
+    last[faces.ravel()] = np.repeat(np.arange(len(faces)), 3)
+    on = last[np.asarray(soma.verts, dtype=np.int64)]
+    comp = np.asarray(labels)[on[on >= 0]]
+    comp = comp[comp >= 0]
+    if len(comp) == 0:
+        return int(largest)
+    return int(np.bincount(comp).argmax())
+
+
 @_deprecated()
 @mesh_args()
 def find_holes(
@@ -3256,7 +3280,8 @@ def find_disconnected(
     """Detect disconnected mesh components from segmentation errors.
 
     Returns disconnected components — broken neurite segments that are
-    separate from the main mesh.  Soma-region components, organelle
+    separate from the main mesh: the component the soma lies on, or the
+    largest when there is no soma.  Soma-region components, organelle
     components, and components enclosed by the main mesh are excluded.
 
     Parameters
@@ -3306,6 +3331,7 @@ def find_disconnected(
             organelles=organelles,
             mesh_stats=mesh_stats,
         )
+    main = _main_component(mesh, labels, main, soma)
 
     found = kernels.pre.find_disconnected(
         np.asarray(mesh.faces, dtype=np.int64),
@@ -3371,7 +3397,8 @@ def find_gaps(
     """Detect gaps between disconnected components and the main mesh.
 
     Each gap is a pair of face groups — the tip faces on each side of
-    the break — ready for bridging.
+    the break — ready for bridging.  The main mesh is the component the
+    soma lies on, or the largest when there is no soma.
 
     Parameters
     ----------
@@ -3383,7 +3410,8 @@ def find_gaps(
     verbose : bool, default False
         Print summary.
     soma : Soma or None
-        Pre-computed soma from any ``find_soma_via_*`` function.
+        Pre-computed soma from any ``find_soma_via_*`` function; found
+        when neither it nor *disconnected* is given.
     disconnected : list[list[int]] or None
         Pre-computed disconnected components from :func:`find_disconnected`.
     fusions : list[list[int]] or None
@@ -3483,6 +3511,11 @@ def find_gaps(
     labels_pre_fusion = labels
     if fusions:
         labels, main = _refine_components_with_fusions(mesh, labels, main, fusions)
+    # found here when find_disconnected would find it, so both name the
+    # same main component
+    if soma is None and disconnected is None:
+        soma = find_soma(mesh, organelles=organelles, mesh_stats=mesh_stats)
+    main = _main_component(mesh, labels, main, soma)
 
     # Get disconnected components (reuse filtering logic)
     if disconnected is not None:
@@ -5375,9 +5408,9 @@ def find_nucleus_center(
     grid_res: float | None = None,
     z_tol: float | None = None,
     max_shift: float = 3000.0,
-    min_void_r: float = 500.0,
+    min_void_r: float | None = None,
     verbose: bool = False,
-) -> np.ndarray | None:
+) -> dict | None:
     """Locate the nucleus center from the mesh geometry alone.
 
     The nucleus membrane folds inward from the soma surface, creating
@@ -5422,8 +5455,13 @@ def find_nucleus_center(
     max_shift : float
         Maximum XY displacement (nm) between consecutive Z-levels for
         a void to be considered part of the same chain.
-    min_void_r : float
-        Minimum void radius (nm) to be considered a candidate.
+    min_void_r : float or None
+        Minimum void radius (nm) to be considered a candidate.  ``None``
+        (default) takes 2.5 grid cells: on EyeWire 2's 200 nm grid, where
+        it was set and validated, the 500 nm that lies past the gaps between
+        a soma's vertices.  In cells it follows the grid as the grid
+        follows the mesh — at a fixed 500 nm a coarse mesh's grid let the
+        lumen of a thick neurite pass for a nucleus.
     verbose : bool
         Print progress.
 
@@ -5448,6 +5486,8 @@ def find_nucleus_center(
         edge = _median_edge(mesh) if len(mesh.faces) else 0.0
         grid_res = max(200.0, edge) if grid_res is None else grid_res
         z_tol = max(150.0, 0.75 * edge) if z_tol is None else z_tol
+    if min_void_r is None:
+        min_void_r = grid_res * 5.0 / 2.0
     if verbose:
         z_unique = np.unique(verts[:, 2])
         n_levels = int((z_unique.max() - z_unique.min()) / 210)

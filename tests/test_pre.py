@@ -438,6 +438,33 @@ class TestFindDisconnected:
         assert len(comps) == 2
         assert len(comps[0]) >= len(comps[1])
 
+    def test_the_main_component_is_the_somas_not_the_largest(self):
+        """A soma cut from its arbor by the segmentation: the arbor is the
+        larger piece, and still the one bridged to the soma."""
+        ball = trimesh.creation.icosphere(subdivisions=3, radius=3000.0)
+        tube = trimesh.creation.capsule(height=20000.0, radius=400.0, count=[32, 32])
+        tube.apply_transform(
+            trimesh.transformations.rotation_matrix(np.pi / 2, [0, 1, 0])
+        )
+        tube.vertices[:, 0] += 3000.0 + 300.0 + 10400.0
+        n = len(ball.vertices)
+        mesh = trimesh.Trimesh(
+            np.vstack([ball.vertices, tube.vertices]),
+            np.vstack([ball.faces, tube.faces + n]),
+            process=False,
+        )
+        assert len(tube.faces) > len(ball.faces)
+        soma = Soma.fit(ball.vertices, verts=np.arange(n))
+        labels, largest = pre._face_edge_components(mesh)
+        assert largest == labels[len(ball.faces)]
+        assert pre._main_component(mesh, labels, largest, soma) == labels[0]
+        assert pre._main_component(mesh, labels, largest, None) == largest
+
+        comps = pre.find_disconnected(mesh, soma=soma)
+        assert [len(c) for c in comps] == [len(tube.faces)]
+        gaps = pre.find_gaps(mesh, soma=soma, **NO_CAP)
+        assert [sorted(g[3:5]) for g in gaps] == [[-1, 0]]
+
 
 # ── find_gaps / remove_gaps ──────────────────────────────────────────
 
@@ -813,9 +840,24 @@ class TestFindNucleusCenter:
         ball = trimesh.creation.icosphere(subdivisions=5, radius=3000.0)
         assert pre._median_edge(ball) < 200.0
         found = pre.find_nucleus_center(ball)
-        fixed = pre.find_nucleus_center(ball, grid_res=200.0, z_tol=150.0)
+        fixed = pre.find_nucleus_center(
+            ball, grid_res=200.0, z_tol=150.0, min_void_r=500.0
+        )
         assert np.array_equal(found["center"], fixed["center"])
         assert np.array_equal(found["slices"], fixed["slices"])
+
+    def test_a_thick_neurites_lumen_on_a_coarse_mesh_is_no_nucleus(self):
+        # a hollow neurite 2.2 um thick lying flat, on ~470 nm edges: its
+        # lumen is a 940 nm void, past 500 nm but two grid cells deep, short
+        # of the 2.5 cells 500 nm is on a 200 nm grid
+        tube = trimesh.creation.cylinder(radius=1100.0, height=15000.0, sections=16)
+        tube = tube.subdivide_to_size(max_edge=500.0)
+        tube.apply_transform(
+            trimesh.transformations.rotation_matrix(np.pi / 2, [0, 1, 0])
+        )
+        assert pre._median_edge(tube) > 400.0
+        assert len(pre.find_nucleus_center(tube, min_void_r=500.0)["slices"]) > 2
+        assert pre.find_nucleus_center(tube) is None
 
 
 # ── find_soma ─────────────────────────────────────────
