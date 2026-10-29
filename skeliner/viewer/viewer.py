@@ -391,6 +391,10 @@ def _create_app(
         # taken per request so that a re-derive nobody passed it to still
         # uses the floor the current components were produced with.
         "claim_min_faces": _CLAIM_MIN_FACES,
+        # Whether the soma is the user's: made or edited by a reassignment.
+        # Input state too — /preprocess takes it instead of find_soma's, so
+        # a soma assigned where none was found is not lost to the next run.
+        "soma_by_hand": False,
     }
 
     def _claim_floor(body) -> int:
@@ -953,6 +957,7 @@ def _create_app(
             mesh_state[key] = None
         mesh_state["rescued"] = np.empty(0, dtype=np.int64)
         mesh_state["released"] = np.empty(0, dtype=np.int64)
+        mesh_state["soma_by_hand"] = False
         _undo_stack.clear()
 
     async def _apply_upload(tmp_path: Path, *, reset: bool = True):
@@ -1770,6 +1775,7 @@ def _create_app(
             return JSONResponse({"ok": False, "error": "No soma found"})
 
         mesh_state["soma"] = soma
+        mesh_state["soma_by_hand"] = False
 
         from skeliner.pre import soma_face_mask
 
@@ -3014,7 +3020,8 @@ def _create_app(
         This *is* ``pre.preprocess`` rather than the panel's buttons pressed
         in order by the server, so the viewer and the library cannot drift
         into two pipelines wearing one name.  Its soma comes from
-        ``find_soma``, as the Soma button's does.
+        ``find_soma``, as the Soma button's does — unless the soma is the
+        user's, assigned or edited by hand, which it takes instead.
 
         Left uncompacted.  ``compact_mesh`` reindexes faces, and annotations,
         the rescue list and every loaded skeleton are all stated in face ids;
@@ -3040,6 +3047,7 @@ def _create_app(
             preprocess,
             mesh,
             organelles=bool(body.get("organelles", True)),
+            soma=mesh_state["soma"] if mesh_state["soma_by_hand"] else None,
             rescued=mesh_state["rescued"],
             released=mesh_state["released"],
             claim_min_faces=floor,
@@ -3063,12 +3071,22 @@ def _create_app(
         return JSONResponse({"ok": True, **out})
 
     def _current_components():
-        """A MeshComponents view of what the viewer currently holds."""
-        from skeliner.dataclass import Discarded, MeshComponents, Neurites
+        """A MeshComponents view of what the viewer currently holds.  No
+        organelles detected — or none looked for, as on a mesh that traces
+        none — is none there."""
+        from skeliner.dataclass import (
+            Discarded,
+            MeshComponents,
+            Neurites,
+            Organelles,
+        )
 
+        org = mesh_state["organelles"]
+        if org is None:
+            org = Organelles.empty(len(mesh_state["mesh"].faces))
         return MeshComponents(
             soma=mesh_state.get("soma"),
-            organelles=mesh_state["organelles"],
+            organelles=org,
             neurites=mesh_state.get("neurites") or Neurites([]),
             discarded=mesh_state.get("discarded") or Discarded([]),
         )
@@ -3101,19 +3119,13 @@ def _create_app(
         """Preview handing the selected faces to soma / organelle / neurites."""
         from skeliner.pre import preview_reassignment
 
+        # Nothing need have run on a freshly loaded cell: no organelles is
+        # none, and the preview derives the components from the edited
+        # state — a soma assigned by hand where find_soma found none splits
+        # the cell itself.
         if mesh_state["mesh"] is None:
             return JSONResponse(
                 {"ok": False, "error": "No mesh loaded"}, status_code=400
-            )
-        if mesh_state.get("organelles") is None:
-            return JSONResponse(
-                {"ok": False, "error": "Run organelle detection first"},
-                status_code=400,
-            )
-        if not mesh_state.get("neurites"):
-            return JSONResponse(
-                {"ok": False, "error": "Run break_up_mesh first"},
-                status_code=400,
             )
 
         body = await request.json()
@@ -3173,7 +3185,10 @@ def _create_app(
             )
 
         components = _current_components()
+        had_soma = components.soma is not None
         apply_reassignment(components, r)
+        if r.target == "soma" or (r.target == "remainder" and had_soma):
+            mesh_state["soma_by_hand"] = components.soma is not None
         # The same set the preview ran with, so what was forecast is what
         # is now in force — and what the next re-derive will honour.
         mesh_state["released"] = _released_after(r.target, r.selected)

@@ -149,12 +149,28 @@ def reassign_client(tmp_path, monkeypatch):
         yield client, state, neurites
 
 
-def test_reassign_refuses_before_components_exist(reassign_client):
+def test_a_soma_is_assigned_on_a_freshly_loaded_cell(reassign_client):
+    # nothing has run: no organelles, no components, no soma — the faces
+    # become the soma and the components are derived from it; the next
+    # preprocess takes that soma instead of find_soma's
     client, state, _ = reassign_client
-    state["neurites"] = Neurites([])
-    r = client.post("/reassign_preview", json={"faces": [0], "to": "soma"})
-    assert r.status_code == 400
-    assert "break_up_mesh" in r.json()["error"]
+    state["soma"] = None
+    state["organelles"] = None
+    state["neurites"] = None
+    state["discarded"] = None
+    faces = np.asarray(state["mesh"].faces)
+    z = state["mesh"].vertices[faces].mean(axis=1)[:, 2]
+    sel = np.flatnonzero(np.abs(z) <= 100.0).tolist()
+
+    r = client.post("/reassign_preview", json={"faces": sel, "to": "soma"})
+    assert r.status_code == 200, r.json()
+    assert client.post("/reassign_apply").json()["ok"]
+    assert state["soma"] is not None and state["soma_by_hand"]
+    soma = state["soma"]
+
+    assert client.post("/preprocess", json={"organelles": False}).json()["ok"]
+    assert state["soma"] is not None and state["soma_by_hand"]
+    assert np.allclose(state["soma"].center, soma.center)
 
 
 @pytest.mark.parametrize(
@@ -192,6 +208,22 @@ def test_preview_reports_the_fringe_and_leaves_state_alone(reassign_client):
     assert len(body["leaving"]) > len(sel)
     assert body["entering"] == []
     assert len(state["soma"].verts) == before, "preview must not commit"
+
+
+def test_a_soma_is_made_by_hand_where_none_was_found(reassign_client):
+    # find_soma found none: assigning faces to the soma makes them it
+    client, state, _ = reassign_client
+    faces = np.asarray(state["mesh"].faces)
+    state["soma"] = None
+    state["neurites"] = Neurites([np.arange(len(faces))])
+    z = state["mesh"].vertices[faces].mean(axis=1)[:, 2]
+    sel = np.flatnonzero(np.abs(z) <= 100.0).tolist()
+
+    r = client.post("/reassign_preview", json={"faces": sel, "to": "soma"})
+    assert r.status_code == 200, r.json()
+    assert client.post("/reassign_apply").json()["ok"]
+    assert state["soma"] is not None
+    assert set(np.unique(faces[sel]).tolist()) <= set(state["soma"].verts.tolist())
 
 
 def test_apply_commits_exactly_what_the_preview_promised(reassign_client):

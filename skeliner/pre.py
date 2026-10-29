@@ -2119,9 +2119,13 @@ def _component_effects(
     descending size, so ids shift whenever anything changes size and
     saying so every time would bury the real news.  A component crossing
     between neurites and discarded *is* reported — that is a verdict, not
-    a position.
+    a position.  With nothing before (a freshly loaded cell) there is
+    nothing to report: every component would be "new".
     """
     b_comps = list(before.neurites) + list(before.discarded)
+    if not b_comps:
+        # a first derive (a freshly loaded cell): nothing to compare against
+        return []
     a_comps = list(after.neurites) + list(after.discarded)
     b_kinds = ["neurite"] * len(before.neurites) + ["discarded"] * len(before.discarded)
     a_kinds = ["neurite"] * len(after.neurites) + ["discarded"] * len(after.discarded)
@@ -2230,9 +2234,11 @@ def preview_reassignment(
     faces : array-like of int
         Face ids to reassign.
     to : {'soma', 'organelle', 'remainder'}
-        ``'soma'`` adds the faces' vertices to the soma; ``'organelle'``
-        sets them in :attr:`~skeliner.dataclass.Organelles.manual`;
-        ``'remainder'`` releases them from both, back to the arbor.
+        ``'soma'`` adds the faces' vertices to the soma — or, on components
+        with none (find_soma found none), makes their largest connected
+        piece the soma, its ellipsoid fitted to it; ``'organelle'`` sets them in
+        :attr:`~skeliner.dataclass.Organelles.manual`; ``'remainder'``
+        releases them from both, back to the arbor.
     rescued : array-like of int, optional
         The component-level arbor claims in force, passed straight to
         :func:`break_up_mesh`.  Without them the re-derive this preview
@@ -2273,15 +2279,16 @@ def preview_reassignment(
 
     soma = components.soma
     org = components.organelles
-    if to == "soma" and soma is None:
-        raise ValueError("no soma on these components to assign faces to")
-
     old_soma_verts = soma.verts if soma is not None else None
     sel_verts = np.unique(mesh_faces[sel])
 
     # --- the state change: soma vertices and/or organelle masks ---
     if to == "soma":
-        new_soma_verts = np.union1d(old_soma_verts, sel_verts)
+        if soma is None:
+            soma = _soma_from_selection(mesh, sel)
+            new_soma_verts = soma.verts
+        else:
+            new_soma_verts = np.union1d(old_soma_verts, sel_verts)
         new_org = org
     elif to == "organelle":
         manual = org.manual.copy()
@@ -2336,6 +2343,43 @@ def preview_reassignment(
         leaving=leaving,
         components=after,
         effects=_component_effects(components, after, len(mesh_faces)),
+    )
+
+
+def _soma_from_selection(mesh: Mesh, sel: np.ndarray) -> Soma:
+    """The soma a hand selection of faces makes where none was found: its
+    largest connected piece (faces joined by a shared vertex, so a lasso
+    that took every other triangle is still one) — a soma is one body, and
+    a lasso drawn through the mesh catches faces behind it — with an
+    ellipsoid fitted to that piece's vertices as find_soma fits one
+    (:meth:`Soma.fit`).  The re-derive that follows absorbs what the
+    selection missed of the soma's surface, as it does for a detected soma.
+    A piece with too few vertices, or flat, spans no ellipsoid.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    verts, local = np.unique(np.asarray(mesh.faces)[sel], return_inverse=True)
+    local = local.reshape(-1, 3)
+    a = np.concatenate([local[:, 0], local[:, 1]])
+    b = np.concatenate([local[:, 1], local[:, 2]])
+    n = len(verts)
+    _, piece = connected_components(
+        coo_matrix((np.ones(len(a)), (a, b)), shape=(n, n)), directed=False
+    )
+    verts = verts[piece == np.bincount(piece).argmax()]
+    if len(verts) >= 4:
+        pts = np.asarray(mesh.vertices, dtype=np.float64)[verts]
+        try:
+            # a flat patch's least variance is zero or a rounding below it
+            with np.errstate(invalid="ignore", divide="ignore"):
+                soma = Soma.fit(pts, verts=verts)
+        except ValueError:
+            soma = None
+        if soma is not None and np.isfinite(soma.axes).all() and soma.axes[-1] > 0:
+            return soma
+    raise ValueError(
+        "these faces span no soma: select faces round it, not a flat patch"
     )
 
 
@@ -5240,6 +5284,7 @@ def preprocess(
     mesh: Mesh,
     *,
     organelles: bool = True,
+    soma: Soma | None = None,
     rescued=None,
     released=None,
     claim_min_faces: int = 0,
@@ -5253,7 +5298,7 @@ def preprocess(
       1. find_parallel_patches → remove_parallel_patches
       2. compute_mesh_stats
       3. find_organelles (unless *organelles* is False)
-      4. find_soma
+      4. find_soma (unless *soma* is given)
       5. find_fusions → find_disconnected → find_gaps
       6. remove_gaps → remove_fusions
       7. break_up_mesh
@@ -5269,6 +5314,10 @@ def preprocess(
         False for a mesh that traces no organelles (hemibrain's): what
         :func:`find_organelles` would flag there is fragments and patches
         of the cell, so it is not run and no face is an organelle.
+    soma : Soma or None
+        A soma to take instead of :func:`find_soma`'s: one assigned by hand
+        where it found none.  Its ``verts`` name this mesh's vertices,
+        which the step before it (parallel patches) keeps.
     rescued : array-like of int, optional
         Face ids the caller has declared arbor, passed through to
         :func:`break_up_mesh` in step 7.  The neurite/discarded split is
@@ -5328,11 +5377,14 @@ def preprocess(
 
     # 4. Soma
     with _timed("↳  find soma", verbose=verbose) as log:
-        soma = find_soma(mesh, organelles=org, mesh_stats=mesh_stats)
         if soma is not None:
-            log(f"center={soma.center.round(0).tolist()}")
+            log(f"given: center={soma.center.round(0).tolist()}")
         else:
-            log("no soma detected")
+            soma = find_soma(mesh, organelles=org, mesh_stats=mesh_stats)
+            if soma is not None:
+                log(f"center={soma.center.round(0).tolist()}")
+            else:
+                log("no soma detected")
 
     # 5. Fusions → disconnected → gaps
     with _timed("↳  find fusions", verbose=verbose) as log:

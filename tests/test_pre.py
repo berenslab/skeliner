@@ -1343,10 +1343,49 @@ class TestPreviewReassignment:
         with pytest.raises(ValueError, match="face ids must lie"):
             pre.preview_reassignment(mesh, comp, [len(mesh.faces)], to="organelle")
 
-    def test_rejects_soma_target_without_a_soma(self):
+    def test_soma_target_without_a_soma_makes_the_selection_the_soma(self):
+        # find_soma found none: the faces lassoed on one side of the body
+        # become the soma, its ellipsoid fitted to them; the re-derive takes
+        # in the rest of the body and leaves the process a neurite
+        mesh, _, org = _ball_with_stub(height=160.0)
+        comp = pre.break_up_mesh(mesh, None, org)
+        assert comp.soma is None
+        f = np.asarray(mesh.faces)
+        # the fixture puts the ball's faces first
+        ball = np.arange(len(trimesh.creation.icosphere(subdivisions=4).faces))
+        top = ball[mesh.vertices[f[ball]].mean(axis=1)[:, 2] > 0]
+        r = pre.preview_reassignment(mesh, comp, top, to="soma")
+        soma = r.components.soma
+        assert soma is not None and soma.nucleus is None
+        assert set(np.unique(f[ball]).tolist()) <= set(soma.verts.tolist())
+        (neurite,) = r.components.neurites
+        far = np.flatnonzero(mesh.vertices[f].mean(axis=1)[:, 2] > 170.0)
+        assert set(far.tolist()) <= set(neurite.tolist())
+        assert not np.isin(neurite, ball).any()
+        pre.apply_reassignment(comp, r)
+        assert comp.soma is soma
+
+    def test_a_soma_made_by_hand_is_one_body_not_the_stray_faces(self):
+        # a lasso drawn through the mesh also caught faces far off on the
+        # process: the soma is the selection's largest connected piece
+        mesh, _, org = _ball_with_stub(height=160.0)
+        comp = pre.break_up_mesh(mesh, None, org)
+        f = np.asarray(mesh.faces)
+        n_ball = len(trimesh.creation.icosphere(subdivisions=4).faces)
+        cz = mesh.vertices[f].mean(axis=1)[:, 2]
+        top = np.flatnonzero((np.arange(len(f)) < n_ball) & (cz > 0))
+        stray = np.flatnonzero(cz > 230.0)[:6]
+        r = pre.preview_reassignment(mesh, comp, np.r_[top, stray], to="soma")
+        assert not np.isin(np.unique(f[stray]), r.components.soma.verts).any()
+        assert np.isin(stray, np.concatenate(list(r.components.neurites))).all()
+
+    def test_soma_target_refuses_a_selection_spanning_no_soma(self):
         mesh, comp = _tube_state()
-        with pytest.raises(ValueError, match="no soma"):
-            pre.preview_reassignment(mesh, comp, [0], to="soma")
+        cap = np.array(sorted(_band(mesh, 499.9, 500.1)))
+        assert len(cap) > 4
+        for sel in ([0], cap):
+            with pytest.raises(ValueError, match="span no soma"):
+                pre.preview_reassignment(mesh, comp, sel, to="soma")
 
     def test_organelle_target_sets_the_manual_mask(self):
         mesh, comp = _tube_state()
@@ -1773,6 +1812,19 @@ class TestRescued:
         _, kept = pre.preprocess(mesh, rescued=speck)
         assert len(kept.discarded) == 0
         assert len(kept.neurites) == 2
+
+    def test_a_full_preprocess_takes_a_soma_given_by_hand(self, monkeypatch):
+        # a soma assigned where find_soma found none is input to the next
+        # run, not a casualty of it: find_soma is not asked again
+        mesh, soma, _ = _ball_with_stub(height=160.0)
+
+        def no(*_a, **_k):
+            raise AssertionError("find_soma ran over a given soma")
+
+        monkeypatch.setattr(pre, "find_soma", no)
+        _, got = pre.preprocess(mesh, organelles=False, soma=soma)
+        assert np.isin(soma.verts, got.soma.verts).all()
+        assert len(got.neurites) == 1
 
     def test_preprocess_without_organelles_takes_none_out(self):
         """For a mesh that traces none: the surface find_organelles would
