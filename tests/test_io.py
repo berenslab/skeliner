@@ -8,12 +8,15 @@ IO round-trip smoke tests.
 """
 
 import json
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+import skeliner as sk
 from skeliner import Skeleton, Soma, dx, skeletonize
+from skeliner._backend import PATHS
 from skeliner.dataclass import MeshStats, Organelles
 from skeliner.io import (
     load_mesh,
@@ -25,6 +28,7 @@ from skeliner.io import (
     load_organelles_npz,
     save_mesh_stats_npz,
     load_mesh_stats_npz,
+    save_mesh,
 )
 
 SAMPLES_DIR = Path(__file__).parent / "data"
@@ -43,9 +47,10 @@ def reference_mesh():
 def test_io_roundtrip(reference_mesh, tmp_path):
     skel = skeletonize(reference_mesh, verbose=False)
 
-    # warm up KD-tree cache (and verify it exists)
+    # warm up the distance index (and verify it exists)
     dx.distance(skel, skel.nodes[0], point_unit=skel.meta.get("unit", "nm"))
-    assert skel._nodes_kdtree is not None
+    assert skel._distance_index is not None
+    assert skel._node_neighbors is not None
 
     # --- write ---------------------------------------------------------
     swc_path = tmp_path / "60427_test.swc"
@@ -59,7 +64,6 @@ def test_io_roundtrip(reference_mesh, tmp_path):
     # --- read back -----------------------------------------------------
     skel_from_swc = load_skeleton_swc(swc_path)
     skel_from_npz = load_skeleton_npz(npz_path)
-    assert skel_from_npz._nodes_kdtree is not None
     assert skel_from_npz._node_neighbors is not None
 
     # --- very coarse equivalence checks --------------------------------
@@ -455,3 +459,452 @@ class TestSkeletonProvenance:
         assert back.meta["track"] == skel.meta["track"]
         assert back.meta["params"] == skel.meta["params"]
         assert back.meta["skeliner_version"] == skel.meta["skeliner_version"]
+
+
+# ---------------------------------------------------------------------
+# mesh readers: the Rust and the Python path read OBJ as trimesh does, and
+# leave anything else to it
+# ---------------------------------------------------------------------
+def _trimesh_arrays(path):
+    import trimesh
+
+    m = trimesh.load_mesh(path, process=False)
+    return np.asarray(m.vertices, np.float64), np.asarray(m.faces, np.int64)
+
+
+def _obj_files(reference_mesh, tmp_path):
+    """OBJ files both readers read."""
+    files = [Path(__file__).parent / "data" / "60427.obj"]
+    written = tmp_path / "written.obj"
+    save_mesh(reference_mesh, written)  # trimesh's export, with its header
+    files.append(written)
+    loose = tmp_path / "loose.obj"  # a vertex no face names, and CRLF
+    loose.write_bytes(b"v 0 0 0\r\nv 9 9 9\r\nv 1 0 0\r\nv 0 1 0\r\n\r\nf 1 3 4\r\n")
+    files.append(loose)
+    numbers = tmp_path / "numbers.obj"  # decimals as writers spell them
+    numbers.write_bytes(
+        b"v 1e3 -2.5E-2 +3.\nv .5 -0 0.1000000000000000055511151231257827\n"
+        b"v 515088.00000 510594.00000 46431.00000\n"
+        b"v 1.7976931348623157e308 4.9e-324 -123456789.123456789\n"
+        b"f 1 2 3\nf 2 3 4\n"
+    )
+    files.append(numbers)
+    return files
+
+
+def test_mesh_readers_read_as_trimesh_on_both_paths(reference_mesh, tmp_path):
+    from skeliner import _rs
+    from skeliner.python import io as python_io
+
+    from ._parity import assert_parity, both
+
+    for path in _obj_files(reference_mesh, tmp_path):
+        want = _trimesh_arrays(path)
+        rust = _rs.io.read_obj(str(path))
+        python = python_io.read_obj(str(path))
+        assert rust is not None, path.name
+        assert_parity(rust, python, path.name)
+        for got in (rust[0], rust[1], python[0], python[1]):
+            assert got.flags.c_contiguous
+        # bit for bit, signed zeros included
+        assert rust[0].tobytes() == want[0].tobytes(), path.name
+        assert np.array_equal(rust[1], want[1]), path.name
+        for mesh in both(load_mesh, path):
+            assert mesh.vertices.tobytes() == want[0].tobytes(), path.name
+            assert np.array_equal(mesh.faces, want[1]), path.name
+    # the vertex no face names is dropped, as trimesh drops it
+    assert len(load_mesh(tmp_path / "loose.obj").vertices) == 3
+
+
+# a seam between two chunks, as CloudVolume stores one: vertices 3, 4, 6
+# copy 1, 2, 0, and the third face copies the first
+SEAM_V = [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0], [0, 0, 0]]
+SEAM_F = [[0, 1, 2], [3, 5, 4], [6, 3, 4]]
+
+
+def test_load_mesh_merges_a_seam(tmp_path):
+    from ._parity import both
+
+    path = tmp_path / "seam.obj"
+    lines = [f"v {x} {y} {z}" for x, y, z in SEAM_V]
+    lines += [f"f {a + 1} {b + 1} {c + 1}" for a, b, c in SEAM_F]
+    path.write_text("\n".join(lines) + "\n")
+    for mesh in both(load_mesh, path):
+        # the copies dropped, the faces in their places, the copied face
+        # collapsed; the two chunks are one piece
+        assert np.array_equal(
+            mesh.vertices, [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]]
+        )
+        assert np.array_equal(mesh.faces, [[0, 1, 2], [1, 3, 2], [0, 0, 0]])
+
+
+def test_a_mesh_remove_fusions_cut_reads_back_as_written(tmp_path):
+    from ._parity import both
+
+    trimesh = pytest.importorskip("trimesh")
+    # two balls sharing one vertex, a bow-tie that remove_fusions cuts into
+    # two vertices at one position: the second ball's antipode of vertex 0
+    # moved onto vertex 0
+    ball = trimesh.creation.icosphere(subdivisions=1, radius=1000.0)
+    b = np.round(ball.vertices)
+    far = int(np.argmin(np.linalg.norm(b + b[0], axis=1)))
+    keep = np.arange(len(b)) != far
+    v = np.vstack([b, (b + 2 * b[0])[keep]])
+    renumber = np.zeros(len(b), dtype=np.int64)
+    renumber[keep] = np.arange(len(b), len(v))
+    f = np.vstack([ball.faces, renumber[np.asarray(ball.faces)]])
+    pinch = int(np.flatnonzero((f == 0).any(axis=1))[0])
+    cut = sk.pre.remove_fusions(sk.Mesh(v, f), fusions=[[pinch]])
+    assert len(cut.vertices) == len(v) + 1
+    assert np.array_equal(cut.vertices[-1], cut.vertices[0])
+    path = tmp_path / "cut.obj"
+    save_mesh(cut, path)
+    for mesh in both(load_mesh, path):
+        assert np.array_equal(mesh.vertices, cut.vertices)
+        assert np.array_equal(mesh.faces, cut.faces)
+
+
+def test_saving_a_vertex_no_face_names_warns(tmp_path):
+    import warnings
+
+    loose = sk.Mesh([[0, 0, 0], [9, 9, 9], [1, 0, 0], [0, 1, 0]], [[0, 2, 3]])
+    with pytest.warns(UserWarning, match="vertex ids from 1 on change"):
+        save_mesh(loose, tmp_path / "loose.obj")
+    # what the warning is about: the vertex is not read back
+    assert len(load_mesh(tmp_path / "loose.obj").vertices) == 3
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        save_mesh(sk.Mesh(SEAM_V[:3], SEAM_F[:1]), tmp_path / "tight.obj")
+
+
+def test_mesh_of_merges_a_seam_keeping_the_vertices():
+    from ._parity import both
+
+    class Chunked:
+        vertices, faces = SEAM_V, SEAM_F
+
+    for mesh in both(sk.Mesh.of, Chunked()):
+        # the caller's vertex ids still name the same points
+        assert np.array_equal(mesh.vertices, SEAM_V)
+        assert np.array_equal(mesh.faces, [[0, 1, 2], [1, 5, 2], [0, 0, 0]])
+    # nothing coincides: the arrays as given
+    plain = sk.Mesh.of(sk.Mesh(SEAM_V[:3], SEAM_F[:1]).to_trimesh())
+    assert np.array_equal(plain.faces, SEAM_F[:1])
+
+
+def test_what_the_readers_do_not_read_goes_to_trimesh(reference_mesh, tmp_path):
+    import trimesh
+
+    from skeliner import _rs
+    from skeliner.python import io as python_io
+
+    from ._parity import both
+
+    tri = b"v 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\n"
+    declined = {
+        "normals.obj": tri + b"vn 0 0 1\nf 1//1 2//1 3//1\n",
+        "quad.obj": tri + b"f 1 2 4 3\n",
+        "objects.obj": b"o a\n" + tri + b"f 1 2 3\no b\nf 1 3 2\n",
+        "relative.obj": tri + b"f -4 -3 -2\n",
+        "colours.obj": b"v 0 0 0 1 0 0\nv 1 0 0 1 0 0\nv 0 1 0 1 0 0\nf 1 2 3\n",
+    }
+    for name, data in declined.items():
+        (tmp_path / name).write_bytes(data)
+        assert _rs.io.read_obj(str(tmp_path / name)) is None, name
+        assert python_io.read_obj(str(tmp_path / name)) is None, name
+    # formats skeliner has no reader for go to trimesh directly
+    others = ["mesh.ply", "mesh.stl", "mesh.off"]
+    for name in others:
+        reference_mesh.export(tmp_path / name)
+    for name in [*declined, *others]:
+        path = tmp_path / name
+        want = trimesh.load_mesh(path, process=False)
+        v, f = np.asarray(want.vertices), np.asarray(want.faces)
+        _, first, inverse = np.unique(v, axis=0, return_index=True, return_inverse=True)
+        if len(first) < len(v):
+            # an STL keeps three vertices of its own per face: coincident
+            # vertices merged into the first at each position, the copies
+            # dropped, the rest renumbered in order
+            kept = np.sort(first)
+            v, f = v[kept], np.searchsorted(kept, first[inverse.reshape(-1)])[f]
+        for mesh in both(load_mesh, path):
+            assert type(mesh) is sk.Mesh, name
+            assert np.array_equal(mesh.vertices, v), name
+            assert np.array_equal(mesh.faces, f), name
+    stl = load_mesh(tmp_path / "mesh.stl")
+    assert len(stl.vertices) == len(reference_mesh.vertices)
+
+
+def test_a_ctm_the_reader_does_not_read_goes_to_trimesh(tmp_path):
+    import trimesh
+
+    from skeliner import _rs
+    from skeliner.python import io as python_io
+
+    path = tmp_path / "other.ctm"
+    path.write_bytes(b"not a CTM file")
+    assert _rs.io.read_ctm(str(path)) is None
+    assert python_io.read_ctm(str(path)) is None
+    # whatever trimesh makes of it (here: no python-openctm), load_mesh does
+    with pytest.raises(Exception) as trimesh_error:
+        trimesh.load_mesh(path, process=False)
+    for name in PATHS:
+        with sk.backend(name), pytest.raises(trimesh_error.type):
+            load_mesh(path)
+
+
+def test_a_missing_mesh_file_raises_as_open_does_on_both_paths(tmp_path):
+    from skeliner import _rs
+    from skeliner.python import io as python_io
+
+    missing = str(tmp_path / "missing.obj")
+    for read in (_rs.io.read_obj, _rs.io.read_ctm):
+        with pytest.raises(FileNotFoundError) as rust:
+            read(missing)
+        with pytest.raises(FileNotFoundError) as python:
+            getattr(python_io, read.__name__)(missing)
+        assert str(rust.value) == str(python.value)
+        assert rust.value.filename == missing
+    with pytest.raises(IsADirectoryError):
+        _rs.io.read_obj(str(tmp_path))
+
+
+# ---------------------------------------------------------------------
+# OpenCTM, for EyeWire 1's meshes: files built here, as the format lays
+# them out, read on both paths
+# ---------------------------------------------------------------------
+def _ctm_block(words) -> bytes:
+    """A packed CTM block of 32-bit *words* ``(count, size)``: four byte
+    planes, most significant first, each component by component, LZMA1
+    packed after its five property bytes."""
+    import lzma
+    import struct
+
+    w = np.asarray(words, dtype=np.uint32).reshape(len(words), -1)
+    planes = np.stack([(w >> s).astype(np.uint8) for s in (24, 16, 8, 0)])
+    alone = lzma.compress(planes.transpose(0, 2, 1).tobytes(), format=lzma.FORMAT_ALONE)
+    # an "alone" stream: properties, unpacked size, data; CTM keeps no size
+    return struct.pack("<I", len(alone) - 13) + alone[:5] + alone[13:]
+
+
+def _ctm_index_deltas(faces) -> np.ndarray:
+    """MG1 / MG2 triangle deltas, as the reference encoder makes them."""
+    w = np.asarray(faces, dtype=np.int64).copy()
+    for i in range(len(w) - 1, -1, -1):
+        if i >= 1 and w[i, 0] == w[i - 1, 0]:
+            w[i, 1] -= w[i - 1, 1]
+        else:
+            w[i, 1] -= w[i, 0]
+        w[i, 2] -= w[i, 0]
+        if i >= 1:
+            w[i, 0] -= w[i - 1, 0]
+    return w & 0xFFFFFFFF
+
+
+def _ctm_file(method: str, vertices, faces) -> tuple[bytes, np.ndarray, np.ndarray]:
+    """An OpenCTM v5 file of *vertices* and *faces*, and what it decodes to:
+    ``(data, vertices, faces)``."""
+    import struct
+
+    v = np.asarray(vertices, dtype=np.float32)
+    f = np.asarray(faces, dtype=np.int64)
+    head = b"OCTM" + struct.pack("<I", 5) + method.encode().ljust(4, b"\0")
+    head += struct.pack("<5I", len(v), len(f), 0, 0, 0) + struct.pack("<I", 4) + b"note"
+    if method == "RAW":
+        body = b"INDX" + f.astype("<u4").tobytes() + b"VERT" + v.astype("<f4").tobytes()
+        return head + body, v.astype(np.float64), f
+    if method == "MG1":
+        body = b"INDX" + _ctm_block(_ctm_index_deltas(f))
+        # one run of 3 × n floats, each vertex's x, y and z in turn
+        body += b"VERT" + _ctm_block(v.view(np.uint32).reshape(-1, 1))
+        return head + body, v.astype(np.float64), f
+    # MG2: each vertex on a 4 x 4 x 4 grid, in steps of the precision from
+    # its cell's corner; vertices sorted by cell, x a delta within one
+    precision, div = np.float32(0.5), np.array([4, 4, 4])
+    lo, hi = v.min(axis=0) - 1, v.max(axis=0) + 1
+    size = (hi - lo) / div.astype(np.float32)
+    g = np.minimum(((v - lo) / size).astype(np.int64), div - 1)
+    cell = g[:, 0] + div[0] * (g[:, 1] + div[1] * g[:, 2])
+    origin = g.astype(np.float32) * size + lo
+    ints = np.round((v - origin) / precision).astype(np.int64)
+    order = np.lexsort((ints[:, 0], cell))
+    cell, ints, origin = cell[order], ints[order], origin[order]
+    new_id = np.empty(len(v), dtype=np.int64)
+    new_id[order] = np.arange(len(v))
+    f = new_id[f]
+    x = ints[:, 0].copy()
+    same = np.r_[False, cell[1:] == cell[:-1]]
+    x[1:][same[1:]] -= ints[:-1, 0][same[1:]]
+    stored = np.column_stack([x, ints[:, 1], ints[:, 2]])
+    mg2h = b"MG2H" + struct.pack("<8f", precision, 0.0, *lo, *hi)
+    mg2h += struct.pack("<3I", *div)
+    body = mg2h + b"VERT" + _ctm_block(stored)
+    body += b"GIDX" + _ctm_block(np.diff(cell, prepend=0)[:, None])
+    body += b"INDX" + _ctm_block(_ctm_index_deltas(f))
+    expected = precision * ints.astype(np.float32) + origin
+    return head + body, expected.astype(np.float64), f
+
+
+@pytest.mark.parametrize("method", ["RAW", "MG1", "MG2"])
+def test_eyewire_ctm_reads_on_both_paths(tmp_path, method):
+    import trimesh
+
+    from skeliner import _rs
+    from skeliner.python import io as python_io
+
+    from ._parity import assert_parity, both
+
+    sphere = trimesh.creation.icosphere(subdivisions=2, radius=40.0)
+    vertices = sphere.vertices + [100.0, 50.0, 7.0]
+    data, want_v, want_f = _ctm_file(method, vertices, sphere.faces)
+    path = tmp_path / f"{method}.ctm"
+    path.write_bytes(data)
+    rust = _rs.io.read_ctm(str(path))
+    assert_parity(rust, python_io.read_ctm(str(path)))
+    assert np.array_equal(rust[0], want_v) and np.array_equal(rust[1], want_f)
+    # the same triangles; MG2's corners within half its precision (0.5)
+    tol = 0.25 + 1e-4 if method == "MG2" else 1e-4
+    assert np.abs(rust[0][rust[1]] - vertices[sphere.faces]).max() <= tol
+    # EyeWire 1 stores (z, x, y); the mesh is (x, y, z), still facing out
+    for mesh in both(load_mesh, path):
+        assert np.array_equal(mesh.vertices, want_v[:, [1, 2, 0]])
+        assert np.array_equal(mesh.faces, want_f)
+        assert mesh.to_trimesh().volume > 0
+
+
+def test_eyewire_ctm_refuses_the_same_broken_files_on_both_paths(tmp_path):
+    import lzma
+    import struct
+
+    import trimesh
+
+    from skeliner import _rs
+    from skeliner.python import io as python_io
+
+    sphere = trimesh.creation.icosphere(subdivisions=1)
+    data, _, _ = _ctm_file("MG2", sphere.vertices, sphere.faces)
+    gidx = data.index(b"GIDX")
+    vert = data.index(b"VERT")
+    # one vertex more in the header than in the packed block: the block's
+    # end marker comes before the size, so the size-known read fails and
+    # the size-unknown one gives too few bytes
+    mg1, _, _ = _ctm_file("MG1", sphere.vertices, sphere.faces)
+    counted = mg1[:12] + struct.pack("<I", len(sphere.vertices) + 1) + mg1[16:]
+    cases = {
+        "counted.ctm": (counted, ValueError, "unpacks to the wrong size"),
+        "short.ctm": (data[:-7], ValueError, "ends early"),
+        "unordered.ctm": (
+            data[:gidx] + b"XXXX" + data[gidx + 4 :],
+            ValueError,
+            "missing or out of place",
+        ),
+        # VERT's first LZMA property byte past the largest valid one
+        "packed.ctm": (
+            data[: vert + 8] + b"\xff" + data[vert + 9 :],
+            lzma.LZMAError,
+            None,
+        ),
+    }
+    for name, (blob, error, match) in cases.items():
+        path = tmp_path / name
+        path.write_bytes(blob)
+        with pytest.raises(error, match=match) as rust:
+            _rs.io.read_ctm(str(path))
+        with pytest.raises(error, match=match) as python:
+            python_io.read_ctm(str(path))
+        assert str(rust.value) == str(python.value), name
+
+
+def test_a_mesh_is_read_only_and_converts_both_ways(reference_mesh):
+    import copy
+    import pickle
+
+    import trimesh
+
+    m = reference_mesh
+    assert type(m) is sk.Mesh and sk.Mesh.of(m) is m
+    with pytest.raises(ValueError):
+        m.vertices[0, 0] = 1.0
+    with pytest.raises(AttributeError):
+        m.vertices = m.vertices * 2
+    # anything with vertices and faces; the arrays are copied
+    tm = m.to_trimesh()
+    assert type(tm) is trimesh.Trimesh
+    back = sk.Mesh.of(tm)
+    tm.vertices[0] += 1.0
+    assert np.array_equal(back.vertices, m.vertices)
+    assert np.array_equal(back.faces, m.faces)
+
+    class Plain:
+        vertices = [[0, 0, 0], [1, 0, 0], [0, 1, 0]]
+        faces = [[0, 1, 2]]
+
+    p = sk.Mesh.of(Plain())
+    assert p.vertices.dtype == np.float64 and p.faces.dtype == np.int64
+    assert np.array_equal(p.face_normals, [[0.0, 0.0, 1.0]])
+    with pytest.raises(TypeError, match="vertices and faces"):
+        sk.Mesh.of(object())
+    with pytest.raises(ValueError, match="names vertex 3"):
+        sk.Mesh([[0, 0, 0]] * 3, [[0, 1, 3]])
+    for twin in (pickle.loads(pickle.dumps(m)), copy.deepcopy(m), m.copy()):
+        assert np.array_equal(twin.vertices, m.vertices)
+        assert np.array_equal(twin.faces, m.faces)
+    # trimesh's submesh: the faces given, in order, their vertices ascending
+    pick = [5, 2, 40, 2]
+    want = tm.submesh([pick], append=True, repair=False)
+    sub = m.submesh(pick)
+    assert np.array_equal(sub.faces, want.faces)
+    assert np.array_equal(
+        sub.vertices, m.to_trimesh().submesh([pick], append=True, repair=False).vertices
+    )
+    mask = np.zeros(len(m.faces), bool)
+    mask[pick] = True
+    assert np.array_equal(
+        m.submesh(mask).faces, m.to_trimesh().submesh([mask], repair=False)[0].faces
+    )
+
+
+def test_obj_is_written_as_trimesh_writes_it_on_both_paths(reference_mesh, tmp_path):
+    import trimesh
+
+    from skeliner import _rs
+    from skeliner.python import io as python_io
+
+    rng = np.random.default_rng(79)
+    v = np.r_[
+        reference_mesh.vertices[:200] + rng.normal(size=(200, 3)) / 512,
+        [[np.nan, -0.0, 1e20], [np.inf, -np.inf, 1 / 512]],
+    ]
+    inside = reference_mesh.faces[(reference_mesh.faces < 200).all(axis=1)][:90]
+    cases = {"reference": reference_mesh, "odd": sk.Mesh(v, inside)}
+    for name, mesh in cases.items():
+        want = tmp_path / f"{name}_trimesh.obj"
+        trimesh.Trimesh(
+            vertices=mesh.vertices.copy(), faces=mesh.faces.copy(), process=False
+        ).export(str(want))
+        for path in (_rs.io, python_io):
+            got = tmp_path / f"{name}_{path.__name__}.obj"
+            path.write_obj(str(got), mesh.vertices, mesh.faces)
+            assert got.read_bytes() == want.read_bytes(), (name, path)
+        # save_mesh on both paths, and what reads it back
+        for path in ("rust", "python"):
+            with sk.backend(path):
+                out = tmp_path / f"{name}_save_{path}.obj"
+                # the odd mesh's vertices past the faces are not read back
+                with pytest.warns(UserWarning) if name == "odd" else nullcontext():
+                    sk.io.save_mesh(mesh, out)
+                assert out.read_bytes() == want.read_bytes()
+    back = load_mesh(tmp_path / "reference_save_rust.obj")
+    assert np.array_equal(back.faces, reference_mesh.faces)
+    # a trimesh mesh writes itself, as before
+    tm = reference_mesh.to_trimesh()
+    sk.io.save_mesh(tm, tmp_path / "self.obj")
+    tm.export(str(tmp_path / "direct.obj"))
+    assert (tmp_path / "self.obj").read_bytes() == (
+        tmp_path / "direct.obj"
+    ).read_bytes()
+    for path in (_rs.io, python_io):
+        with pytest.raises(OSError):
+            path.write_obj(
+                str(tmp_path / "no" / "dir.obj"), v[:3], np.array([[0, 1, 2]])
+            )

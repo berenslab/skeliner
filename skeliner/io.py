@@ -1,16 +1,18 @@
 import json
-import pickle
 import re
+import warnings
 from pathlib import Path
 from typing import Iterable, List
 
 import numpy as np
-import trimesh
 
+from ._backend import kernels
 from ._core import _bfs_parents
 from ._state import rebuild_vert2node
 from .dataclass import (
+    coincident_merged,
     Discarded,
+    Mesh,
     MeshComponents,
     MeshStats,
     Neurites,
@@ -59,34 +61,118 @@ _META_JSON = re.compile(r"#\s*meta\s+(\{.*\})")  #  single-line JSON
 # ------------
 
 
-def load_mesh(filepath: str | Path) -> trimesh.Trimesh:
+def _trimesh():
+    """trimesh, which reads and writes the formats skeliner does not."""
+    try:
+        import trimesh
+    except ImportError:
+        raise ImportError(
+            "formats other than OBJ (and EyeWire 1's CTM) go through trimesh: "
+            "pip install 'skeliner[trimesh]'"
+        ) from None
+    return trimesh
+
+
+def load_mesh(filepath: str | Path) -> Mesh:
+    """Read a mesh file as a :class:`skeliner.Mesh` of the arrays
+    ``trimesh.load_mesh(filepath, process=False)`` reads, with the copies of
+    a vertex along a seam merged: a mesh stored in chunks (CloudVolume's
+    multi-resolution meshes, for one) or as separate triangles (STL) copies
+    the vertices along every seam, which cuts it there. Every face names the
+    first vertex at each position that a seam joins it to, the copies are
+    dropped as the readers drop any vertex no face names, and a face the
+    merge made a copy of another collapses to ``[0, 0, 0]``. Vertices that
+    only touch — a seam is a chain of edges both sides of it repeat — stay
+    apart: :func:`skeliner.pre.remove_fusions` leaves a cut so, and a mesh it
+    cleaned reads back as written. Faces keep their places, so face ids into
+    the file stay valid.
+
+    OBJ files of plain vertices and triangles, the form EyeWire 2, MICrONS
+    and FlyWire meshes come in and skeliner's own pipeline writes, are read
+    by skeliner's own reader on the active path (:class:`skeliner.backend`),
+    to the same arrays. An OBJ with anything more (normals, texture
+    coordinates, groups, polygons, ...) and every other format are read by
+    trimesh, which must then be installed (``skeliner[trimesh]``).
+
+    ``.ctm`` (OpenCTM) has a reader of its own here, but it is only for
+    reading EyeWire 1's meshes
+    (https://drive.google.com/file/d/1-qmE1sEL3AIGpNfi0w50MEOgm2WIF4_1/view),
+    which trimesh cannot read without ``python-openctm`` (x86-64 and Python
+    3.11 at most): OpenCTM v5 with RAW, MG1 or MG2 compression, vertices and
+    triangles only, no normals, UV maps or attribute maps. Those files store
+    each vertex as (z, x, y), the retina's depth first; it is read as
+    (x, y, z), the depth in z as in the other data.
+    """
     filepath = Path(filepath)
-    if filepath.suffix.lower() == ".ctm":
-        print(
-            "CTM file detected.  skeliner no longer bundles explicit OpenCTM "
-            "support.  Loading will fall back to trimesh’s limited reader.\n"
-            "Full read/write support is still possible on compatible setups:\n"
-            "  • Python ≤ 3.11, x86-64  →  pip install python-openctm\n"
-            "Then load manually:\n"
-            "    import openctm, trimesh\n"
-            "    mesh = openctm.import_mesh(filepath)\n"
-            "    mesh = trimesh.Trimesh(vertices=mesh.vertices,\n"
-            "                            faces=mesh.faces,\n"
-            "                            process=False)\n"
-        )
 
-    mesh = trimesh.load_mesh(filepath, process=False)
-
-    return mesh
+    # OBJ and EyeWire 1's CTM on the active path; the readers decline (None)
+    # whatever else such a file holds, and trimesh reads it
+    reader = {".obj": "read_obj", ".ctm": "read_ctm"}.get(filepath.suffix.lower())
+    if reader is not None:
+        found = getattr(kernels.io, reader)(str(filepath))
+        if found is not None:
+            vertices, faces = found
+            if reader == "read_ctm":
+                # (z, x, y) to (x, y, z): a rotation, so the faces keep facing out
+                vertices = np.ascontiguousarray(vertices[:, [1, 2, 0]])
+            return _without_copies(vertices, faces)
+    read = _trimesh().load_mesh(filepath, process=False)
+    read = Mesh(read.vertices, read.faces)
+    return _without_copies(read.vertices, read.faces)
 
 
-def save_mesh(mesh: trimesh.Trimesh, path: str | Path) -> None:
-    """Write a mesh to disk. Format is inferred from the file extension.
+def _without_copies(vertices: np.ndarray, faces: np.ndarray) -> Mesh:
+    """The mesh of a file's arrays with the copies of a vertex along a seam
+    merged and dropped (the vertices the merge left no face naming), the
+    faces renumbered."""
+    merged = coincident_merged(vertices, faces)
+    if merged is faces:
+        return Mesh._adopt(vertices, faces)
+    named = np.zeros(len(vertices), dtype=bool)
+    named[faces.ravel()] = True
+    still = np.zeros(len(vertices), dtype=bool)
+    still[merged.ravel()] = True
+    keep = ~named | still
+    renumbered = np.cumsum(keep) - 1
+    return Mesh._adopt(np.ascontiguousarray(vertices[keep]), renumbered[merged])
 
-    Supports any format that trimesh can export (obj, ply, stl, glb, ...).
+
+def save_mesh(mesh, path: str | Path) -> None:
+    """Write a mesh to disk, the format by the file's suffix.
+
+    A :class:`skeliner.Mesh` (or anything with ``vertices`` and ``faces``) goes
+    to OBJ through skeliner's own writer on the active path, as trimesh
+    writes a plain mesh, and to every other format (ply, stl, glb, ...)
+    through trimesh, which must then be installed. A mesh with an
+    ``export`` of its own — a ``trimesh.Trimesh`` — writes itself.
+
+    An OBJ keeps every vertex, but :func:`load_mesh` reads back only the
+    vertices a face names, as trimesh reads OBJ, and numbers the rest on: a
+    mesh the ``remove_*`` stages left vertices no face names (``preprocess``
+    without ``compact=True``) reads back with other vertex ids, and vertex
+    ids saved beside it — a soma's ``verts`` — would name other vertices.
+    Writing such a mesh to OBJ warns; :func:`skeliner.pre.compact_mesh` it
+    first, with its components, when vertex ids are saved beside it.
     """
     path = Path(path)
-    mesh.export(str(path))
+    if not isinstance(mesh, Mesh) and hasattr(mesh, "export"):
+        mesh.export(str(path))
+        return
+    mesh = Mesh.of(mesh)
+    if path.suffix.lower() == ".obj":
+        named = np.zeros(len(mesh.vertices), dtype=bool)
+        named[mesh.faces.ravel()] = True
+        if not named.all():
+            warnings.warn(
+                f"{path}: {int((~named).sum()):,} vertices no face names are"
+                " written but not read back, so the vertex ids from"
+                f" {int(np.argmin(named)):,} on change when the file is read;"
+                " compact the mesh first when vertex ids are saved beside it",
+                stacklevel=2,
+            )
+        kernels.io.write_obj(str(path), mesh.vertices, mesh.faces)
+    else:
+        mesh.to_trimesh().export(str(path))
 
 
 # -----------
@@ -285,8 +371,9 @@ def save_skeleton_swc(
         for idx, (coord, r, pa, t) in enumerate(
             zip(nodes[:, axis_order] * scale, radii * scale, parent, ntype), start=1
         ):
+            # ensure soma has type -1 or +1
             fh.write(
-                f"{idx} {int(-1 if ((idx == 1) and t not in [-1, 1]) else t)} "  # ensure soma has type -1 or +1
+                f"{idx} {int(-1 if ((idx == 1) and t not in [-1, 1]) else t)} "
                 f"{coord[0]} {coord[1]} {coord[2]} {r} "
                 f"{(pa + 1) if pa != -1 else -1}\n"
             )
@@ -343,12 +430,8 @@ def load_skeleton_npz(path: str | Path) -> Skeleton:
             # stored as length-1 object array; .item() unwraps the dict
             meta = z["meta"].item()
 
-        node_kdtree = None
-        if "kdtree_nodes" in z.files:
-            blob = z["kdtree_nodes"]
-            if blob.size:
-                node_kdtree = pickle.loads(blob.item())
-
+        # older archives also hold a pickled scipy KD-tree ("kdtree_nodes"),
+        # left unread
         node_neighbors = None
         if "neighbors_idx" in z.files and "neighbors_off" in z.files:
             idx = z["neighbors_idx"].astype(np.int64)
@@ -368,8 +451,6 @@ def load_skeleton_npz(path: str | Path) -> Skeleton:
         extra=extra,
         meta=meta,
     )
-    if node_kdtree is not None:
-        skel._nodes_kdtree = node_kdtree
     if node_neighbors is not None:
         skel._node_neighbors = node_neighbors
     return skel
@@ -390,8 +471,10 @@ def save_skeleton_npz(
     compress
         When *True* use :func:`numpy.savez_compressed`.
     cache_kdtree
-        When *True* (default) ensure the node KD-tree and adjacency caches are
-        built and embedded in the archive for fast reloads.
+        When *True* (default) ensure the adjacency cache (each node's
+        neighbours) is built and embedded in the archive for fast reloads.
+        A KD-tree is no longer stored: :func:`skeliner.dx.distance` builds
+        its own index in milliseconds.
     """
     path = Path(path)
 
@@ -400,7 +483,6 @@ def save_skeleton_npz(
         path = path.with_suffix(".npz")
 
     if cache_kdtree:
-        skeleton._ensure_nodes_kdtree()
         skeleton._ensure_node_neighbors()
 
     # radii_<name>  : one array per estimator
@@ -464,10 +546,6 @@ def save_skeleton_npz(
     extra = {"extra": np.array(skeleton.extra, dtype=object)}
     meta = {"meta": np.array(skeleton.meta, dtype=object)} if skeleton.meta else {}
     tree_payload = {}
-    if skeleton._nodes_kdtree is not None:
-        tree_payload["kdtree_nodes"] = np.array(
-            pickle.dumps(skeleton._nodes_kdtree), dtype=object
-        )
     if skeleton._node_neighbors is not None:
         lengths = np.fromiter(
             (len(nbrs) for nbrs in skeleton._node_neighbors),
@@ -643,7 +721,7 @@ def save_mesh_stats_npz(
 
 def load_mesh_stats_npz(
     path: str | Path,
-    mesh: trimesh.Trimesh | None = None,
+    mesh=None,
 ) -> MeshStats:
     """Load a :class:`MeshStats` written by :func:`save_mesh_stats_npz`.
 
@@ -651,7 +729,7 @@ def load_mesh_stats_npz(
     ----------
     path : str or Path
         Source archive.
-    mesh : trimesh.Trimesh or None, optional
+    mesh : Mesh or None, optional
         If provided, the loaded face count is validated against
         ``len(mesh.faces)``.  A mismatch raises :class:`ValueError`
         because the cached stats no longer match the mesh.
@@ -937,7 +1015,8 @@ def _unpack_ragged_2d_fixed(stacked: np.ndarray, ptr: np.ndarray) -> list[np.nda
 
 
 def _save_stats_to_payload(stats: dict | None, prefix: str, payload: dict) -> None:
-    """Pack dict of 1D arrays into NPZ payload using '<prefix>_keys' + '<prefix>__{key}'."""
+    """Pack dict of 1D arrays into NPZ payload using '<prefix>_keys' +
+    '<prefix>__{key}'."""
     if not stats:
         return
     keys = list(stats.keys())
@@ -1001,12 +1080,15 @@ def save_contact_sites_npz(res, path: str | Path, *, compress: bool = True) -> N
         bbox_B=np.asarray(res.bbox_B, np.float64),
         bbox=np.asarray(res.bbox, np.float64),
         meta_json=_json_encode_meta(res.meta),
-        _schema=np.array("ContactSitesResult@2", dtype="U"),
+        _schema=np.array("ContactSitesResult@3", dtype="U"),
     )
+    if getattr(res, "kind", None) is not None:
+        payload["kind"] = np.asarray(res.kind, dtype="U")
     # Optional stats: flattened into many arrays with explicit key list per group
     _save_stats_to_payload(getattr(res, "stats_A", None), "stats_A", payload)
     _save_stats_to_payload(getattr(res, "stats_B", None), "stats_B", payload)
     _save_stats_to_payload(getattr(res, "stats_pair", None), "stats_pair", payload)
+    _save_stats_to_payload(getattr(res, "geometry", None), "geometry", payload)
     if compress:
         np.savez_compressed(path, **payload)
     else:
@@ -1035,6 +1117,8 @@ def load_contact_sites_npz(path: str | Path):
         stats_A = _load_stats_from_npz(z, "stats_A")
         stats_B = _load_stats_from_npz(z, "stats_B")
         stats_pair = _load_stats_from_npz(z, "stats_pair")
+        geometry = _load_stats_from_npz(z, "geometry")
+        kind = z["kind"].astype(str) if "kind" in z else None
 
         if stats_A is None and isinstance(meta.get("stats_A"), dict):
             stats_A = {k: np.asarray(v, np.float64) for k, v in meta["stats_A"].items()}
@@ -1067,6 +1151,8 @@ def load_contact_sites_npz(path: str | Path):
             stats_A=stats_A,
             stats_B=stats_B,
             stats_pair=stats_pair,
+            kind=kind,
+            geometry=geometry,
         )
 
 
@@ -1075,7 +1161,6 @@ def load_contact_sites_npz(path: str | Path):
 
 def _deprecated_alias(old_name: str, new_func):
     import functools
-    import warnings
 
     @functools.wraps(new_func)
     def wrapper(*args, **kwargs):

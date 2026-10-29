@@ -1,0 +1,5 @@
+# Cargo output for the workspace in skeliner/rust/, kept out of the Python
+# package: every cargo run in this repository (maturin, CI, by hand) finds
+# this file in a parent directory.
+[build]
+target-dir = "target"

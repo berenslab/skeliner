@@ -3,8 +3,11 @@
 import warnings
 from typing import Any, Dict, List, Sequence, Set, Tuple
 
-import igraph as ig
 import numpy as np
+
+from ._backend import kernels
+from ._state import vertex_arrays
+from .dataclass import mesh_args
 
 __skeleton__ = [
     "check_connectivity",
@@ -39,9 +42,26 @@ __skeleton__ = [
 # -----------------------------------------------------------------------------
 
 
-def _graph(skel) -> ig.Graph:
-    """Return the undirected *igraph* view of the skeleton."""
-    return skel._igraph()
+def _edges(skel) -> np.ndarray:
+    """The skeleton's edges as an ``(E, 2)`` int64 array."""
+    return np.asarray(skel.edges, dtype=np.int64).reshape(-1, 2)
+
+
+def _degrees(skel) -> np.ndarray:
+    """Each node's degree, a self-loop counted twice."""
+    return np.bincount(_edges(skel).ravel(), minlength=len(skel.nodes))
+
+
+def _node(skel, node_id) -> int:
+    """*node_id* as one of the skeleton's nodes."""
+    v, n = int(node_id), len(skel.nodes)
+    if not 0 <= v < n:
+        raise ValueError(f"node {v} is not one of {n} nodes")
+    return v
+
+
+def _n_components(edges: np.ndarray, n: int) -> int:
+    return int(kernels.dx.components(edges, n).max()) + 1 if n else 0
 
 
 # -----------------------------------------------------------------------------
@@ -59,12 +79,10 @@ def check_connectivity(skel, *, return_isolated: bool = False):
     return_isolated
         When *True* return a list of orphan node indices instead of a boolean.
     """
-    g = _graph(skel)
-    order, _, _ = g.bfs(0, mode="ALL")  # order[i] == -1 ⇔ unreachable
-    reachable = {v for v in order if v != -1}
+    reached = np.isfinite(kernels.dx.hops(_edges(skel), len(skel.nodes), 0))
     if return_isolated:
-        return [i for i in range(g.vcount()) if i not in reachable]
-    return len(reachable) == g.vcount()
+        return np.flatnonzero(~reached).tolist()
+    return bool(reached.all())
 
 
 def connectivity(skel, *, return_isolated: bool = False):
@@ -83,24 +101,24 @@ def check_acyclicity(skel, *, return_cycles: bool = False):
     If a cycle exists and ``return_cycles`` is *True*, a representative list
     of (u, v) edges forming the cycle is returned.
     """
-    g = _graph(skel)
-    n_comp = len(g.components())
-    acyclic = g.ecount() == g.vcount() - n_comp
+    edges = _edges(skel)
+    n = len(skel.nodes)
+    acyclic = len(edges) == n - _n_components(edges, n)
     if acyclic or not return_cycles:
         return acyclic
-    return _cycle_edges(g, g.minimum_cycle_basis()[0])
+    return _cycle_edges(edges, kernels.dx.cycle_basis(edges, n)[0])
 
 
-def _cycle_edges(g: ig.Graph, eids) -> List[Tuple[int, int]]:
+def _cycle_edges(edges: np.ndarray, eids) -> List[Tuple[int, int]]:
     """Edge ids from a cycle basis → ``(u, v)`` pairs, walked in loop order.
 
-    ``minimum_cycle_basis`` and ``fundamental_cycles`` return **edge** ids,
-    where the removed ``cycle_basis`` returned **vertex** ids.  Reading the
-    new output as the old — indexing it as a vertex ring — silently yields a
-    plausible list of pairs that are not the cycle, which is why this
-    conversion is one named function rather than repeated at each call site.
+    A cycle basis names **edge** ids (igraph's ``minimum_cycle_basis``, where
+    its removed ``cycle_basis`` named **vertex** ids).  Reading one as the
+    other — indexing it as a vertex ring — silently yields a plausible list
+    of pairs that are not the cycle, which is why this conversion is one
+    named function rather than repeated at each call site.
     """
-    pairs = [tuple(sorted(g.es[int(e)].tuple)) for e in eids]
+    pairs = [tuple(sorted(map(int, edges[int(e)]))) for e in eids]
     nbr: Dict[int, List[int]] = {}
     for a, b in pairs:
         nbr.setdefault(a, []).append(b)
@@ -117,6 +135,7 @@ def _cycle_edges(g: ig.Graph, eids) -> List[Tuple[int, int]]:
     return [(ring[i], ring[(i + 1) % len(ring)]) for i in range(len(ring))]
 
 
+@mesh_args()
 def cycles(skel, mesh=None) -> List[Dict[str, Any]]:
     """Every independent loop, and where the tree most likely closed it wrongly.
 
@@ -150,8 +169,8 @@ def cycles(skel, mesh=None) -> List[Dict[str, Any]]:
         Longest loop first — a two-node loop is a duplicated edge, while a
         long one spans the structure the tree got wrong.
     """
-    g = _graph(skel)
-    basis = g.minimum_cycle_basis()
+    skel_edges = _edges(skel)
+    basis = kernels.dx.cycle_basis(skel_edges, len(skel.nodes))
     if not basis:
         return []
 
@@ -163,7 +182,7 @@ def cycles(skel, mesh=None) -> List[Dict[str, Any]]:
     nodes = np.asarray(skel.nodes, dtype=np.float64)
     out: List[Dict[str, Any]] = []
     for eids in basis:
-        edges = _cycle_edges(g, eids)
+        edges = _cycle_edges(skel_edges, eids)
         ring = [a for a, _ in edges]
         length = float(sum(np.linalg.norm(nodes[a] - nodes[b]) for a, b in edges))
         out.append(
@@ -190,6 +209,7 @@ def acyclicity(skel, *, return_cycles: bool = False):
     return check_acyclicity(skel, return_cycles=return_cycles)
 
 
+@mesh_args()
 def check_bins(skel, *, mesh=None, return_report: bool = False):
     """Verify that ``node2verts`` and ``vert2node`` still agree.
 
@@ -247,55 +267,42 @@ def check_bins(skel, *, mesh=None, return_report: bool = False):
         report = {"ok": False, "reason": "node2verts length != node count"}
         return report if return_report else False
 
-    bins = [np.asarray(v, dtype=np.int64).ravel() for v in n2v]
-    arbor = bins[1:]
-
-    owned = (
-        np.concatenate([b for b in arbor if b.size])
-        if any(b.size for b in arbor)
-        else np.empty(0, dtype=np.int64)
-    )
-    uniq, counts = np.unique(owned, return_counts=True)
-    duplicated = uniq[counts > 1]
-
+    ptr, idx = _bins_csr(n2v)
     # `vert2node` must be what rebuild_vert2node() would produce: ascending
     # node order, so an arbor bin overwrites node 0 on the shared boundary.
-    keys = np.fromiter(v2n.keys(), np.int64, len(v2n))
-    vals = np.fromiter(v2n.values(), np.int64, len(v2n))
-    size = 1 + int(
-        max(owned.max(initial=-1), bins[0].max(initial=-1), keys.max(initial=-1))
+    keys, vals = vertex_arrays(v2n)
+    n_owned, duplicated, mismatched, empty_bins, soma_overlap = kernels.dx.check_bins(
+        ptr, idx, keys, vals
     )
-
-    expect = np.full(size, -1, dtype=np.int64)
-    for nid, b in enumerate(bins):
-        if b.size:
-            expect[b] = nid
-    actual = np.full(size, -1, dtype=np.int64)
-    actual[keys] = vals
-    mismatched = np.flatnonzero(expect != actual)
-
     ok = duplicated.size == 0 and mismatched.size == 0
 
     if not return_report:
         return bool(ok)
 
-    soma_overlap = (
-        np.intersect1d(bins[0], uniq, assume_unique=False).size if bins[0].size else 0
-    )
     report: Dict[str, Any] = {
         "ok": bool(ok),
-        "n_nodes": len(bins),
-        "n_owned": int(uniq.size),
+        "n_nodes": len(n2v),
+        "n_owned": int(n_owned),
         "duplicated": duplicated,
         "mismatched": mismatched,
-        "empty_bins": [i for i, b in enumerate(bins) if b.size == 0],
+        "empty_bins": list(empty_bins),
         "soma_overlap": int(soma_overlap),
     }
     if mesh is not None:
-        report["fragmented"] = _fragmented_bins(bins, mesh)
+        report["fragmented"] = _fragmented_bins(n2v, mesh)
     return report
 
 
+def _bins_csr(node2verts) -> tuple[np.ndarray, np.ndarray]:
+    """The bins as a CSR: ``ptr`` ``(N + 1,)`` and the vertex ids ``idx``."""
+    bins = [np.asarray(v, dtype=np.int64).ravel() for v in node2verts]
+    ptr = np.zeros(len(bins) + 1, dtype=np.int64)
+    np.cumsum([b.size for b in bins], out=ptr[1:])
+    idx = np.concatenate(bins) if bins else np.empty(0, dtype=np.int64)
+    return ptr, idx
+
+
+@mesh_args()
 def check_mesh_pairing(skel, mesh, *, return_report: bool = False):
     """Is *mesh* the surface ``skel`` was built from?
 
@@ -360,11 +367,7 @@ def check_mesh_pairing(skel, mesh, *, return_report: bool = False):
     if n2v is None:
         return _out(False, False, "skeleton carries no mesh data")
 
-    highest = -1
-    for b in n2v:
-        b = np.asarray(b, dtype=np.int64).ravel()
-        if b.size:
-            highest = max(highest, int(b.max()))
+    highest = int(_bins_csr(n2v)[1].max(initial=-1))
     if highest >= n_verts:
         return _out(
             False,
@@ -395,6 +398,7 @@ def check_mesh_pairing(skel, mesh, *, return_report: bool = False):
     return _out(True, True, "counts match the mesh this was built from")
 
 
+@mesh_args()
 def edge_support(skel, mesh) -> Dict[str, Any]:
     """Which node pairs the mesh surface joins, against which ones the tree has.
 
@@ -430,53 +434,37 @@ def edge_support(skel, mesh) -> Dict[str, Any]:
         raise ValueError("skeleton carries no vert2node — cannot rebuild G")
 
     g_edges = _edges_from_mesh(np.asarray(mesh.edges_unique), v2n, len(mesh.vertices))
-    tree = np.unique(np.sort(np.asarray(skel.edges, dtype=np.int64), axis=1), axis=0)
-    tset = {(int(u), int(v)) for u, v in tree}
-    gset = {(int(u), int(v)) for u, v in g_edges}
+    tree = np.unique(np.sort(_edges(skel), axis=1), axis=0)
+    g_edges = np.asarray(g_edges, dtype=np.int64).reshape(-1, 2)
+    # each sorted pair as one number, in the pairs' own order
+    base = 1 + int(max(tree.max(initial=-1), g_edges.max(initial=-1)))
+    t_code = tree[:, 0] * base + tree[:, 1]
+    g_code = np.unique(g_edges[:, 0] * base + g_edges[:, 1])
+
+    def _pairs(codes: np.ndarray) -> List[Tuple[int, int]]:
+        return list(zip((codes // base).tolist(), (codes % base).tolist(), strict=True))
 
     return {
         "n_nodes": len(skel.nodes),
-        "n_tree": len(tset),
-        "dropped": sorted(gset - tset),
-        "unsupported": sorted(tset - gset),
+        "n_tree": len(tree),
+        "dropped": _pairs(np.setdiff1d(g_code, t_code, assume_unique=True)),
+        "unsupported": _pairs(np.setdiff1d(t_code, g_code, assume_unique=True)),
     }
 
 
-def _fragmented_bins(bins: List[np.ndarray], mesh) -> Dict[int, int]:
-    """Map bin id → number of connected surface patches, for bins with >1.
-
-    One pass over the whole mesh rather than a BFS per bin: keep only the mesh
-    edges whose endpoints share an owner, label the connected components of
-    what is left, then count distinct labels within each bin.
-    """
-    from scipy.sparse import coo_matrix
-    from scipy.sparse.csgraph import connected_components
-
-    n_verts = len(mesh.vertices)
-    owner = np.full(n_verts, -1, dtype=np.int64)
-    for nid, b in enumerate(bins):
-        if nid and b.size:  # node 0 is soma.verts, not a bin
-            owner[b] = nid
-
-    e = np.asarray(mesh.edges_unique)
-    keep = (owner[e[:, 0]] == owner[e[:, 1]]) & (owner[e[:, 0]] >= 1)
-    e = e[keep]
-
-    adj = coo_matrix(
-        (np.ones(len(e), dtype=np.int8), (e[:, 0], e[:, 1])),
-        shape=(n_verts, n_verts),
+def _fragmented_bins(node2verts, mesh) -> Dict[int, int]:
+    """Map bin id → number of connected surface patches, for bins with >1."""
+    ptr, idx = _bins_csr(node2verts)
+    nodes, pieces = kernels.dx.fragmented_bins(
+        ptr,
+        idx,
+        np.asarray(mesh.edges_unique, dtype=np.int64).reshape(-1, 2),
+        len(mesh.vertices),
     )
-    _, labels = connected_components(adj, directed=False)
-
-    out: Dict[int, int] = {}
-    for nid, b in enumerate(bins):
-        if nid and b.size > 1:
-            n_pieces = np.unique(labels[b]).size
-            if n_pieces > 1:
-                out[nid] = int(n_pieces)
-    return out
+    return dict(zip(nodes.tolist(), pieces.tolist(), strict=True))
 
 
+@mesh_args()
 def face_owner(skel, mesh) -> np.ndarray:
     """Per-face owning node, ``-1`` where no node owns a majority.
 
@@ -498,8 +486,7 @@ def face_owner(skel, mesh) -> np.ndarray:
         return np.full(len(mesh.faces), -1, dtype=np.int64)
 
     lut = np.full(len(mesh.vertices), -1, dtype=np.int64)
-    keys = np.fromiter(skel.vert2node.keys(), np.int64, len(skel.vert2node))
-    vals = np.fromiter(skel.vert2node.values(), np.int64, len(skel.vert2node))
+    keys, vals = vertex_arrays(skel.vert2node)
     # An id past the end means this is not the mesh the bins were built over.
     # Left to numpy it is an IndexError naming an array nobody passed in; a
     # mesh one vertex *larger* than the original would not raise at all, which
@@ -511,15 +498,10 @@ def face_owner(skel, mesh) -> np.ndarray:
             "mesh (see dx.check_mesh_pairing)"
         )
     lut[keys] = vals
-
-    per_face = np.sort(lut[np.asarray(mesh.faces)], axis=1)
-    return np.where(
-        per_face[:, 0] == per_face[:, 1],
-        per_face[:, 0],
-        np.where(per_face[:, 1] == per_face[:, 2], per_face[:, 1], -1),
-    )
+    return kernels.dx.face_owner(np.asarray(mesh.faces, dtype=np.int64), lut)
 
 
+@mesh_args()
 def bin_faces(skel, mesh, node: int, *, owner: np.ndarray | None = None) -> np.ndarray:
     """Face ids owned by one node — the surface its radius is measured over.
 
@@ -538,16 +520,19 @@ def bin_faces(skel, mesh, node: int, *, owner: np.ndarray | None = None) -> np.n
 
 def degree(skel, node_id: int | Sequence[int]):
     """Return the degree(s) of one node *or* a sequence of nodes."""
-    g = _graph(skel)
+    deg = _degrees(skel)
     if isinstance(node_id, (list, tuple, np.ndarray)):
-        return np.asarray(g.degree(node_id))
-    return int(g.degree(node_id))
+        return deg[np.asarray([_node(skel, v) for v in node_id], dtype=np.int64)]
+    return int(deg[_node(skel, node_id)])
 
 
 def neighbors(skel, node_id: int) -> List[int]:
-    """Neighbour vertex IDs of *node_id* (undirected)."""
-    g = _graph(skel)
-    return [int(v) for v in g.neighbors(node_id)]
+    """Neighbour vertex IDs of *node_id* (undirected), ascending; a self-loop
+    lists the node twice."""
+    v = _node(skel, node_id)
+    e = _edges(skel)
+    nb = np.concatenate([e[e[:, 0] == v, 1], e[e[:, 1] == v, 0]])
+    return np.sort(nb, kind="stable").tolist()
 
 
 def _point_segment_distance(
@@ -679,7 +664,6 @@ def distance(
     if k_nearest < 1:
         raise ValueError("k_nearest must be at least 1.")
 
-    tree = skel._ensure_nodes_kdtree()
     neighbours = skel._ensure_node_neighbors()
 
     skel_unit = skel.meta.get("unit")
@@ -702,7 +686,6 @@ def distance(
     else:
         radii = None
 
-    distances = np.empty(len(pts), dtype=np.float64)
     max_k = min(int(k_nearest), len(skel.nodes))
     nodes = skel.nodes
 
@@ -724,82 +707,52 @@ def distance(
             a, b = (u2, v2) if u2 < v2 else (v2, u2)
             allowed_edges_set.add((a, b))
 
-    for i, p in enumerate(pts):
-        p_skel = p * scale_in
+    if (
+        use_whitelist
+        and not surface
+        and allowed_edges_set is None
+        and scale_in == 1.0
+        and scale_out == 1.0
+    ):
+        # the same minimum over the allowed centres and their edges, once
+        segments = sorted(
+            {
+                (min(nid, int(nb)), max(nid, int(nb)))
+                for nid in allowed_nodes_set
+                for nb in neighbours[nid]
+            }
+        )
+        distances = kernels.dx.segment_distances(
+            pts,
+            np.asarray(nodes, dtype=np.float64),
+            sorted(allowed_nodes_set),
+            segments,
+        )
+        return float(distances[0]) if single_input else distances
 
-        # Initialize best distance from node centres
-        if use_whitelist:
-            # Collect centres to consider: explicit allowed nodes and endpoints of allowed edges
-            centres: Set[int] = set()
-            if allowed_nodes_set is not None:
-                centres.update(allowed_nodes_set)
-            if allowed_edges_set is not None:
-                for a, b in allowed_edges_set:
-                    centres.add(a)
-                    centres.add(b)
-
-            if centres:
-                # compute min distance to allowed centres
-                centres_list = list(centres)
-                diffs = nodes[centres_list] - p_skel
-                nn_dist_arr = np.linalg.norm(diffs, axis=1)
-                if surface:
-                    rad = (
-                        np.asarray([radii[c] for c in centres_list], dtype=np.float64)
-                        if radii is not None
-                        else 0.0
-                    )
-                    best = float(np.min(nn_dist_arr - rad))
-                else:
-                    best = float(np.min(nn_dist_arr))
-            else:
-                best = float("inf")
-
-            # Candidate edges: explicit allowed_edges plus edges incident to allowed_nodes
-            candidates: Set[tuple[int, int]] = set()
-            if allowed_edges_set is not None:
-                candidates.update(allowed_edges_set)
-            if allowed_nodes_set is not None:
-                for nid in allowed_nodes_set:
-                    for nb in neighbours[nid]:
-                        a, b = (nid, nb) if nid < nb else (nb, nid)
-                        candidates.add((a, b))
-        else:
-            # default global behaviour via KD-tree + incident edges
-            nn_dist, nn_idx = tree.query(p_skel, k=max_k)
-            nn_idx_arr = np.atleast_1d(nn_idx).astype(np.int64, copy=False)
-            nn_dist_arr = np.atleast_1d(nn_dist)
-            if surface:
-                best = float(np.min(nn_dist_arr - radii[nn_idx_arr]))
-            else:
-                best = float(nn_dist_arr.min())
-
-            candidates: set[tuple[int, int]] = set()
-            for nid in nn_idx_arr:
-                for nb in neighbours[nid]:
-                    a, b = (nid, nb) if nid < nb else (nb, nid)
-                    candidates.add((a, b))
-
-        if candidates:
-            for a_idx, b_idx in candidates:
-                if surface:
-                    d = _point_segment_capsule_distance(
-                        p_skel,
-                        nodes[a_idx],
-                        nodes[b_idx],
-                        radii[a_idx],
-                        radii[b_idx],
-                    )
-                else:
-                    d = _point_segment_distance(p_skel, nodes[a_idx], nodes[b_idx])
-                if d < best:
-                    best = d
-
-        if surface:
-            distances[i] = max(best, 0.0) * scale_out
-        else:
-            distances[i] = best * scale_out
-
+    centres = segments = None
+    if use_whitelist:
+        # the same nodes and edges for every point: the allowed nodes and the
+        # ends of the allowed edges; the allowed edges and every edge at an
+        # allowed node
+        ends: Set[int] = set(allowed_nodes_set or ())
+        candidates: Set[tuple[int, int]] = set(allowed_edges_set or ())
+        for a, b in allowed_edges_set or ():
+            ends.update((a, b))
+        for nid in allowed_nodes_set or ():
+            for nb in neighbours[nid]:
+                nb = int(nb)
+                candidates.add((nid, nb) if nid < nb else (nb, nid))
+        centres, segments = sorted(ends), sorted(candidates)
+    distances = skel._ensure_distance_index().distance(
+        pts,
+        radii,
+        max_k,
+        centres,
+        segments,
+        float(scale_in),
+        float(scale_out),
+    )
     return float(distances[0]) if single_input else distances
 
 
@@ -807,10 +760,9 @@ def _node_summary_from_cache(
     skel,
     node_id: int,
     radius_metric: str | None,
-    g: ig.Graph,
     deg: np.ndarray,
 ) -> Dict[str, Any]:
-    """Internal helper that reuses a precomputed degree vector + graph."""
+    """Internal helper that reuses a precomputed degree vector."""
     if radius_metric is None:
         radius_metric = skel.recommend_radius()[0]
 
@@ -822,7 +774,7 @@ def _node_summary_from_cache(
         "radius": r_root,
         "neighbors": [],
     }
-    for nb in g.neighbors(node_id):
+    for nb in neighbors(skel, node_id):
         summary["neighbors"].append(
             {
                 "id": int(nb),
@@ -852,9 +804,7 @@ def node_summary(
             ]
         }
     """
-    g = _graph(skel)
-    deg = np.asarray(g.degree())
-    return _node_summary_from_cache(skel, node_id, radius_metric, g, deg)
+    return _node_summary_from_cache(skel, node_id, radius_metric, _degrees(skel))
 
 
 # -----------------------------------------------------------------------------
@@ -882,8 +832,7 @@ def degree_distribution(
         Which radius column to report. Default = the estimator recommended
         by :py:meth:`Skeleton.recommend_radius`.
     """
-    g = _graph(skel)
-    deg = np.asarray(g.degree())
+    deg = _degrees(skel)
 
     hist = np.bincount(deg)
     thresh = np.percentile(deg, high_deg_percentile)
@@ -894,7 +843,7 @@ def degree_distribution(
         high_dict[int(idx)] = int(deg[idx])
         if detailed:
             high_dict[int(idx)] = _node_summary_from_cache(
-                skel, int(idx), radius_metric, g, deg
+                skel, int(idx), radius_metric, deg
             )
 
     return {
@@ -915,8 +864,7 @@ def nodes_of_degree(skel, k: int):
     """
     if k < 0:
         raise ValueError("k must be non‑negative")
-    g = _graph(skel)
-    deg = np.asarray(g.degree())
+    deg = _degrees(skel)
     idx = np.where(deg == k)[0]
     if k == deg[0]:  # avoid returning the soma
         idx = idx[idx != 0]
@@ -955,43 +903,16 @@ def branches_of_length(
         If *True* endpoints are counted as part of the path and therefore
         contribute to *k*.  If *False* only the *interior* degree‑2 vertices
         are counted.
+
+    Returns
+    -------
+    list[list[int]]
+        Each branch walked from the end met first — ends in ascending order,
+        each end's neighbours ascending — in that order.
     """
-    g = _graph(skel)
-    deg = np.asarray(g.degree())
-
-    # Mark endpoints = vertices with degree != 2 OR soma (0) even if deg==2
-    endpoints: Set[int] = {i for i, d in enumerate(deg) if d != 2}
-    endpoints.add(0)
-
-    visited_edges: Set[Tuple[int, int]] = set()
-    branches: List[List[int]] = []
-
-    for ep in endpoints:
-        for nb in g.neighbors(ep):
-            edge = tuple(sorted((ep, nb)))
-            if edge in visited_edges:
-                continue
-
-            path = [ep]
-            prev, curr = ep, nb
-            while True:
-                path.append(curr)
-                visited_edges.add(
-                    (min(int(prev), int(curr)), max(int(prev), int(curr)))
-                )
-                if curr in endpoints:
-                    break
-                # internal vertex (deg==2) → continue straight
-                nxts = [v for v in g.neighbors(curr) if v != prev]
-                if not nxts:
-                    break  # should not happen in a well‑formed tree
-                prev, curr = curr, nxts[0]
-
-            length = len(path) if include_endpoints else len(path) - 2
-            if length == k:
-                branches.append([int(v) for v in path])
-
-    return branches
+    return kernels.dx.branches(
+        _edges(skel), len(skel.nodes), int(k), bool(include_endpoints)
+    )
 
 
 def twigs_of_length(
@@ -1025,35 +946,12 @@ def twigs_of_length(
         Each sub-list is ordered **proximal ➜ leaf**.
         * Length == k              when include_branching_node=False
         * Length == k + 1          when include_branching_node=True
+
+        A leaf the soma does not reach (another tree of a forest) has none.
     """
-    g = _graph(skel)
-    deg = np.asarray(g.degree())
-
-    twigs: List[List[int]] = []
-
-    # candidates = all leaves (deg==1, exclude soma)
-    leaves = [v for v in range(1, len(deg)) if deg[v] == 1]
-    parent = g.bfs(0, mode="ALL")[2]
-
-    for leaf in leaves:
-        chain = [leaf]
-        curr = leaf
-        while True:
-            par = parent[curr]
-            if par == -1:
-                break  # should not happen – disconnected
-            if deg[par] == 2 and par != 0:
-                chain.append(par)
-                curr = par
-                continue
-            # par is branching point (deg!=2 or soma)
-            if len(chain) == k:
-                if include_branching_node:
-                    chain.append(par)
-                twigs.append(chain[::-1])  # proximal➜distal order
-            break
-
-    return twigs
+    return kernels.dx.twigs(
+        _edges(skel), len(skel.nodes), int(k), bool(include_branching_node)
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -1062,17 +960,14 @@ def twigs_of_length(
 
 
 def leaf_depths(skel) -> np.ndarray:
-    """Depth (in *edges*) of every leaf node relative to the soma."""
-    g = _graph(skel)
-    deg = np.asarray(g.degree())
+    """Depth (in *edges*) of every leaf node relative to the soma, by leaf
+    id; -1 for a leaf the soma does not reach."""
+    deg = _degrees(skel)
     leaves = np.where((deg == 1) & (np.arange(len(deg)) != 0))[0]
     if leaves.size == 0:
         return np.empty(0, dtype=int)
-    # Only compute distances to the leaf subset to avoid full all-pairs output
-    dists = np.asarray(
-        g.shortest_paths_dijkstra(source=0, target=leaves.tolist(), weights=None)[0]
-    )
-    return dists.astype(int)
+    dists = kernels.dx.hops(_edges(skel), len(deg), 0)[leaves]
+    return np.where(np.isfinite(dists), dists, -1).astype(int)
 
 
 def suspicious_tips(
@@ -1126,11 +1021,9 @@ def suspicious_tips(
     r_max = float(skel.soma.axes.max())
     near_thr = near_factor * r_max
 
-    # Build an igraph view with edge‑length weights (Euclidean)
-    g: ig.Graph = skel._igraph()
-    g.es["weight"] = [
-        float(np.linalg.norm(skel.nodes[a] - skel.nodes[b])) for a, b in skel.edges
-    ]
+    # Edge‑length weights (Euclidean)
+    e = _edges(skel)
+    weights = np.linalg.norm(skel.nodes[e[:, 0]] - skel.nodes[e[:, 1]], axis=1)
 
     # Tip detection – degree = 1, excluding the soma (node 0)
     deg = np.bincount(skel.edges.flatten(), minlength=len(skel.nodes))
@@ -1140,10 +1033,9 @@ def suspicious_tips(
         return [] if not return_stats else ([], {})
 
     # Shortest path (edge‑weighted) length to soma for every tip
-    path_d = np.asarray(
-        g.distances(source=list(tips), target=[0], weights="weight"),
-        dtype=np.float64,
-    ).reshape(-1)
+    path_d = kernels.dx.path_lengths(
+        e, len(skel.nodes), weights, tips.astype(np.int64), 0
+    )
 
     # Straight‑line metrics
     eucl_d = np.linalg.norm(skel.nodes[tips] - soma_c, axis=1)
@@ -1209,91 +1101,19 @@ def _arm_cables(skel, min_degree: int) -> Dict[int, Dict[str, Any]]:
     Recursion is avoided throughout — a long neurite is a deep tree, and the
     recursive form overflows the stack on real cells.
     """
-    n = len(skel.nodes)
-    edges = np.asarray(skel.edges, dtype=np.int64).reshape(-1, 2)
-    if n == 0 or edges.size == 0:
-        return {}
-
-    nodes = np.asarray(skel.nodes, dtype=np.float64)
-    lengths = np.linalg.norm(nodes[edges[:, 0]] - nodes[edges[:, 1]], axis=1)
-
-    # CSR-style adjacency: neighbour ids and the length of the edge used.
-    deg = np.bincount(edges.reshape(-1), minlength=n)
-    start = np.zeros(n + 1, dtype=np.int64)
-    np.cumsum(deg, out=start[1:])
-    fill = start[:-1].copy()
-    adj = np.empty(2 * len(edges), dtype=np.int64)
-    adj_len = np.empty(2 * len(edges), dtype=np.float64)
-    for (a, b), ln in zip(edges, lengths, strict=True):
-        adj[fill[a]] = b
-        adj_len[fill[a]] = ln
-        fill[a] += 1
-        adj[fill[b]] = a
-        adj_len[fill[b]] = ln
-        fill[b] += 1
-
-    parent = np.full(n, -1, dtype=np.int64)
-    parent_len = np.zeros(n, dtype=np.float64)
-    order = np.empty(n, dtype=np.int64)  # BFS order, roots first
-    seen = np.zeros(n, dtype=bool)
-    k = 0
-    for root in range(n):  # node 0 first, so the soma roots its own component
-        if seen[root]:
-            continue
-        seen[root] = True
-        order[k] = root
-        k += 1
-        head = k - 1
-        while head < k:
-            v = order[head]
-            head += 1
-            for j in range(start[v], start[v + 1]):
-                w = adj[j]
-                if not seen[w]:
-                    seen[w] = True
-                    parent[w] = v
-                    parent_len[w] = adj_len[j]
-                    order[k] = w
-                    k += 1
-
-    # Post-order accumulation: walk the BFS order backwards, so every child is
-    # finished before its parent is read.
-    sub = np.zeros(n, dtype=np.float64)
-    for idx in range(n - 1, -1, -1):
-        v = order[idx]
-        p = parent[v]
-        if p >= 0:
-            sub[p] += sub[v] + parent_len[v]
-
-    # Total cable of the component each node belongs to — the proximal arm is
-    # measured against its own component, not the whole file.
-    comp_total = np.zeros(n, dtype=np.float64)
-    comp_of = np.zeros(n, dtype=np.int64)
-    for idx in range(n):
-        v = order[idx]
-        comp_of[v] = v if parent[v] < 0 else comp_of[parent[v]]
-    for v in range(n):
-        comp_total[v] = sub[comp_of[v]]
-
-    out: Dict[int, Dict[str, Any]] = {}
-    for v in range(n):
-        if deg[v] < min_degree or parent[v] < 0:
-            # A component root has no proximal arm, so "one arm holds the
-            # soma and the others do not" is undefined there.  The soma is
-            # legitimately high-degree anyway.
-            continue
-        distal = [
-            float(sub[adj[j]] + adj_len[j])
-            for j in range(start[v], start[v + 1])
-            if adj[j] != parent[v]
-        ]
-        distal.sort(reverse=True)
-        out[int(v)] = {
-            "degree": int(deg[v]),
-            "proximal_cable": float(comp_total[v] - sub[v]),
-            "distal_cables": distal,
+    junctions, degrees, proximal, ptr, distal = kernels.dx.arm_cables(
+        np.asarray(skel.nodes, dtype=np.float64).reshape(-1, 3),
+        np.asarray(skel.edges, dtype=np.int64).reshape(-1, 2),
+        int(min_degree),
+    )
+    return {
+        int(v): {
+            "degree": int(degrees[k]),
+            "proximal_cable": float(proximal[k]),
+            "distal_cables": distal[ptr[k] : ptr[k + 1]].tolist(),
         }
-    return out
+        for k, v in enumerate(junctions.tolist())
+    }
 
 
 def suspicious_junctions(
@@ -1405,14 +1225,13 @@ def suspicious_junctions(
 def _collapse_adjacent(skel, nodes: List[int], *, key) -> List[int]:
     """Reduce each connected cluster of *nodes* to its highest-*key* member."""
     want = set(int(n) for n in nodes)
-    edges = np.asarray(skel.edges, dtype=np.int64).reshape(-1, 2)
+    edges = _edges(skel)
+    edges = edges[np.isin(edges, list(want)).all(axis=1)]
 
     nbr: Dict[int, List[int]] = {n: [] for n in want}
-    for a, b in edges:
-        a, b = int(a), int(b)
-        if a in want and b in want:
-            nbr[a].append(b)
-            nbr[b].append(a)
+    for a, b in edges.tolist():
+        nbr[a].append(b)
+        nbr[b].append(a)
 
     reps: List[int] = []
     unseen = set(want)
@@ -1471,31 +1290,7 @@ def extract_neurites(
     N = len(skel.nodes)
     if root < 0 or root >= N:
         raise ValueError("root is out of range")
-
-    # 1. shortest‑path distance from soma to EVERY node (unweighted graph)
-    g = skel._igraph()
-    dists = np.asarray(g.shortest_paths(source=[0])[0], dtype=int)
-
-    # 2. build children[]: edge directed along *increasing* distance
-    children: List[List[int]] = [[] for _ in range(N)]
-    for a, b in skel.edges:
-        da, db = dists[a], dists[b]
-        if da == db:
-            # should not happen in a tree, but guard anyway
-            continue
-        parent, child = (a, b) if da < db else (b, a)
-        children[parent].append(child)
-
-    # 3. DFS from root collecting all downstream vertices
-    out: List[int] = []
-    stack = [root]
-    while stack:
-        v = stack.pop()
-        if v != root or include_root:
-            out.append(v)
-        stack.extend(children[v])
-
-    return sorted(out)
+    return kernels.dx.neurite(_edges(skel), N, int(root), bool(include_root)).tolist()
 
 
 def neurite_names(skel) -> Dict[int, str]:
@@ -1585,43 +1380,21 @@ def neurites_out_of_bounds(
 
     Notes
     -----
-    * Works on acyclic skeletons (trees).
-    * Uses only igraph helpers; no custom BFS routine.
+    * Works on acyclic skeletons (trees). A node the soma does not reach (on
+      another tree of a forest) that lies outside starts a subtree of its
+      own.
     """
     lo_hi = _parse_bbox(bounds)
     if lo_hi is None:
         raise ValueError("bounds must be provided")
     lo, hi = lo_hi
-
-    coords = skel.nodes
-    outside = np.any((coords < lo) | (coords > hi), axis=1)
-    if not outside.any():
-        return []
-
-    # ------------------------------------------------------------------
-    # one igraph shortest-path pass from soma (vertex 0)
-    # ------------------------------------------------------------------
-    g = skel._igraph()
-    dists = np.asarray(g.shortest_paths(source=[0])[0], dtype=int)
-
-    # For every edge (u,v) orient from proximal→distal
-    children: list[list[int]] = [[] for _ in range(len(coords))]
-    for u, v in skel.edges:
-        parent, child = (u, v) if dists[u] < dists[v] else (v, u)
-        children[parent].append(child)
-
-    # ------------------------------------------------------------------
-    # Treat each *first* out-of-bounds node as a neurite root
-    # ------------------------------------------------------------------
-    targets: set[int] = set()
-    for nid in np.where(outside)[0]:
-        # ensure nid is indeed the *first* outside node on its path
-        par = g.bfs(0, mode="ALL")[2][nid]
-        if par != -1 and outside[par]:
-            continue  # ancestor already outside – skip
-        targets.update(extract_neurites(skel, int(nid), include_root=include_root))
-
-    return sorted(targets)
+    return kernels.dx.neurites_out_of_bounds(
+        np.asarray(skel.nodes, dtype=np.float64).reshape(-1, 3),
+        _edges(skel),
+        lo.tolist(),
+        hi.tolist(),
+        bool(include_root),
+    ).tolist()
 
 
 # -----------------------------------------------------------------------------
@@ -1709,138 +1482,32 @@ def _voxelize_union(
     include_soma: bool,
 ):
     """
-    Boolean occupancy grid for the union of edge frusta and (optionally) soma,
-    inside [lo, hi].  Returns (occ, h, (nx,ny,nz), lo, hi).
+    How many voxels inside [lo, hi] the union of edge frusta and (optionally)
+    soma fills.  Returns (count, h, (nx,ny,nz), lo, hi).
     """
     h, (nx, ny, nz) = _choose_voxel_size(radii, lo, hi, user_voxel=voxel_size)
-    xs = lo[0] + (np.arange(nx) + 0.5) * h
-    ys = lo[1] + (np.arange(ny) + 0.5) * h
-    zs = lo[2] + (np.arange(nz) + 0.5) * h
-
-    occ = np.zeros((nx, ny, nz), dtype=bool)
-    nodes = skel.nodes.astype(np.float64, copy=False)
-    edges = skel.edges.astype(np.int64, copy=False)
-
-    # ---------------- helpers ----------------
-    def _range_x(x0, x1):
-        i0 = int(max(0, np.floor((x0 - lo[0]) / h)))
-        i1 = int(min(nx - 1, np.floor((x1 - lo[0]) / h)))
-        return i0, i1
-
-    def _range_y(y0, y1):
-        j0 = int(max(0, np.floor((y0 - lo[1]) / h)))
-        j1 = int(min(ny - 1, np.floor((y1 - lo[1]) / h)))
-        return j0, j1
-
-    def _range_z(z0, z1):
-        k0 = int(max(0, np.floor((z0 - lo[2]) / h)))
-        k1 = int(min(nz - 1, np.floor((z1 - lo[2]) / h)))
-        return k0, k1
-
-    # --------- precompute soma mask once (if there is a soma) ------------
-    soma_slice = None
-    soma_mask = None
+    soma = None
     if getattr(skel, "soma", None) is not None:
         slo, shi = _ellipsoid_aabb(skel.soma)
-        # clip to global bbox
-        slo = np.maximum(slo, lo)
-        shi = np.minimum(shi, hi)
-        i0, i1 = _range_x(slo[0], shi[0])
-        j0, j1 = _range_y(slo[1], shi[1])
-        k0, k1 = _range_z(slo[2], shi[2])
-
-        if (i1 >= i0) and (j1 >= j0) and (k1 >= k0):
-            # broadcasted coordinate slabs (no big meshgrid; uses ogrid)
-            xi = xs[i0 : i1 + 1][:, None, None]
-            yj = ys[j0 : j1 + 1][None, :, None]
-            zk = zs[k0 : k1 + 1][None, None, :]
-
-            cx, cy, cz = skel.soma.center
-            Rt = skel.soma.R.T  # 3x3
-            ax, ay, az = skel.soma.axes
-            ax2, ay2, az2 = ax * ax, ay * ay, az * az
-
-            dx = xi - cx
-            dy = yj - cy
-            dz = zk - cz
-
-            # rotate into soma body-frame: u = R^T (x - c)
-            ux = Rt[0, 0] * dx + Rt[0, 1] * dy + Rt[0, 2] * dz
-            uy = Rt[1, 0] * dx + Rt[1, 1] * dy + Rt[1, 2] * dz
-            uz = Rt[2, 0] * dx + Rt[2, 1] * dy + Rt[2, 2] * dz
-
-            soma_mask = (ux * ux) / ax2 + (uy * uy) / ay2 + (uz * uz) / az2 <= 1.0
-            soma_slice = (slice(i0, i1 + 1), slice(j0, j1 + 1), slice(k0, k1 + 1))
-
-    # If soma is to be included, OR it now.
-    if include_soma and soma_mask is not None:
-        occ[soma_slice] |= soma_mask
-
-    # ---------------- rasterize every edge (broadcasted) -----------------
-    for i, j in edges:
-        a = nodes[i]
-        b = nodes[j]
-        r0 = float(radii[i])
-        r1 = float(radii[j])
-
-        rmax = max(r0, r1)
-        if not np.isfinite(rmax) or rmax < 0.0:
-            continue
-
-        # edge AABB padded by rmax, clipped to [lo,hi]
-        lo_e = np.maximum(np.minimum(a, b) - rmax, lo)
-        hi_e = np.minimum(np.maximum(a, b) + rmax, hi)
-        if np.any(lo_e > hi_e):
-            continue
-
-        ii0, ii1 = _range_x(lo_e[0], hi_e[0])
-        jj0, jj1 = _range_y(lo_e[1], hi_e[1])
-        kk0, kk1 = _range_z(lo_e[2], hi_e[2])
-        if (ii1 < ii0) or (jj1 < jj0) or (kk1 < kk0):
-            continue
-
-        xi = xs[ii0 : ii1 + 1][:, None, None]
-        yj = ys[jj0 : jj1 + 1][None, :, None]
-        zk = zs[kk0 : kk1 + 1][None, None, :]
-
-        v = b - a
-        L2 = float(v @ v)
-        if L2 <= 1e-24:
-            # degenerate: paint a ball of radius rmax at 'a'
-            dx = xi - a[0]
-            dy = yj - a[1]
-            dz = zk - a[2]
-            d2 = dx * dx + dy * dy + dz * dz
-            mask = d2 <= (rmax * rmax)
-            occ[ii0 : ii1 + 1, jj0 : jj1 + 1, kk0 : kk1 + 1] |= mask
-            continue
-
-        vx, vy, vz = v
-        # projection parameter s (broadcasted), then clamp to [0,1]
-        dx = xi - a[0]
-        dy = yj - a[1]
-        dz = zk - a[2]
-        s = (dx * vx + dy * vy + dz * vz) / L2
-        # clip in-place to save a temporary
-        np.clip(s, 0.0, 1.0, out=s)
-
-        # distance from voxel center to closest point on segment
-        rx = dx - s * vx
-        ry = dy - s * vy
-        rz = dz - s * vz
-        d2 = rx * rx + ry * ry + rz * rz
-
-        # linear radius along the frustum
-        r = r0 + s * (r1 - r0)
-        mask = d2 <= (r * r)
-
-        occ[ii0 : ii1 + 1, jj0 : jj1 + 1, kk0 : kk1 + 1] |= mask
-
-    # If soma is to be excluded, carve it out once (reuses precomputed mask).
-    if (not include_soma) and (soma_mask is not None):
-        occ[soma_slice] &= ~soma_mask
-
-    return occ, float(h), (int(nx), int(ny), int(nz)), lo, hi
+        soma = (
+            [float(c) for c in skel.soma.center],
+            [float(a) for a in skel.soma.axes],
+            np.ascontiguousarray(skel.soma.R.T, dtype=np.float64).tolist(),
+            [float(c) for c in slo],
+            [float(c) for c in shi],
+        )
+    count = kernels.dx.voxel_union_count(
+        skel.nodes.astype(np.float64, copy=False),
+        np.asarray(radii, dtype=np.float64),
+        skel.edges.astype(np.int64, copy=False).reshape(-1, 2),
+        [float(c) for c in lo],
+        [float(c) for c in hi],
+        float(h),
+        [nx, ny, nz],
+        soma,
+        bool(include_soma),
+    )
+    return int(count), float(h), (int(nx), int(ny), int(nz)), lo, hi
 
 
 def volume(
@@ -1911,10 +1578,9 @@ def volume(
     else:
         lo, hi = lo_hi
 
-    occ, h, (nx, ny, nz), lo, hi = _voxelize_union(
+    count, h, (nx, ny, nz), lo, hi = _voxelize_union(
         skel, radii, lo, hi, voxel_size=voxel_size, include_soma=include_soma
     )
-    count = int(occ.sum())
     V = float(count) * (h**3)
     if not return_details:
         return V
@@ -1930,44 +1596,6 @@ def volume(
 # -----------------------------------------------------------------------------
 # path length (sum of edge lengths) with optional bbox clipping
 # -----------------------------------------------------------------------------
-
-
-def _segment_aabb_clip_length(
-    a: np.ndarray, b: np.ndarray, lo: np.ndarray, hi: np.ndarray
-) -> float:
-    """
-    Return the length of the line segment [a,b] that lies inside the
-    axis-aligned box [lo, hi].  Zero if there is no intersection.
-    """
-    v = b - a
-    L = float(np.linalg.norm(v))
-    if L <= 0.0:
-        # Degenerate edge → contributes nothing (even if "inside").
-        return 0.0
-
-    # Liang–Barsky style parametric clipping in 3D.
-    t0, t1 = 0.0, 1.0
-    for d in range(3):
-        vd = float(v[d])
-        ad = float(a[d])
-        eps = 1e-12 * max(1.0, abs(v[0]), abs(v[1]), abs(v[2]))
-        if abs(vd) < eps:
-            # Segment is parallel to this slab; reject if outside.
-            if ad < lo[d] or ad > hi[d]:
-                return 0.0
-            continue
-
-        t_enter = (lo[d] - ad) / vd
-        t_exit = (hi[d] - ad) / vd
-        if t_enter > t_exit:
-            t_enter, t_exit = t_exit, t_enter
-
-        t0 = max(t0, t_enter)
-        t1 = min(t1, t_exit)
-        if t0 > t1:
-            return 0.0
-
-    return L * max(0.0, t1 - t0)
 
 
 def total_path_length(
@@ -2031,14 +1659,9 @@ def total_path_length(
         }
 
     lo, hi = _parse_bbox(bbox)
-
-    total = 0.0
-    n_hit = 0
-    for u, v in edges:
-        ell = _segment_aabb_clip_length(nodes[u], nodes[v], lo, hi)
-        if ell > 0.0:
-            total += ell
-            n_hit += 1
+    total, n_hit = kernels.dx.path_length_in_box(
+        nodes, edges.astype(np.int64).reshape(-1, 2), lo.tolist(), hi.tolist()
+    )
 
     if not return_details:
         return float(total)

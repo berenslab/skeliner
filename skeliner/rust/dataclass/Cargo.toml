@@ -1,0 +1,12 @@
+[package]
+name = "dataclass"
+version = "0.1.0"
+description = "A skeleton's containers (`sk.dataclass`)."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import heapq
-from collections import deque
+import dataclasses
 from typing import Callable, List
 
-import igraph as ig
 import numpy as np
-from scipy.spatial import KDTree
 
-from ._state import SkeletonState, compact_state, rebuild_vert2node, swap_nodes
+from ._backend import kernels
+from ._state import SkeletonState, rebuild_vert2node, swap_nodes
 from .dataclass import Soma
 
 __all__ = [
@@ -39,67 +37,35 @@ def _find_soma(
     """
     if nodes.shape[0] == 0:
         raise ValueError("empty skeleton")
-
-    # -------------------------------------------------------------
-    # 1. radius threshold → initial candidate set
-    # -------------------------------------------------------------
-    large_thresh = np.percentile(radii, pct_large)
-    cand_idx = np.where(radii >= large_thresh)[0]
-    if cand_idx.size == 0:
+    found = kernels.skeletonize.find_soma(
+        np.asarray(nodes, dtype=np.float64),
+        np.asarray(radii, dtype=np.float64),
+        float(pct_large),
+        float(dist_factor),
+        int(min_keep),
+    )
+    if found is None:
         raise RuntimeError(
             f"no nodes above the {pct_large:g}-th percentile (try lowering pct_large)"
         )
-    # -------------------------------------------------------------
-    # 2. choose the global-maximum node as “soma anchor”
-    # -------------------------------------------------------------
-    idx_max = int(np.argmax(radii))
-    R_max = radii[idx_max]
-
-    # -------------------------------------------------------------
-    # 3. distance filter: stay close to anchor
-    # -------------------------------------------------------------
-    dists = np.linalg.norm(nodes[cand_idx] - nodes[idx_max], axis=1)
-    keep = dists <= dist_factor * R_max
-    soma_idx = cand_idx[keep]
-    has_soma = soma_idx.size >= min_keep
-
+    soma_idx, idx_max, center, r_max, has_soma = found
     if not has_soma:
-        return Soma.from_sphere(nodes[idx_max], R_max, None), soma_idx, has_soma
-
-    soma = Soma.from_sphere(
-        center=nodes[soma_idx].mean(0),
-        radius=R_max,
-        verts=None,
-    )
+        return Soma.from_sphere(nodes[idx_max], r_max, None), soma_idx, has_soma
+    soma = Soma.from_sphere(center=np.asarray(center), radius=r_max, verts=None)
     return soma, soma_idx, has_soma
 
 
 def _bfs_parents(edges: np.ndarray, n_nodes: int, *, root: int = 0) -> List[int]:
     """Return parent[] array of BFS tree from *root* given an undirected edge list."""
-    adj: List[List[int]] = [[] for _ in range(n_nodes)]
-    for a, b in edges:
-        adj[int(a)].append(int(b))
-        adj[int(b)].append(int(a))
-    parent = [-1] * n_nodes
-    q = deque([root])
-    while q:
-        u = q.popleft()
-        for v in adj[u]:
-            if v != root and parent[v] == -1:
-                parent[v] = u
-                q.append(v)
-    return parent
+    edges = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
+    return kernels.skeletonize.bfs_parents(edges, int(n_nodes), int(root)).tolist()
 
 
 def _build_mst(nodes: np.ndarray, edges: np.ndarray) -> np.ndarray:
     """Return the edge list of the global minimum-spanning tree."""
-    g = ig.Graph(
-        n=len(nodes), edges=[tuple(map(int, e)) for e in edges], directed=False
-    )
-    g.es["weight"] = [float(np.linalg.norm(nodes[a] - nodes[b])) for a, b in edges]
-    mst = g.spanning_tree(weights="weight")
-    return np.asarray(
-        sorted(tuple(sorted(e)) for e in mst.get_edgelist()), dtype=np.int64
+    return kernels.skeletonize.build_mst(
+        np.asarray(nodes, dtype=np.float64),
+        np.asarray(edges, dtype=np.int64).reshape(-1, 2),
     )
 
 
@@ -190,6 +156,37 @@ def _radii_from_distances(
     return stale
 
 
+def _pack(nodes, radii_dict: dict, node2verts) -> tuple:
+    """A skeleton's radii and vertex lists as ``_core``'s stages take them:
+    ``(keys, radii (K, N), ptr, idx)``, the vertices as a CSR."""
+    n = len(nodes)
+    keys = list(radii_dict)
+    radii = np.empty((len(keys), n), dtype=np.float64)
+    for k, key in enumerate(keys):
+        radii[k] = radii_dict[key]
+    lens = [len(v) for v in node2verts]
+    ptr = np.zeros(n + 1, dtype=np.int64)
+    ptr[1:] = np.cumsum(lens)
+    idx = (
+        np.concatenate([np.asarray(v, dtype=np.int64).ravel() for v in node2verts])
+        if n
+        else np.empty(0, dtype=np.int64)
+    )
+    return keys, radii, ptr, idx
+
+
+def _unpack(arrays, keys: list, radii_like: dict) -> tuple:
+    """``(nodes, radii dict, node2verts, edges)`` back from a stage's arrays,
+    each radius in the dtype it came in."""
+    nodes, radii, ptr, idx, edges = arrays
+    radii_dict = {
+        key: radii[k].astype(np.asarray(radii_like[key]).dtype)
+        for k, key in enumerate(keys)
+    }
+    node2verts = [idx[ptr[i] : ptr[i + 1]] for i in range(len(nodes))]
+    return nodes, radii_dict, node2verts, edges
+
+
 def _merge_near_soma_nodes(
     nodes: np.ndarray,
     radii_dict: dict[str, np.ndarray],
@@ -203,6 +200,7 @@ def _merge_near_soma_nodes(
     near_factor: float = 1.2,
     fat_factor: float = 0.20,
     log: Callable | None = None,
+    with_vert2node: bool = True,
 ):
     """
     Collapse every skeleton node whose sphere overlaps the soma (stage 5).
@@ -233,6 +231,9 @@ def _merge_near_soma_nodes(
         Dimensionless thresholds controlling the tests described above.
     log
         Optional callback used for verbose progress output.
+    with_vert2node
+        Whether to rebuild ``vert2node``; None in its place otherwise (for a
+        caller that rebuilds it later anyway).
 
     Returns
     -------
@@ -241,80 +242,39 @@ def _merge_near_soma_nodes(
         ``node2verts_new`` and ``vert2node`` are *None* when mesh data is
         unavailable.
     """
-    r_soma = soma.spherical_radius
-    r_primary = radii_dict[radius_key]
-    d2s = soma.distance(nodes, to="surface")
-    d2c = soma.distance(nodes, to="center")
-    inside = d2s < -inside_tol
-    near = d2c < near_factor * r_soma
-    fat = r_primary > fat_factor * r_soma
-
-    keep_mask = ~(inside | (near & fat))
-    keep_mask[0] = True
-    merged_idx = np.where(~keep_mask)[0]
-
-    if log:
-        log(f"{merged_idx.size} nodes merged into soma")
-
-    state_in = SkeletonState(
-        nodes=nodes,
-        radii=radii_dict,
-        edges=edges,
-        node2verts=node2verts,
-        vert2node=None,
+    if radius_key not in radii_dict:
+        raise KeyError(radius_key)
+    n = len(nodes)
+    lists = node2verts if node2verts is not None else [np.empty(0, np.int64)] * n
+    keys, radii, ptr, idx = _pack(nodes, radii_dict, lists)
+    arrays, old2new, soma_verts, n_merged = kernels.skeletonize.merge_near_soma_nodes(
+        np.asarray(nodes, dtype=np.float64),
+        keys,
+        radii,
+        ptr,
+        idx,
+        np.asarray(edges, dtype=np.int64).reshape(-1, 2),
+        keys.index(radius_key),
+        np.asarray(soma.center, dtype=np.float64),
+        np.asarray(soma.axes, dtype=np.float64),
+        np.asarray(soma.R, dtype=np.float64),
+        None if soma.verts is None else np.asarray(soma.verts, dtype=np.int64),
+        None if mesh_vertices is None else np.asarray(mesh_vertices, np.float64),
+        float(inside_tol),
+        float(near_factor),
+        float(fat_factor),
     )
-    state_out, old2new = compact_state(state_in, keep_mask, return_old2new=True)
+    if log:
+        log(f"{n_merged} nodes merged into soma")
+    nodes_keep, radii_keep, node2_keep, edges_out = _unpack(arrays, keys, radii_dict)
+    if node2verts is None:
+        node2_keep = None
 
-    nodes_keep = state_out.nodes
-    radii_keep = state_out.radii
-    node2_keep = state_out.node2verts
-    edges_out = state_out.edges
-
-    leaves: set[int] = set()
-    for u, v in edges:
-        if keep_mask[u] and not keep_mask[v]:
-            leaves.add(int(old2new[u]))
-        elif keep_mask[v] and not keep_mask[u]:
-            leaves.add(int(old2new[v]))
-    if leaves:
-        leaf_edges = np.array([[0, nid] for nid in sorted(leaves)], dtype=np.int64)
-        edges_out = (
-            leaf_edges if edges_out.size == 0 else np.vstack([edges_out, leaf_edges])
-        )
-        edges_out = np.unique(np.sort(edges_out, axis=1), axis=0)
-
-    if merged_idx.size:
-        if node2verts is not None:
-            w = np.array(
-                [len(node2verts[0]), *[len(node2verts[i]) for i in merged_idx]],
-                dtype=np.float64,
-            )
-        else:
-            w = np.ones(merged_idx.size + 1, dtype=np.float64)
-        nodes_keep[0] = np.average(
-            np.vstack([nodes[0], nodes[merged_idx]]), axis=0, weights=w
-        )
-        if node2_keep is not None:
-            for idx in merged_idx:
-                vidx = node2verts[idx]
-                if mesh_vertices is not None:
-                    d_local = soma.distance_to_surface(mesh_vertices[vidx])
-                    close = d_local < near_factor * r_soma
-                    contrib = vidx[close]
-                else:
-                    contrib = vidx
-                if contrib.size:
-                    soma.verts = (
-                        np.concatenate((soma.verts, contrib))
-                        if soma.verts is not None
-                        else contrib
-                    )
-                    node2_keep[0] = np.concatenate((node2_keep[0], contrib))
-
-    vert2node = rebuild_vert2node(node2_keep) if node2_keep is not None else None
-
-    if soma.verts is not None:
-        soma.verts = np.unique(soma.verts).astype(np.int64)
+    vert2node = (
+        rebuild_vert2node(node2_keep)
+        if node2_keep is not None and with_vert2node
+        else None
+    )
 
     if mesh_vertices is None:
         if log:
@@ -322,16 +282,24 @@ def _merge_near_soma_nodes(
                 "mesh_vertices not provided; cannot re-fit soma, "
                 "falling back to spherical approximation."
             )
-        soma = Soma.from_sphere(soma.center, soma.spherical_radius, verts=soma.verts)
-    elif soma.verts is not None and soma.verts.size:
+        soma = Soma.from_sphere(soma.center, soma.spherical_radius, verts=soma_verts)
+    elif soma_verts is not None and soma_verts.size:
         try:
-            soma = Soma.fit(mesh_vertices[soma.verts], verts=soma.verts)
+            soma = Soma.fit(mesh_vertices[soma_verts], verts=soma_verts)
         except ValueError:
             if log:
                 log("Soma fitting failed, using spherical approximation instead.")
             soma = Soma.from_sphere(
-                soma.center, soma.spherical_radius, verts=soma.verts
+                soma.center, soma.spherical_radius, verts=soma_verts
             )
+    else:
+        soma = dataclasses.replace(
+            soma,
+            center=soma.center.copy(),
+            axes=soma.axes.copy(),
+            R=soma.R.copy(),
+            verts=soma_verts,
+        )
 
     nodes_keep[0] = soma.center
     r_soma = soma.spherical_radius
@@ -385,80 +353,24 @@ def _prune_neurites(
             "warning: mesh_vertices not provided; skipping soma/radius refits "
             "and reusing existing estimates."
         )
-
-    r_soma = soma.spherical_radius
-    d2c = np.asarray(soma.distance(nodes, to="center"))
-
-    N = len(nodes)
-    parent = _bfs_parents(edges, N, root=0)
-
-    adj = [[] for _ in range(N)]
-    for a, b in edges:
-        adj[a].append(b)
-        adj[b].append(a)
-
-    merge2soma, visited = set(), np.zeros(N, bool)
-
-    for child in adj[0]:  # one neurite at a time
-        if visited[child]:
-            continue
-
-        comp = []
-        stack, prev = [child], 0
-        while stack:
-            v = stack.pop()
-            if visited[v]:
-                continue
-            visited[v] = True
-            comp.append(v)
-            for nb in adj[v]:
-                if nb != prev and (parent[nb] == v or parent[v] == nb):
-                    stack.append(nb)
-            prev = v
-
-        max_d = d2c[comp].max()
-        thr = (stem_extent_factor if parent[child] == 0 else tip_extent_factor) * r_soma
-        if max_d <= thr:
-            merge2soma.update(comp)
-
-    if merge2soma:
-        for nid in merge2soma:
-            node2verts[0] = np.concatenate((node2verts[0], node2verts[nid]))
-
-        node2verts[0] = np.unique(node2verts[0])  # dedup
-
-        if mesh_vertices is not None and node2verts[0].size:
-            d0 = np.linalg.norm(mesh_vertices[node2verts[0]] - nodes[0], axis=1)
-            _radii_from_distances(radii_dict, 0, d0)
-
-        if log:
-            log(f"Merged {len(merge2soma)} peri-soma nodes into soma ")
-
-    keep = np.ones(N, dtype=bool)
-    if merge2soma:
-        keep[list(merge2soma)] = False
-    keep[0] = True
-
-    orig_indices = np.where(keep)[0]
-
-    state = SkeletonState(
-        nodes=nodes,
-        radii=radii_dict,
-        edges=edges,
-        node2verts=node2verts,
-        vert2node=None,
+    keys, radii, ptr, idx = _pack(nodes, radii_dict, node2verts)
+    arrays, old2new, soma_verts, n_merged = kernels.skeletonize.prune_neurites(
+        np.asarray(nodes, dtype=np.float64),
+        keys,
+        radii,
+        ptr,
+        idx,
+        np.asarray(edges, dtype=np.int64).reshape(-1, 2),
+        np.asarray(soma.center, dtype=np.float64),
+        float(soma.spherical_radius),
+        None if mesh_vertices is None else np.asarray(mesh_vertices, np.float64),
+        float(tip_extent_factor),
+        float(stem_extent_factor),
+        bool(drop_single_node_branches),
     )
-    state, _ = compact_state(state, keep)
+    if n_merged and log:
+        log(f"Merged {n_merged} peri-soma nodes into soma ")
 
-    nodes_new = state.nodes
-    node2verts_new = state.node2verts
-    radii_new = state.radii
-    edges_new = state.edges
-    vert2node = (
-        rebuild_vert2node(node2verts_new) if node2verts_new is not None else None
-    )
-
-    soma_verts = np.unique(node2verts_new[0]).astype(np.int64)
     if mesh_vertices is not None and soma_verts.size:
         pts = mesh_vertices[soma_verts]
         try:
@@ -487,29 +399,8 @@ def _prune_neurites(
         log(f"Moved soma to [{centre_txt}]")
         log(f"(r = {radii_txt})")
 
-    if drop_single_node_branches:
-        (
-            nodes_new,
-            radii_new,
-            node2verts_new,
-            vert2node,
-            edges_new,
-            extra_indices,
-        ) = _merge_single_node_branches(
-            nodes_new,
-            radii_new,
-            node2verts_new,
-            edges_new,
-            mesh_vertices=mesh_vertices,
-            min_parent_degree=3,
-            return_mapping=True,
-        )
-        if extra_indices is not None:
-            orig_indices = orig_indices[extra_indices]
-
-    old2new = -np.ones(N, dtype=np.int64)
-    old2new[orig_indices] = np.arange(len(nodes_new))
-
+    nodes_new, radii_new, node2verts_new, edges_new = _unpack(arrays, keys, radii_dict)
+    vert2node = rebuild_vert2node(node2verts_new)
     return nodes_new, radii_new, node2verts_new, vert2node, edges_new, soma, old2new
 
 
@@ -582,138 +473,12 @@ def _bridge_gaps(
         component.  The array is sorted row-wise and de-duplicated.
     """
 
-    def _auto_bridge_max(
-        gaps: list[float],
-        edge_mean: float,
-        *,
-        pct: float = 55.0,
-        lo: float = 6.0,
-        hi: float = 12.0,
-    ) -> float:
-        """
-        Choose a bridge_max_factor from the initial gap distribution. Default is the
-        55th percentile of the gap distribution, clipped to [6, 20] times the mean edge
-        """
-        raw = np.percentile(gaps, pct) / edge_mean
-        return float(np.clip(raw, lo, hi))
-
-    def _auto_recalc_after(n_gaps: int) -> int:
-        """Return a suitable recalc period for the given number of gaps."""
-        if n_gaps <= 10:  # tiny: update often
-            return 2
-        if n_gaps <= 50:  # small: every 3–4 merges
-            return 4
-        if n_gaps <= 200:  # medium: every ~5 % of gaps
-            return max(4, n_gaps // 20)
-        # giant meshes: cap to 32 so we never starve
-        return 32
-
-    # -- 0. quick exit if already connected ---------------------------------
-    g = ig.Graph(
-        n=len(nodes), edges=[tuple(map(int, e)) for e in edges], directed=False
+    return kernels.skeletonize.bridge_gaps(
+        np.asarray(nodes, dtype=np.float64),
+        np.asarray(edges, dtype=np.int64).reshape(-1, 2),
+        None if bridge_max_factor is None else float(bridge_max_factor),
+        None if bridge_recalc_after is None else int(bridge_recalc_after),
     )
-    comps = [set(c) for c in g.components()]
-    comp_idx = {
-        cid: np.fromiter(verts, dtype=np.int64) for cid, verts in enumerate(comps)
-    }
-    soma_cid = g.components().membership[0]
-    if len(comps) == 1:
-        return edges
-
-    # -- 1. build one KD-tree per component ---------------------------------
-    edge_len_mean = np.linalg.norm(
-        nodes[edges[:, 0]] - nodes[edges[:, 1]], axis=1
-    ).mean()
-
-    # -- 2. grow the island using a distance-ordered priority queue ---------
-    island = set(comps[soma_cid])
-    island_idx = np.fromiter(island, dtype=np.int64)
-    island_tree = KDTree(nodes[island_idx])
-
-    # helper to compute the *current* closest gap of a component
-    def closest_pair(cid: int) -> tuple[float, int, int]:
-        pts = nodes[comp_idx[cid]]
-        dists, idx_is = island_tree.query(pts, k=1, workers=-1)
-        best = int(np.argmin(dists))
-        return float(dists[best]), best, np.asarray(idx_is, dtype=np.int64)[best]
-
-    # priority queue of (gap_distance, cid, best_comp_idx, best_island_idx)
-    pq = []
-    gap_samples = []
-    for cid in range(len(comps)):
-        if cid == soma_cid:
-            continue
-        gap, b_comp, b_is = closest_pair(cid)
-        pq.append((gap, cid, b_comp, b_is))
-        gap_samples.append(gap)
-    heapq.heapify(pq)
-
-    # -- heuristic hyperparameters if not given -------------------------------
-    if bridge_max_factor is None:
-        bridge_max_factor = _auto_bridge_max(gap_samples, edge_len_mean)
-
-    if bridge_recalc_after is None:
-        gaps = len(comps) - 1
-        recalc_after = _auto_recalc_after(gaps)
-    else:
-        recalc_after = bridge_recalc_after
-
-    edges_new: list[tuple[int, int]] = []
-    merges_since_recalc = 0
-
-    stall = 0
-    relax_factor = 1.5
-    max_stall = 3 * len(pq)
-    current_max = bridge_max_factor * edge_len_mean
-
-    while pq:
-        _, cid, _, _ = heapq.heappop(pq)
-        # postpone if the component is still too far away
-        gap, best_c, best_i = closest_pair(cid)
-
-        if gap > current_max:
-            heapq.heappush(pq, (gap, cid, best_c, best_i))  # still too far, re-queue
-            stall += 1
-            if stall >= 2 * max_stall:
-                # after too many futile tries, do a *forced* heap rebuild
-                pq = [
-                    (g, cid2, bc, bi)
-                    for _, cid2, _, _ in pq
-                    for g, bc, bi in (closest_pair(cid2),)
-                ]
-                heapq.heapify(pq)
-                current_max *= relax_factor
-                stall = 0
-            continue
-
-        stall = 0
-        verts_idx = comp_idx[cid]
-        u = int(verts_idx[best_c])
-        v = int(island_idx[best_i])
-        edges_new.append((u, v))
-
-        # merge component into island and rebuild KD-tree
-        island |= comps[cid]
-        island_idx = np.concatenate([island_idx, verts_idx])
-        island_tree = KDTree(nodes[island_idx])
-
-        merges_since_recalc += 1
-        if merges_since_recalc >= recalc_after:
-            # distances of *every* remaining component may have changed
-            pq = [
-                (gap, cid, b_comp, b_is)
-                for _, cid, _, _ in pq
-                for gap, b_comp, b_is in (closest_pair(cid),)
-            ]
-            heapq.heapify(pq)
-            merges_since_recalc = 0
-
-    if edges_new:
-        edges_aug = np.vstack([edges, np.asarray(edges_new, dtype=np.int64)])
-    else:
-        edges_aug = edges
-
-    return np.unique(edges_aug, axis=0)
 
 
 def _merge_single_node_branches(
@@ -737,59 +502,27 @@ def _merge_single_node_branches(
     Iteratively merge every leaf whose *parent* has degree ≥ `min_parent_degree`.
     Terminates when no such leaves are left.
     """
-    state = SkeletonState(
-        nodes=nodes,
-        radii=radii_dict,
-        edges=edges,
-        node2verts=node2verts,
-        vert2node=None,
+    keys, radii, ptr, idx = _pack(nodes, radii_dict, node2verts)
+    arrays, kept = kernels.skeletonize.merge_single_node_branches(
+        np.asarray(nodes, dtype=np.float64),
+        keys,
+        radii,
+        ptr,
+        idx,
+        np.asarray(edges, dtype=np.int64).reshape(-1, 2),
+        None if mesh_vertices is None else np.asarray(mesh_vertices, np.float64),
+        int(min_parent_degree),
     )
-    orig_indices = (
-        np.arange(len(state.nodes), dtype=np.int64) if return_mapping else None
+    nodes_new, radii_new, node2verts_new, edges_new = _unpack(arrays, keys, radii_dict)
+    vert2node = rebuild_vert2node(node2verts_new)
+    return (
+        nodes_new,
+        radii_new,
+        node2verts_new,
+        vert2node,
+        edges_new,
+        kept if return_mapping else None,
     )
-
-    while True:
-        deg = np.zeros(len(state.nodes), dtype=int)
-        for a, b in state.edges:
-            deg[a] += 1
-            deg[b] += 1
-
-        leaves = [i for i, d in enumerate(deg) if d == 1 and i != 0]
-        parent = _bfs_parents(state.edges, len(state.nodes), root=0)
-        singles = [leaf for leaf in leaves if deg[parent[leaf]] >= min_parent_degree]
-
-        if not singles:
-            break
-
-        to_drop = set()
-        for leaf in singles:
-            par = parent[leaf]
-            state.node2verts[par] = np.concatenate(
-                (state.node2verts[par], state.node2verts[leaf])
-            )
-            if mesh_vertices is not None and state.node2verts[par].size:
-                pts = mesh_vertices[state.node2verts[par]]
-                d = np.linalg.norm(pts - state.nodes[par], axis=1)
-                _radii_from_distances(state.radii, par, d)
-            to_drop.add(leaf)
-
-        keep = np.ones(len(state.nodes), bool)
-        keep[list(to_drop)] = False
-        state, _ = compact_state(state, keep)
-        if return_mapping and orig_indices is not None:
-            orig_indices = orig_indices[keep]
-
-    vert2node = rebuild_vert2node(state.node2verts)
-    if return_mapping:
-        return (
-            state.nodes,
-            state.radii,
-            state.node2verts,
-            vert2node,
-            state.edges,
-            orig_indices,
-        )
-    return state.nodes, state.radii, state.node2verts, vert2node, state.edges, None
 
 
 def _detect_soma(
@@ -873,23 +606,23 @@ def _detect_soma(
 
     old2new = _identity()
 
+    # the soma's vertices, before a soma node moves to node 0
+    lists = [np.asarray(node2verts[int(i)], dtype=np.int64) for i in soma_nodes]
+    ptr = np.zeros(len(lists) + 1, dtype=np.int64)
+    ptr[1:] = np.cumsum([len(v) for v in lists])
+    soma_vert_ids = kernels.skeletonize.soma_vertices(
+        np.asarray(nodes[soma_nodes], dtype=np.float64),
+        ptr,
+        np.concatenate(lists) if lists else np.empty(0, dtype=np.int64),
+        np.asarray(soma_est.center, dtype=np.float64),
+        float(soma_est.spherical_radius),
+    )
+
     if 0 not in soma_nodes:
         new_root = int(soma_nodes[np.argmax(radii[radius_key][soma_nodes])])
         swap_nodes(state, 0, new_root)
         old2new[0], old2new[new_root] = old2new[new_root], old2new[0]
 
-    all_close = (
-        soma_est.distance(nodes[soma_nodes], to="center")
-        < soma_est.spherical_radius * 2
-    )
-    close_lists = [
-        node2verts[int(i)] for i in soma_nodes[all_close] if node2verts[int(i)].size
-    ]
-    if close_lists:
-        soma_vert_ids = np.unique(np.concatenate(close_lists)).astype(np.int64)
-    else:
-        fallback = _soma_verts(int(soma_nodes[0]))
-        soma_vert_ids = fallback if fallback is not None else np.empty(0, np.int64)
     soma_est.verts = soma_vert_ids if soma_vert_ids.size else None
 
     nodes[0] = soma_est.center

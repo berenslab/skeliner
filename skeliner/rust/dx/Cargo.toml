@@ -1,0 +1,15 @@
+[package]
+name = "dx"
+version = "0.1.0"
+description = "Measuring a skeleton (`sk.dx`)."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mesh.workspace = true
+threads.workspace = true
+rayon.workspace = true
+
+[lints]
+workspace = true

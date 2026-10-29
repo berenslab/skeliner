@@ -1,13 +1,15 @@
-"""Tests for skeliner.plot.viewer — the interactive server.
+"""Tests for skeliner.viewer — the interactive server.
 
 The viewer mirrors an operation's terminal output into the browser over
 the WebSocket, which is the only sign a long-running step is moving.
 """
 
 import asyncio
+import base64
 import contextlib
 import copy
 import io
+import json
 import threading
 
 import numpy as np
@@ -15,7 +17,7 @@ import pytest
 import trimesh
 
 from skeliner.dataclass import Discarded, Neurites, Organelles, Soma
-from skeliner.plot.viewer import _LogTee, _create_app
+from skeliner.viewer.viewer import _LogTee, _create_app
 from skeliner.skeletonize import _timed
 
 
@@ -119,7 +121,7 @@ def reassign_client(tmp_path, monkeypatch):
     """A viewer serving a tube whose components are already derived."""
     from starlette.testclient import TestClient
 
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
     mesh, soma, org, neurites = _tube_with_components()
@@ -147,12 +149,28 @@ def reassign_client(tmp_path, monkeypatch):
         yield client, state, neurites
 
 
-def test_reassign_refuses_before_components_exist(reassign_client):
+def test_a_soma_is_assigned_on_a_freshly_loaded_cell(reassign_client):
+    # nothing has run: no organelles, no components, no soma — the faces
+    # become the soma and the components are derived from it; the next
+    # preprocess takes that soma instead of find_soma's
     client, state, _ = reassign_client
-    state["neurites"] = Neurites([])
-    r = client.post("/reassign_preview", json={"faces": [0], "to": "soma"})
-    assert r.status_code == 400
-    assert "break_up_mesh" in r.json()["error"]
+    state["soma"] = None
+    state["organelles"] = None
+    state["neurites"] = None
+    state["discarded"] = None
+    faces = np.asarray(state["mesh"].faces)
+    z = state["mesh"].vertices[faces].mean(axis=1)[:, 2]
+    sel = np.flatnonzero(np.abs(z) <= 100.0).tolist()
+
+    r = client.post("/reassign_preview", json={"faces": sel, "to": "soma"})
+    assert r.status_code == 200, r.json()
+    assert client.post("/reassign_apply").json()["ok"]
+    assert state["soma"] is not None and state["soma_by_hand"]
+    soma = state["soma"]
+
+    assert client.post("/preprocess", json={"organelles": False}).json()["ok"]
+    assert state["soma"] is not None and state["soma_by_hand"]
+    assert np.allclose(state["soma"].center, soma.center)
 
 
 @pytest.mark.parametrize(
@@ -190,6 +208,22 @@ def test_preview_reports_the_fringe_and_leaves_state_alone(reassign_client):
     assert len(body["leaving"]) > len(sel)
     assert body["entering"] == []
     assert len(state["soma"].verts) == before, "preview must not commit"
+
+
+def test_a_soma_is_made_by_hand_where_none_was_found(reassign_client):
+    # find_soma found none: assigning faces to the soma makes them it
+    client, state, _ = reassign_client
+    faces = np.asarray(state["mesh"].faces)
+    state["soma"] = None
+    state["neurites"] = Neurites([np.arange(len(faces))])
+    z = state["mesh"].vertices[faces].mean(axis=1)[:, 2]
+    sel = np.flatnonzero(np.abs(z) <= 100.0).tolist()
+
+    r = client.post("/reassign_preview", json={"faces": sel, "to": "soma"})
+    assert r.status_code == 200, r.json()
+    assert client.post("/reassign_apply").json()["ok"]
+    assert state["soma"] is not None
+    assert set(np.unique(faces[sel]).tolist()) <= set(state["soma"].verts.tolist())
 
 
 def test_apply_commits_exactly_what_the_preview_promised(reassign_client):
@@ -338,7 +372,7 @@ def bin_client(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
 
     from skeliner import skeletonize
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
     mesh = trimesh.creation.cylinder(radius=40.0, height=1200.0, sections=24)
@@ -590,7 +624,7 @@ def rescue_client(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
 
     from skeliner import pre
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
 
@@ -767,12 +801,71 @@ def test_preprocess_leaves_the_mesh_uncompacted(rescue_client):
     assert len(state["mesh"].faces) == n_before
 
 
+def test_preprocess_runs_without_organelles_when_asked(rescue_client, monkeypatch):
+    """The Run button's switch, for meshes that trace none."""
+    from skeliner import pre
+
+    client, state, _ = rescue_client
+    seen = {}
+    run = pre.preprocess
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(pre, "preprocess", spy)
+    assert client.post("/preprocess", json={"organelles": False}).status_code == 200
+    assert seen["organelles"] is False
+    assert not state["organelles"].mask.any()
+    assert client.post("/preprocess").status_code == 200
+    assert seen["organelles"] is True
+
+
+def test_break_runs_without_detected_organelles(rescue_client):
+    """None detected is none there, not a step left out."""
+    client, state, _ = rescue_client
+    state["organelles"] = None
+    r = client.post("/break_up_mesh")
+    assert r.status_code == 200, r.text
+    assert r.json()["nDiscarded"] == 1
+    assert not state["organelles"].mask.any()
+
+
 def test_preprocess_refuses_without_a_mesh(rescue_client):
     client, state, _ = rescue_client
     state["mesh"] = None
     r = client.post("/preprocess")
     assert r.status_code == 400
     assert "No mesh loaded" in r.json()["error"]
+
+
+def test_remove_parallel_counts_only_the_faces_it_removes(tmp_path, monkeypatch):
+    """Faces the load already collapsed to [0, 0, 0] — seam copies of a
+    chunked mesh — are not this step's."""
+    from starlette.testclient import TestClient
+
+    from skeliner import pre
+    from skeliner.viewer import viewer as viewer_mod
+
+    from .test_rust_core import _sandwich
+
+    monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
+    sandwich = _sandwich()
+    patches = pre.find_parallel_patches(sandwich, boundaries={0: np.array([0])})
+    faces = np.asarray(sandwich.faces).copy()
+    in_patch = {int(f) for p in patches for f in p["faces"]}
+    collapsed = next(f for f in range(len(faces)) if f not in in_patch)
+    faces[collapsed] = 0
+    mesh = trimesh.Trimesh(sandwich.vertices, faces, process=False)
+    app = _create_app(preload_mesh=mesh, port=8915)
+    with TestClient(app) as client:
+        state = _mesh_state_of(app)
+        state["mesh"] = mesh
+        state["parallel_patches"] = patches
+        r = client.post("/remove_parallel_patches")
+        assert r.status_code == 200, r.text
+        zeroed = np.all(np.asarray(state["mesh"].faces) == 0, axis=1)
+        assert zeroed[collapsed] and r.json()["facesRemoved"] == zeroed.sum() - 1 > 0
 
 
 def test_the_override_is_recorded_as_face_ids(rescue_client):
@@ -1172,7 +1265,7 @@ def loop_client(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
 
     from skeliner import skeletonize
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
     mesh = trimesh.creation.torus(
@@ -1638,7 +1731,7 @@ def named_client(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
 
     from skeliner import pre
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
 
@@ -1877,7 +1970,7 @@ def drop_files(tmp_path):
 def drop_client(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
 
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path / "state", raising=False)
     with TestClient(_create_app(port=8913)) as client:
@@ -1971,6 +2064,32 @@ def test_a_new_mesh_clears_the_components_that_chose_the_track(drop_client, drop
     assert not _neurite_labels(drop_client)
 
 
+def test_an_eyewire_ctm_drop_is_a_mesh_its_components_follow(
+    drop_client, drop_files, tmp_path
+):
+    """EyeWire 1's meshes come as OpenCTM; one dropped with its components
+    is applied first, as an OBJ is, though ``components.npz`` sorts ahead of
+    ``mesh.ctm``."""
+    import skeliner as sk
+
+    from .test_io import _ctm_file
+
+    mesh_path, comp_path, _ = drop_files
+    mesh = sk.io.load_mesh(mesh_path)
+    ctm_path = tmp_path / "mesh.ctm"
+    ctm_path.write_bytes(_ctm_file("RAW", mesh.vertices, mesh.faces)[0])
+
+    r = drop_client.post("/upload_batch", files=_as_batch(comp_path, ctm_path))
+    assert r.status_code == 200, r.text
+    results = r.json()["results"]
+    assert [(x["name"], x["ok"]) for x in results] == [
+        ("mesh.ctm", True),
+        ("components.npz", True),
+    ]
+    assert drop_client.get("/loaded").json()["mesh"]["nFaces"] == len(mesh.faces)
+    assert _neurite_labels(drop_client)
+
+
 # ── a mesh edit invalidates the components ────────────────────────────
 #
 # `break_up_mesh` runs once the mesh is settled, so a components split and a
@@ -2038,7 +2157,7 @@ def _skel_defaults_tracks():
     import re
     from pathlib import Path
 
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     html = Path(viewer_mod.__file__).with_name("viewer.html").read_text()
     block = html.split("const SKEL_DEFAULTS = {")[1].split("\n            };")[0]
@@ -2112,7 +2231,7 @@ def _skel_defaults_values():
     import re
     from pathlib import Path
 
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     html = Path(viewer_mod.__file__).with_name("viewer.html").read_text()
     block = html.split("const SKEL_DEFAULTS = {")[1].split("\n            };")[0]
@@ -2168,7 +2287,7 @@ def _mode_wiring():
     import re
     from pathlib import Path
 
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     html = Path(viewer_mod.__file__).with_name("viewer.html").read_text()
 
@@ -2241,7 +2360,7 @@ def mismatch_client(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
 
     from skeliner import skeletonize
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
     own = trimesh.creation.cylinder(radius=40.0, height=1200.0, sections=24)
@@ -2355,7 +2474,7 @@ def test_the_dropdown_offers_exactly_the_diagnostics_that_exist(bin_client):
     import re
     from pathlib import Path
 
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     client, name, _mesh, _skel = bin_client
     html = Path(viewer_mod.__file__).with_name("viewer.html").read_text()
@@ -2395,7 +2514,7 @@ def test_the_diagnostics_are_listed_in_the_order_dx_lists_them():
     from pathlib import Path
 
     from skeliner import dx
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     html = Path(viewer_mod.__file__).with_name("viewer.html").read_text()
     sel = re.search(r'id="dxKindSel".*?</select>', html, re.S | re.I)
@@ -2520,7 +2639,7 @@ def test_a_marker_lands_exactly_on_the_node_it_marks(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
 
     from skeliner import skeletonize
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
     mesh = trimesh.creation.cylinder(radius=40.0, height=1200.0, sections=24)
@@ -2574,7 +2693,7 @@ def test_a_loop_is_drawn_so_it_can_be_traced(tmp_path, monkeypatch):
 
     from skeliner import post, skeletonize
     from skeliner.io import load_mesh
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
     mesh = load_mesh(Path(__file__).parent / "data" / "60427.obj")
@@ -2624,6 +2743,339 @@ def test_an_unknown_diagnostic_is_named_rather_than_crashing(bin_client):
     assert "nonesuch" in r.json()["error"]
 
 
+# ── what a page is sent for the mesh ──────────────────────────────────
+
+
+class _Page:
+    """A connected tab that records every broadcast instead of drawing it."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send_text(self, data):
+        self.sent.append(json.loads(data))
+
+    def meshes(self):
+        return [m["payload"] for m in self.sent if m["type"] == "mesh_loaded"]
+
+
+def _connect_page(app):
+    for route in app.routes:
+        fn = getattr(route, "endpoint", None)
+        names = getattr(getattr(fn, "__code__", None), "co_freevars", ())
+        if "connected_clients" in names:
+            page = _Page()
+            cell = fn.__closure__[names.index("connected_clients")]
+            cell.cell_contents.append(page)
+            return page
+    raise AssertionError("could not reach connected_clients")
+
+
+@pytest.fixture
+def mesh_client(tmp_path, monkeypatch):
+    """A viewer with a mesh far from the origin, so centring is visible."""
+    from starlette.testclient import TestClient
+
+    from skeliner.viewer import viewer as viewer_mod
+
+    monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
+    mesh = trimesh.creation.icosphere(subdivisions=3, radius=100.0)
+    mesh.apply_translation([480_000.0, -310_000.0, 205_000.0])
+    with TestClient(_create_app(preload_mesh=mesh, port=8918)) as client:
+        yield client, mesh
+
+
+_TRIANGLE = [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]]
+_EDITS = {
+    "remove": [("/remove_selected", {"faces": [0, 1, 2]})],
+    "edit vertices": [
+        ("/edit_vertices", {"faceEdits": [{"face": 0, "verts": _TRIANGLE}]})
+    ],
+    "undo": [("/remove_selected", {"faces": [0, 1, 2]}), ("/undo", None)],
+    "compact": [("/compact_mesh", None)],
+}
+
+
+@pytest.mark.parametrize("steps", _EDITS.values(), ids=_EDITS.keys())
+def test_only_the_page_that_edited_keeps_its_camera(mesh_client, steps):
+    """A page opened after an edit has no view to keep: told to keep one, it
+    never frames the mesh and is left looking at nothing."""
+    client, _ = mesh_client
+    page = _connect_page(client.app)
+    for route, body in steps:
+        r = client.post(route, json=body) if body else client.post(route)
+        assert r.status_code == 200, r.text
+
+    assert page.meshes()[-1]["keepCamera"] is True
+    assert "keepCamera" not in client.get("/mesh").json()
+
+
+def test_the_page_is_sent_the_mesh_exactly(mesh_client):
+    """Packed little-endian float32 vertices, centroid-relative, and uint32
+    faces — the layout ``meshArrays`` views them in."""
+    client, mesh = mesh_client
+    body = client.get("/mesh").json()
+    verts = np.frombuffer(base64.b64decode(body["vertices"]), dtype="<f4")
+    faces = np.frombuffer(base64.b64decode(body["faces"]), dtype="<u4")
+
+    v32 = np.asarray(mesh.vertices, dtype=np.float32)
+    assert body["nVertices"] == len(v32) and body["nFaces"] == len(mesh.faces)
+    np.testing.assert_array_equal(body["centroid"], v32.mean(axis=0))
+    np.testing.assert_array_equal(verts.reshape(-1, 3), v32 - v32.mean(axis=0))
+    np.testing.assert_array_equal(faces.reshape(-1, 3), mesh.faces)
+
+
+def _wait_for(cond, timeout=3.0):
+    import time
+
+    deadline = time.monotonic() + timeout
+    while not cond():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.02)
+
+
+def test_a_page_hears_of_an_annotation_change_once(mesh_client, tmp_path):
+    """The page fetches on the server's own announcement; the file watcher,
+    there for other programs' writes, must not resend the file as well —
+    each delivery rebuilds every overlay."""
+    import time
+
+    client, _ = mesh_client
+    page = _connect_page(client.app)
+    _wait_for(lambda: any(m["type"] == "annotations" for m in page.sent))
+    page.sent.clear()
+
+    marks = {"highlights": [{"faces": [0, 1, 2], "color": [1, 0, 0], "label": "x"}]}
+    upload = {"file": ("marks.json", json.dumps(marks).encode())}
+    assert client.post("/upload", files=upload).json()["ok"]
+    time.sleep(1.1)  # two of the watcher's looks at the file
+    kinds = [m["type"] for m in page.sent]
+    assert kinds.count("annotations_updated") == 1
+    assert "annotations" not in kinds
+
+    other = {"markers": [{"position": [0, 0, 0], "label": "from elsewhere"}]}
+    (tmp_path / "8918" / "annotations.json").write_text(json.dumps(other))
+    _wait_for(lambda: any(m["type"] == "annotations" for m in page.sent))
+    sent = [m for m in page.sent if m["type"] == "annotations"]
+    assert sent[-1]["payload"] == other
+
+
+# ── what a mesh leaves behind ─────────────────────────────────────────
+#
+# Everything found on a mesh names its faces.  Kept past the mesh, it lands
+# on whichever comes next: a cached detection is removed at its own face ids,
+# a soma's wireframe floats over another cell.
+
+
+_SENTINEL_CACHES = (
+    "fusion_clusters",
+    "disconnected",
+    "gap_clusters",
+    "hole_loops",
+    "parallel_patches",
+    "fragment_mask",
+    "pending_reassignment",
+)
+
+
+def _plant_caches(client):
+    state = _mesh_state_of(client.app)
+    for key in _SENTINEL_CACHES:
+        state[key] = ["from the previous mesh"]
+    return state
+
+
+def test_a_new_cell_starts_without_the_last_ones_detections(mesh_client, tmp_path):
+    client, _ = mesh_client
+    assert client.post("/remove_selected", json={"faces": [0, 1, 2]}).json()["ok"]
+    state = _plant_caches(client)
+
+    other = trimesh.creation.icosphere(subdivisions=2, radius=70.0)
+    path = tmp_path / "other.obj"
+    other.export(path)
+    upload = {"file": ("other.obj", path.read_bytes())}
+    assert client.post("/upload", files=upload).json()["ok"]
+
+    for key in _SENTINEL_CACHES:
+        assert state[key] is None, f"{key} survived a new mesh"
+    assert client.post("/undo").status_code == 400, "undo restored the old cell"
+
+
+def test_removing_the_mesh_takes_what_was_found_on_it(mesh_client, tmp_path):
+    client, _ = mesh_client
+    page = _connect_page(client.app)
+    marks = {"highlights": [{"faces": [0, 1, 2], "color": [1, 0, 0], "label": "x"}]}
+    client.post("/update_annotations", json=marks)
+    assert client.post("/remove_selected", json={"faces": [5]}).json()["ok"]
+    state = _plant_caches(client)
+    page.sent.clear()
+
+    assert client.post("/remove", json={"type": "mesh"}).json()["ok"]
+
+    assert client.get("/annotations").json() == {}
+    assert "annotations_updated" in [m["type"] for m in page.sent]
+    for key in _SENTINEL_CACHES:
+        assert state[key] is None, f"{key} outlived its mesh"
+    assert client.post("/undo").status_code == 400
+    state_file = json.loads((tmp_path / "8918" / "state.json").read_text())
+    assert "mesh" not in state_file
+
+
+def test_compacting_keeps_every_centroid_relative_position(mesh_client):
+    """Markers, wireframes and skeletons are all stored about the centroid;
+    recentring on the vertices a compaction keeps would move the mesh out
+    from under each of them."""
+    client, mesh = mesh_client
+    before = client.get("/mesh").json()
+    marks = {
+        "markers": [{"position": [10.0, 20.0, 30.0], "label": "here"}],
+        "ellipsoids": [{"center": [1.0, 2.0, 3.0], "axes": [5, 5, 5], "label": "e"}],
+    }
+    client.post("/update_annotations", json=marks)
+    # A removal leaves vertices only the compaction then drops, which moves
+    # their mean: the case where recentring would show.
+    removed = list(range(0, len(mesh.faces), 3))
+    assert client.post("/remove_selected", json={"faces": removed}).json()["ok"]
+    page = _connect_page(client.app)
+
+    assert client.post("/compact_mesh").json()["ok"]
+
+    after = client.get("/mesh").json()
+    assert after["centroid"] == before["centroid"]
+    assert after["nFaces"] < before["nFaces"]
+    ann = client.get("/annotations").json()
+    assert ann["markers"] == marks["markers"]
+    assert ann["ellipsoids"] == marks["ellipsoids"]
+    assert page.meshes()[-1].get("facesRenumbered") is True
+
+
+def test_undo_brings_back_the_annotations_of_the_mesh_it_restores(mesh_client):
+    client, _ = mesh_client
+    first = {"highlights": [{"faces": [0, 1, 2, 3], "color": [1, 0, 0], "label": "a"}]}
+    client.post("/update_annotations", json=first)
+    assert client.post("/remove_selected", json={"faces": [0, 1]}).json()["ok"]
+    later = {"highlights": [{"faces": [9], "color": [0, 1, 0], "label": "b"}]}
+    client.post("/update_annotations", json=later)
+
+    assert client.post("/undo").json()["ok"]
+
+    assert client.get("/annotations").json() == first
+
+
+def test_detecting_the_soma_again_replaces_it(mesh_client, monkeypatch):
+    """One soma, one wireframe, tied by label — a second run used to add a
+    second of each, and only one of the wireframes followed its highlight."""
+    from skeliner import pre
+
+    client, mesh = mesh_client
+    vs = np.flatnonzero(mesh.vertices[:, 2] > mesh.vertices[:, 2].mean())
+    soma = Soma.fit(np.asarray(mesh.vertices)[vs], verts=vs)
+    monkeypatch.setattr(pre, "find_soma", lambda *_a, **_k: soma)
+
+    for _ in range(2):
+        r = client.post("/detect_soma", json={"method": "ring_cutoff"})
+        assert r.json()["ok"], r.text
+
+    ann = client.get("/annotations").json()
+    somas = [h for h in ann["highlights"] if h["label"] == "soma"]
+    assert len(somas) == 1 and len(ann["ellipsoids"]) == 1
+    assert ann["ellipsoids"][0]["label"] == "soma"
+    expected = np.flatnonzero(pre.soma_face_mask(mesh.faces, vs))
+    np.testing.assert_array_equal(somas[0]["faces"], expected)
+
+
+def test_a_pages_own_edit_is_announced_with_its_name(mesh_client):
+    """The page that made an edit already shows it; told by name, it skips
+    the fetch every other page makes."""
+    client, _ = mesh_client
+    page = _connect_page(client.app)
+    marks = {"highlights": [{"faces": [0], "color": [1, 0, 0], "label": "mine"}]}
+    client.post("/update_annotations", json=marks, headers={"X-Skeliner-Page": "p1"})
+    told = [m for m in page.sent if m["type"] == "annotations_updated"]
+    assert told and told[-1]["origin"] == "p1"
+
+
+def _page_html():
+    from pathlib import Path
+
+    from skeliner.viewer import viewer as viewer_mod
+
+    return Path(viewer_mod.__file__).with_name("viewer.html").read_text()
+
+
+def test_an_empty_slot_never_stops_the_overlays_updating():
+    """A group with nothing to draw holds a null slot so rows and meshes stay
+    aligned.  Every walk over the slots must step over it: one that did not
+    threw at the top of applyAnnotations, and from then on nothing redrew —
+    a soma wireframe stayed on screen across cells."""
+    import re
+
+    html = _page_html()
+    walks = re.findall(
+        r"for \(const m of (?:annotationMeshes|markerMeshes|edgeGroupMeshes)\)"
+        r"\s*(\{[^}]*\}|[^\n]*)",
+        html,
+    )
+    assert walks
+    for body in walks:
+        assert re.search(r"disposeObj\(m\)|if \(!m\) continue|if \(m\)", body), body
+    dispose = html.split("function disposeObj(m) {")[1].split("}")[0]
+    assert "if (!m) return;" in dispose
+    # Edge groups keep a slot each too, or every later row names the wrong one.
+    assert "if (segs.length === 0) { edgeGroupMeshes.push(null); continue; }" in html
+
+
+def test_every_function_the_page_calls_is_defined():
+    """A call to an undefined function only fails when its line runs, so a
+    page that loads cleanly can still throw on a button — as all four
+    `fetchAnnotations()` calls did."""
+    import re
+
+    html = _page_html()
+    script = html.split('<script type="module">')[1].split("</script>")[0]
+    script = re.sub(r"//[^\n]*|`[^`]*`|\"[^\"\n]*\"|'[^'\n]*'", "", script)
+    called = set(re.findall(r"(?<![\w.$])([A-Za-z_$][\w$]*)\s*\(", script))
+    defined = set(re.findall(r"function\s+([A-Za-z_$][\w$]*)", script))
+    defined |= set(re.findall(r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=", script))
+    defined |= set(re.findall(r"import\s*\{\s*([\w$]+)", script))
+    defined |= set(re.findall(r"([A-Za-z_$][\w$]*)\s*=>", script))
+    for params in re.findall(
+        r"function\s*[\w$]*\s*\(([^)]*)\)|\(([^()]*)\)\s*=>", script
+    ):
+        for p in ",".join(params).split(","):
+            name = p.split("=")[0].strip(" {}[].")
+            if name:
+                defined.add(name)
+    builtins = {
+        "if", "for", "while", "switch", "catch", "return", "typeof", "function",
+        "await", "new", "fetch", "parseInt", "parseFloat", "setTimeout",
+        "clearTimeout", "requestAnimationFrame", "confirm", "atob", "isNaN",
+        "Number", "String", "Array", "Object", "Set", "Map", "JSON", "Math",
+        "Date", "Promise", "Float32Array", "Uint32Array", "Uint8Array",
+        "Int32Array", "Error", "Boolean", "URL", "FormData", "Blob", "async",
+        "WebSocket", "encodeURIComponent", "Event",
+    }  # fmt: skip
+    missing = sorted(called - defined - builtins)
+    assert not missing, f"called but never defined: {missing}"
+
+
+def test_every_mesh_builder_unpacks_the_arrays():
+    """Typed-array constructors take a base64 string without complaint and
+    give an empty mesh, so a builder that skips ``meshArrays`` draws nothing."""
+    import re
+    from pathlib import Path
+
+    from skeliner.viewer import viewer as viewer_mod
+
+    html = Path(viewer_mod.__file__).with_name("viewer.html").read_text()
+    builders = re.findall(r"function (build\w*Mesh)\(", html)
+    assert {"buildMesh", "buildExtraMesh"} <= set(builders)
+    for name in builders:
+        body = html.split(f"function {name}(")[1].split("\n            }")[0]
+        assert "meshArrays(data)" in body, f"{name} reads the packed arrays raw"
+        assert not re.search(r"data\.(vertices|faces)\b", body)
+
+
 # ── every annotation channel you can list, you can fly to ─────────────
 #
 # `markers` had a list row, a colour swatch, a visibility toggle and a
@@ -2639,7 +3091,7 @@ def _focus_wiring():
     import re
     from pathlib import Path
 
-    from skeliner.plot import viewer as viewer_mod
+    from skeliner.viewer import viewer as viewer_mod
 
     html = Path(viewer_mod.__file__).with_name("viewer.html").read_text()
     defined = set(re.findall(r"function (focusOn\w+)\(", html))
@@ -2678,3 +3130,561 @@ def test_a_marker_can_name_the_node_it_marks():
     assert 'panelMode !== "skeleton"' in body, (
         "bin selection is attempted outside the mode that has a bin panel"
     )
+
+
+# ── contact sites ─────────────────────────────────────────────────────
+
+
+@pytest.fixture(scope="module")
+def two_kinds():
+    """A tube touched by one tube crossing it and one lying beside it."""
+    from skeliner import pair
+
+    from .test_pair import _tube
+
+    a = _tube([0, 0, 1], [0.0, 0.0, 0.0])
+    b = trimesh.util.concatenate(
+        [_tube([1, 0, 0], [0.0, 405.0, 0.0]), _tube([0, 0, 1], [405.0, 0.0, 0.0])]
+    )
+    return a, b, pair.scan_contacts(a, b, tol=20.0)
+
+
+def _overlay(a, b, sites, **kw):
+    from skeliner.viewer.viewer import _contact_overlay
+
+    args = dict(sides="both", show_aabb=True, aabb_mode="union", color_by="kind")
+    return _contact_overlay(a, b, np.zeros(3), sites, **{**args, **kw})
+
+
+def test_contact_sites_are_coloured_and_labelled_by_kind(two_kinds):
+    from skeliner.viewer.viewer import _KIND_COLORS
+
+    a, b, sites = two_kinds
+    assert sorted(sites.kind.tolist()) == ["crossing", "other"]
+    ann, state = _overlay(a, b, sites)
+    for h in ann["highlights"]:
+        assert h["kind"] == sites.kind[h["site"]]
+        assert h["label"] == f"Site {h['site']}{h['side']} · {h['kind']}"
+        assert h["color"] == _KIND_COLORS[h["kind"]]
+    assert [k["kind"] for k in state["kinds"]] == ["crossing", "other"]
+    assert [k["count"] for k in state["kinds"]] == [1, 1]
+    assert [k["color"] for k in state["kinds"]] == [
+        _KIND_COLORS["crossing"],
+        _KIND_COLORS["other"],
+    ]
+    assert all(" · " in g["label"] for g in ann["edge_groups"])
+
+
+def test_colouring_by_site_keeps_the_kinds_in_the_labels(two_kinds):
+    from skeliner.viewer.viewer import _SITE_COLORS
+
+    a, b, sites = two_kinds
+    ann, state = _overlay(a, b, sites, color_by="site")
+    colours = {h["site"]: h["color"] for h in ann["highlights"]}
+    assert colours == {0: _SITE_COLORS[0], 1: _SITE_COLORS[1]}
+    assert all(" · " in h["label"] for h in ann["highlights"])
+    # still listed, for the panel to show or hide each kind, but no key
+    assert [k["kind"] for k in state["kinds"]] == ["crossing", "other"]
+    assert all("color" not in k for k in state["kinds"])
+
+
+def test_sites_without_kinds_look_as_before(two_kinds):
+    from skeliner import pair
+    from skeliner.viewer.viewer import _SITE_COLORS
+
+    a, b, _ = two_kinds
+    plain = pair.scan_contacts(a, b, tol=20.0, label=False)
+    ann, state = _overlay(a, b, plain)
+    assert all(" · " not in h["label"] for h in ann["highlights"])
+    assert {tuple(h["color"]) for h in ann["highlights"]} <= {
+        tuple(c) for c in _SITE_COLORS
+    }
+    assert "kinds" not in state and state["nSites"] == 2
+
+
+def test_both_sides_are_sent_whichever_is_shown_first(two_kinds):
+    """The contact panel switches sides in the page, so every side of every
+    site is sent, tagged, and *sides* is only what the page shows first."""
+    a, b, sites = two_kinds
+    for first in ("A", "B", "both"):
+        ann, state = _overlay(a, b, sites, sides=first)
+        assert state["sides"] == first
+        sent = {(h["site"], h["side"], h["meshKey"]) for h in ann["highlights"]}
+        assert sent == {
+            (i, side, key)
+            for i in range(2)
+            for side, key in (("A", "primary"), ("B", "mesh_B"))
+        }
+
+
+def test_a_side_s_highlight_holds_that_mesh_s_faces(two_kinds):
+    a, b, sites = two_kinds
+    ann, _ = _overlay(a, b, sites, sides="A")
+    for h in ann["highlights"]:
+        faces = sites.faces_A if h["side"] == "A" else sites.faces_B
+        assert h["faces"] == np.asarray(faces[h["site"]]).tolist()
+
+
+@pytest.mark.parametrize("mode", ["union", "split"])
+def test_every_box_names_its_site(two_kinds, mode):
+    a, b, sites = two_kinds
+    ann, _ = _overlay(a, b, sites, aabb_mode=mode)
+    boxes = ann["edge_groups"]
+    assert all(g["aabb"] and g["kind"] == sites.kind[g["site"]] for g in boxes)
+    if mode == "union":
+        assert sorted(g["site"] for g in boxes) == [0, 1]
+        assert not any("side" in g for g in boxes)
+    else:
+        assert sorted((g["site"], g["side"]) for g in boxes) == [
+            (0, "A"),
+            (0, "B"),
+            (1, "A"),
+            (1, "B"),
+        ]
+
+
+def test_boxes_are_sent_hidden_rather_than_left_out(two_kinds):
+    a, b, sites = two_kinds
+    ann, state = _overlay(a, b, sites, show_aabb=False)
+    assert state["boxes"] is False and len(ann["edge_groups"]) == 2
+
+
+def test_an_unknown_side_or_box_mode_is_named(two_kinds):
+    a, b, sites = two_kinds
+    with pytest.raises(ValueError, match="sides"):
+        _overlay(a, b, sites, sides="C")
+    with pytest.raises(ValueError, match="aabb_mode"):
+        _overlay(a, b, sites, aabb_mode="none")
+
+
+@pytest.fixture
+def contact_launch(tmp_path, monkeypatch):
+    """``view_contacts`` up to the server it would start: its app, behind a
+    test client."""
+    from starlette.testclient import TestClient
+
+    from skeliner.viewer import viewer as viewer_mod
+
+    monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
+    launched = {}
+    monkeypatch.setattr(
+        viewer_mod, "_launch_app", lambda app, **_kw: launched.update(app=app)
+    )
+
+    def launch(*args, **kwargs):
+        viewer_mod.view_contacts(*args, port=8919, **kwargs)
+        return TestClient(launched["app"])
+
+    return launch
+
+
+def test_the_sites_are_found_when_none_are_given(two_kinds, contact_launch):
+    from skeliner import pair
+
+    a, b, _ = two_kinds
+    expected = pair.scan_contacts(a, b)
+    client = contact_launch(a, b)
+    state = client.get("/contact_sites").json()
+    assert state["nSites"] == len(expected.faces_A) > 0
+    assert sum(k["count"] for k in state["kinds"]) == len(expected.kind)
+    highlights = client.get("/annotations").json()["highlights"]
+    on_a = {h["site"]: h["faces"] for h in highlights if h["side"] == "A"}
+    assert on_a == {
+        i: np.asarray(f).tolist() for i, f in enumerate(expected.faces_A) if len(f)
+    }
+
+
+def test_the_panel_is_told_the_meshes_and_the_launch(two_kinds, contact_launch):
+    a, b, sites = two_kinds
+    first = contact_launch(a, b, sites, names=("cell a", "cell b"))
+    first = first.get("/contact_sites").json()
+    again = contact_launch(a, b, sites).get("/contact_sites").json()
+    assert [(m["side"], m["key"], m["name"], m["nFaces"]) for m in first["meshes"]] == [
+        ("A", "primary", "cell a", len(a.faces)),
+        ("B", "mesh_B", "cell b", len(b.faces)),
+    ]
+    # a reload keeps the panel's settings, a new launch does not
+    assert first["session"] != again["session"]
+
+
+def test_sites_found_on_other_meshes_are_refused(two_kinds, contact_launch):
+    a, b, sites = two_kinds
+    fewer = trimesh.Trimesh(a.vertices, a.faces[:10], process=False)
+    with pytest.raises(ValueError, match="other meshes"):
+        contact_launch(fewer, b, sites)
+
+
+def test_a_b_side_site_is_saved_from_mesh_b(two_kinds, contact_launch):
+    """A highlight's faces number the mesh it is drawn on."""
+    a, b, sites = two_kinds
+    client = contact_launch(a, b, sites)
+    highlights = client.get("/annotations").json()["highlights"]
+    idx = next(i for i, h in enumerate(highlights) if h["side"] == "B")
+    r = client.get(f"/export_annotation_submesh?index={idx}")
+    assert r.status_code == 200
+    faces = np.asarray(highlights[idx]["faces"])
+    used = np.unique(np.asarray(b.faces)[faces])
+    assert r.text.count("\nv ") + r.text.startswith("v ") == len(used)
+
+
+# ── starting and stopping ─────────────────────────────────────────────
+#
+# In a notebook a viewer serves from a thread until it is stopped, so two
+# of them can run side by side on two ports.
+
+
+def test_the_old_names_warn_and_reach_start_and_stop():
+    import skeliner as sk
+
+    for old, new in (("view", "start"), ("stop_viewer", "stop")):
+        with pytest.warns(DeprecationWarning, match=rf"sk\.viewer\.{new}\(\)"):
+            assert getattr(sk.viewer, old) is getattr(sk.viewer, new)
+    with pytest.raises(AttributeError):
+        sk.viewer.no_such_function
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _serving(port: int) -> bool:
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/loaded", timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def _within(cond, seconds: float = 10.0) -> bool:
+    import time
+
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < seconds:
+        if cond():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+@pytest.fixture
+def notebook_viewers(tmp_path, monkeypatch):
+    """``start`` as a notebook calls it: inside a running event loop."""
+    from skeliner.viewer import viewer as viewer_mod
+
+    monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
+
+    def start(*ports):
+        async def cell():
+            for p in ports:
+                viewer_mod.start(port=p, no_browser=True)
+
+        asyncio.run(cell())
+
+    yield start, viewer_mod.stop
+    viewer_mod.stop()
+
+
+def test_a_viewer_on_another_port_leaves_the_first_running(notebook_viewers):
+    start, stop = notebook_viewers
+    first, second = _free_port(), _free_port()
+    start(first)
+    assert _within(lambda: _serving(first))
+    start(second)
+    assert _within(lambda: _serving(second))
+    assert _serving(first)
+
+
+def test_stopping_a_port_stops_that_viewer_only(notebook_viewers):
+    start, stop = notebook_viewers
+    first, second = _free_port(), _free_port()
+    start(first, second)
+    assert _within(lambda: _serving(first) and _serving(second))
+    stop(first)
+    assert _within(lambda: not _serving(first))
+    assert _serving(second)
+    stop()
+    assert _within(lambda: not _serving(second))
+
+
+def test_starting_again_on_a_port_replaces_its_viewer(notebook_viewers):
+    from skeliner.viewer import viewer as viewer_mod
+
+    start, stop = notebook_viewers
+    port = _free_port()
+    start(port)
+    assert _within(lambda: _serving(port))
+    old = viewer_mod._servers[port][0]
+    start(port)
+    assert viewer_mod._servers[port][0] is not old and old.should_exit
+    assert _within(lambda: _serving(port))
+
+
+# ── the command line ──────────────────────────────────────────────────
+
+
+def _cli(monkeypatch, *argv):
+    """``skeliner *argv``, with what it would launch recorded instead."""
+    from skeliner import __main__ as cli
+    from skeliner.viewer import viewer as viewer_mod
+
+    called = {}
+    monkeypatch.setattr(
+        viewer_mod, "start", lambda *a, **kw: called.update(start=(a, kw))
+    )
+    monkeypatch.setattr(
+        viewer_mod,
+        "view_contacts",
+        lambda *a, **kw: called.update(view_contacts=(a, kw)),
+    )
+    monkeypatch.setattr("sys.argv", ["skeliner", *argv])
+    cli.main()
+    return called
+
+
+def test_view_starts_the_viewer_on_the_mesh(monkeypatch):
+    called = _cli(monkeypatch, "view", "cell.obj", "--port", "9123", "--no-browser")
+    args, kw = called["start"]
+    assert args == ("cell.obj",)
+    assert kw == dict(host="127.0.0.1", port=9123, no_browser=True)
+
+
+def test_view_contacts_reads_the_meshes_and_the_sites(two_kinds, tmp_path, monkeypatch):
+    import skeliner as sk
+
+    a, b, sites = two_kinds
+    (tmp_path / "cellA").mkdir()
+    a.export(tmp_path / "cellA" / "mesh.obj")
+    b.export(tmp_path / "B.obj")
+    sk.io.save_contact_sites(sites, tmp_path / "sites.npz")
+    called = _cli(
+        monkeypatch,
+        "view-contacts",
+        str(tmp_path / "cellA" / "mesh.obj"),
+        str(tmp_path / "B.obj"),
+        str(tmp_path / "sites.npz"),
+        "--sides",
+        "both",
+        "--boxes",
+        "split",
+        "--color-by",
+        "site",
+        "--no-browser",
+    )
+    (A, B, found), kw = called["view_contacts"]
+    assert len(A.faces) == len(a.faces) and len(B.faces) == len(b.faces)
+    assert [f.tolist() for f in found.faces_B] == [
+        np.asarray(f).tolist() for f in sites.faces_B
+    ]
+    assert found.kind.tolist() == sites.kind.tolist()
+    assert kw["names"] == ("cellA/mesh.obj", f"{tmp_path.name}/B.obj")
+    assert (kw["sides"], kw["aabb_mode"], kw["show_aabb"], kw["color_by"]) == (
+        "both",
+        "split",
+        True,
+        "site",
+    )
+
+
+def test_view_contacts_without_sites_leaves_them_to_the_scan(
+    two_kinds, tmp_path, monkeypatch
+):
+    a, b, _ = two_kinds
+    a.export(tmp_path / "A.obj")
+    b.export(tmp_path / "B.obj")
+    called = _cli(
+        monkeypatch,
+        "view-contacts",
+        str(tmp_path / "A.obj"),
+        str(tmp_path / "B.obj"),
+        "--boxes",
+        "none",
+    )
+    (_, _, found), kw = called["view_contacts"]
+    assert found is None
+    assert kw["show_aabb"] is False and kw["sides"] == "A"
+
+
+# ── a contact viewer filled by drag and drop ──────────────────────────
+#
+# A bare ``skeliner view-contacts`` starts with both mesh slots empty; each
+# dropped mesh fills the next, A then B, and the sites are found once both
+# are in — or taken from a dropped sites file.
+
+
+@pytest.fixture
+def empty_contacts(tmp_path, monkeypatch):
+    """An empty contact viewer, its client and a page that records every
+    broadcast."""
+    from starlette.testclient import TestClient
+
+    from skeliner.viewer import viewer as viewer_mod
+
+    monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path / "state", raising=False)
+    launched = {}
+    monkeypatch.setattr(
+        viewer_mod, "_launch_app", lambda app, **_kw: launched.update(app=app)
+    )
+    viewer_mod.view_contacts(port=8920)
+    return TestClient(launched["app"]), _connect_page(launched["app"])
+
+
+@pytest.fixture
+def pair_files(two_kinds, tmp_path):
+    """The two tubes as OBJ files, and the meshes they read back as."""
+    import skeliner as sk
+
+    a, b, _ = two_kinds
+    paths = tmp_path / "cell_a.obj", tmp_path / "cell_b.obj"
+    a.export(paths[0])
+    b.export(paths[1])
+    return paths, tuple(sk.io.load_mesh(p) for p in paths)
+
+
+def _drop(client, *paths):
+    files = [("files", (p.name, p.read_bytes())) for p in paths]
+    return client.post("/contact_upload", files=files)
+
+
+def _slots(client):
+    state = client.get("/contact_sites").json()
+    return [m["loaded"] for m in state["meshes"]], state["nSites"]
+
+
+def test_an_empty_contact_viewer_waits_for_two_meshes(empty_contacts):
+    client, _ = empty_contacts
+    assert _slots(client) == ([False, False], 0)
+    assert client.get("/mesh").json() is None
+    assert client.get("/extra_meshes").json() is None
+
+
+def test_meshes_dropped_one_by_one_fill_a_then_b(empty_contacts, pair_files):
+    from skeliner import pair
+
+    client, page = empty_contacts
+    (path_a, path_b), (a, b) = pair_files
+    assert _drop(client, path_a).json()["results"][0]["side"] == "A"
+    assert _slots(client) == ([True, False], 0)
+    assert _drop(client, path_b).json()["results"][0]["side"] == "B"
+    expected = pair.scan_contacts(a, b)
+    assert _slots(client) == ([True, True], len(expected.faces_A))
+    assert len(expected.faces_A) > 0
+    sent = [m["type"] for m in page.sent]
+    assert sent.index("mesh_loaded") < sent.index("extra_mesh_loaded")
+    highlights = client.get("/annotations").json()["highlights"]
+    assert {h["side"] for h in highlights} == {"A", "B"}
+    names = [m["name"] for m in client.get("/contact_sites").json()["meshes"]]
+    assert names == ["cell_a.obj", "cell_b.obj"]
+
+
+def test_both_meshes_share_the_first_one_s_centre(empty_contacts, pair_files):
+    client, page = empty_contacts
+    (path_a, path_b), (a, _) = pair_files
+    _drop(client, path_a)
+    _drop(client, path_b)
+    a_sent = next(m for m in page.sent if m["type"] == "mesh_loaded")["payload"]
+    b_sent = next(m for m in page.sent if m["type"] == "extra_mesh_loaded")["payload"]
+    assert a_sent["centroid"] == b_sent["centroid"]
+    np.testing.assert_allclose(
+        a_sent["centroid"], np.asarray(a.vertices, np.float32).mean(0), rtol=1e-6
+    )
+
+
+def test_eyewire_ctm_meshes_fill_the_slots_as_obj_ones_do(
+    empty_contacts, pair_files, tmp_path
+):
+    from .test_io import _ctm_file
+
+    client, _ = empty_contacts
+    _, meshes = pair_files
+    paths = tmp_path / "cell_a.ctm", tmp_path / "cell_b.ctm"
+    for path, mesh in zip(paths, meshes):
+        path.write_bytes(_ctm_file("RAW", mesh.vertices, mesh.faces)[0])
+    results = _drop(client, *paths).json()["results"]
+    assert [(x["name"], x["side"]) for x in results] == [
+        ("cell_a.ctm", "A"),
+        ("cell_b.ctm", "B"),
+    ]
+    assert _slots(client)[0] == [True, True]
+
+
+def test_a_full_viewer_takes_a_mesh_once_one_is_removed(empty_contacts, pair_files):
+    client, page = empty_contacts
+    (path_a, path_b), _ = pair_files
+    _drop(client, path_a, path_b)
+    found = _slots(client)[1]
+    refused = _drop(client, path_a)
+    assert refused.status_code == 400 and "remove one" in refused.json()["error"]
+    assert client.post("/contact_remove", json={"side": "B"}).json()["ok"]
+    assert _slots(client) == ([True, False], 0)
+    assert "highlights" not in client.get("/annotations").json()
+    assert {"name": "mesh_B"} in [
+        m["payload"] for m in page.sent if m["type"] == "extra_mesh_removed"
+    ]
+    _drop(client, path_b)
+    assert _slots(client) == ([True, True], found)
+
+
+def test_a_dropped_sites_file_is_used_instead_of_the_scan(
+    empty_contacts, pair_files, tmp_path
+):
+    import skeliner as sk
+
+    client, _ = empty_contacts
+    (path_a, path_b), (a, b) = pair_files
+    one = sk.pair.pick_contacts(sk.pair.scan_contacts(a, b), np.array([True, False]))
+    sk.io.save_contact_sites(one, tmp_path / "one.npz")
+    _drop(client, path_a, path_b, tmp_path / "one.npz")
+    assert _slots(client) == ([True, True], 1)
+
+
+def test_sites_dropped_before_the_second_mesh_wait_for_it(
+    empty_contacts, pair_files, tmp_path
+):
+    import skeliner as sk
+
+    client, _ = empty_contacts
+    (path_a, path_b), (a, b) = pair_files
+    one = sk.pair.pick_contacts(sk.pair.scan_contacts(a, b), np.array([True, False]))
+    sk.io.save_contact_sites(one, tmp_path / "one.npz")
+    _drop(client, path_a, tmp_path / "one.npz")
+    assert _slots(client) == ([True, False], 0)
+    _drop(client, path_b)
+    assert _slots(client) == ([True, True], 1)
+
+
+def test_dropped_sites_of_other_meshes_are_refused(
+    empty_contacts, pair_files, tmp_path
+):
+    import skeliner as sk
+
+    client, _ = empty_contacts
+    (path_a, path_b), (a, b) = pair_files
+    swapped = sk.pair.scan_contacts(b, a)
+    sk.io.save_contact_sites(swapped, tmp_path / "swapped.npz")
+    results = _drop(client, path_a, path_b, tmp_path / "swapped.npz").json()["results"]
+    assert any(not r["ok"] and "other meshes" in r["error"] for r in results)
+    assert _slots(client)[1] == len(sk.pair.scan_contacts(a, b).faces_A)
+
+
+def test_only_a_contact_viewer_takes_contact_drops(tmp_path, monkeypatch):
+    from starlette.testclient import TestClient
+
+    from skeliner.viewer import viewer as viewer_mod
+
+    monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
+    client = TestClient(_create_app(port=8921))
+    assert client.get("/contact_sites").json() is None
+    assert client.post("/contact_remove", json={"side": "A"}).status_code == 400
+
+
+def test_bare_view_contacts_starts_an_empty_viewer(monkeypatch):
+    called = _cli(monkeypatch, "view-contacts")
+    (a, b, sites), kw = called["view_contacts"]
+    assert (a, b, sites) == (None, None, None)
+    assert kw["names"] == ("A", "B")

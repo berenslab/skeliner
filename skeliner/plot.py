@@ -1,17 +1,23 @@
+"""Figures of skeletons and meshes, drawn with matplotlib.
+
+The interactive web viewer is :mod:`skeliner.viewer`.
+"""
+
+import importlib
+import sys
+import warnings
 from typing import Mapping, Sequence
 
 import matplotlib as mpl
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
-import trimesh
 from matplotlib.axes import Axes
 from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.figure import Figure
 from matplotlib.patches import Circle, Ellipse
-from scipy.stats import binned_statistic_2d
 
-from ..dataclass import MeshComponents, Organelles, Skeleton
+from .dataclass import Mesh, MeshComponents, Organelles, Skeleton
 
 __all__ = [
     "projection",
@@ -291,7 +297,7 @@ def _resolve_swc_palette_from_skel_cmap(skel_cmap) -> np.ndarray:
 
 def projection(
     skel: Skeleton,
-    mesh: trimesh.Trimesh | None = None,
+    mesh: Mesh | None = None,
     *,
     plane: str = "xy",
     radius_metric: str | None = None,
@@ -333,7 +339,7 @@ def projection(
     ----------
     skel : Skeleton
         The centre‑line skeleton to visualise.
-    mesh : trimesh.Trimesh | None, default *None*
+    mesh : Mesh | None, default *None*
         Surface mesh used to draw a vertex‑density heat‑map and (optionally) the
         soma surface.  Pass *None* to **omit** the background histogram and any
         mesh‑based overlays.
@@ -447,6 +453,8 @@ def projection(
             bins_arg = (int(bins[0]), int(bins[1]))
         else:
             raise ValueError("bins must be an int or a tuple of two ints")
+
+        from scipy.stats import binned_statistic_2d  # heavy import lazily
 
         hist, xedges, yedges, _ = binned_statistic_2d(
             xy_mesh[:, 0],
@@ -659,7 +667,7 @@ def projection(
 
 def details(
     skel: Skeleton,
-    mesh: trimesh.Trimesh | None = None,
+    mesh: Mesh | None = None,
     *,
     plane: str = "xy",
     # background histogram ------------------------------------------------- #
@@ -1036,7 +1044,7 @@ def _plane_axes(plane: str) -> tuple[str, str]:
 
 def threeviews(
     skel: Skeleton,
-    mesh: trimesh.Trimesh | None = None,
+    mesh: Mesh | None = None,
     *,
     planes: tuple[str, str, str] | list[str] = ["xy", "xz", "zy"],
     scale: float | tuple[float, float] = 1.0,  # nm → µm by default
@@ -1196,7 +1204,7 @@ def _window_for_node(
 
 def node_details(
     skel: Skeleton,
-    mesh: trimesh.Trimesh | None = None,
+    mesh: Mesh | None = None,
     node_id: int = 0,
     *,
     plane: str = "xy",
@@ -1249,7 +1257,7 @@ def node_details(
 
 
 def z_section(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     z: float | None = None,
     *,
     z_tol: float = 150.0,
@@ -1267,7 +1275,7 @@ def z_section(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input neuron mesh.
     z : float
         Z-level to slice at.
@@ -1523,7 +1531,7 @@ def z_section(
 
 
 def z_section_grid(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     nucleus: dict,
     *,
     z_step: float = 210.0,
@@ -1540,7 +1548,7 @@ def z_section_grid(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input neuron mesh.
     nucleus : dict
         Result dict from :func:`find_nucleus_center`.
@@ -1597,7 +1605,7 @@ def z_section_grid(
 
 
 def diagnose_soma(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     *,
     nucleus: dict | None = None,
     soma: object = None,
@@ -1617,7 +1625,7 @@ def diagnose_soma(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh.
     nucleus : dict or None
         Result from :func:`find_nucleus_center`.
@@ -1634,7 +1642,7 @@ def diagnose_soma(
     -------
     fig, axes : Figure, list[Axes]
     """
-    # Color scheme — matches skeliner.plot.viewer
+    # Color scheme — matches skeliner.viewer
     SOMA_COLOR = (0.9, 0.5, 0.9)
     POCKET_COLOR = (1.0, 0.15, 0.15)
     ISOLATED_COLOR = (0.15, 0.8, 0.15)
@@ -1765,7 +1773,7 @@ def diagnose_soma(
 
 
 def diagnose_components(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     components: MeshComponents,
     *,
     planes: tuple[str, str, str] = ("xy", "xz", "zy"),
@@ -1780,7 +1788,7 @@ def diagnose_components(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh.
     components : MeshComponents
         Result of :func:`~skeliner.pre.break_up_mesh`.
@@ -1793,7 +1801,7 @@ def diagnose_components(
     -------
     fig, axes : Figure, list[Axes]
     """
-    # Color scheme — matches skeliner.plot.viewer post break_up_mesh
+    # Color scheme — matches skeliner.viewer post break_up_mesh
     SOMA_COLOR = (0.9, 0.5, 0.9)
     ORG_COLOR = (1.0, 0.8, 0.0)
     NEURITE_COLORS = [
@@ -1963,7 +1971,7 @@ def diagnose_components(
 
 
 def diagnose_discarded(
-    mesh: trimesh.Trimesh,
+    mesh: Mesh,
     components: MeshComponents,
     *,
     min_faces: int = 1000,
@@ -1978,7 +1986,7 @@ def diagnose_discarded(
 
     Parameters
     ----------
-    mesh : trimesh.Trimesh
+    mesh : Mesh
         Input mesh (after preprocessing).
     components : MeshComponents
         Result of :func:`~skeliner.pre.break_up_mesh`.
@@ -2071,3 +2079,32 @@ def diagnose_discarded(
 
     fig.tight_layout()
     return fig, all_axes
+
+
+# `skeliner.plot` held the web viewer too, and these figures as `vis2d`,
+# until the viewer became `skeliner.viewer`: each old name, its new one
+_MOVED = {
+    "view": "start",
+    "view3d": "view3d",
+    "view_contacts": "view_contacts",
+    "stop_viewer": "stop",
+}
+
+
+def __getattr__(name: str):
+    if name in _MOVED:
+        new = _MOVED[name]
+        warnings.warn(
+            f"sk.plot.{name}() is deprecated, use sk.viewer.{new}() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return getattr(importlib.import_module("skeliner.viewer"), new)
+    if name == "vis2d":
+        warnings.warn(
+            "sk.plot.vis2d is deprecated, its figures are sk.plot's own.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return sys.modules[__name__]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
