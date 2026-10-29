@@ -385,7 +385,7 @@ struct Current {
     index: usize,
     n_fits: usize,
     verts: Vec<u32>,
-    /// A neurite the first absorption round would have taken was kept out
+    /// A neurite small enough to pass for a pocket by its size was kept out
     /// of the soma: the exits are eroded as after a pruned tube.
     held_out: bool,
     /// The vertices of the pieces outside the soma reaching out past three
@@ -453,11 +453,12 @@ fn assign_soma_verts<E>(
         }
     }
 
-    // pockets: pieces of the component outside the soma, absorbed unless
-    // Otsu on their sizes calls them neurites.  Every piece is bounded by
-    // the soma alone (a vertex's neighbours are on the component: in the
-    // soma or in its piece), and absorbing pieces leaves the others as
-    // they were, so the pieces are found once for every round.
+    // pockets: the pieces of the component outside the soma that do not
+    // stand out of it like a neurite, absorbed while smaller than the soma
+    // (a round at a time, as it grows).  Every piece is bounded by the soma
+    // alone (a vertex's neighbours are on the component: in the soma or in
+    // its piece), and absorbing pieces leaves the others as they were, so
+    // the pieces are found once for every round.
     let outside: Vec<bool> = threads::install(|| {
         (0..nv as u32)
             .into_par_iter()
@@ -466,7 +467,9 @@ fn assign_soma_verts<E>(
     });
     let pieces = g.pieces_of(&outside, |_, _| true);
     let (neurite, tube) = stands_out(m, g, e, &soma_set, &pieces);
-    // the pieces the first round would have absorbed, neurites with them
+    // a neurite under Otsu's split of the sizes of the pieces smaller than
+    // the soma passes for a pocket by its size: its base inside the
+    // dilation is a stub
     let first: Vec<u32> = pieces
         .list
         .iter()
@@ -494,23 +497,9 @@ fn assign_soma_verts<E>(
     let mut absorb = vec![false; nv];
     let mut soma_len = soma_set.len;
     for _ in 0..10 {
-        let trapped: Vec<u32> = left
-            .iter()
-            .copied()
-            .filter(|&p| pieces.size(p) < soma_len)
-            .collect();
-        if trapped.is_empty() {
-            break;
-        }
-        let size_thresh = if trapped.len() >= 2 {
-            let sizes: Vec<f64> = trapped.iter().map(|&p| pieces.size(p) as f64).collect();
-            otsu_threshold(&sizes).0
-        } else {
-            0.0
-        };
         let mut absorbed = 0;
-        for &p in &trapped {
-            if pieces.size(p) as f64 <= size_thresh {
+        for &p in &left {
+            if pieces.size(p) < soma_len {
                 absorbed += pieces.size(p);
                 absorb[p as usize] = true;
             }
@@ -1024,6 +1013,77 @@ mod tests {
         for (&p, c) in found.list.iter().zip(&listed) {
             assert_eq!(found.size(p), c.len());
         }
+    }
+
+    /// A grid whose soma is a disc with a hole in it, a bulge of the surface
+    /// left outside, and a strip of tube leaving the disc; with a neurite
+    /// held out, the erosion walks in from the strip, never from the hole's
+    /// rim nor the disc's edge.
+    #[test]
+    fn the_stub_erosion_starts_at_tubes_alone() {
+        let n = 41u32;
+        let mut verts = Vec::new();
+        for i in 0..n {
+            for j in 0..n {
+                verts.push([i as f64 * 100.0 - 2000.0, j as f64 * 100.0 - 2000.0, 0.0]);
+            }
+        }
+        let mut faces = Vec::new();
+        for i in 0..n - 1 {
+            for j in 0..n - 1 {
+                let (a, b) = (i * n + j, (i + 1) * n + j);
+                faces.push([a, b, b + 1]);
+                faces.push([a, b + 1, a + 1]);
+            }
+        }
+        let nv = verts.len();
+        let from = |v: usize, c: [f64; 2]| (verts[v][0] - c[0]).hypot(verts[v][1] - c[1]);
+        let hole = |v: usize| from(v, [800.0, 0.0]) <= 300.0;
+        let soma: Vec<u32> = (0..nv as u32)
+            .filter(|&v| from(v as usize, [0.0, 0.0]) <= 1500.0 && !hole(v as usize))
+            .collect();
+        let labels = vec![0i64; faces.len()];
+        let organelle = vec![false; faces.len()];
+        let m = SomaMesh {
+            faces: &faces,
+            verts: &verts,
+            labels: &labels,
+            main: 0,
+            organelle: &organelle,
+            avg_edge: 100.0,
+        };
+        let all: Vec<u32> = (0..faces.len() as u32).collect();
+        let g = Graph::new(&faces, &all, nv);
+        // wide enough to hold the grid: nothing past it to prune
+        let s = 1.0 / 5000.0;
+        let wide = Ellipsoid {
+            center: [0.0; 3],
+            w: [[s, 0.0, 0.0], [0.0, s, 0.0], [0.0, 0.0, s]],
+        };
+        let mut cur = Current {
+            fit: Fit {
+                ellipsoid: wide,
+                axes_min: 5000.0,
+            },
+            index: 0,
+            n_fits: 1,
+            verts: soma.clone(),
+            held_out: true,
+            tube: (0..nv)
+                .map(|v| verts[v][1] == 0.0 && verts[v][0] < -1500.0)
+                .collect(),
+        };
+        prune(&m, &g, &wide, &mut cur, &mut |_, _| Ok::<_, ()>(None)).unwrap();
+        let kept = Set::from(nv, cur.verts.iter().copied());
+        let rim: Vec<u32> = soma
+            .iter()
+            .copied()
+            .filter(|&v| g.nbrs(v).iter().any(|&u| hole(u as usize)))
+            .collect();
+        assert!(rim.len() > 10 && rim.iter().all(|&v| kept.has(v)));
+        // the strip's stub went, and nothing else
+        let lost: Vec<u32> = soma.iter().copied().filter(|&v| !kept.has(v)).collect();
+        assert!(!lost.is_empty() && lost.iter().all(|&v| verts[v as usize][0] < -1000.0));
     }
 
     #[test]

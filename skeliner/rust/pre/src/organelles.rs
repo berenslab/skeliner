@@ -415,6 +415,10 @@ pub struct Inside<'a> {
 /// face lying in an opening's plane does not look through it.
 pub const FAN_CLEARANCE: f64 = 1e-6;
 
+/// A ray costs microseconds, so this many are worth casting across the
+/// pool (`threads::MIN_PARALLEL` is for items costing nanoseconds).
+const RAYS_PARALLEL: usize = 256;
+
 impl<'a> Inside<'a> {
     pub fn new(
         verts: &'a [[f64; 3]],
@@ -431,28 +435,51 @@ impl<'a> Inside<'a> {
         }
     }
 
+    /// Build the rays' trees now, on the pool, unless they are built: call
+    /// it before the parallel loops that cast rays, which otherwise build
+    /// them on the first ray's thread, one core at work and the rest
+    /// waiting.
+    pub fn prepare(&self) {
+        if self.probe.get().is_none() {
+            let built = threads::install(|| self.trees(true));
+            // a ray cast meanwhile may have built them first: the same trees
+            let _ = self.probe.set(built);
+        }
+    }
+
+    fn probe(&self) -> &(TriangleBvh, TriangleBvh) {
+        // sequential: rayon inside a lazy initialiser can deadlock
+        self.probe.get_or_init(|| self.trees(false))
+    }
+
     /// The faces' tree, and the tree of a fan to its centroid over each
     /// loop of open edges (an edge named by one face; a vertex repeated
-    /// makes no edge).
-    fn probe(&self) -> &(TriangleBvh, TriangleBvh) {
-        self.probe.get_or_init(|| {
-            let tris: Vec<[[f64; 3]; 3]> = self
-                .faces
-                .iter()
-                .map(|f| f.map(|v| self.verts[v as usize]))
-                .collect();
-            let (mut fans, mut fan_normals) = (Vec::new(), Vec::new());
-            let mut edges: Vec<(u32, u32)> = self
-                .faces
-                .iter()
-                .flat_map(|t| {
-                    [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])]
-                        .into_iter()
-                        .filter(|(a, b)| a != b)
-                        .map(|(a, b)| (a.min(b), a.max(b)))
-                })
-                .collect();
+    /// makes no edge); on the pool when `parallel`.
+    fn trees(&self, parallel: bool) -> (TriangleBvh, TriangleBvh) {
+        let corners = |f: &[u32; 3]| f.map(|v| self.verts[v as usize]);
+        let sides = |t: &[u32; 3]| {
+            [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])]
+                .into_iter()
+                .filter(|(a, b)| a != b)
+                .map(|(a, b)| (a.min(b), a.max(b)))
+        };
+        let tris: Vec<[[f64; 3]; 3]> = if parallel {
+            self.faces.par_iter().map(corners).collect()
+        } else {
+            self.faces.iter().map(corners).collect()
+        };
+        let mut edges: Vec<(u32, u32)> = if parallel {
+            self.faces.par_iter().flat_map_iter(sides).collect()
+        } else {
+            self.faces.iter().flat_map(sides).collect()
+        };
+        if parallel {
+            edges.par_sort_unstable();
+        } else {
             edges.sort_unstable();
+        }
+        {
+            let (mut fans, mut fan_normals) = (Vec::new(), Vec::new());
             let open: Vec<(u32, u32)> = edges
                 .chunk_by(|x, y| x == y)
                 .filter(|run| run.len() == 1)
@@ -488,11 +515,19 @@ impl<'a> Inside<'a> {
                     });
                 }
             }
-            (
-                TriangleBvh::new(tris, self.normals.to_vec()),
-                TriangleBvh::new(fans, fan_normals),
-            )
-        })
+            let normals = self.normals.to_vec();
+            if parallel {
+                (
+                    TriangleBvh::new_parallel(tris, normals),
+                    TriangleBvh::new_parallel(fans, fan_normals),
+                )
+            } else {
+                (
+                    TriangleBvh::new(tris, normals),
+                    TriangleBvh::new(fans, fan_normals),
+                )
+            }
+        }
     }
 
     /// Does face `f` look into the cell: does its normal ray meet another
@@ -500,14 +535,20 @@ impl<'a> Inside<'a> {
     pub fn looks_in(&self, f: usize) -> bool {
         let (faces, fans) = self.probe();
         let (o, d) = (self.centers[f], self.normals[f]);
-        faces.first_hit(o, d, f64::NEG_INFINITY, Some(f)).is_some()
-            || fans.first_hit(o, d, FAN_CLEARANCE, None).is_some()
+        faces.hits_past(o, d, f64::NEG_INFINITY, Some(f))
+            || fans.hits_past(o, d, FAN_CLEARANCE, None)
     }
 
     /// Does the piece of faces `piece` lie inside the cell: do more than
     /// half its faces look into it?
     pub fn holds(&self, piece: &[u32]) -> bool {
-        let looking_in = piece.iter().filter(|&&f| self.looks_in(f as usize)).count();
+        let looks = |&f: &u32| self.looks_in(f as usize);
+        let looking_in = if piece.len() >= RAYS_PARALLEL {
+            self.prepare();
+            threads::install(|| piece.par_iter().filter(|f| looks(f)).count())
+        } else {
+            piece.iter().filter(|f| looks(f)).count()
+        };
         2 * looking_in > piece.len()
     }
 }
@@ -523,8 +564,7 @@ pub fn grow_into_cell(topo: &Topology, seeds: &[bool], inside: &Inside<'_>) -> V
     let mut seen = seeds.to_vec();
     let mut front: Vec<usize> = (0..seeds.len()).filter(|&f| seeds[f]).collect();
     if !front.is_empty() {
-        // the tree is built here, not by the pool's first ray
-        inside.probe();
+        inside.prepare();
     }
     while !front.is_empty() {
         let mut ring = Vec::new();
@@ -537,7 +577,11 @@ pub fn grow_into_cell(topo: &Topology, seeds: &[bool], inside: &Inside<'_>) -> V
                 }
             }
         }
-        let looks = threads::map(&ring, |&g| inside.looks_in(g));
+        let looks: Vec<bool> = if ring.len() >= RAYS_PARALLEL {
+            threads::install(|| ring.par_iter().map(|&g| inside.looks_in(g)).collect())
+        } else {
+            ring.iter().map(|&g| inside.looks_in(g)).collect()
+        };
         front = ring
             .into_iter()
             .zip(looks)
@@ -1158,6 +1202,9 @@ pub fn pocket_organelles(
     for &r in wall_of.iter().filter(|&&r| r != u32::MAX) {
         wall_size[r as usize] += 1;
     }
+    if !holes.is_empty() {
+        inside.prepare();
+    }
     let filled: Vec<bool> = threads::install(|| {
         holes
             .par_iter()
@@ -1214,6 +1261,9 @@ pub fn pocket_organelles(
     *pocket = kept;
     let flagged = pocket.clone();
     let comps = components_where_unordered(s, |f| flagged[f]);
+    if !comps.is_empty() {
+        inside.prepare();
+    }
     let shallow: Vec<bool> = threads::install(|| {
         comps
             .par_iter()
@@ -1284,6 +1334,10 @@ pub fn find_organelles(
         ..PocketParams::default()
     };
     let inside = Inside::new(s.verts, s.faces, s.centers, s.normals);
+    if structural.iter().chain(&isolated.mask).any(|&b| b) {
+        // the growth casts rays from anything found
+        inside.prepare();
+    }
     let holds = |piece: &[u32]| inside.holds(piece);
     let pockets = pocket_organelles(s, &structural, Some(&non_main), &params, svd, &inside);
     let candidates: Vec<bool> = (0..s.faces.len())

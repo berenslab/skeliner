@@ -4281,10 +4281,10 @@ def _assign_soma_verts(
     absorption, and disconnected-component absorption; then
     ``refit(soma, ids)`` the ellipsoid to the final vertex set:
     ``(fit, held_out, tube_verts)``, *held_out* whether a piece standing
-    out like a neurite, one the first round would have absorbed, was kept
-    out of it, *tube_verts* the vertices of the pieces outside it reaching
-    out past three times their junction's radius: tubes, their bases in it
-    stubs."""
+    out like a neurite, small enough to pass for a pocket by its size, was
+    kept out of it, *tube_verts* the vertices of the pieces outside it
+    reaching out past three times their junction's radius: tubes, their
+    bases in it stubs."""
     # Containment: main-component vertices inside the ellipsoid
     all_main_verts = np.unique(faces[main_fi])
     inside = soma.contains(verts[all_main_verts])
@@ -4316,11 +4316,10 @@ def _assign_soma_verts(
     # Absorb pockets: connected components of non-soma verts that are
     # topologically trapped (only reachable through the soma).
     # A neuron can have multiple neurite trees stemming from the soma;
-    # all of them are trapped by definition.  We separate neurites
-    # (large, preserve) from pockets (small surface artifacts, absorb)
-    # using Otsu on trapped component sizes.
+    # all of them are trapped by definition.  A piece standing out like a
+    # neurite is never a pocket; the others are absorbed while smaller
+    # than the soma, a round at a time as it grows.
     all_main_set = set(all_main_verts.tolist())
-    # pieces standing out like a neurite are never pockets
     outside = all_main_set - soma_set
     pieces: list[list[int]] = []
     seen: set[int] = set()
@@ -4345,7 +4344,9 @@ def _assign_soma_verts(
             neurite_verts.update(piece)
         if tube:
             tube_verts.update(piece)
-    # the pieces the first round would have absorbed, neurites with them
+    # a neurite under Otsu's split of the sizes of the pieces smaller than
+    # the soma passes for a pocket by its size: its base inside the
+    # dilation is a stub
     first = [
         (piece, out)
         for piece, out in zip(pieces, is_neurite)
@@ -4384,21 +4385,8 @@ def _assign_soma_verts(
 
         if not trapped_comps:
             break
-
-        # Otsu on component sizes to split neurites from pockets
-        sizes = np.array([len(c) for c in trapped_comps], dtype=np.float64)
-        if len(sizes) >= 2:
-            size_thresh, _ = otsu_threshold(sizes)
-        else:
-            size_thresh = 0.0  # single component — absorb it
-
-        absorbed = 0
         for comp in trapped_comps:
-            if len(comp) <= size_thresh:
-                soma_set.update(comp)
-                absorbed += len(comp)
-        if absorbed == 0:
-            break
+            soma_set.update(comp)
 
     # Absorb disconnected-component vertices inside the ellipsoid.
     all_verts = np.arange(len(verts))
@@ -4737,8 +4725,8 @@ def find_soma_ring_cutoff(
         # Find soma boundary verts adjacent to a tube left outside the soma
         # or pruned in 6a: walking in from the rim of a bulge or an
         # organelle left outside would cut a ring of the soma round it.
-        # Only erode when step 6a pruned neurite chains, or a neurite the
-        # first absorption round would have taken was kept out of it.
+        # Only erode when step 6a pruned neurite chains, or a neurite
+        # small enough to pass for a pocket was kept out of it.
         exit_verts: set[int] = set()
         if neurite_prune or held_out:
             for v in soma_set & comp_vert_set:

@@ -3,6 +3,7 @@
 
 use mesh::Topology;
 use mesh::components::listed_face_components;
+use rayon::prelude::*;
 
 use crate::organelles::Inside;
 
@@ -109,13 +110,15 @@ pub fn classify(m: &BreakUpMesh<'_>, has_soma: bool) -> (Vec<Vec<u32>>, Vec<Piec
             org_of[f as usize] = k as u32;
         }
     }
-    let inside = Inside::new(m.verts, m.faces, m.centers, m.normals);
-    let mut in_comp = vec![false; nf];
-    let kinds = components
+    // a piece cut off from the cell's body is trapped when no bigger than
+    // the organelles walling it, or lying inside the cell: the rays of the
+    // bigger ones cast across the pool
+    let wraps: Vec<Option<usize>> = components
         .iter()
         .map(|comp| {
-            let claimed = comp.iter().any(|&f| m.claimed[f as usize]);
-            if !claimed && !comp.iter().any(|&f| reachable[f as usize]) {
+            let cut_off = !comp.iter().any(|&f| m.claimed[f as usize])
+                && !comp.iter().any(|&f| reachable[f as usize]);
+            cut_off.then(|| {
                 let mut around: Vec<u32> = comp
                     .iter()
                     .flat_map(|&f| topo.face_neighbors(f as usize))
@@ -124,11 +127,39 @@ pub fn classify(m: &BreakUpMesh<'_>, has_soma: bool) -> (Vec<Vec<u32>>, Vec<Piec
                     .collect();
                 around.sort_unstable();
                 around.dedup();
-                let wrap: usize = around.iter().map(|&k| org_comps[k as usize].len()).sum();
-                if comp.len() <= wrap || inside.holds(comp) {
-                    return Piece::Trapped;
-                }
+                around.iter().map(|&k| org_comps[k as usize].len()).sum()
+            })
+        })
+        .collect();
+    let mut trapped: Vec<bool> = components
+        .iter()
+        .zip(&wraps)
+        .map(|(comp, wrap)| wrap.is_some_and(|w| comp.len() <= w))
+        .collect();
+    let cast: Vec<usize> = (0..components.len())
+        .filter(|&i| wraps[i].is_some() && !trapped[i])
+        .collect();
+    if !cast.is_empty() {
+        let inside = Inside::new(m.verts, m.faces, m.centers, m.normals);
+        inside.prepare();
+        let held: Vec<bool> = threads::install(|| {
+            cast.par_iter()
+                .map(|&i| inside.holds(&components[i]))
+                .collect()
+        });
+        for (&i, h) in cast.iter().zip(held) {
+            trapped[i] = h;
+        }
+    }
+    let mut in_comp = vec![false; nf];
+    let kinds = components
+        .iter()
+        .zip(&trapped)
+        .map(|(comp, &trapped)| {
+            if trapped {
+                return Piece::Trapped;
             }
+            let claimed = comp.iter().any(|&f| m.claimed[f as usize]);
             if !has_soma || claimed || comp.len() > soma_size {
                 return Piece::Candidate;
             }

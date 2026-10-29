@@ -12,6 +12,8 @@
 //! 5.1.5), exact up to rounding; [`closest_point_trimesh`] and
 //! [`TriangleBvh::nearest_trimesh`] are trimesh's own, to the bit.
 
+use rayon::join;
+
 type V3 = [f64; 3];
 
 /// trimesh's `diagonal_dot` of two 3-vectors.
@@ -177,8 +179,11 @@ fn box_distance2(p: V3, lo: V3, hi: V3) -> f64 {
 }
 
 const LEAF: usize = 8;
+/// [`TriangleBvh::new_parallel`] builds the two halves of a node over more
+/// triangles than this side by side.
+const PARALLEL_BUILD: usize = 1 << 14;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct Node {
     lo: V3,
     hi: V3,
@@ -203,8 +208,27 @@ impl TriangleBvh {
         let mut order: Vec<u32> = (0..tris.len() as u32).collect();
         let mut nodes = Vec::new();
         if !tris.is_empty() {
-            build(&tris, &mut order, 0, tris.len(), &mut nodes);
+            build(&tris, &mut order, 0, &mut nodes);
         }
+        TriangleBvh {
+            tris,
+            normals,
+            order,
+            nodes,
+        }
+    }
+
+    /// [`new`](Self::new)'s tree, node for node, its halves built side by
+    /// side on the chosen pool.  Not from inside a lazy initialiser that
+    /// parallel code reads: a pool thread waiting in it can steal work
+    /// that waits on the same initialiser.
+    pub fn new_parallel(tris: Vec<[V3; 3]>, normals: Vec<V3>) -> TriangleBvh {
+        let mut order: Vec<u32> = (0..tris.len() as u32).collect();
+        let nodes = if tris.is_empty() {
+            Vec::new()
+        } else {
+            threads::install(|| build_parallel(&tris, &mut order, 0))
+        };
         TriangleBvh {
             tris,
             normals,
@@ -229,6 +253,37 @@ impl TriangleBvh {
                 for &t in &self.order[n.start..n.end] {
                     let t = t as usize;
                     if hits_triangle(o, d, &self.tris[t], self.normals[t]) {
+                        return true;
+                    }
+                }
+            } else {
+                stack.push(n.left);
+                stack.push(n.right);
+            }
+        }
+        false
+    }
+
+    /// Does the ray hit a triangle past `min_t`, leaving out `skip`: whether
+    /// [`first_hit`](Self::first_hit) finds one, stopping at the first met.
+    pub fn hits_past(&self, o: V3, d: V3, min_t: f64, skip: Option<usize>) -> bool {
+        if self.nodes.is_empty() {
+            return false;
+        }
+        let inv = d.map(|c| 1.0 / c);
+        let mut stack = vec![0usize];
+        while let Some(i) = stack.pop() {
+            let n = &self.nodes[i];
+            if !slab(o, inv, n.lo, n.hi) {
+                continue;
+            }
+            if n.left == usize::MAX {
+                for &t in &self.order[n.start..n.end] {
+                    let t = t as usize;
+                    if Some(t) != skip
+                        && hit_distance(o, d, &self.tris[t], self.normals[t])
+                            .is_some_and(|h| h > min_t)
+                    {
                         return true;
                     }
                 }
@@ -451,26 +506,9 @@ fn bounds(tris: &[[V3; 3]], ids: &[u32]) -> (V3, V3) {
     (lo, hi)
 }
 
-fn build(
-    tris: &[[V3; 3]],
-    order: &mut [u32],
-    start: usize,
-    end: usize,
-    nodes: &mut Vec<Node>,
-) -> usize {
-    let (lo, hi) = bounds(tris, &order[start..end]);
-    let me = nodes.len();
-    nodes.push(Node {
-        lo,
-        hi,
-        start,
-        end,
-        left: usize::MAX,
-        right: usize::MAX,
-    });
-    if end - start <= LEAF {
-        return me;
-    }
+/// Split `order`, the triangles of a node, at its median along the widest
+/// axis of their bounds `lo`, `hi`: the left half's length.
+fn split(tris: &[[V3; 3]], order: &mut [u32], lo: V3, hi: V3) -> usize {
     let centroid = |t: u32, k: usize| {
         let p = &tris[t as usize];
         p[0][k] + p[1][k] + p[2][k]
@@ -478,15 +516,80 @@ fn build(
     let axis = (0..3)
         .max_by(|&a, &b| (hi[a] - lo[a]).total_cmp(&(hi[b] - lo[b])))
         .expect("three axes");
-    let mid = start + (end - start) / 2;
-    order[start..end].select_nth_unstable_by(mid - start, |&a, &b| {
+    let mid = order.len() / 2;
+    order.select_nth_unstable_by(mid, |&a, &b| {
         centroid(a, axis).total_cmp(&centroid(b, axis))
     });
-    let left = build(tris, order, start, mid, nodes);
-    let right = build(tris, order, mid, end, nodes);
+    mid
+}
+
+/// The nodes over `order`, the triangles from position `start` of the
+/// tree's order on, appended to `nodes` depth first; the root's index.
+fn build(tris: &[[V3; 3]], order: &mut [u32], start: usize, nodes: &mut Vec<Node>) -> usize {
+    let (lo, hi) = bounds(tris, order);
+    let me = nodes.len();
+    nodes.push(Node {
+        lo,
+        hi,
+        start,
+        end: start + order.len(),
+        left: usize::MAX,
+        right: usize::MAX,
+    });
+    if order.len() <= LEAF {
+        return me;
+    }
+    let mid = split(tris, order, lo, hi);
+    let (l, r) = order.split_at_mut(mid);
+    let left = build(tris, l, start, nodes);
+    let right = build(tris, r, start + mid, nodes);
     nodes[me].left = left;
     nodes[me].right = right;
     me
+}
+
+/// [`build`] of a subtree into nodes of its own, the halves of a big node
+/// side by side; laid out depth first as `build` lays them.
+fn build_parallel(tris: &[[V3; 3]], order: &mut [u32], start: usize) -> Vec<Node> {
+    if order.len() <= PARALLEL_BUILD {
+        let mut nodes = Vec::new();
+        build(tris, order, start, &mut nodes);
+        return nodes;
+    }
+    let (lo, hi) = bounds(tris, order);
+    let end = start + order.len();
+    let mid = split(tris, order, lo, hi);
+    let (l, r) = order.split_at_mut(mid);
+    let (left, right) = join(
+        || build_parallel(tris, l, start),
+        || build_parallel(tris, r, start + mid),
+    );
+    let shifted = |n: Node, by: usize| Node {
+        left: if n.left == usize::MAX {
+            n.left
+        } else {
+            n.left + by
+        },
+        right: if n.right == usize::MAX {
+            n.right
+        } else {
+            n.right + by
+        },
+        ..n
+    };
+    let (from_left, from_right) = (1, 1 + left.len());
+    let mut nodes = Vec::with_capacity(1 + left.len() + right.len());
+    nodes.push(Node {
+        lo,
+        hi,
+        start,
+        end,
+        left: from_left,
+        right: from_right,
+    });
+    nodes.extend(left.into_iter().map(|n| shifted(n, from_left)));
+    nodes.extend(right.into_iter().map(|n| shifted(n, from_right)));
+    nodes
 }
 
 /// Where the ray enters the (padded) box, if it reaches it — as [`slab`]
@@ -544,6 +647,69 @@ mod tests {
             [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
         ];
         (t, vec![[0.0, 0.0, 1.0]; 2])
+    }
+
+    /// A soup of small triangles scattered in a box, from a fixed seed.
+    fn soup(n: usize) -> (Vec<[V3; 3]>, Vec<V3>) {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut tris = Vec::with_capacity(n);
+        let mut normals = Vec::with_capacity(n);
+        for _ in 0..n {
+            let c = [next() * 100.0, next() * 100.0, next() * 100.0];
+            let t = [0, 1, 2].map(|_| [0, 1, 2].map(|k| c[k] + next() * 2.0 - 1.0));
+            let (u, w) = (sub(t[1], t[0]), sub(t[2], t[0]));
+            let nrm = [
+                u[1] * w[2] - u[2] * w[1],
+                u[2] * w[0] - u[0] * w[2],
+                u[0] * w[1] - u[1] * w[0],
+            ];
+            let len = dd(nrm, nrm).sqrt();
+            tris.push(t);
+            normals.push(nrm.map(|x| x / len));
+        }
+        (tris, normals)
+    }
+
+    #[test]
+    fn the_tree_built_in_parallel_is_the_tree() {
+        let (t, n) = soup(3 * PARALLEL_BUILD + 17);
+        let serial = TriangleBvh::new(t.clone(), n.clone());
+        let parallel = TriangleBvh::new_parallel(t, n);
+        assert!(serial.nodes.len() > 2 * PARALLEL_BUILD / LEAF);
+        assert_eq!(serial.order, parallel.order);
+        assert_eq!(serial.nodes, parallel.nodes);
+    }
+
+    #[test]
+    fn a_hit_past_is_a_first_hit_found() {
+        let (t, n) = soup(5000);
+        let bvh = TriangleBvh::new(t.clone(), n);
+        let (mut hits, mut misses) = (0, 0);
+        for (i, tri) in t.iter().enumerate().take(2000) {
+            let o = [0, 1, 2].map(|k| (tri[0][k] + tri[1][k] + tri[2][k]) / 3.0);
+            let d = {
+                let a = i as f64 * 0.37;
+                let z = (i % 7) as f64 / 3.5 - 1.0;
+                let r = (1.0 - z * z).sqrt();
+                [r * a.cos(), r * a.sin(), z]
+            };
+            for (min_t, skip) in [(f64::NEG_INFINITY, Some(i)), (5.0, None), (0.0, Some(i))] {
+                let first = bvh.first_hit(o, d, min_t, skip).is_some();
+                assert_eq!(bvh.hits_past(o, d, min_t, skip), first);
+                if first {
+                    hits += 1;
+                } else {
+                    misses += 1;
+                }
+            }
+        }
+        assert!(hits > 100 && misses > 100);
     }
 
     #[test]
