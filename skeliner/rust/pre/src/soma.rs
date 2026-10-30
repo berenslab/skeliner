@@ -13,38 +13,12 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use mesh::components::LowestRootSets;
-use mesh::geometry::{numpy_argmin, numpy_order, numpy_sum, row_times_matrix};
+use mesh::geometry::{numpy_argmin, numpy_order, numpy_sum};
 use rayon::prelude::*;
 
 /// An ellipsoid as `skeliner.dataclass.Soma` tests it: a point is inside
 /// when `|(x - center) @ w|^2 <= 1`, where `w = R / axes`.
-#[derive(Debug, Clone, Copy)]
-pub struct Ellipsoid {
-    pub center: [f64; 3],
-    pub w: [[f64; 3]; 3],
-}
-
-impl Ellipsoid {
-    /// `Soma._body_coords`: `(x - center) @ w`, rounded as numpy's matmul.
-    pub fn body_coords(&self, x: &[f64; 3]) -> [f64; 3] {
-        let d = [
-            x[0] - self.center[0],
-            x[1] - self.center[1],
-            x[2] - self.center[2],
-        ];
-        row_times_matrix(&d, &self.w)
-    }
-
-    /// `|body_coords(x)|^2`, summed in numpy's order.
-    pub fn rho2(&self, x: &[f64; 3]) -> f64 {
-        let xi = self.body_coords(x);
-        xi[0] * xi[0] + xi[1] * xi[1] + xi[2] * xi[2]
-    }
-
-    pub fn contains(&self, x: &[f64; 3]) -> bool {
-        self.rho2(x) <= 1.0
-    }
-}
+pub use dataclass::soma::Body as Ellipsoid;
 
 /// A fitted soma: its ellipsoid and smallest semi-axis.
 #[derive(Debug, Clone, Copy)]

@@ -432,12 +432,11 @@ def load_skeleton_npz(path: str | Path) -> Skeleton:
 
         # older archives also hold a pickled scipy KD-tree ("kdtree_nodes"),
         # left unread
-        node_neighbors = None
+        adjacency = None
         if "neighbors_idx" in z.files and "neighbors_off" in z.files:
-            idx = z["neighbors_idx"].astype(np.int64)
-            off = z["neighbors_off"].astype(np.int64)
-            node_neighbors = tuple(
-                idx[off[i] : off[i + 1]] for i in range(len(off) - 1)
+            adjacency = (
+                z["neighbors_off"].astype(np.int64),
+                z["neighbors_idx"].astype(np.int64),
             )
 
     skel = Skeleton(
@@ -451,8 +450,8 @@ def load_skeleton_npz(path: str | Path) -> Skeleton:
         extra=extra,
         meta=meta,
     )
-    if node_neighbors is not None:
-        skel._node_neighbors = node_neighbors
+    if adjacency is not None:
+        skel._adjacency = adjacency
     return skel
 
 
@@ -483,7 +482,7 @@ def save_skeleton_npz(
         path = path.with_suffix(".npz")
 
     if cache_kdtree:
-        skeleton._ensure_node_neighbors()
+        skeleton._ensure_adjacency()
 
     # radii_<name>  : one array per estimator
     radii_flat = {f"r_{k}": v for k, v in skeleton.radii.items()}
@@ -546,18 +545,8 @@ def save_skeleton_npz(
     extra = {"extra": np.array(skeleton.extra, dtype=object)}
     meta = {"meta": np.array(skeleton.meta, dtype=object)} if skeleton.meta else {}
     tree_payload = {}
-    if skeleton._node_neighbors is not None:
-        lengths = np.fromiter(
-            (len(nbrs) for nbrs in skeleton._node_neighbors),
-            dtype=np.int64,
-            count=len(skeleton._node_neighbors),
-        )
-        offsets = np.concatenate(([0], np.cumsum(lengths)))
-        data = (
-            np.concatenate(skeleton._node_neighbors)
-            if offsets[-1]
-            else np.empty(0, dtype=np.int64)
-        )
+    if skeleton._adjacency is not None:
+        offsets, data = skeleton._adjacency
         tree_payload["neighbors_idx"] = data.astype(np.int64, copy=False)
         tree_payload["neighbors_off"] = offsets.astype(np.int64, copy=False)
 

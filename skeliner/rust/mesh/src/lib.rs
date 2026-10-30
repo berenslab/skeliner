@@ -57,8 +57,9 @@ pub struct Mesh {
     faces: Vec<[u32; 3]>,
 }
 
-/// Narrow face indices to `u32`, checking each names one of `n_vertices`.
-pub fn checked_faces(faces: &[[i64; 3]], n_vertices: usize) -> Result<Vec<[u32; 3]>, MeshError> {
+/// Check that every face index names one of `n_vertices`; the error names
+/// the first that does not, in row order.
+pub fn check_faces(faces: &[[i64; 3]], n_vertices: usize) -> Result<(), MeshError> {
     let out_of_range = |v: i64| {
         u32::try_from(v)
             .ok()
@@ -77,6 +78,12 @@ pub fn checked_faces(faces: &[[i64; 3]], n_vertices: usize) -> Result<Vec<[u32; 
             n_vertices,
         });
     }
+    Ok(())
+}
+
+/// Narrow face indices to `u32`, checking each names one of `n_vertices`.
+pub fn checked_faces(faces: &[[i64; 3]], n_vertices: usize) -> Result<Vec<[u32; 3]>, MeshError> {
+    check_faces(faces, n_vertices)?;
     // every index fits a u32
     Ok(threads::map(faces, |f| f.map(|v| v as u32)))
 }

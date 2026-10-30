@@ -697,7 +697,7 @@ fn merge_near_soma_nodes<'py>(
     let [r0, r1, r2] = r.as_slice() else {
         return Err(PyValueError::new_err("the rotation must be (3, 3)"));
     };
-    let soma = ::skeletonize::core::Ellipsoid {
+    let soma = ::dataclass::soma::Soma {
         center,
         axes,
         r: [*r0, *r1, *r2],

@@ -4,11 +4,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
 use mesh::Topology;
-use mesh::geometry::numpy_order;
+use mesh::geometry::{numpy_order, right_singular};
 use mesh::spatial::{KdTree, Sum};
 use rayon::prelude::*;
-
-use crate::fits::Svd;
 
 /// Knobs of `skeliner.pre.find_gaps`, with every default resolved.
 #[derive(Debug, Clone, Copy)]
@@ -207,7 +205,7 @@ fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
 
 /// Local two-sidedness at a contact: 0 when the piece ends there (a tip or
 /// cut), towards 1 when it carries on past it on both sides (a kiss).
-fn flank(c: &Component, idx: usize, kiss_r: f64, svd: &dyn Svd) -> f64 {
+fn flank(c: &Component, idx: usize, kiss_r: f64) -> f64 {
     let p = c.coords[idx];
     let nb = c.tree.within(&p, kiss_r);
     if nb.len() < 6 {
@@ -223,7 +221,7 @@ fn flank(c: &Component, idx: usize, kiss_r: f64, svd: &dyn Svd) -> f64 {
     }
     let mean = mean.map(|m| m / n);
     let centred: Vec<[f64; 3]> = pts.iter().map(|q| sub(*q, mean)).collect();
-    let axis = svd.right_singular(&centred, false)[0];
+    let axis = right_singular(&centred)[0];
     let (mut pos, mut neg) = (0usize, 0usize);
     for q in &pts {
         let d = sub(*q, p);
@@ -306,7 +304,6 @@ pub fn find_gaps(
     disc: &[Vec<u32>],
     fusion_faces: &[u32],
     params: &GapParams,
-    svd: &dyn Svd,
 ) -> Gaps {
     let mut out = Gaps::default();
     if disc.is_empty() {
@@ -430,7 +427,7 @@ pub fn find_gaps(
         let ib = ib as usize;
         let mut mst_cost = cost;
         if cost >= 1.0 {
-            let f = flank(da, min_i, params.kiss_r, svd).min(flank(db, ib, params.kiss_r, svd));
+            let f = flank(da, min_i, params.kiss_r).min(flank(db, ib, params.kiss_r));
             mst_cost = cost * (1.0 + params.kiss_penalty * f);
         }
         let fusion_join = match (&da.fusion_dist, &db.fusion_dist) {

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import functools
 import inspect
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Tuple
@@ -48,8 +48,6 @@ class Mesh:
     __slots__ = ("_vertices", "_faces", "_derived")
 
     def __init__(self, vertices, faces):
-        from .python.mesh import checked_faces
-
         vertices = np.array(vertices, dtype=np.float64, order="C")
         if vertices.size == 0:
             vertices = vertices.reshape(0, 3)
@@ -58,7 +56,9 @@ class Mesh:
         faces = np.array(faces, dtype=np.int64, order="C")
         if faces.size == 0:
             faces = faces.reshape(0, 3)
-        faces, _ = checked_faces(faces, len(vertices))
+        if faces.ndim != 2 or faces.shape[1] != 3:
+            raise ValueError(f"expected (F, 3) array, got shape {list(faces.shape)}")
+        faces, _ = _kernels().mesh.checked_faces(faces, len(vertices))
         vertices.flags.writeable = False
         faces.flags.writeable = False
         self._vertices = vertices
@@ -132,7 +132,10 @@ class Mesh:
     @property
     def triangles(self) -> np.ndarray:
         """``(F, 3, 3)`` each face's vertex positions."""
-        return self._get("triangles", lambda: self._vertices[self._faces])
+        return self._get(
+            "triangles",
+            lambda: _kernels().mesh.triangles(self._vertices, self._faces),
+        )
 
     @property
     def triangles_cross(self) -> np.ndarray:
@@ -195,14 +198,11 @@ class Mesh:
         vertices they use, ascending, renumbered: trimesh's ``submesh(...,
         append=True)``."""
         current = self._faces[np.asarray(faces)].reshape(-1, 3)
-        used = np.unique(current)
-        renumber = np.zeros(len(self._vertices), dtype=np.int64)
-        renumber[used] = np.arange(len(used))
-        return Mesh(self._vertices[used], renumber[current])
+        return Mesh._adopt(*_kernels().mesh.submesh(self._vertices, current))
 
     def copy(self) -> "Mesh":
         """A mesh of the same vertices and faces."""
-        return Mesh(self._vertices, self._faces)
+        return Mesh._adopt(self._vertices.copy(), self._faces.copy())
 
     def to_trimesh(self):
         """This mesh as a ``trimesh.Trimesh`` (trimesh must be installed)."""
@@ -657,12 +657,17 @@ class MeshComponents:
         """
         if isinstance(indices, (int, np.integer)):
             indices = [int(indices)]
+        n = len(self.discarded.components)
+        picked = set()
+        for i in indices:
+            i = int(i)
+            if not -n <= i < n:
+                raise IndexError(f"discarded index {i} out of range for {n}")
+            picked.add(i % n)
         # Pop from the back so the earlier indices stay valid, then
         # append in the original order: `discarded` is sorted by
         # descending size, and so is `neurites`.
-        moved = [
-            self.discarded.components.pop(i) for i in sorted(indices, reverse=True)
-        ]
+        moved = [self.discarded.components.pop(i) for i in sorted(picked, reverse=True)]
         for comp in reversed(moved):
             self.neurites.components.append(comp)
             # Appending leaves the existing positions alone, so the names
@@ -778,9 +783,6 @@ class Soma:
     verts: np.ndarray | None = None  # (N,)
     nucleus: dict | None = None
 
-    # ---- cached helper (not part of the public API) -----------------------
-    _W: np.ndarray = field(init=False, repr=False)  # (3,3) affine map
-
     # ---------------------------------------------------------------------
     # dataclass life-cycle
     # ---------------------------------------------------------------------
@@ -793,8 +795,19 @@ class Soma:
         if not np.all(np.diff(self.axes) <= 0):
             raise ValueError("axes must be sorted a ≥ b ≥ c")
 
-        # ---- pre-compute affine map  ξ = (x−c) @ W -----------------------
-        self._W = (self.R / self.axes).astype(np.float64)
+    def __setstate__(self, state) -> None:
+        # a pickle from when the map to the unit sphere was stored carries
+        # it as `_W`; it is derived now
+        _, slots = state if isinstance(state, tuple) else (None, state)
+        for name, value in slots.items():
+            if name != "_W":
+                object.__setattr__(self, name, value)
+
+    @property
+    def _W(self) -> np.ndarray:
+        """``(3, 3)`` the map to the unit sphere, ``ξ = (x − c) @ W``: ``R``
+        over the axes, from the current ones."""
+        return self.R / self.axes
 
     # ---------------------------------------------------------------------
     # geometry
@@ -809,9 +822,11 @@ class Soma:
         Boolean mask telling whether points lie **inside** the scaled ellipsoid
         (‖ξ‖ ≤ inside_frac).
         """
-        ξ = self._body_coords(x)
-        ρ2 = (ξ**2).sum(axis=-1)
-        return ρ2 <= inside_frac**2
+        x = np.asarray(x, dtype=np.float64)
+        inside = _kernels().dataclass.soma_contains(
+            self.center, self.axes, self.R, x.reshape(-1, 3), inside_frac**2
+        )
+        return inside.reshape(x.shape[:-1])[()]
 
     def remap(self, vert_map: np.ndarray) -> "Soma":
         """Return a copy with vertex indices translated by *vert_map*.
@@ -825,7 +840,7 @@ class Soma:
         Returns
         -------
         Soma
-            New Soma with the same geometry but remapped verts.
+            New Soma with the same geometry and nucleus but remapped verts.
         """
         if self.verts is None:
             new_verts = None
@@ -839,6 +854,30 @@ class Soma:
             axes=self.axes.copy(),
             R=self.R.copy(),
             verts=new_verts,
+            nucleus=None if self.nucleus is None else dict(self.nucleus),
+        )
+
+    def _scaled(self, scale: Callable[[Any], Any]) -> "Soma":
+        """A copy with every length — centre, axes, the nucleus' centre,
+        radius, z range and slices — passed through *scale*."""
+        nucleus = None
+        if self.nucleus is not None:
+            nucleus = dict(self.nucleus)
+            for key in ("center", "slices"):
+                if key in nucleus:
+                    nucleus[key] = scale(np.asarray(nucleus[key], dtype=np.float64))
+            if "peak_r" in nucleus:
+                nucleus["peak_r"] = float(scale(float(nucleus["peak_r"])))
+            if "z_range" in nucleus:
+                nucleus["z_range"] = tuple(
+                    float(scale(float(z))) for z in nucleus["z_range"]
+                )
+        return Soma(
+            center=scale(self.center),
+            axes=scale(self.axes),
+            R=self.R.copy(),
+            verts=None if self.verts is None else self.verts.copy(),
+            nucleus=nucleus,
         )
 
     def distance(self, x, to="center"):
@@ -870,7 +909,7 @@ class Soma:
         single_input = x.ndim == 1
         if single_input:
             x = x[None, :]
-        d = np.linalg.norm(x - self.center, axis=1)
+        d = _kernels().dataclass.soma_distance_to_center(self.center, x)
         return d[0] if single_input else d
 
     def distance_to_surface(
@@ -879,52 +918,19 @@ class Soma:
         """
         Exact signed Euclidean distance to the ellipsoid surface
         ( > 0 outside | ≈ 0 on surface | < 0 inside ).
+
+        Outside, Newton's iteration on the nearest point's Lagrange
+        multiplier, one loop for all of *x*, stopped once every step is
+        below *atol* (*max_iter* steps at most); inside, Eberly's bisection,
+        to the last bit.
         """
         x = np.asanyarray(x, dtype=np.float64)
         single_input = x.ndim == 1
         if single_input:
             x = x[None, :]
-
-        # --- body-coordinates: align to principal axes --------------------
-        p = (x - self.center) @ self.R  # (N,3)
-        a = self.axes
-        a2 = a * a
-        r2 = (p**2 / a2).sum(axis=1)  # ‖p‖² in unit-sphere space
-        out = r2 > 1.0 + 1e-12  # bool mask
-        dist = np.empty(len(p), dtype=np.float64)
-
-        # ---------------- OUTSIDE points  ---------------------------------
-        if out.any():
-            po = p[out]
-            t = np.zeros(len(po))
-            for _ in range(max_iter):
-                denom = t[:, None] + a2
-                f = (a2 * po**2 / denom**2).sum(1) - 1.0
-                fp = (-2.0 * a2 * po**2 / denom**3).sum(1)
-                dt = -f / fp
-                t += dt
-                if np.all(np.abs(dt) < atol):
-                    break
-            xs = a2 * po / (t[:, None] + a2)  # nearest surface points
-            dist[out] = np.linalg.norm(xs - po, axis=1)
-
-        # ---------------- INSIDE points  ----------------------------------
-        inn = ~out
-        if inn.any():
-            idx_inn = np.where(inn)[0]
-            pi = p[inn]
-            s = np.sqrt(r2[inn])  # radial factor
-            nz = s > atol  # not at exact center
-
-            # general interior points
-            if nz.any():
-                xs = pi[nz] / s[nz, None]  # radial projection
-                dist[idx_inn[nz]] = -np.linalg.norm(xs - pi[nz], axis=1)
-
-            # exact center → shortest half-axis
-            if (~nz).any():
-                dist[idx_inn[~nz]] = -a.min()
-
+        dist = _kernels().dataclass.soma_distance_to_surface(
+            self.center, self.axes, self.R, x, float(atol), int(max_iter)
+        )
         return dist[0] if single_input else dist
 
     # ---------------------------------------------------------------------
@@ -949,13 +955,14 @@ class Soma:
         """
         Fast PCA-based ellipsoid fit to ≥ 3×`axes` sample points.
         Rough 95 %-mass envelope, same idea as the original *sphere* fit.
+
+        Centred on the points' mean, its axes the eigenvectors of their
+        covariance (Jacobi's), each semi-axis ``√(5 λ)`` of its eigenvalue,
+        largest first; ``R`` a rotation.  Raises ``ValueError`` for fewer
+        than two points, a spread that is not finite, or none along an axis.
         """
-        pts = np.asarray(pts, dtype=np.float64)
-        center = pts.mean(axis=0)
-        cov = np.cov(pts - center, rowvar=False)
-        evals, evecs = np.linalg.eigh(cov)  # λ₁ ≤ λ₂ ≤ λ₃
-        axes = np.sqrt(evals * 5.0)[::-1]  # 95 % of mass → 2 σ ≈ √5
-        R = evecs[:, ::-1]  # reorder to a ≥ b ≥ c
+        pts = np.asarray(pts, dtype=np.float64).reshape(-1, 3)
+        center, axes, R = _kernels().dataclass.soma_fit(pts)
         return cls(center, axes, R, verts=verts)
 
     @classmethod
@@ -988,6 +995,24 @@ class Soma:
 # -----------------------------------------------------------------------------
 # Skeleton dataclass
 # -----------------------------------------------------------------------------
+#: Each unit a skeleton converts between, as a power of ten of a metre.
+_UNIT_POWERS: dict[str, int] = {
+    "nm": -9,
+    "nanometer": -9,
+    "µm": -6,
+    "μm": -6,
+    "um": -6,
+    "micron": -6,
+    "micrometer": -6,
+    "mm": -3,
+    "millimeter": -3,
+    "cm": -2,
+    "centimeter": -2,
+    "m": 0,
+    "meter": 0,
+}
+
+
 @dataclass(slots=True)
 class Skeleton:
     """Light-weight skeleton graph."""
@@ -1008,7 +1033,8 @@ class Skeleton:
     meta: dict[str, Any] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
     # ---- cached spatial helpers ------------------------------
-    _node_neighbors: tuple[np.ndarray, ...] | None = field(
+    # (ptr, idx): each node's neighbours as a CSR (`_ensure_adjacency`)
+    _adjacency: tuple[np.ndarray, np.ndarray] | None = field(
         default=None, init=False, repr=False, compare=False
     )
     # (path, index): `dx.distance`'s index, built by the path then active
@@ -1021,7 +1047,13 @@ class Skeleton:
     # ---------------------------------------------------------------------
     def __post_init__(self) -> None:
         """Validate basic shape constraints."""
-        N = self.nodes.shape[0]
+        nodes = np.asarray(self.nodes)
+        if nodes.size == 0:
+            nodes = nodes.reshape(0, 3)
+        if nodes.ndim != 2 or nodes.shape[1] != 3:
+            raise ValueError(f"nodes must be (N, 3), not {nodes.shape}")
+        self.nodes = nodes
+        N = nodes.shape[0]
 
         # ---- vert2node --------------------------------------------------
         if self.vert2node is not None and not isinstance(self.vert2node, VertexMap):
@@ -1032,8 +1064,12 @@ class Skeleton:
             raise ValueError("All radius arrays must match the number of nodes")
 
         # ---- edges ---------------------------------------------------
-        if self.edges.ndim != 2 or self.edges.shape[1] != 2:
+        edges = np.asarray(self.edges)
+        if edges.size == 0:
+            edges = edges.reshape(0, 2).astype(np.int64)
+        if edges.ndim != 2 or edges.shape[1] != 2:
             raise ValueError("Edges must be of shape (E, 2)")
+        self.edges = edges
 
         # ---- ntype ---------------------------------------------------
         if self.ntype is None:
@@ -1041,25 +1077,45 @@ class Skeleton:
             ntype = np.full(N, 0, dtype=np.int8)
             if N:
                 ntype[0] = -1
-                self.ntype = ntype
         else:
-            self.ntype = np.asanyarray(self.ntype, dtype=np.int8).reshape(-1)
-            if len(self.ntype) != N:
+            ntype = np.asanyarray(self.ntype, dtype=np.int8).reshape(-1)
+            if len(ntype) != N:
                 raise ValueError("ntype length must match number of nodes")
-            self.ntype[0] = (
-                -1 if self.ntype[0] not in [-1, 1] else self.ntype[0]
-            )  # root must be "root" or "soma"
+            if N and ntype[0] not in (-1, 1):
+                # root must be "root" or "soma"; the caller's array stays
+                ntype = ntype.copy()
+                ntype[0] = -1
+        self.ntype = ntype
 
         if self.soma is not None:
             if self.soma.verts is not None and self.soma.verts.ndim != 1:
                 raise ValueError("soma_verts must be 1-D")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        object.__setattr__(self, name, value)
+        if name in ("nodes", "edges"):
+            # what was built from them is stale
+            self._invalidate_spatial_index()
+
+    def __getstate__(self) -> dict[str, Any]:
+        # the fields only: the caches are rebuilt when asked for
+        return {f.name: getattr(self, f.name) for f in fields(self) if f.init}
+
+    def __setstate__(self, state) -> None:
+        # a pickle from another version may carry caches this one keeps
+        # differently, or none: the fields come back, the caches do not
+        _, slots = state if isinstance(state, tuple) else (None, state)
+        self._invalidate_spatial_index()
+        for f in fields(self):
+            if f.init and f.name in slots:
+                object.__setattr__(self, f.name, slots[f.name])
 
     # ---------------------------------------------------------------------
     # spatial helpers (distance index + adjacency cache)
     # ---------------------------------------------------------------------
     def _invalidate_spatial_index(self) -> None:
         """Drop cached spatial structures (distance index, adjacency)."""
-        self._node_neighbors = None
+        self._adjacency = None
         self._distance_index = None
 
     def _ensure_distance_index(self):
@@ -1070,35 +1126,27 @@ class Skeleton:
 
         path = backend.get()
         if self._distance_index is None or self._distance_index[0] != path:
-            neighbours = self._ensure_node_neighbors()
-            ptr = np.zeros(len(neighbours) + 1, dtype=np.int64)
-            ptr[1:] = np.cumsum([len(nb) for nb in neighbours])
-            idx = (
-                np.concatenate(neighbours).astype(np.int64)
-                if neighbours
-                else np.empty(0, dtype=np.int64)
-            )
+            ptr, idx = self._ensure_adjacency()
             index = kernels.dx.SkeletonIndex(
                 np.asarray(self.nodes, dtype=np.float64), ptr, idx
             )
             self._distance_index = (path, index)
         return self._distance_index[1]
 
-    def _ensure_node_neighbors(self) -> tuple[np.ndarray, ...]:
-        """Return cached neighbour lists for every node."""
-        if self._node_neighbors is None:
-            # each node's neighbours in the order the edges name them, the
-            # edge's first end before its second (a self-loop lists it twice)
-            n = len(self.nodes)
+    def _ensure_adjacency(self) -> tuple[np.ndarray, np.ndarray]:
+        """Each node's neighbours as a CSR ``(ptr, idx)``, int64: in the
+        order the edges name them, an edge's first end before its second (a
+        self-loop lists its node twice); cached."""
+        if self._adjacency is None:
             e = np.asarray(self.edges, dtype=np.int64).reshape(-1, 2)
-            if e.size and (e.min() < 0 or e.max() >= n):
-                raise ValueError(f"an edge names a node that is not one of {n}")
-            order = np.argsort(e.reshape(-1), kind="stable")
-            others = e[:, ::-1].reshape(-1)[order]
-            ptr = np.zeros(n + 1, dtype=np.int64)
-            np.cumsum(np.bincount(e.reshape(-1), minlength=n), out=ptr[1:])
-            self._node_neighbors = tuple(others[ptr[i] : ptr[i + 1]] for i in range(n))
-        return self._node_neighbors
+            self._adjacency = _kernels().dataclass.node_neighbors(e, len(self.nodes))
+        return self._adjacency
+
+    def _ensure_node_neighbors(self) -> tuple[np.ndarray, ...]:
+        """Each node's neighbours (:meth:`_ensure_adjacency`), one array per
+        node."""
+        ptr, idx = self._ensure_adjacency()
+        return tuple(idx[ptr[i] : ptr[i + 1]] for i in range(len(ptr) - 1))
 
     # ---------------------------------------------------------------------
     # helpers
@@ -1109,7 +1157,7 @@ class Skeleton:
 
         return ig.Graph(
             n=len(self.nodes),
-            edges=[tuple(map(int, e)) for e in self.edges],
+            edges=np.asarray(self.edges, dtype=np.int64).reshape(-1, 2).tolist(),
             directed=False,
         )
 
@@ -1184,7 +1232,11 @@ class Skeleton:
         mean = self.radii.get("mean")
         median = self.radii.get("median")
         if mean is None or median is None:
-            return "median", "Only one radius column available; using it.", {}
+            if median is not None or mean is not None:
+                key = "median" if median is not None else "mean"
+            else:
+                key = next(iter(self.radii), "median")
+            return key, f"No mean and median to compare; using {key!r}.", {}
 
         ok = (mean > 0) & (median > 0)
         if not np.all(ok):
@@ -1225,58 +1277,46 @@ class Skeleton:
         self.meta["unit"] = unit
 
     def convert_unit(self, target_unit: str, current_unit: str | None = None):
-        """Convert all coordinates/radii to a new unit."""
+        """Convert every length to *target_unit*: the nodes, the radii, the
+        soma (centre, axes, nucleus) and the centreline distances kept in
+        ``extra``.  Each is replaced, never scaled in place, so a skeleton
+        sharing an array or the soma with this one keeps its own."""
         if current_unit is None:
             current_unit = self.meta.get("unit", None)
             if current_unit is None:
                 raise ValueError("current_unit must be specified")
 
-        if current_unit == target_unit:
-            return
+        k = self._unit_power(current_unit, target_unit)
+        if k:
+            # by a power of ten held exactly, so each value is rounded once
+            step = 10.0 ** abs(k)
 
-        factor = self._get_unit_conversion_factor(current_unit, target_unit)
-        if factor is None:
-            raise ValueError(f"Cannot convert from {current_unit} to {target_unit}")
+            def scale(x):
+                return x * step if k > 0 else x / step
 
-        self.nodes *= factor
-        for key in self.radii.keys():
-            self.radii[key] *= factor
-        if self.soma is not None:
-            self.soma.axes *= factor
+            self.nodes = scale(self.nodes)
+            self.radii = {key: scale(r) for key, r in self.radii.items()}
+            if self.soma is not None:
+                self.soma = self.soma._scaled(scale)
+            vals = self.extra.get("cl_dist_vals")
+            if vals is not None:
+                self.extra = {**self.extra, "cl_dist_vals": scale(np.asarray(vals))}
+        self.meta = {**self.meta, "unit": target_unit}
 
-        self.meta["unit"] = target_unit
-        self._invalidate_spatial_index()
-
-    def _get_unit_conversion_factor(
-        self, current_unit: str, target_unit: str
-    ) -> float | None:
+    def _get_unit_conversion_factor(self, current_unit: str, target_unit: str) -> float:
         """Return the conversion factor from current_unit to target_unit."""
-        conversion_factors = {
-            "nm": 1e-9,
-            "nanometer": 1e-9,
-            "µm": 1e-6,
-            "μm": 1e-6,
-            "um": 1e-6,
-            "micron": 1e-6,
-            "micrometer": 1e-6,
-            "mm": 1e-3,
-            "millimeter": 1e-3,
-            "cm": 1e-2,
-            "centimeter": 1e-2,
-            "m": 1.0,
-            "meter": 1.0,
-        }
+        k = self._unit_power(current_unit, target_unit)
+        return 10.0**k if k >= 0 else 1.0 / 10.0**-k
 
-        if (
-            current_unit not in conversion_factors
-            or target_unit not in conversion_factors
-        ):
+    @staticmethod
+    def _unit_power(current_unit: str, target_unit: str) -> int:
+        """The power of ten from *current_unit* to *target_unit*."""
+        if current_unit not in _UNIT_POWERS or target_unit not in _UNIT_POWERS:
             raise ValueError(
                 f"Unsupported unit conversion from {current_unit} to {target_unit}. "
-                "Supported units: " + ", ".join(conversion_factors.keys())
+                "Supported units: " + ", ".join(_UNIT_POWERS)
             )
-
-        return conversion_factors[current_unit] / conversion_factors[target_unit]
+        return _UNIT_POWERS[current_unit] - _UNIT_POWERS[target_unit]
 
     # ------------------------------------------------------------------
     # Properties

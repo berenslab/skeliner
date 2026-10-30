@@ -1,14 +1,10 @@
 //! `skeliner._rs.pre`: the `pre` crate's stages for `skeliner.pre`.
 
-use numpy::ndarray::{Array1, Array2, Array3};
+use numpy::ndarray::{Array1, Array2};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-
-use std::collections::BTreeMap;
-use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::{Mutex, MutexGuard};
 
 use crate::common::*;
 
@@ -317,121 +313,6 @@ fn find_disconnected<'py>(
     ))
 }
 
-/// numpy's SVD, called back from the Rust core (`::pre::fits::Svd`).
-struct PySvd {
-    rows: Py<PyAny>,
-    /// The first error a callback raised: later calls return NaN without
-    /// calling back, and [`PySvd::run`] raises it in place of the result.
-    error: Mutex<Option<PyErr>>,
-}
-
-impl PySvd {
-    fn new(rows: Bound<'_, PyAny>) -> Self {
-        Self {
-            rows: rows.unbind(),
-            error: Mutex::new(None),
-        }
-    }
-
-    /// `kernel`'s result without the GIL, or the first error a callback
-    /// raised — also when the NaN given back in its place made the kernel
-    /// panic.
-    fn run<T: Send>(&self, py: Python<'_>, kernel: impl FnOnce() -> T + Send) -> PyResult<T> {
-        let out = py.detach(|| catch_unwind(AssertUnwindSafe(kernel)));
-        match (self.failed().take(), out) {
-            (Some(e), _) => Err(e),
-            (None, Ok(found)) => Ok(found),
-            (None, Err(panic)) => resume_unwind(panic),
-        }
-    }
-
-    /// `call`'s value, or `nan` once a callback has failed (keeping the
-    /// first error).
-    fn checked<T>(&self, nan: T, call: impl FnOnce() -> PyResult<T>) -> T {
-        if self.failed().is_some() {
-            return nan;
-        }
-        call().unwrap_or_else(|e| {
-            self.failed().get_or_insert(e);
-            nan
-        })
-    }
-
-    fn failed(&self) -> MutexGuard<'_, Option<PyErr>> {
-        self.error.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn call_rows(&self, x: &[[f64; 3]], full_matrices: bool) -> PyResult<[[f64; 3]; 3]> {
-        Python::attach(|py| {
-            let out = self
-                .rows
-                .call1(py, (rows_to_array(x).into_pyarray(py), full_matrices))?;
-            let m: PyReadonlyArray2<'_, f64> = out.extract(py)?;
-            let rows = rows3("Vt", &m)?;
-            if rows.len() != 3 {
-                return Err(PyValueError::new_err("svd callback must return (3, 3)"));
-            }
-            Ok([rows[0], rows[1], rows[2]])
-        })
-    }
-
-    /// The callback on the matrices `xs`, all of `rows` rows, stacked into
-    /// one `(len, rows, 3)` array.
-    fn call_stacked(
-        &self,
-        xs: &[&[[f64; 3]]],
-        rows: usize,
-        full_matrices: bool,
-    ) -> PyResult<Vec<[[f64; 3]; 3]>> {
-        let flat: Vec<f64> = xs
-            .iter()
-            .flat_map(|x| x.iter().flatten())
-            .copied()
-            .collect();
-        let stack = Array3::from_shape_vec((xs.len(), rows, 3), flat).expect("rows of three");
-        Python::attach(|py| {
-            let out = self
-                .rows
-                .call1(py, (stack.into_pyarray(py), full_matrices))?;
-            let m: numpy::PyReadonlyArray3<'_, f64> = out.extract(py)?;
-            let m = m.as_array();
-            if m.shape() != [xs.len(), 3, 3] {
-                return Err(PyValueError::new_err("svd callback must return (k, 3, 3)"));
-            }
-            Ok((0..xs.len())
-                .map(|k| [0, 1, 2].map(|i| [0, 1, 2].map(|j| m[[k, i, j]])))
-                .collect())
-        })
-    }
-}
-
-impl ::pre::fits::Svd for PySvd {
-    fn right_singular(&self, x: &[[f64; 3]], full_matrices: bool) -> [[f64; 3]; 3] {
-        self.checked([[f64::NAN; 3]; 3], || self.call_rows(x, full_matrices))
-    }
-
-    /// One callback per row count, its matrices stacked: numpy's SVD of a
-    /// stack is each matrix's alone, bit for bit (the same LAPACK call on
-    /// each).
-    fn right_singular_each(&self, xs: &[&[[f64; 3]]], full_matrices: bool) -> Vec<[[f64; 3]; 3]> {
-        let mut by_rows: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for (i, x) in xs.iter().enumerate() {
-            by_rows.entry(x.len()).or_default().push(i);
-        }
-        let mut out = vec![[[f64::NAN; 3]; 3]; xs.len()];
-        for (rows, at) in by_rows {
-            let group: Vec<&[[f64; 3]]> = at.iter().map(|&i| xs[i]).collect();
-            let vts = self.checked(Vec::new(), || {
-                self.call_stacked(&group, rows, full_matrices)
-            });
-            for (&i, vt) in at.iter().zip(vts) {
-                out[i] = vt;
-            }
-        }
-        out
-    }
-}
-
 /// A mask over the faces and the counts behind it.
 type MaskCounts<'py> = (Bound<'py, PyArray1<bool>>, Bound<'py, PyDict>);
 
@@ -544,7 +425,7 @@ fn pocket_arrays(
 /// each pocket's mouth edges, pockets in the order of their lowest face.
 #[pyfunction]
 #[pyo3(signature = (
-    faces, vertices, areas, outward_dots, main_face_mask, topology, svd_rows,
+    faces, vertices, areas, outward_dots, main_face_mask, topology,
     *, min_pocket_size=5, min_fold_ratio=3.0, non_main_mask=None,
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -556,7 +437,6 @@ fn pocket_mouths<'py>(
     outward_dots: numpy::PyReadonlyArray1<'py, f64>,
     main_face_mask: numpy::PyReadonlyArray1<'py, bool>,
     topology: PyRef<'py, crate::mesh::PyTopology>,
-    svd_rows: Bound<'py, PyAny>,
     min_pocket_size: usize,
     min_fold_ratio: f64,
     non_main_mask: Option<numpy::PyReadonlyArray1<'py, bool>>,
@@ -571,7 +451,6 @@ fn pocket_mouths<'py>(
         non_main_mask,
         topo,
     )?;
-    let svd = PySvd::new(svd_rows);
     let params = ::pre::organelles::PocketParams {
         min_pocket_size,
         min_fold_ratio,
@@ -587,9 +466,8 @@ fn pocket_mouths<'py>(
         areas: &areas,
         dots: &dots,
     };
-    let mouths = svd.run(py, || {
-        ::pre::organelles::pocket_mouths(&surface, &main, non_main.as_deref(), &params, &svd)
-    })?;
+    let mouths = py
+        .detach(|| ::pre::organelles::pocket_mouths(&surface, &main, non_main.as_deref(), &params));
     Ok(mouths
         .into_iter()
         .map(|m| m.into_iter().map(|[a, b]| (a, b)).collect())
@@ -600,7 +478,7 @@ fn pocket_mouths<'py>(
 /// `topology`: `(pocket, counts)`, the counts its verbose report prints.
 #[pyfunction]
 #[pyo3(signature = (
-    faces, vertices, areas, outward_dots, main_face_mask, topology, svd_rows,
+    faces, vertices, areas, outward_dots, main_face_mask, topology,
     *, centers, normals, grow_threshold=0.1, bridge_threshold=0.3, max_hole_size=500,
     hole_enclosure_ratio=0.5, min_pocket_size=5, min_fold_ratio=3.0, min_cluster_size=5,
     non_main_mask=None,
@@ -614,7 +492,6 @@ fn pocket_organelles<'py>(
     outward_dots: numpy::PyReadonlyArray1<'py, f64>,
     main_face_mask: numpy::PyReadonlyArray1<'py, bool>,
     topology: PyRef<'py, crate::mesh::PyTopology>,
-    svd_rows: Bound<'py, PyAny>,
     centers: PyReadonlyArray2<'py, f64>,
     normals: PyReadonlyArray2<'py, f64>,
     grow_threshold: f64,
@@ -636,7 +513,6 @@ fn pocket_organelles<'py>(
         non_main_mask,
         topo,
     )?;
-    let svd = PySvd::new(svd_rows);
     let params = ::pre::organelles::PocketParams {
         grow_threshold,
         bridge_threshold,
@@ -662,16 +538,9 @@ fn pocket_organelles<'py>(
         dots: &dots,
     };
     let inside = ::pre::organelles::Inside::new(&verts, &tris, &centers, &normals);
-    let found = svd.run(py, || {
-        ::pre::organelles::pocket_organelles(
-            &surface,
-            &main,
-            non_main.as_deref(),
-            &params,
-            &svd,
-            &inside,
-        )
-    })?;
+    let found = py.detach(|| {
+        ::pre::organelles::pocket_organelles(&surface, &main, non_main.as_deref(), &params, &inside)
+    });
     let report = counts(
         py,
         &[
@@ -775,7 +644,7 @@ type OrganelleOut<'py> = (
 #[pyfunction]
 #[pyo3(signature = (
     vertices, faces, centers, normals, areas, outward_dots, face_comp, main, adjacency,
-    svd_rows, min_cluster_size=5,
+    min_cluster_size=5,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn find_organelles<'py>(
@@ -789,10 +658,8 @@ fn find_organelles<'py>(
     face_comp: numpy::PyReadonlyArray1<'py, i64>,
     main: i64,
     adjacency: PyReadonlyArray2<'py, i64>,
-    svd_rows: Bound<'py, PyAny>,
     min_cluster_size: usize,
 ) -> PyResult<OrganelleOut<'py>> {
-    let svd = PySvd::new(svd_rows);
     let verts = rows3("V", &vertices)?;
     let (tris, n) = checked_faces(&faces, Some(verts.len()))?;
     let centers = rows3("F", &centers)?;
@@ -833,7 +700,7 @@ fn find_organelles<'py>(
             .map(|r| pair(r[0], r[1]))
             .collect::<PyResult<_>>()?,
     };
-    let found = svd.run(py, || {
+    let found = py.detach(|| {
         let topo = ::mesh::Topology::new(&tris, n);
         let surface = ::pre::organelles::Surface {
             topo: &topo,
@@ -844,15 +711,8 @@ fn find_organelles<'py>(
             areas: &areas,
             dots: &dots,
         };
-        ::pre::organelles::find_organelles(
-            &surface,
-            &face_comp,
-            main,
-            &adjacency,
-            min_cluster_size,
-            &svd,
-        )
-    })?;
+        ::pre::organelles::find_organelles(&surface, &face_comp, main, &adjacency, min_cluster_size)
+    });
     let report = PyDict::new(py);
     let iso = &found.isolated;
     let pk = &found.pockets;
@@ -977,7 +837,7 @@ type GapTuple = (Vec<u32>, Vec<u32>, f64, i64, i64);
 #[pyo3(signature = (
     faces, vertices, centers, labels, labels_pre_fusion, main, disc, fusion_faces,
     tip_rings, fusion_clear, fusion_fallback, max_bridge_ratio, bridge_floor,
-    bridge_abs_cap, kiss_r, kiss_penalty, relay_min_faces, repair_stranded, svd_rows,
+    bridge_abs_cap, kiss_r, kiss_penalty, relay_min_faces, repair_stranded,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn find_gaps<'py>(
@@ -1000,9 +860,7 @@ fn find_gaps<'py>(
     kiss_penalty: f64,
     relay_min_faces: usize,
     repair_stranded: bool,
-    svd_rows: Bound<'py, PyAny>,
 ) -> PyResult<(Vec<GapTuple>, usize, usize)> {
-    let svd = PySvd::new(svd_rows);
     let verts = rows3("V", &vertices)?;
     let (tris, n) = checked_faces(&faces, Some(verts.len()))?;
     let centers = rows3("F", &centers)?;
@@ -1048,7 +906,7 @@ fn find_gaps<'py>(
         relay_min_faces,
         repair_stranded,
     };
-    let found = svd.run(py, || {
+    let found = py.detach(|| {
         let topo = ::mesh::Topology::new(&tris, n);
         let mesh = ::pre::find_gaps::GapMesh {
             topo: &topo,
@@ -1056,8 +914,8 @@ fn find_gaps<'py>(
             verts: &verts,
             centers: &centers,
         };
-        ::pre::find_gaps::find_gaps(&mesh, &labels, &pre, main, &disc, &fusion, &params, &svd)
-    })?;
+        ::pre::find_gaps::find_gaps(&mesh, &labels, &pre, main, &disc, &fusion, &params)
+    });
     let gaps = found
         .gaps
         .into_iter()

@@ -17,8 +17,12 @@ import numpy as np
 from scipy.spatial import KDTree
 
 from .._core import RECOMPUTABLE_RADII, TRIM_FRACTION, _estimate_radius
-from .._state import remap_edges
 from ..dataclass import Mesh, Soma
+from .dataclass import (
+    remap_edges,
+    soma_distance_to_center,
+    soma_distance_to_surface,
+)
 from .mesh import (
     KdTree,
     checked_faces,
@@ -1344,8 +1348,12 @@ def merge_near_soma_nodes(
         raise ValueError("the skeleton has no nodes")
     soma = Soma(center=center, axes=axes, R=rows3("R", rotation))
     r_soma = soma.spherical_radius
-    inside = soma.distance_to_surface(nodes) < -inside_tol
-    near = soma.distance_to_center(nodes) < near_factor * r_soma
+
+    def to_surface(x):
+        return soma_distance_to_surface(soma.center, soma.axes, soma.R, x, 1e-9, 64)
+
+    inside = to_surface(nodes) < -inside_tol
+    near = soma_distance_to_center(soma.center, nodes) < near_factor * r_soma
     fat = radii[radius_row] > fat_factor * r_soma
     keep = ~(inside | (near & fat))
     keep[0] = True
@@ -1369,7 +1377,7 @@ def merge_near_soma_nodes(
     for i in merged:
         vidx = node2verts[i]
         if mesh_vertices is not None:
-            close = soma.distance_to_surface(mesh_vertices[vidx]) < near_factor * r_soma
+            close = to_surface(mesh_vertices[vidx]) < near_factor * r_soma
             contrib = vidx[close]
         else:
             contrib = vidx

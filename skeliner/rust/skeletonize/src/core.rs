@@ -4,7 +4,9 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
 
-use mesh::geometry::{numpy_argmin, numpy_order, numpy_sum, row_times_matrix};
+use dataclass::soma::Soma;
+use dataclass::state::remap_edges;
+use mesh::geometry::{numpy_argmin, numpy_order, numpy_sum};
 use mesh::spatial::{KdTree, Sum};
 use rayon::prelude::*;
 
@@ -78,129 +80,6 @@ fn retain_kept<T>(v: &mut Vec<T>, keep: &[bool]) {
         i += 1;
         keep[i - 1]
     });
-}
-
-/// `dataclass.Soma`'s ellipsoid: `world = R @ body + center`, its semi-axes
-/// largest first.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Ellipsoid {
-    pub center: [f64; 3],
-    pub axes: [f64; 3],
-    /// The rows of `R`, whose columns are the principal axes.
-    pub r: [[f64; 3]; 3],
-}
-
-impl Ellipsoid {
-    /// `Soma.spherical_radius`: Python's `max` over the axes.
-    pub fn spherical_radius(&self) -> f64 {
-        let mut best = self.axes[0];
-        for &a in &self.axes[1..] {
-            if a > best {
-                best = a;
-            }
-        }
-        best
-    }
-
-    /// `Soma.distance_to_center`: `‖x − center‖`, summed left to right.
-    pub fn distance_to_center(&self, x: &[[f64; 3]]) -> Vec<f64> {
-        x.iter()
-            .map(|p| {
-                let d = [0, 1, 2].map(|k| p[k] - self.center[k]);
-                (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
-            })
-            .collect()
-    }
-
-    /// `Soma.distance_to_surface` (`atol` 1e-9, 64 steps at most): the
-    /// signed distance to the surface, negative inside, as numpy computes
-    /// it — the body coordinates through `dgemm`'s FMA chain, every sum left
-    /// to right, `** 3` as `pow`, and one Newton loop for all the points
-    /// outside, stopped once every step is below `atol`, so a point's result
-    /// depends on the others in the same call.
-    pub fn distance_to_surface(&self, x: &[[f64; 3]]) -> Vec<f64> {
-        const ATOL: f64 = 1e-9;
-        let a = self.axes;
-        let a2 = [a[0] * a[0], a[1] * a[1], a[2] * a[2]];
-        let p: Vec<[f64; 3]> = x
-            .iter()
-            .map(|q| row_times_matrix(&[0, 1, 2].map(|k| q[k] - self.center[k]), &self.r))
-            .collect();
-        let r2: Vec<f64> = p
-            .iter()
-            .map(|q| (q[0] * q[0] / a2[0] + q[1] * q[1] / a2[1]) + q[2] * q[2] / a2[2])
-            .collect();
-        let out: Vec<usize> = (0..p.len()).filter(|&i| r2[i] > 1.0 + 1e-12).collect();
-        let mut t = vec![0.0f64; out.len()];
-        let step = |(&i, &ti): (&usize, &f64)| {
-            let q = p[i];
-            let den = [ti + a2[0], ti + a2[1], ti + a2[2]];
-            let f = [0, 1, 2].map(|k| a2[k] * (q[k] * q[k]) / (den[k] * den[k]));
-            let fp = [0, 1, 2].map(|k| (-2.0 * a2[k]) * (q[k] * q[k]) / den[k].powf(3.0));
-            -((f[0] + f[1]) + f[2] - 1.0) / ((fp[0] + fp[1]) + fp[2])
-        };
-        for _ in 0..64 {
-            // every point's step at once when there are enough of them
-            let dts: Vec<f64> = if out.len() >= 1024 {
-                threads::install(|| out.par_iter().zip(&t).map(step).collect())
-            } else {
-                out.iter().zip(&t).map(step).collect()
-            };
-            let mut converged = true;
-            for (ti, dt) in t.iter_mut().zip(&dts) {
-                *ti += dt;
-                // a NaN step never converges, as with numpy's `all`
-                converged &= dt.abs() < ATOL;
-            }
-            if converged {
-                break;
-            }
-        }
-        let norm = |e: [f64; 3]| (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt();
-        let mut dist = vec![0.0f64; p.len()];
-        let mut outside = vec![false; p.len()];
-        for (&i, &ti) in out.iter().zip(&t) {
-            outside[i] = true;
-            let q = p[i];
-            dist[i] = norm([0, 1, 2].map(|k| a2[k] * q[k] / (ti + a2[k]) - q[k]));
-        }
-        // numpy's `min` of the axes
-        let min_axis = a.iter().copied().fold(f64::INFINITY, |m, v| {
-            if m.is_nan() || v.is_nan() {
-                f64::NAN
-            } else {
-                m.min(v)
-            }
-        });
-        for i in (0..p.len()).filter(|&i| !outside[i]) {
-            let s = r2[i].sqrt();
-            dist[i] = if s > ATOL {
-                let q = p[i];
-                -norm([0, 1, 2].map(|k| q[k] / s - q[k]))
-            } else {
-                -min_axis
-            };
-        }
-        dist
-    }
-}
-
-/// `remap_edges`: the edges between kept nodes, renumbered, each sorted, no
-/// self-loops, unique and in order.
-pub fn remap_edges(edges: &[[usize; 2]], old2new: &[i64]) -> Vec<[usize; 2]> {
-    let mut out: Vec<[usize; 2]> = edges
-        .iter()
-        .filter_map(|&[a, b]| {
-            let (a, b) = (old2new[a], old2new[b]);
-            (a >= 0 && b >= 0 && a != b).then(|| {
-                let (a, b) = (a as usize, b as usize);
-                [a.min(b), a.max(b)]
-            })
-        })
-        .collect();
-    out.sort_unstable();
-    out.dedup();
-    out
 }
 
 /// `_merge_single_node_branches`: every leaf (one edge, not the root) whose
@@ -621,7 +500,7 @@ pub struct MergedNear {
 pub fn merge_near_soma_nodes(
     s: &mut Arrays,
     radius_row: usize,
-    soma: &Ellipsoid,
+    soma: &Soma,
     soma_verts: Option<&[i64]>,
     mesh_vertices: Option<&[[f64; 3]]>,
     inside_tol: f64,

@@ -17,11 +17,15 @@ from .mesh import (
     hull_measures,
     nearest,
     non_degenerate,
+    right_singular,
     row_dot,
     rows3,
     Topology,
 )
 from .post import _RAY_CHUNK
+
+#: float64's machine epsilon, Rust's ``f64::EPSILON``.
+_EPS = float(np.finfo(np.float64).eps)
 
 
 def sever_cost(sel: set[int], face_adj: dict[int, set[int]], budget: int) -> int:
@@ -962,11 +966,14 @@ def find_disconnected(
     )
 
 
-def rim_enclosed_area(boundary_edges, vertices, svd_rows) -> float:
+def rim_enclosed_area(boundary_edges, vertices) -> float:
     """Total planar area enclosed by the closed loops among *boundary_edges*:
-    each loop projected onto its best-fit plane (``svd_rows(x,
-    full_matrices)`` is numpy's SVD's ``Vt``), its area by the shoelace
-    formula; a piece that is not one closed loop counts nothing."""
+    each loop projected onto its best-fit plane (its first two right-singular
+    vectors, :func:`~skeliner.python.mesh.right_singular`), its area by the
+    shoelace formula; a piece that is not one closed loop counts nothing,
+    nor does a loop whose sum is within the rounding of its *n* points
+    (``4 n ε R²``, *R* the farthest from their mean) — a degenerate face's
+    collinear outline."""
     if not boundary_edges:
         return 0.0
 
@@ -1027,22 +1034,26 @@ def rim_enclosed_area(boundary_edges, vertices, svd_rows) -> float:
         pts = vertices[ordered]
         centroid = pts.mean(axis=0)
         centered = pts - centroid
-        vh = svd_rows(centered, True)
+        vh = right_singular(centered)
         u_ax, v_ax = vh[0], vh[1]
         pts_2d = np.column_stack([centered @ u_ax, centered @ v_ax])
         x, y = pts_2d[:, 0], pts_2d[:, 1]
-        area = 0.5 * abs(
-            np.sum(x[:-1] * y[1:] - x[1:] * y[:-1]) + x[-1] * y[0] - x[0] * y[-1]
-        )
-        total_area += area
+        s = np.sum(x[:-1] * y[1:] - x[1:] * y[:-1]) + x[-1] * y[0] - x[0] * y[-1]
+        # within the rounding of its points (two projected coordinates in each
+        # of n terms): a degenerate face's outline, which encloses nothing
+        r2 = max(float((centered * centered).sum(axis=1).max()), 0.0)
+        if abs(s) <= 4.0 * len(ordered) * _EPS * r2:
+            continue
+        total_area += 0.5 * abs(s)
 
     return total_area
 
 
-def opening_hull_area(pts, svd_rows) -> float:
+def opening_hull_area(pts) -> float:
     """``find_pocket_mouths``' opening when no rim loop closes: the
     convex-hull area of *pts* centred on their mean, on the plane of their
-    first two right-singular vectors (*svd_rows*, numpy's SVD) — 0 where
+    first two right-singular vectors (:func:`~skeliner.python.mesh.
+    right_singular`) — 0 where
     qhull, which scipy's ``ConvexHull`` ran, refuses them as flat
     (:func:`~skeliner.python.mesh.hull_measures`)."""
     pts = np.asarray(pts, dtype=np.float64)
@@ -1050,7 +1061,7 @@ def opening_hull_area(pts, svd_rows) -> float:
     for p in pts:
         total = total + p
     centred = pts - total / len(pts)
-    vt = svd_rows(centred, True)
+    vt = right_singular(centred)
     plane = np.c_[
         centred[:, 0] * vt[0][0] + centred[:, 1] * vt[0][1] + centred[:, 2] * vt[0][2],
         centred[:, 0] * vt[1][0] + centred[:, 1] * vt[1][1] + centred[:, 2] * vt[1][2],
@@ -1065,7 +1076,6 @@ def pocket_mouths(
     outward_dots,
     main_face_mask,
     topology: Topology,
-    svd_rows,
     *,
     min_pocket_size: int = 5,
     min_fold_ratio: float = 3.0,
@@ -1146,7 +1156,7 @@ def pocket_mouths(
         # A real pocket folds inward through a small opening (high ratio).
         # A flat patch has ratio near 1.
         pocket_area = float(area_arr[np.sort(cluster)].sum())
-        opening_area = rim_enclosed_area(boundary_edges, verts_arr, svd_rows)
+        opening_area = rim_enclosed_area(boundary_edges, verts_arr)
         if opening_area <= 0:
             # Boundary loops with non-manifold junctions (vertex
             # shared by 4+ boundary edges) get discarded by
@@ -1162,7 +1172,7 @@ def pocket_mouths(
             if not on_non_main:
                 bverts = sorted({v for e in boundary_edges for v in e})
                 if len(bverts) >= 3:
-                    opening_area = opening_hull_area(verts_arr[bverts], svd_rows)
+                    opening_area = opening_hull_area(verts_arr[bverts])
             if opening_area <= 0:
                 continue
         fold_ratio = pocket_area / opening_area
@@ -1181,7 +1191,6 @@ def pocket_organelles(
     outward_dots,
     main_face_mask,
     topology: Topology,
-    svd_rows,
     *,
     centers,
     normals,
@@ -1231,7 +1240,6 @@ def pocket_organelles(
         outward_dots,
         main_face_mask,
         topology,
-        svd_rows,
         min_pocket_size=min_pocket_size,
         min_fold_ratio=min_fold_ratio,
         non_main_mask=non_main_mask,
@@ -1849,7 +1857,6 @@ def find_organelles(
     face_comp,
     main: int,
     adjacency,
-    svd_rows,
     min_cluster_size: int = 5,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
     """Organelle membranes, given the mesh stats: ``(pocket, isolated,
@@ -1907,7 +1914,6 @@ def find_organelles(
         outward_dots,
         structural_mask,
         topo,
-        svd_rows,
         centers=centers,
         normals=normals,
         min_cluster_size=min_cluster_size,
@@ -1966,7 +1972,6 @@ def find_gaps(
     kiss_penalty: float,
     relay_min_faces: int,
     repair_stranded: bool,
-    svd_rows,
 ) -> tuple[list[tuple[list[int], list[int], float, int, int]], int, int]:
     """The bridges that join the disconnected components *disc* back to
     *main*: ``(gaps, n_capped, n_repaired)``, each gap ``(tip faces a, tip
@@ -2171,7 +2176,7 @@ def find_gaps(
         if len(nb) < 6:
             return 0.0
         nbr = cd["coords"][nb]
-        vh = svd_rows(nbr - nbr.mean(0), False)
+        vh = right_singular(nbr - nbr.mean(0))
         t = (nbr - p) @ vh[0]
         return 2.0 * min(float(np.mean(t > 0)), float(np.mean(t < 0)))
 

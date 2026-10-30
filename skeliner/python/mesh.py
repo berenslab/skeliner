@@ -124,6 +124,70 @@ def hull_equations(points) -> np.ndarray | None:
     return np.array(rows, dtype=np.float64)
 
 
+#: A bound on :func:`jacobi`'s sweeps, which a 3 × 3 matrix never comes near.
+JACOBI_SWEEPS = 64
+
+
+def jacobi(a) -> tuple[list[float], list[list[float]]]:
+    """Jacobi's eigen-decomposition of the symmetric 3 × 3 *a*: its
+    eigenvalues, and the rows of the matrix whose columns are their
+    eigenvectors.  Sweeps over the pairs (0, 1), (0, 2), (1, 2), each
+    rotation zeroing its entry (Rutishauser's formulas), until no entry is
+    left off the diagonal; one too small to move either diagonal entry it
+    couples is zeroed without a rotation.  Only + − × ÷ and √: the Rust
+    path computes the same bits on any platform."""
+    a = [[float(x) for x in row] for row in a]
+    v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    for _ in range(JACOBI_SWEEPS):
+        if a[0][1] == 0.0 and a[0][2] == 0.0 and a[1][2] == 0.0:
+            break
+        for p, q in ((0, 1), (0, 2), (1, 2)):
+            apq = a[p][q]
+            if apq == 0.0:
+                continue
+            app, aqq = a[p][p], a[q][q]
+            if app + apq == app and aqq + apq == aqq:
+                a[p][q] = a[q][p] = 0.0
+                continue
+            theta = (aqq - app) / (2.0 * apq)
+            t = math.copysign(1.0, theta) / (
+                abs(theta) + math.sqrt(theta * theta + 1.0)
+            )
+            c = 1.0 / math.sqrt(t * t + 1.0)
+            s = t * c
+            tau = s / (1.0 + c)
+            h = t * apq
+            a[p][p] = app - h
+            a[q][q] = aqq + h
+            a[p][q] = a[q][p] = 0.0
+            r = 3 - p - q
+            arp, arq = a[r][p], a[r][q]
+            a[r][p] = a[p][r] = arp - s * (arq + tau * arp)
+            a[r][q] = a[q][r] = arq + s * (arp - tau * arq)
+            for row in v:
+                vp, vq = row[p], row[q]
+                row[p] = vp - s * (vq + tau * vp)
+                row[q] = vq + s * (vp - tau * vq)
+    return [a[0][0], a[1][1], a[2][2]], v
+
+
+def right_singular(x) -> np.ndarray:
+    """numpy's ``np.linalg.svd(x)[2]`` up to the vectors' signs: the right
+    singular vectors of *x* ``(k, 3)`` (as given — centre it first for
+    principal directions) as rows, largest singular value first, ties in
+    axis order.  They are the eigenvectors of ``xᵀx`` by :func:`jacobi`, its
+    entries numpy's pairwise sums of the columns' products, as the Rust path
+    computes them, bit for bit."""
+    x = rows3("X", x)
+    gram = [[0.0] * 3 for _ in range(3)]
+    for j in range(3):
+        for k in range(j, 3):
+            gram[j][k] = gram[k][j] = float(np.sum(x[:, j] * x[:, k]))
+    lam, v = jacobi(gram)
+    order = sorted(range(3), key=lambda i: -lam[i])
+    return np.array([[v[0][i], v[1][i], v[2][i]] for i in order])
+
+
 def node_pairs(edges, n: int) -> np.ndarray:
     """Skeleton *edges* as an ``(E, 2)`` int64 array checked against the node
     count *n*."""
@@ -153,6 +217,25 @@ def checked_faces(faces, n_vertices: int | None = None) -> tuple[np.ndarray, int
             f" {n_vertices} vertices"
         )
     return faces, int(n_vertices)
+
+
+def triangles(vertices, faces) -> np.ndarray:
+    """``sk.Mesh.triangles``: each face's three vertices, ``(F, 3, 3)``."""
+    vertices = rows3("V", vertices)
+    faces, _ = checked_faces(faces, len(vertices))
+    return vertices[faces]
+
+
+def submesh(vertices, faces) -> tuple[np.ndarray, np.ndarray]:
+    """trimesh's ``submesh(..., append=True)`` of *faces* ``(F, 3)``
+    (``sk.Mesh.submesh``): the vertices they name, ascending, and the faces
+    renumbered to them, in order."""
+    vertices = rows3("V", vertices)
+    faces, _ = checked_faces(faces, len(vertices))
+    used = np.unique(faces)
+    renumber = np.zeros(len(vertices), dtype=np.int64)
+    renumber[used] = np.arange(len(used))
+    return vertices[used], renumber[faces]
 
 
 def mesh_roundtrip(vertices, faces) -> tuple[np.ndarray, np.ndarray]:

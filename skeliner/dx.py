@@ -664,8 +664,6 @@ def distance(
     if k_nearest < 1:
         raise ValueError("k_nearest must be at least 1.")
 
-    neighbours = skel._ensure_node_neighbors()
-
     skel_unit = skel.meta.get("unit")
     if point_unit is None or skel_unit is None or point_unit == skel_unit:
         scale_in = 1.0
@@ -715,11 +713,12 @@ def distance(
         and scale_out == 1.0
     ):
         # the same minimum over the allowed centres and their edges, once
+        ptr, nbrs = skel._ensure_adjacency()
         segments = sorted(
             {
                 (min(nid, int(nb)), max(nid, int(nb)))
                 for nid in allowed_nodes_set
-                for nb in neighbours[nid]
+                for nb in nbrs[ptr[nid] : ptr[nid + 1]]
             }
         )
         distances = kernels.dx.segment_distances(
@@ -739,8 +738,9 @@ def distance(
         candidates: Set[tuple[int, int]] = set(allowed_edges_set or ())
         for a, b in allowed_edges_set or ():
             ends.update((a, b))
+        ptr, nbrs = skel._ensure_adjacency()
         for nid in allowed_nodes_set or ():
-            for nb in neighbours[nid]:
+            for nb in nbrs[ptr[nid] : ptr[nid + 1]]:
                 nb = int(nb)
                 candidates.add((nid, nb) if nid < nb else (nb, nid))
         centres, segments = sorted(ends), sorted(candidates)
