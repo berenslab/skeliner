@@ -2,7 +2,9 @@
 //! array conversion checks.
 
 use numpy::ndarray::{Array1, Array2};
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+};
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyIterator, PyList, PyTuple};
@@ -362,6 +364,81 @@ fn pairs_out<'py>(py: Python<'py>, pairs: &[[u32; 2]]) -> Bound<'py, PyArray2<i6
         .into_pyarray(py)
 }
 
+/// `checked_faces`: `faces` `(F, 3)` checked against the vertex count, which
+/// defaults to one past the highest index: `(faces, count)`, `faces` the
+/// array given.
+#[pyfunction(name = "checked_faces")]
+#[pyo3(signature = (faces, n_vertices=None))]
+fn checked_faces_in_place<'py>(
+    faces: Bound<'py, PyArray2<i64>>,
+    n_vertices: Option<usize>,
+) -> PyResult<(Bound<'py, PyArray2<i64>>, usize)> {
+    let n = {
+        let view = faces.readonly();
+        let a = view.as_array();
+        if a.ncols() != 3 {
+            return Err(PyValueError::new_err(format!(
+                "expected (F, 3) array, got shape {:?}",
+                a.shape()
+            )));
+        }
+        let copied: Vec<[i64; 3]>;
+        let rows: &[[i64; 3]] = match a.as_slice() {
+            Some(flat) => flat.as_chunks::<3>().0,
+            None => {
+                copied = a.rows().into_iter().map(|r| [r[0], r[1], r[2]]).collect();
+                &copied
+            }
+        };
+        let n = match n_vertices {
+            Some(n) => n,
+            None => threads::map(rows, |r| r[0].max(r[1]).max(r[2]))
+                .into_iter()
+                .max()
+                .map_or(0, |m| usize::try_from(m).map_or(0, |m| m + 1)),
+        };
+        ::mesh::check_faces(rows, n).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        n
+    };
+    Ok((faces, n))
+}
+
+/// `sk.Mesh.triangles`: each face's three vertices, `(F, 3, 3)`.
+#[pyfunction]
+fn triangles<'py>(
+    py: Python<'py>,
+    vertices: PyReadonlyArray2<'py, f64>,
+    faces: PyReadonlyArray2<'py, i64>,
+) -> PyResult<Bound<'py, PyArray3<f64>>> {
+    let (verts, tris) = mesh_in(&vertices, &faces)?;
+    // zeroed pages cost nothing until the fill writes them
+    let out = PyArray3::<f64>::zeros(py, [tris.len(), 3, 3], false);
+    {
+        let mut rw = out.readwrite();
+        let flat = rw.as_slice_mut().expect("a new array is contiguous");
+        py.detach(|| ::mesh::derived::fill_triangles(&verts, &tris, flat));
+    }
+    Ok(out)
+}
+
+/// trimesh's `submesh(..., append=True)` of `faces` `(F, 3)`
+/// (`sk.Mesh.submesh`): the vertices they name, ascending, and the faces
+/// renumbered to them, in order.
+#[pyfunction]
+fn submesh<'py>(
+    py: Python<'py>,
+    vertices: PyReadonlyArray2<'py, f64>,
+    faces: PyReadonlyArray2<'py, i64>,
+) -> PyResult<MeshArrays<'py>> {
+    let (verts, tris) = mesh_in(&vertices, &faces)?;
+    let (kept, renumbered) = py.detach(|| ::mesh::derived::submesh(&verts, &tris));
+    let renumbered: Vec<[i64; 3]> = threads::map(&renumbered, |f| f.map(i64::from));
+    Ok((
+        rows_to_array(&kept).into_pyarray(py),
+        rows_to_array(&renumbered).into_pyarray(py),
+    ))
+}
+
 /// trimesh's `triangles_cross`: `(t1 − t0) × (t2 − t1)` per face.
 #[pyfunction]
 fn face_crosses<'py>(
@@ -514,6 +591,9 @@ fn hull_equations<'py>(
 /// Add this module's functions and classes to `m`.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mesh_roundtrip, m)?)?;
+    m.add_function(wrap_pyfunction!(checked_faces_in_place, m)?)?;
+    m.add_function(wrap_pyfunction!(triangles, m)?)?;
+    m.add_function(wrap_pyfunction!(submesh, m)?)?;
     m.add_function(wrap_pyfunction!(face_crosses, m)?)?;
     m.add_function(wrap_pyfunction!(face_normals, m)?)?;
     m.add_function(wrap_pyfunction!(merge_coincident_vertices, m)?)?;

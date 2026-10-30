@@ -57,6 +57,39 @@ pub fn face_centers(verts: &[[f64; 3]], faces: &[[u32; 3]]) -> Vec<[f64; 3]> {
     })
 }
 
+/// `sk.Mesh.triangles` into `out`, nine values a face: each face's three
+/// vertices.  `out` holds `9 * faces.len()` values.
+pub fn fill_triangles(verts: &[[f64; 3]], faces: &[[u32; 3]], out: &mut [f64]) {
+    let put = |(slot, f): (&mut [f64], &[u32; 3])| {
+        for (k, &v) in f.iter().enumerate() {
+            slot[3 * k..3 * k + 3].copy_from_slice(&verts[v as usize]);
+        }
+    };
+    if faces.len() < threads::MIN_PARALLEL {
+        out.chunks_mut(9).zip(faces).for_each(put);
+    } else {
+        threads::install(|| out.par_chunks_mut(9).zip(faces.par_iter()).for_each(put));
+    }
+}
+
+/// trimesh's `submesh(..., append=True)` (`sk.Mesh.submesh`) of `faces`: the
+/// vertices they name, ascending, and the faces renumbered to them, in
+/// order (a face naming one vertex twice is kept).
+pub fn submesh(verts: &[[f64; 3]], faces: &[[u32; 3]]) -> (Vec<[f64; 3]>, Vec<[u32; 3]>) {
+    let mut named = vec![false; verts.len()];
+    for &v in faces.as_flattened() {
+        named[v as usize] = true;
+    }
+    let mut renumber = vec![u32::MAX; verts.len()];
+    let mut kept = Vec::new();
+    for (v, _) in named.iter().enumerate().filter(|&(_, &n)| n) {
+        renumber[v] = kept.len() as u32;
+        kept.push(verts[v]);
+    }
+    let faces = threads::map(faces, |f| f.map(|v| renumber[v as usize]));
+    (kept, faces)
+}
+
 /// trimesh's `face_adjacency`: for every edge two face edges share — by its
 /// higher end, then its lower — the two faces, lower first; an edge three
 /// or more face edges share has none, and one a face shares with itself
@@ -92,6 +125,17 @@ pub fn adjacent_faces(faces: &[[u32; 3]], n_vertices: usize) -> Vec<[u32; 2]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_submesh_keeps_the_vertices_its_faces_name_in_order() {
+        let verts: Vec<[f64; 3]> = (0..6).map(|i| [i as f64, 0.0, 0.0]).collect();
+        let (v, f) = submesh(&verts, &[[5, 1, 3], [3, 3, 3], [1, 5, 5]]);
+        assert_eq!(v, [[1.0, 0.0, 0.0], [3.0, 0.0, 0.0], [5.0, 0.0, 0.0]]);
+        assert_eq!(f, [[2, 0, 1], [1, 1, 1], [0, 2, 2]]);
+        let mut out = [0.0; 9];
+        fill_triangles(&verts, &[[2, 0, 4]], &mut out);
+        assert_eq!(out, [2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0]);
+    }
 
     #[test]
     fn a_square_of_two_triangles() {

@@ -62,10 +62,20 @@ class VertexMap(MutableMapping):
         bin lists it, mapped to the last bin listing it."""
         from ._backend import kernels
 
-        bins = [np.asarray(v, dtype=np.int64).reshape(-1) for v in node2verts]
+        bins = node2verts if isinstance(node2verts, list) else list(node2verts)
+        try:
+            sizes = np.fromiter(map(len, bins), dtype=np.int64, count=len(bins))
+        except TypeError:  # a bin with no length
+            sizes = None
+        idx = np.concatenate(bins, axis=None) if bins else np.empty(0, np.int64)
+        if sizes is None or sizes.sum() != idx.size:
+            # bins that are not flat: each one flattened
+            flat = [np.asarray(v).reshape(-1) for v in bins]
+            sizes = np.fromiter(map(len, flat), dtype=np.int64, count=len(flat))
+            idx = np.concatenate(flat) if flat else np.empty(0, np.int64)
         ptr = np.zeros(len(bins) + 1, dtype=np.int64)
-        np.cumsum([b.size for b in bins], out=ptr[1:])
-        idx = np.concatenate(bins) if bins else np.empty(0, dtype=np.int64)
+        np.cumsum(sizes, out=ptr[1:])
+        idx = idx.astype(np.int64, copy=False)
         return cls._of_arrays(*kernels.dataclass.vertex_map(ptr, idx, n_vertices))
 
     def _settle(self) -> None:
@@ -287,19 +297,12 @@ def remap_edges(edges: np.ndarray, old2new: np.ndarray) -> np.ndarray:
     """
     if edges.size == 0:
         return edges.copy()
+    from ._backend import kernels
 
-    remapped = old2new[edges]
-    keep = (remapped[:, 0] >= 0) & (remapped[:, 1] >= 0)
-    if not np.any(keep):
-        return np.empty((0, 2), dtype=np.int64)
-
-    remapped = remapped[keep]
-    remapped = remapped[remapped[:, 0] != remapped[:, 1]]
-    if remapped.size == 0:
-        return np.empty((0, 2), dtype=np.int64)
-
-    remapped.sort(axis=1)
-    return np.unique(remapped, axis=0)
+    return kernels.dataclass.remap_edges(
+        np.asarray(edges, dtype=np.int64).reshape(-1, 2),
+        np.asarray(old2new, dtype=np.int64),
+    )
 
 
 def rebuild_vert2node(node2verts: list[np.ndarray] | None) -> VertexMap | None:

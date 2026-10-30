@@ -50,7 +50,7 @@ def test_io_roundtrip(reference_mesh, tmp_path):
     # warm up the distance index (and verify it exists)
     dx.distance(skel, skel.nodes[0], point_unit=skel.meta.get("unit", "nm"))
     assert skel._distance_index is not None
-    assert skel._node_neighbors is not None
+    assert skel._adjacency is not None
 
     # --- write ---------------------------------------------------------
     swc_path = tmp_path / "60427_test.swc"
@@ -64,7 +64,7 @@ def test_io_roundtrip(reference_mesh, tmp_path):
     # --- read back -----------------------------------------------------
     skel_from_swc = load_skeleton_swc(swc_path)
     skel_from_npz = load_skeleton_npz(npz_path)
-    assert skel_from_npz._node_neighbors is not None
+    assert skel_from_npz._adjacency is not None
 
     # --- very coarse equivalence checks --------------------------------
     # (Exact float equality is not expected; topology & sizes should match.)

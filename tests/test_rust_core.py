@@ -1663,7 +1663,25 @@ def test_the_derived_arrays_are_trimeshs_on_both_paths(dirty_mesh, reference_mes
             _rs.mesh.adjacent_faces(faces, len(verts)),
             python_mesh.adjacent_faces(faces, len(verts)),
         )
+        assert_parity(
+            _rs.mesh.triangles(verts, faces), python_mesh.triangles(verts, faces)
+        )
+        # a submesh of some faces, some twice, out of order
+        pick = faces[rng.integers(0, len(faces), size=len(faces) // 2)]
+        sub = _rs.mesh.submesh(verts, pick)
+        assert_parity(sub, python_mesh.submesh(verts, pick))
+        assert np.array_equal(sub[0][sub[1]], verts[pick])
+        for n in (len(verts), None):
+            got = _rs.mesh.checked_faces(faces, n)
+            assert got[0] is faces
+            assert_parity(got, python_mesh.checked_faces(faces, n))
     assert compared > 100_000, compared
     for path in (_rs.mesh, python_mesh):
         with pytest.raises(ValueError, match="names vertex 7"):
             path.face_crosses(np.zeros((3, 3)), np.array([[0, 1, 7]]))
+        with pytest.raises(ValueError, match="names vertex 7"):
+            path.submesh(np.zeros((3, 3)), np.array([[0, 1, 7]]))
+        with pytest.raises(
+            ValueError, match="face 1 names vertex -1, but the mesh has 3 vertices"
+        ):
+            path.checked_faces(np.array([[0, 1, 2], [2, -1, 0]]), 3)

@@ -155,6 +155,25 @@ def checked_faces(faces, n_vertices: int | None = None) -> tuple[np.ndarray, int
     return faces, int(n_vertices)
 
 
+def triangles(vertices, faces) -> np.ndarray:
+    """``sk.Mesh.triangles``: each face's three vertices, ``(F, 3, 3)``."""
+    vertices = rows3("V", vertices)
+    faces, _ = checked_faces(faces, len(vertices))
+    return vertices[faces]
+
+
+def submesh(vertices, faces) -> tuple[np.ndarray, np.ndarray]:
+    """trimesh's ``submesh(..., append=True)`` of *faces* ``(F, 3)``
+    (``sk.Mesh.submesh``): the vertices they name, ascending, and the faces
+    renumbered to them, in order."""
+    vertices = rows3("V", vertices)
+    faces, _ = checked_faces(faces, len(vertices))
+    used = np.unique(faces)
+    renumber = np.zeros(len(vertices), dtype=np.int64)
+    renumber[used] = np.arange(len(used))
+    return vertices[used], renumber[faces]
+
+
 def mesh_roundtrip(vertices, faces) -> tuple[np.ndarray, np.ndarray]:
     """*vertices* and *faces*, checked and returned unchanged."""
     vertices = np.asarray(vertices)

@@ -54,6 +54,11 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 [[package]]
 name = "dataclass"
 version = "0.1.0"
+dependencies = [
+ "mesh",
+ "rayon",
+ "threads",
+]
 
 [[package]]
 name = "dx"
@@ -211,6 +216,7 @@ dependencies = [
 name = "pre"
 version = "0.1.0"
 dependencies = [
+ "dataclass",
  "mesh",
  "rayon",
  "threads",
@@ -327,6 +333,7 @@ checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 name = "skeletonize"
 version = "0.1.0"
 dependencies = [
+ "dataclass",
  "mesh",
  "rayon",
  "threads",
