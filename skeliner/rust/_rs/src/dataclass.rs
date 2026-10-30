@@ -25,6 +25,28 @@ fn soma_of(
     })
 }
 
+/// A soma's centre, semi-axes and rotation `(3, 3)`.
+type SomaArrays<'py> = (
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray2<f64>>,
+);
+
+/// `Soma.fit`: the centre, semi-axes (largest first) and rotation of the
+/// ellipsoid of `points` `(N, 3)`' spread.
+#[pyfunction]
+fn soma_fit<'py>(py: Python<'py>, points: PyReadonlyArray2<'py, f64>) -> PyResult<SomaArrays<'py>> {
+    let points = points3(&points)?;
+    let soma = py
+        .detach(|| ::dataclass::soma::fit(&points))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok((
+        Array1::from(soma.center.to_vec()).into_pyarray(py),
+        Array1::from(soma.axes.to_vec()).into_pyarray(py),
+        rows_to_array(&soma.r).into_pyarray(py),
+    ))
+}
+
 /// `Soma.contains`: which of `points` `(N, 3)` lie inside the ellipsoid
 /// (`center`, `axes`, `rotation`), their body coordinates' squared length
 /// at most `limit`.
@@ -135,6 +157,7 @@ fn vertex_map<'py>(
 
 /// Add this module's functions to `m`.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(soma_fit, m)?)?;
     m.add_function(wrap_pyfunction!(soma_contains, m)?)?;
     m.add_function(wrap_pyfunction!(soma_distance_to_center, m)?)?;
     m.add_function(wrap_pyfunction!(soma_distance_to_surface, m)?)?;

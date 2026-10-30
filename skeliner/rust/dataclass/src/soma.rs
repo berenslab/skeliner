@@ -1,7 +1,8 @@
-//! `skeliner.dataclass.Soma`: the soma's ellipsoid, measured as the Python
-//! path's numpy measures it (`skeliner/python/dataclass.py`).
+//! `skeliner.dataclass.Soma`: the soma's ellipsoid — fitted to points, and
+//! measured as the Python path's numpy measures it
+//! (`skeliner/python/dataclass.py`).
 
-use mesh::geometry::row_times_matrix;
+use mesh::geometry::{numpy_sum, row_times_matrix};
 use rayon::prelude::*;
 
 /// `Soma.distance_to_surface`'s defaults: its Newton steps stop once every
@@ -11,12 +12,41 @@ pub const MAX_ITER: usize = 64;
 
 /// A Newton step for this many points or more is taken at once.
 const NEWTON_PARALLEL: usize = 1024;
-/// Points inside, each a bisection of some sixty halvings: at once from
-/// this many.
+/// Points inside, each a bisection of tens of halvings: at once from this
+/// many.
 const INSIDE_PARALLEL: usize = 256;
 /// Eberly's bound on the halvings: as many as a double has values between
 /// two of its powers of two, down to the subnormals.
 const MAX_BISECTIONS: usize = (f64::MANTISSA_DIGITS as i32 - f64::MIN_EXP) as usize;
+
+/// A bound on Jacobi's sweeps, which a 3 × 3 matrix never comes near.
+const JACOBI_SWEEPS: usize = 64;
+
+/// Why [`fit`] made no ellipsoid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FitError {
+    /// Fewer than two points: no spread.
+    TooFew(usize),
+    /// A coordinate, or the spread, is not finite.
+    NotFinite,
+    /// No spread along an axis: an eigenvalue at or below zero.
+    Flat,
+}
+
+impl std::fmt::Display for FitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooFew(n) => write!(f, "a soma is fitted to two points or more, not {n}"),
+            Self::NotFinite => write!(f, "the points' spread is not finite"),
+            Self::Flat => write!(
+                f,
+                "the points have no spread along an axis: no ellipsoid fits them"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FitError {}
 
 /// `Soma`'s ellipsoid: `world = R @ body + center`, its semi-axes largest
 /// first.
@@ -182,6 +212,124 @@ impl Soma {
     }
 }
 
+/// `Soma.fit`: the ellipsoid of `pts`' spread — centred on their mean
+/// (numpy's over the rows: a sum down them, then over the count), its axes
+/// the covariance's eigenvectors, each semi-axis `√(5 λ)` of its
+/// eigenvalue, largest first (ties in axis order), `R` a rotation (the
+/// smallest axis turned when the columns come left-handed).  The covariance
+/// is numpy's pairwise sums of the centred products over `n − 1`, its
+/// eigen-decomposition [`jacobi`]'s: only + − × ÷ and √, so the Python
+/// path computes the same bits on any platform.
+pub fn fit(pts: &[[f64; 3]]) -> Result<Soma, FitError> {
+    let n = pts.len();
+    if n < 2 {
+        return Err(FitError::TooFew(n));
+    }
+    let mut sum = pts[0];
+    for p in &pts[1..] {
+        for k in 0..3 {
+            sum[k] += p[k];
+        }
+    }
+    let center = sum.map(|s| s / n as f64);
+    let d: Vec<[f64; 3]> = pts
+        .iter()
+        .map(|p| [p[0] - center[0], p[1] - center[1], p[2] - center[2]])
+        .collect();
+    let mut cov = [[0.0f64; 3]; 3];
+    let mut products = vec![0.0f64; n];
+    for j in 0..3 {
+        for k in j..3 {
+            for (x, p) in products.iter_mut().zip(&d) {
+                *x = p[j] * p[k];
+            }
+            let c = numpy_sum(&products) / (n - 1) as f64;
+            cov[j][k] = c;
+            cov[k][j] = c;
+        }
+    }
+    if !cov.iter().flatten().all(|c| c.is_finite()) {
+        return Err(FitError::NotFinite);
+    }
+    let (lam, vec) = jacobi(cov);
+    if !lam.iter().all(|l| l.is_finite()) {
+        return Err(FitError::NotFinite);
+    }
+    if lam.iter().any(|&l| l <= 0.0) {
+        return Err(FitError::Flat);
+    }
+    let mut order = [0usize, 1, 2];
+    order.sort_by(|&i, &j| {
+        lam[j]
+            .partial_cmp(&lam[i])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let axes = order.map(|i| (lam[i] * 5.0).sqrt());
+    let mut r = vec.map(|row| order.map(|i| row[i]));
+    let col = |c: usize| [r[0][c], r[1][c], r[2][c]];
+    let (e0, e1, e2) = (col(0), col(1), col(2));
+    let cross = [
+        e0[1] * e1[2] - e0[2] * e1[1],
+        e0[2] * e1[0] - e0[0] * e1[2],
+        e0[0] * e1[1] - e0[1] * e1[0],
+    ];
+    if cross[0] * e2[0] + cross[1] * e2[1] + cross[2] * e2[2] < 0.0 {
+        for row in &mut r {
+            row[2] = -row[2];
+        }
+    }
+    Ok(Soma { center, axes, r })
+}
+
+/// Jacobi's eigen-decomposition of the symmetric `a`: its eigenvalues, and
+/// the rows of the matrix whose columns are their eigenvectors.  Sweeps
+/// over the pairs (0, 1), (0, 2), (1, 2), each rotation zeroing its entry
+/// (Rutishauser's formulas), until no entry is left off the diagonal; one
+/// too small to move either diagonal entry it couples is zeroed without a
+/// rotation.
+fn jacobi(mut a: [[f64; 3]; 3]) -> ([f64; 3], [[f64; 3]; 3]) {
+    let mut v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    for _ in 0..JACOBI_SWEEPS {
+        if a[0][1] == 0.0 && a[0][2] == 0.0 && a[1][2] == 0.0 {
+            break;
+        }
+        for (p, q) in [(0, 1), (0, 2), (1, 2)] {
+            let apq = a[p][q];
+            if apq == 0.0 {
+                continue;
+            }
+            let (app, aqq) = (a[p][p], a[q][q]);
+            if app + apq == app && aqq + apq == aqq {
+                a[p][q] = 0.0;
+                a[q][p] = 0.0;
+                continue;
+            }
+            let theta = (aqq - app) / (2.0 * apq);
+            let t = 1.0f64.copysign(theta) / (theta.abs() + (theta * theta + 1.0).sqrt());
+            let c = 1.0 / (t * t + 1.0).sqrt();
+            let s = t * c;
+            let tau = s / (1.0 + c);
+            let h = t * apq;
+            a[p][p] = app - h;
+            a[q][q] = aqq + h;
+            a[p][q] = 0.0;
+            a[q][p] = 0.0;
+            let r = 3 - p - q;
+            let (arp, arq) = (a[r][p], a[r][q]);
+            a[r][p] = arp - s * (arq + tau * arp);
+            a[p][r] = a[r][p];
+            a[r][q] = arq + s * (arp - tau * arq);
+            a[q][r] = a[r][q];
+            for row in &mut v {
+                let (vp, vq) = (row[p], row[q]);
+                row[p] = vp - s * (vq + tau * vp);
+                row[q] = vq + s * (vp - tau * vq);
+            }
+        }
+    }
+    ([a[0][0], a[1][1], a[2][2]], v)
+}
+
 /// `Soma.distance_to_center`: `‖x − center‖`, summed left to right.
 pub fn distance_to_center(center: [f64; 3], x: &[[f64; 3]]) -> Vec<f64> {
     threads::map(x, |p| {
@@ -194,36 +342,41 @@ pub fn distance_to_center(center: [f64; 3], x: &[[f64; 3]]) -> Vec<f64> {
 /// `y` in its frame and in its first octant (`y >= 0`): Eberly's robust
 /// bisection ("Distance from a point to an ellipse, an ellipsoid, or a
 /// hyperellipsoid", Geometric Tools), which needs no tolerance — it halves
-/// until no double lies between its ends.  A coordinate of `y` that is zero
-/// leaves the ellipse of the other two, or the foot of a perpendicular off
-/// the plane.
+/// until no double lies between its ends — on `u = s + 1` rather than his
+/// `s`: near a principal plane the root lies a small coordinate's share of
+/// its axis from the pole, where `s + 1` cancels and the foot `y / (s + 1)`
+/// is lost.  A coordinate whose share of its axis (`y_i / e_i`) is below
+/// the smallest normal double — where the bisection's steps are no longer
+/// relative — counts as zero: it leaves the ellipse of the other two, or
+/// the foot of a perpendicular off the plane.
 pub fn inside_distance(e: [f64; 3], y: [f64; 3]) -> f64 {
     let [e0, e1, e2] = e;
     let [y0, y1, y2] = y;
-    if y2 > 0.0 {
-        if y1 > 0.0 {
-            if y0 > 0.0 {
-                let (z0, z1, z2) = (y0 / e0, y1 / e1, y2 / e2);
+    let [z0, z1, z2] = [y0 / e0, y1 / e1, y2 / e2];
+    if z2 >= f64::MIN_POSITIVE {
+        if z1 >= f64::MIN_POSITIVE {
+            if z0 >= f64::MIN_POSITIVE {
                 let g = z0 * z0 + z1 * z1 + z2 * z2 - 1.0;
                 if g == 0.0 {
                     return 0.0;
                 }
                 let (q0, q1) = (e0 / e2, e1 / e2);
                 let (r0, r1) = (q0 * q0, q1 * q1);
-                let s = root3(r0, r1, z0, z1, z2, g);
-                let x = [r0 * y0 / (s + r0), r1 * y1 / (s + r1), y2 / (s + 1.0)];
+                let (gap0, gap1) = (pole_gap(e0, e2), pole_gap(e1, e2));
+                let u = bisect(&[r0 * z0, r1 * z1], &[gap0, gap1], z2, g);
+                let x = [r0 * y0 / (u + gap0), r1 * y1 / (u + gap1), y2 / u];
                 let d = [x[0] - y0, x[1] - y1, x[2] - y2];
                 (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
             } else {
                 ellipse_distance(e1, e2, y1, y2)
             }
-        } else if y0 > 0.0 {
+        } else if z0 >= f64::MIN_POSITIVE {
             ellipse_distance(e0, e2, y0, y2)
         } else {
             (y2 - e2).abs()
         }
     } else {
-        let (denom0, denom1) = (e0 * e0 - e2 * e2, e1 * e1 - e2 * e2);
+        let (denom0, denom1) = (squares_apart(e0, e2), squares_apart(e1, e2));
         let (numer0, numer1) = (e0 * y0, e1 * y1);
         if numer0 < denom0 && numer1 < denom1 {
             let (xde0, xde1) = (numer0 / denom0, numer1 / denom1);
@@ -241,23 +394,24 @@ pub fn inside_distance(e: [f64; 3], y: [f64; 3]) -> f64 {
 /// [`inside_distance`] in two dimensions: `y` to the ellipse of semi-axes
 /// `e0 >= e1`.
 fn ellipse_distance(e0: f64, e1: f64, y0: f64, y1: f64) -> f64 {
-    if y1 > 0.0 {
-        if y0 > 0.0 {
-            let (z0, z1) = (y0 / e0, y1 / e1);
+    let (z0, z1) = (y0 / e0, y1 / e1);
+    if z1 >= f64::MIN_POSITIVE {
+        if z0 >= f64::MIN_POSITIVE {
             let g = z0 * z0 + z1 * z1 - 1.0;
             if g == 0.0 {
                 return 0.0;
             }
             let q0 = e0 / e1;
             let r0 = q0 * q0;
-            let s = root2(r0, z0, z1, g);
-            let d = [r0 * y0 / (s + r0) - y0, y1 / (s + 1.0) - y1];
+            let gap0 = pole_gap(e0, e1);
+            let u = bisect(&[r0 * z0], &[gap0], z1, g);
+            let d = [r0 * y0 / (u + gap0) - y0, y1 / u - y1];
             (d[0] * d[0] + d[1] * d[1]).sqrt()
         } else {
             (y1 - e1).abs()
         }
     } else {
-        let (numer0, denom0) = (e0 * y0, e0 * e0 - e1 * e1);
+        let (numer0, denom0) = (e0 * y0, squares_apart(e0, e1));
         if numer0 < denom0 {
             let xde0 = numer0 / denom0;
             let x = [e0 * xde0, e1 * (1.0 - xde0 * xde0).sqrt()];
@@ -267,6 +421,17 @@ fn ellipse_distance(e0: f64, e1: f64, y0: f64, y1: f64) -> f64 {
             (y0 - e0).abs()
         }
     }
+}
+
+/// `a² − b²` without the cancellation of squaring first.
+fn squares_apart(a: f64, b: f64) -> f64 {
+    (a - b) * (a + b)
+}
+
+/// How far below `u = 0` the pole of axis `a` lies against axis `b`:
+/// `(a / b)² − 1`, without its cancellation when `a` is near `b`.
+fn pole_gap(a: f64, b: f64) -> f64 {
+    squares_apart(a, b) / (b * b)
 }
 
 /// `|v|`, scaled by its largest magnitude so no square overflows.
@@ -279,47 +444,40 @@ fn robust_length(v: &[f64]) -> f64 {
     }
 }
 
-/// The root of `sum_i (n_i / (s + r_i))^2 + (z / (s + 1))^2 = 1` that
-/// [`inside_distance`] bisects for, the bracket from `g`'s sign.
-fn bisect(n: &[f64], r: &[f64], z: f64, g: f64) -> f64 {
-    let mut lo = z - 1.0;
+/// The root `u` of `sum_i (n_i / (u + gap_i))^2 + (z / u)^2 = 1` that
+/// [`inside_distance`] bisects for: at least `z`, where the last term alone
+/// is one, and at most 1 inside (`g < 0`), the length of `(n, z)` outside.
+fn bisect(n: &[f64], gap: &[f64], z: f64, g: f64) -> f64 {
+    let mut lo = z;
     let mut hi = if g < 0.0 {
-        0.0
+        1.0
     } else {
         let mut v = n.to_vec();
         v.push(z);
-        robust_length(&v) - 1.0
+        robust_length(&v)
     };
-    let mut s = 0.0;
+    let mut u = lo;
     for _ in 0..MAX_BISECTIONS {
-        s = (lo + hi) / 2.0;
-        if s == lo || s == hi {
+        u = (lo + hi) / 2.0;
+        if u == lo || u == hi {
             break;
         }
         let mut sum = 0.0;
-        for (&ni, &ri) in n.iter().zip(r) {
-            let ratio = ni / (s + ri);
+        for (&ni, &gi) in n.iter().zip(gap) {
+            let ratio = ni / (u + gi);
             sum += ratio * ratio;
         }
-        let ratio = z / (s + 1.0);
+        let ratio = z / u;
         let g = sum + ratio * ratio - 1.0;
         if g > 0.0 {
-            lo = s;
+            lo = u;
         } else if g < 0.0 {
-            hi = s;
+            hi = u;
         } else {
             break;
         }
     }
-    s
-}
-
-fn root3(r0: f64, r1: f64, z0: f64, z1: f64, z2: f64, g: f64) -> f64 {
-    bisect(&[r0 * z0, r1 * z1], &[r0, r1], z2, g)
-}
-
-fn root2(r0: f64, z0: f64, z1: f64, g: f64) -> f64 {
-    bisect(&[r0 * z0], &[r0], z1, g)
+    u
 }
 
 #[cfg(test)]
@@ -373,6 +531,75 @@ mod tests {
         assert!((inside_distance(e, [2.0, 0.0, 0.0]) - 0.5f64.sqrt()).abs() < 1e-15);
         // until the axis' end is nearer
         assert!((inside_distance(e, [2.9, 0.0, 0.0]) - 0.1).abs() < 1e-15);
+    }
+
+    #[test]
+    fn near_a_principal_plane_the_distance_is_the_planes() {
+        // a coordinate a rounding's share of its axis puts the root at the
+        // pole, where Eberly's `s + 1` cancelled: at (1, 0.5, t) inside
+        // (3, 2, 1) it gave inf at 1e-17, 0.50 at 1e-16, 0.92 at 1e-15 for
+        // the plane's 0.89
+        let e = [3.0, 2.0, 1.0];
+        for flat in [[1.0, 0.5, 0.0], [0.0, 0.5, 0.25], [1.0, 0.0, 0.25]] {
+            let on = inside_distance(e, flat);
+            for t in [5e-324, 1e-310, 1e-300, 1e-17, 1e-16, 1e-15, 1e-12, 1e-9] {
+                let near = flat.map(|v: f64| if v == 0.0 { t } else { v });
+                let d = inside_distance(e, near);
+                assert!(
+                    d.is_finite() && (d - on).abs() < 1e-8,
+                    "{near:?}: {d} against {on}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_fit_recovers_the_ellipsoid_it_was_sampled_from() {
+        // points on the axes of a rotated ellipsoid: their covariance has
+        // the rotation's columns as eigenvectors
+        let (c, s) = (0.6f64, 0.8f64);
+        let rot = [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]];
+        let lengths = [5.0, 3.0, 1.0];
+        let mut pts = Vec::new();
+        for (k, &len) in lengths.iter().enumerate() {
+            for sign in [-1.0, 1.0] {
+                pts.push([0, 1, 2].map(|row| 10.0 + sign * len * rot[row][k]));
+            }
+        }
+        let soma = fit(&pts).expect("a spread in every direction");
+        assert!(soma.center.iter().all(|&x| (x - 10.0).abs() < 1e-12));
+        // each axis' variance: two points at ±len over n − 1 = 5
+        for (a, len) in soma.axes.iter().zip(lengths) {
+            assert!((a - (5.0 * 2.0 * len * len / 5.0f64).sqrt()).abs() < 1e-12);
+        }
+        let columns = |m: [[f64; 3]; 3]| [0, 1, 2].map(|k| [m[0][k], m[1][k], m[2][k]]);
+        for (k, (got, want)) in columns(soma.r).iter().zip(columns(rot)).enumerate() {
+            let dot: f64 = got.iter().zip(want).map(|(a, b)| a * b).sum();
+            assert!((dot.abs() - 1.0).abs() < 1e-12, "axis {k}: {dot}");
+        }
+        let det = {
+            let r = soma.r;
+            r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1])
+                - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
+                + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0])
+        };
+        assert!(det > 0.0);
+    }
+
+    #[test]
+    fn a_fit_refuses_too_few_flat_and_infinite_spreads() {
+        assert_eq!(fit(&[[1.0, 2.0, 3.0]]), Err(FitError::TooFew(1)));
+        let flat = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ];
+        assert_eq!(fit(&flat), Err(FitError::Flat));
+        assert_eq!(
+            fit(&[[0.0; 3], [f64::NAN, 0.0, 0.0]]),
+            Err(FitError::NotFinite)
+        );
     }
 
     #[test]

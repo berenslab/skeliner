@@ -955,17 +955,14 @@ class Soma:
         """
         Fast PCA-based ellipsoid fit to ≥ 3×`axes` sample points.
         Rough 95 %-mass envelope, same idea as the original *sphere* fit.
+
+        Centred on the points' mean, its axes the eigenvectors of their
+        covariance (Jacobi's), each semi-axis ``√(5 λ)`` of its eigenvalue,
+        largest first; ``R`` a rotation.  Raises ``ValueError`` for fewer
+        than two points, a spread that is not finite, or none along an axis.
         """
-        pts = np.asarray(pts, dtype=np.float64)
-        center = pts.mean(axis=0)
-        cov = np.cov(pts - center, rowvar=False)
-        evals, evecs = np.linalg.eigh(cov)  # λ₁ ≤ λ₂ ≤ λ₃
-        axes = np.sqrt(evals * 5.0)[::-1]  # 95 % of mass → 2 σ ≈ √5
-        R = evecs[:, ::-1]  # reorder to a ≥ b ≥ c
-        if np.dot(np.cross(R[:, 0], R[:, 1]), R[:, 2]) < 0:
-            # a rotation: an axis' direction is either way, so the smallest
-            # one turns
-            R[:, 2] = -R[:, 2]
+        pts = np.asarray(pts, dtype=np.float64).reshape(-1, 3)
+        center, axes, R = _kernels().dataclass.soma_fit(pts)
         return cls(center, axes, R, verts=verts)
 
     @classmethod

@@ -469,20 +469,68 @@ def test_soma_fit_is_a_rotation():
     from skeliner import Soma
 
     rng = np.random.default_rng(13)
-    flipped = 0
     for _ in range(100):
         pts = rng.normal(size=(int(rng.integers(5, 60)), 3)) * rng.uniform(1, 9, 3)
         soma = Soma.fit(pts)
         R = soma.R
         assert np.dot(np.cross(R[:, 0], R[:, 1]), R[:, 2]) > 0  # right-handed
-        evals, evecs = np.linalg.eigh(np.cov(pts - pts.mean(axis=0), rowvar=False))
-        raw = Soma(soma.center, soma.axes, evecs[:, ::-1])  # as fit made it
-        flipped += not np.array_equal(raw.R, soma.R)
-        # the same ellipsoid: every measure squares the body coordinates
+        np.testing.assert_allclose(R.T @ R, np.eye(3), atol=1e-12)
+        # an axis turned is the same ellipsoid: every measure squares the
+        # body coordinates
+        turned = Soma(soma.center, soma.axes, R * [1.0, 1.0, -1.0])
         x = soma.center + rng.normal(size=(40, 3)) * 5.0
-        assert np.array_equal(raw.contains(x), soma.contains(x))
-        assert np.array_equal(raw.distance_to_surface(x), soma.distance_to_surface(x))
-    assert 20 < flipped < 100  # the eigenvectors come both ways
+        assert np.array_equal(turned.contains(x), soma.contains(x))
+        assert np.array_equal(
+            turned.distance_to_surface(x), soma.distance_to_surface(x)
+        )
+
+
+def test_soma_fit_on_both_paths_and_as_numpy_fits():
+    """The Rust fit and its twin agree bit for bit — the same arithmetic,
+    no LAPACK — and with numpy's ``cov`` + ``eigh`` (the fit before) to
+    rounding: the same centre, axes and axis directions."""
+    from skeliner import _rs
+    from skeliner.python import dataclass as python_dataclass
+
+    from ._parity import assert_parity
+
+    def fits(pts):
+        out = []
+        for kernel in (_rs.dataclass, python_dataclass):
+            try:
+                out.append(kernel.soma_fit(pts))
+            except ValueError as e:
+                out.append(str(e))
+        return out
+
+    rng = np.random.default_rng(19)
+    for trial in range(120):
+        m = int(rng.choice([4, 9, 130, 2000, 9000]))
+        scale = 10.0 ** rng.uniform(-2, 6)
+        spread = rng.uniform(0.2, 5, 3) if trial % 5 else np.array([1, 1 + 1e-7, 0.5])
+        pts = (rng.normal(size=(m, 3)) * spread + rng.normal(size=3) * 1e3) * scale
+        rust, python = fits(pts)
+        assert_parity(rust, python)
+        center, axes, R = rust
+        c0 = pts.mean(axis=0)
+        evals, evecs = np.linalg.eigh(np.cov(pts - c0, rowvar=False))
+        assert np.array_equal(center, c0)
+        np.testing.assert_allclose(axes, np.sqrt(evals * 5.0)[::-1], rtol=1e-9)
+        if trial % 5:  # eigenvalues apart: the directions are the same
+            cos = np.abs(np.sum(R * evecs[:, ::-1], axis=0))
+            assert (cos > 1 - 1e-12).all()
+    # what has no ellipsoid, refused alike on both paths
+    plane = rng.normal(size=(50, 3)) * [3.0, 2.0, 0.0]
+    for pts, message in (
+        (np.ones((1, 3)), "two points or more, not 1"),
+        (np.zeros((0, 3)), "two points or more, not 0"),
+        (np.ones((5, 3)), "no spread along an axis"),
+        (plane, "no spread along an axis"),
+        (np.outer(np.arange(6.0), [1.0, 2.0, 3.0]), "no spread along an axis"),
+        (np.array([[0.0, 0, 0], [1, 1, 1], [np.nan, 0, 0]]), "not finite"),
+    ):
+        rust, python = fits(pts)
+        assert isinstance(rust, str) and rust == python and message in rust, rust
 
 
 def test_a_skeleton_leaves_its_inputs_alone_and_may_have_no_nodes():
@@ -602,6 +650,9 @@ def _somas_and_points(rng):
             soma = Soma(np.zeros(3), axes, R)
             body = rng.uniform(-1.2, 1.2, size=(600, 3)) * axes
             body[rng.random(body.shape) < 0.3] = 0.0  # on axes and planes
+            # and a rounding's share of an axis off them, to the subnormals
+            off = rng.random(body.shape) < 0.05
+            body[off] = 10.0 ** -rng.uniform(15, 323, off.sum()) * axes[0]
             body[:8] = 0.0
             body[8:20] = np.round(body[8:20] / np.asarray(axes), 1) * axes
             on = rng.normal(size=(20, 3))
@@ -628,10 +679,15 @@ def test_soma_measures_on_both_paths():
             _rs.dataclass.soma_distance_to_center(soma.center, x),
             python_dataclass.soma_distance_to_center(soma.center, x),
         )
+        # the distances' rounding is the coordinates': without a Newton step
+        # (max_iter <= 0) an outside point's is all rounding
+        scale = float(max(np.abs(x - soma.center).max(), soma.axes.max()))
         for atol, max_iter in ((1e-9, 64), (1e-3, 5), (1e-9, 0), (1e-9, -2)):
             rust = _rs.dataclass.soma_distance_to_surface(*args, atol, max_iter)
             assert_parity(
-                rust, python_dataclass.soma_distance_to_surface(*args, atol, max_iter)
+                rust,
+                python_dataclass.soma_distance_to_surface(*args, atol, max_iter),
+                scale=scale,
             )
             if max_iter == 64:
                 inside, outside = (rust < 0).sum(), (rust > 0).sum()
@@ -712,3 +768,34 @@ def test_vert2node_from_bins_of_any_shape():
     ):
         vm = VertexMap.from_bins(bins)
         assert list(vm.items()) == list(want.items())
+
+
+def test_soma_distance_holds_still_at_its_planes_and_under_an_ulp():
+    """A distance moves by rounding when its point does: near a principal
+    plane (a coordinate a rounding's share of its axis, down to the
+    subnormals, where the bisection's root sits at its pole) as on it, and
+    under a one-ulp change of the input — what another platform's rounding
+    of the body coordinates amounts to."""
+    import skeliner as sk
+    from skeliner import Soma
+
+    from ._parity import RTOL
+
+    soma = Soma(np.zeros(3), [3.0, 2.0, 1.0], np.eye(3))
+    flats = np.array([[1.0, 0.5, 0.0], [0.0, 0.5, 0.25], [1.0, 0.0, 0.25]])
+    for path in ("rust", "python"):
+        with sk.backend(path):
+            on = soma.distance_to_surface(flats)
+            for t in (5e-324, 1e-310, 1e-300, 1e-17, 1e-16, 1e-15, 1e-12):
+                near = np.where(flats == 0.0, t, flats)
+                assert np.abs(soma.distance_to_surface(near) - on).max() < 1e-12, t
+            rng = np.random.default_rng(18)
+            moved = 0
+            for s, x in _somas_and_points(rng):
+                scale = float(max(np.abs(x - s.center).max(), s.axes.max()))
+                d = s.distance_to_surface(x)
+                for way in (np.inf, -np.inf):
+                    e = s.distance_to_surface(np.nextafter(x, way))
+                    assert np.abs(e - d).max() <= RTOL * scale
+                    moved += int((e != d).sum())
+            assert moved  # the nudges did change some distances
