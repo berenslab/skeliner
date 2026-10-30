@@ -567,6 +567,18 @@ fn points2(points: &PyReadonlyArray2<'_, f64>) -> PyResult<Vec<[f64; 2]>> {
     Ok(a.rows().into_iter().map(|r| [r[0], r[1]]).collect())
 }
 
+/// numpy's `np.linalg.svd(x)[2]` up to the vectors' signs, for `x` `(k, 3)`:
+/// its right singular vectors as rows, largest singular value first — the
+/// eigenvectors of `xᵀx` by Jacobi's rotations.
+#[pyfunction]
+fn right_singular<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let x = rows3("X", &x)?;
+    Ok(rows_to_array(&::mesh::geometry::right_singular(&x)).into_pyarray(py))
+}
+
 /// `(area, perimeter)` of the convex hull of 2D `points` `(N, 2)` — scipy's
 /// `ConvexHull` `volume` and `area` — both 0 where qhull refuses the points
 /// as flat.
@@ -602,6 +614,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(adjacent_faces, m)?)?;
     m.add_function(wrap_pyfunction!(unique_edges, m)?)?;
     m.add_function(wrap_pyfunction!(edge_lengths, m)?)?;
+    m.add_function(wrap_pyfunction!(right_singular, m)?)?;
     m.add_function(wrap_pyfunction!(hull_measures, m)?)?;
     m.add_function(wrap_pyfunction!(hull_equations, m)?)?;
     m.add_class::<PyTopology>()?;

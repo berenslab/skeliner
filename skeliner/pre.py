@@ -129,12 +129,6 @@ def _edge_map(mesh: Mesh):
 _row_dot = _py_mesh.row_dot
 
 
-def _svd_rows(x: np.ndarray, full_matrices: bool) -> np.ndarray:
-    """``np.linalg.svd(x, full_matrices=...)[2]``.  The Rust core calls back
-    for every SVD: the platform's LAPACK rounds as no Rust solver does."""
-    return np.linalg.svd(x, full_matrices=full_matrices)[2]
-
-
 _nearest = _py_mesh.nearest
 
 
@@ -3602,7 +3596,6 @@ def find_gaps(
         float(kiss_penalty),
         int(relay_min_faces),
         bool(repair_stranded),
-        _svd_rows,
     )
     if verbose:
         _report_gaps(gaps, disc, n_capped, n_repaired, _t0)
@@ -4062,7 +4055,6 @@ def find_pocket_mouths(
         np.asarray(outward_dots, dtype=np.float64),
         np.asarray(main_face_mask, dtype=bool),
         kernels.mesh.Topology(faces, len(mesh.vertices)),
-        _svd_rows,
         min_pocket_size=min_pocket_size,
         min_fold_ratio=min_fold_ratio,
         non_main_mask=_non_main_mask,
@@ -4177,7 +4169,6 @@ def find_pocket_organelles(
         np.asarray(outward_dots, dtype=np.float64),
         np.asarray(main_face_mask, dtype=bool),
         kernels.mesh.Topology(faces, len(mesh.vertices)),
-        _svd_rows,
         centers=np.asarray(mesh.triangles_center, dtype=np.float64),
         normals=np.asarray(mesh.face_normals, dtype=np.float64),
         grow_threshold=grow_threshold,
@@ -4347,7 +4338,6 @@ def find_organelles(
         np.asarray(face_comp, dtype=np.int64),
         int(main_ci),
         np.asarray(mesh.face_adjacency, dtype=np.int64),
-        _svd_rows,
         int(min_cluster_size),
     )
     n_structural, enclosed_count = rep["n_structural"], rep["n_enclosed"]

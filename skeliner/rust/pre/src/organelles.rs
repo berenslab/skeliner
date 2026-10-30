@@ -190,6 +190,27 @@ pub fn enclosure_pass(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_degenerate_faces_outline_encloses_nothing() {
+        // a zero-area face's corners, collinear, whose projection rounds to
+        // a speck (1.1e-12 without the rounding test), and a 10 x 10 square
+        let line = [
+            [697724.0, 958735.0, 845926.0],
+            [697868.0, 958849.0, 845722.0],
+            [697964.0, 958925.0, 845586.0],
+        ];
+        let square = [
+            [0.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [10.0, 10.0, 0.0],
+            [0.0, 10.0, 0.0],
+        ];
+        let loops = [crate::fits::centred(&line), crate::fits::centred(&square)];
+        let vts: Vec<_> = loops.iter().map(|l| right_singular(l)).collect();
+        assert_eq!(rim_area(&loops[..1], &vts[..1]), 0.0);
+        assert!((rim_area(&loops, &vts) - 100.0).abs() < 1e-9);
+    }
+
     fn yes(_: &[u32]) -> bool {
         true
     }
@@ -386,12 +407,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use mesh::Topology;
 use mesh::components::LowestRootSets;
-use mesh::geometry::numpy_sum;
+use mesh::geometry::{numpy_sum, right_singular};
 use mesh::ray::TriangleBvh;
 use mesh::spatial::{KdTree, Sum};
 use rayon::prelude::*;
 
-use crate::fits::{Svd, centred, hull_area_on};
+use crate::fits::{centred, hull_area_on};
 
 /// Whether a piece of the surface lies inside the cell: more than half its
 /// faces look into it, the ray from a face's centre along its normal (out
@@ -418,6 +439,19 @@ pub const FAN_CLEARANCE: f64 = 1e-6;
 /// A ray costs microseconds, so this many are worth casting across the
 /// pool (`threads::MIN_PARALLEL` is for items costing nanoseconds).
 const RAYS_PARALLEL: usize = 256;
+
+/// Fits of a rim's or a boundary's points (microseconds each): at once
+/// from this many.
+const FITS_PARALLEL: usize = 256;
+
+/// Each of `xs`' right singular vectors ([`right_singular`]), in order.
+fn right_singular_each(xs: &[&[[f64; 3]]]) -> Vec<[[f64; 3]; 3]> {
+    if xs.len() >= FITS_PARALLEL {
+        threads::install(|| xs.par_iter().map(|x| right_singular(x)).collect())
+    } else {
+        xs.iter().map(|x| right_singular(x)).collect()
+    }
+}
 
 impl<'a> Inside<'a> {
     pub fn new(
@@ -935,7 +969,11 @@ pub fn rim_loops(edges: &[[u32; 2]], verts: &[[f64; 3]]) -> Vec<Vec<[f64; 3]>> {
 
 /// `skeliner.pre._rim_enclosed_area`: the planar area enclosed by the
 /// [`rim_loops`], each projected onto the plane of the first two of its
-/// right-singular vectors `vts`.
+/// right-singular vectors `vts`.  A loop whose shoelace sum is within the
+/// rounding of its `n` points — `4 n ε R²`, `R` the farthest from their
+/// mean: two projected coordinates in each of `n` terms — encloses nothing:
+/// a degenerate face's outline, collinear, whose area is zero but whose
+/// projection rounds to a speck that made an opening of nothing.
 pub fn rim_area(loops: &[Vec<[f64; 3]>], vts: &[[[f64; 3]; 3]]) -> f64 {
     let mut total = 0.0;
     for (centred, vh) in loops.iter().zip(vts) {
@@ -949,6 +987,13 @@ pub fn rim_area(loops: &[Vec<[f64; 3]>], vts: &[[[f64; 3]; 3]]) -> f64 {
             .map(|i| p2[i][0] * p2[i + 1][1] - p2[i + 1][0] * p2[i][1])
             .collect();
         let s = numpy_sum(&terms) + p2[n - 1][0] * p2[0][1] - p2[0][0] * p2[n - 1][1];
+        let r2 = centred
+            .iter()
+            .map(|c| c[0] * c[0] + c[1] * c[1] + c[2] * c[2])
+            .fold(0.0, f64::max);
+        if s.abs() <= 4.0 * n as f64 * f64::EPSILON * r2 {
+            continue;
+        }
         total += 0.5 * s.abs();
     }
     total
@@ -989,7 +1034,6 @@ pub fn pocket_mouths(
     main_mask: &[bool],
     non_main: Option<&[bool]>,
     params: &PocketParams,
-    svd: &dyn Svd,
 ) -> Vec<Vec<[u32; 2]>> {
     let neg = |f: usize| s.dots[f] < 0.0 && main_mask[f];
     let (clusters, of) = components_where(s, neg);
@@ -1049,7 +1093,7 @@ pub fn pocket_mouths(
         .iter()
         .flat_map(|r| r.loops.iter().map(Vec::as_slice))
         .collect();
-    let vts = svd.right_singular_each(&loops, true);
+    let vts = right_singular_each(&loops);
     let mut at = 0;
     let mut openings: Vec<f64> = rims
         .iter()
@@ -1072,7 +1116,7 @@ pub fn pocket_mouths(
         })
         .collect();
     let pts: Vec<&[[f64; 3]]> = hulls.iter().map(|(_, c)| c.as_slice()).collect();
-    for ((i, c), vt) in hulls.iter().zip(svd.right_singular_each(&pts, true)) {
+    for ((i, c), vt) in hulls.iter().zip(right_singular_each(&pts)) {
         openings[*i] = hull_area_on(c, vt);
     }
     rims.into_iter()
@@ -1103,11 +1147,10 @@ pub fn pocket_organelles(
     main_mask: &[bool],
     non_main: Option<&[bool]>,
     params: &PocketParams,
-    svd: &dyn Svd,
     inside: &Inside<'_>,
 ) -> Pockets {
     let n = s.faces.len();
-    let mouths = pocket_mouths(s, main_mask, non_main, params, svd);
+    let mouths = pocket_mouths(s, main_mask, non_main, params);
     let mut out = Pockets {
         mask: vec![false; n],
         n_mouths: mouths.len(),
@@ -1317,7 +1360,6 @@ pub fn find_organelles(
     main: i64,
     adjacency: &[[u32; 2]],
     min_cluster_size: usize,
-    svd: &dyn Svd,
 ) -> Organelles {
     let fragments = Fragments {
         faces: s.faces,
@@ -1339,7 +1381,7 @@ pub fn find_organelles(
         inside.prepare();
     }
     let holds = |piece: &[u32]| inside.holds(piece);
-    let pockets = pocket_organelles(s, &structural, Some(&non_main), &params, svd, &inside);
+    let pockets = pocket_organelles(s, &structural, Some(&non_main), &params, &inside);
     let candidates: Vec<bool> = (0..s.faces.len())
         .map(|f| structural[f] && !pockets.mask[f] && !isolated.mask[f])
         .collect();

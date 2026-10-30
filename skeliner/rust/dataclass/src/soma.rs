@@ -2,7 +2,7 @@
 //! measured as the Python path's numpy measures it
 //! (`skeliner/python/dataclass.py`).
 
-use mesh::geometry::{numpy_sum, row_times_matrix};
+use mesh::geometry::{jacobi, numpy_sum, row_times_matrix};
 use rayon::prelude::*;
 
 /// `Soma.distance_to_surface`'s defaults: its Newton steps stop once every
@@ -18,9 +18,6 @@ const INSIDE_PARALLEL: usize = 256;
 /// Eberly's bound on the halvings: as many as a double has values between
 /// two of its powers of two, down to the subnormals.
 const MAX_BISECTIONS: usize = (f64::MANTISSA_DIGITS as i32 - f64::MIN_EXP) as usize;
-
-/// A bound on Jacobi's sweeps, which a 3 × 3 matrix never comes near.
-const JACOBI_SWEEPS: usize = 64;
 
 /// Why [`fit`] made no ellipsoid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,8 +215,8 @@ impl Soma {
 /// eigenvalue, largest first (ties in axis order), `R` a rotation (the
 /// smallest axis turned when the columns come left-handed).  The covariance
 /// is numpy's pairwise sums of the centred products over `n − 1`, its
-/// eigen-decomposition [`jacobi`]'s: only + − × ÷ and √, so the Python
-/// path computes the same bits on any platform.
+/// eigen-decomposition [`jacobi`]'s (`mesh::geometry`): only + − × ÷ and
+/// √, so the Python path computes the same bits on any platform.
 pub fn fit(pts: &[[f64; 3]]) -> Result<Soma, FitError> {
     let n = pts.len();
     if n < 2 {
@@ -279,55 +276,6 @@ pub fn fit(pts: &[[f64; 3]]) -> Result<Soma, FitError> {
         }
     }
     Ok(Soma { center, axes, r })
-}
-
-/// Jacobi's eigen-decomposition of the symmetric `a`: its eigenvalues, and
-/// the rows of the matrix whose columns are their eigenvectors.  Sweeps
-/// over the pairs (0, 1), (0, 2), (1, 2), each rotation zeroing its entry
-/// (Rutishauser's formulas), until no entry is left off the diagonal; one
-/// too small to move either diagonal entry it couples is zeroed without a
-/// rotation.
-fn jacobi(mut a: [[f64; 3]; 3]) -> ([f64; 3], [[f64; 3]; 3]) {
-    let mut v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-    for _ in 0..JACOBI_SWEEPS {
-        if a[0][1] == 0.0 && a[0][2] == 0.0 && a[1][2] == 0.0 {
-            break;
-        }
-        for (p, q) in [(0, 1), (0, 2), (1, 2)] {
-            let apq = a[p][q];
-            if apq == 0.0 {
-                continue;
-            }
-            let (app, aqq) = (a[p][p], a[q][q]);
-            if app + apq == app && aqq + apq == aqq {
-                a[p][q] = 0.0;
-                a[q][p] = 0.0;
-                continue;
-            }
-            let theta = (aqq - app) / (2.0 * apq);
-            let t = 1.0f64.copysign(theta) / (theta.abs() + (theta * theta + 1.0).sqrt());
-            let c = 1.0 / (t * t + 1.0).sqrt();
-            let s = t * c;
-            let tau = s / (1.0 + c);
-            let h = t * apq;
-            a[p][p] = app - h;
-            a[q][q] = aqq + h;
-            a[p][q] = 0.0;
-            a[q][p] = 0.0;
-            let r = 3 - p - q;
-            let (arp, arq) = (a[r][p], a[r][q]);
-            a[r][p] = arp - s * (arq + tau * arp);
-            a[p][r] = a[r][p];
-            a[r][q] = arq + s * (arp - tau * arq);
-            a[q][r] = a[r][q];
-            for row in &mut v {
-                let (vp, vq) = (row[p], row[q]);
-                row[p] = vp - s * (vq + tau * vp);
-                row[q] = vq + s * (vp - tau * vq);
-            }
-        }
-    }
-    ([a[0][0], a[1][1], a[2][2]], v)
 }
 
 /// `Soma.distance_to_center`: `‖x − center‖`, summed left to right.

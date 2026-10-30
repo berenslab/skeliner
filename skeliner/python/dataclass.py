@@ -8,7 +8,7 @@ import math
 
 import numpy as np
 
-from .mesh import node_pairs, rows3
+from .mesh import jacobi, node_pairs, rows3
 
 #: Eberly's bound on the halvings of a bisection: as many as a double has
 #: values between two of its powers of two, down to the subnormals.
@@ -18,10 +18,6 @@ MAX_BISECTIONS = 1074
 _NORMAL = float(np.finfo(np.float64).tiny)
 
 
-#: A bound on Jacobi's sweeps, which a 3 × 3 matrix never comes near.
-JACOBI_SWEEPS = 64
-
-
 def soma_fit(points) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """``Soma.fit``: the centre, semi-axes and rotation of the ellipsoid of
     *points* ``(N, 3)``' spread — centred on their mean, its axes the
@@ -29,7 +25,7 @@ def soma_fit(points) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     largest first (ties in axis order), the rotation's columns turned
     right-handed by the smallest axis.  The covariance is numpy's pairwise
     sums of the centred products over ``n − 1``, its eigen-decomposition
-    :func:`jacobi`'s: only + − × ÷ and √, the same bits as the Rust path's
+    :func:`~skeliner.python.mesh.jacobi`'s: only + − × ÷ and √, the same bits as the Rust path's
     on any platform."""
     points = rows3("N", points)
     n = len(points)
@@ -63,48 +59,6 @@ def soma_fit(points) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         for row in r:
             row[2] = -row[2]
     return center, np.array(axes), np.array(r)
-
-
-def jacobi(a) -> tuple[list[float], list[list[float]]]:
-    """Jacobi's eigen-decomposition of the symmetric 3 × 3 *a*: its
-    eigenvalues, and the rows of the matrix whose columns are their
-    eigenvectors.  Sweeps over the pairs (0, 1), (0, 2), (1, 2), each
-    rotation zeroing its entry (Rutishauser's formulas), until no entry is
-    left off the diagonal; one too small to move either diagonal entry it
-    couples is zeroed without a rotation."""
-    a = [[float(x) for x in row] for row in a]
-    v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
-    for _ in range(JACOBI_SWEEPS):
-        if a[0][1] == 0.0 and a[0][2] == 0.0 and a[1][2] == 0.0:
-            break
-        for p, q in ((0, 1), (0, 2), (1, 2)):
-            apq = a[p][q]
-            if apq == 0.0:
-                continue
-            app, aqq = a[p][p], a[q][q]
-            if app + apq == app and aqq + apq == aqq:
-                a[p][q] = a[q][p] = 0.0
-                continue
-            theta = (aqq - app) / (2.0 * apq)
-            t = math.copysign(1.0, theta) / (
-                abs(theta) + math.sqrt(theta * theta + 1.0)
-            )
-            c = 1.0 / math.sqrt(t * t + 1.0)
-            s = t * c
-            tau = s / (1.0 + c)
-            h = t * apq
-            a[p][p] = app - h
-            a[q][q] = aqq + h
-            a[p][q] = a[q][p] = 0.0
-            r = 3 - p - q
-            arp, arq = a[r][p], a[r][q]
-            a[r][p] = a[p][r] = arp - s * (arq + tau * arp)
-            a[r][q] = a[q][r] = arq + s * (arp - tau * arq)
-            for row in v:
-                vp, vq = row[p], row[q]
-                row[p] = vp - s * (vq + tau * vp)
-                row[q] = vq + s * (vp - tau * vq)
-    return [a[0][0], a[1][1], a[2][2]], v
 
 
 def soma_contains(center, axes, rotation, points, limit: float) -> np.ndarray:

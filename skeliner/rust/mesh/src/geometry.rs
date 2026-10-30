@@ -113,74 +113,86 @@ pub fn arange(start: f64, stop: f64, step: f64) -> Vec<f64> {
     out
 }
 
-/// Eigenvalues and eigenvectors of a symmetric 3x3 matrix by cyclic Jacobi
-/// rotations, sorted by eigenvalue, largest first; `vectors[k]` goes with
-/// `values[k]`.
-pub fn symmetric_eigen(m: [[f64; 3]; 3]) -> ([f64; 3], [[f64; 3]; 3]) {
-    let mut a = m;
+/// A bound on [`jacobi`]'s sweeps, which a 3 × 3 matrix never comes near.
+const JACOBI_SWEEPS: usize = 64;
+
+/// Jacobi's eigen-decomposition of the symmetric `a`: its eigenvalues, and
+/// the rows of the matrix whose columns are their eigenvectors.  Sweeps
+/// over the pairs (0, 1), (0, 2), (1, 2), each rotation zeroing its entry
+/// (Rutishauser's formulas), until no entry is left off the diagonal; one
+/// too small to move either diagonal entry it couples is zeroed without a
+/// rotation.  Only + − × ÷ and √: the Python path's twin computes the same
+/// bits on any platform.
+pub fn jacobi(mut a: [[f64; 3]; 3]) -> ([f64; 3], [[f64; 3]; 3]) {
     let mut v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-    for _ in 0..64 {
-        let off = a[0][1].abs() + a[0][2].abs() + a[1][2].abs();
-        if off <= f64::EPSILON * (a[0][0].abs() + a[1][1].abs() + a[2][2].abs()) {
+    for _ in 0..JACOBI_SWEEPS {
+        if a[0][1] == 0.0 && a[0][2] == 0.0 && a[1][2] == 0.0 {
             break;
         }
         for (p, q) in [(0, 1), (0, 2), (1, 2)] {
-            if a[p][q] == 0.0 {
+            let apq = a[p][q];
+            if apq == 0.0 {
                 continue;
             }
-            let theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
-            let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
-            let t = if theta == 0.0 { 1.0 } else { t };
+            let (app, aqq) = (a[p][p], a[q][q]);
+            if app + apq == app && aqq + apq == aqq {
+                a[p][q] = 0.0;
+                a[q][p] = 0.0;
+                continue;
+            }
+            let theta = (aqq - app) / (2.0 * apq);
+            let t = 1.0f64.copysign(theta) / (theta.abs() + (theta * theta + 1.0).sqrt());
             let c = 1.0 / (t * t + 1.0).sqrt();
             let s = t * c;
-            // A <- J^T A J for the rotation J in the (p, q) plane
-            for row in &mut a {
-                let (akp, akq) = (row[p], row[q]);
-                row[p] = c * akp - s * akq;
-                row[q] = s * akp + c * akq;
-            }
-            let (rp, rq) = (a[p], a[q]);
-            a[p] = [0, 1, 2].map(|k| c * rp[k] - s * rq[k]);
-            a[q] = [0, 1, 2].map(|k| s * rp[k] + c * rq[k]);
+            let tau = s / (1.0 + c);
+            let h = t * apq;
+            a[p][p] = app - h;
+            a[q][q] = aqq + h;
+            a[p][q] = 0.0;
+            a[q][p] = 0.0;
+            let r = 3 - p - q;
+            let (arp, arq) = (a[r][p], a[r][q]);
+            a[r][p] = arp - s * (arq + tau * arp);
+            a[p][r] = a[r][p];
+            a[r][q] = arq + s * (arp - tau * arq);
+            a[q][r] = a[r][q];
             for row in &mut v {
-                let (vkp, vkq) = (row[p], row[q]);
-                row[p] = c * vkp - s * vkq;
-                row[q] = s * vkp + c * vkq;
+                let (vp, vq) = (row[p], row[q]);
+                row[p] = vp - s * (vq + tau * vp);
+                row[q] = vq + s * (vp - tau * vq);
             }
         }
     }
-    let mut order = [0usize, 1, 2];
-    order.sort_by(|&i, &j| a[j][j].total_cmp(&a[i][i]));
-    let values = order.map(|i| a[i][i]);
-    let vectors = order.map(|i| [v[0][i], v[1][i], v[2][i]]);
-    (values, vectors)
+    ([a[0][0], a[1][1], a[2][2]], v)
 }
 
-/// Mean of `pts` and an orthonormal basis `(u, w)` of their best-fit plane
-/// (the two leading principal directions), as numpy's SVD of the centred
-/// points gives them up to sign.
-pub fn best_fit_plane(pts: &[[f64; 3]]) -> ([f64; 3], [f64; 3], [f64; 3]) {
-    let n = pts.len() as f64;
-    let mut mean = [0.0f64; 3];
-    for p in pts {
-        for k in 0..3 {
-            mean[k] += p[k];
-        }
-    }
-    for m in &mut mean {
-        *m /= n;
-    }
-    let mut cov = [[0.0f64; 3]; 3];
-    for p in pts {
-        let d = [p[0] - mean[0], p[1] - mean[1], p[2] - mean[2]];
-        for i in 0..3 {
-            for j in 0..3 {
-                cov[i][j] += d[i] * d[j];
+/// numpy's `np.linalg.svd(x)[2]` up to the vectors' signs: the right
+/// singular vectors of `x` (as given — centre it first for principal
+/// directions) as rows, largest singular value first, ties in axis order.
+/// They are the eigenvectors of `xᵀx` by [`jacobi`], its entries numpy's
+/// pairwise sums of the columns' products ([`numpy_sum`]), so the Python
+/// path's twin computes the same bits on any platform.
+pub fn right_singular(x: &[[f64; 3]]) -> [[f64; 3]; 3] {
+    let mut gram = [[0.0f64; 3]; 3];
+    let mut products = vec![0.0f64; x.len()];
+    for j in 0..3 {
+        for k in j..3 {
+            for (p, r) in products.iter_mut().zip(x) {
+                *p = r[j] * r[k];
             }
+            let g = numpy_sum(&products);
+            gram[j][k] = g;
+            gram[k][j] = g;
         }
     }
-    let (_, vecs) = symmetric_eigen(cov);
-    (mean, vecs[0], vecs[1])
+    let (lam, v) = jacobi(gram);
+    let mut order = [0usize, 1, 2];
+    order.sort_by(|&i, &j| {
+        lam[j]
+            .partial_cmp(&lam[i])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    order.map(|i| [v[0][i], v[1][i], v[2][i]])
 }
 
 /// Coordinates of `pts` in the plane through `origin` spanned by `u`, `w`.
@@ -359,25 +371,33 @@ mod tests {
     }
 
     #[test]
-    fn eigen_of_a_diagonal_and_a_rotated_matrix() {
-        let (vals, vecs) = symmetric_eigen([[1.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 2.0]]);
-        assert_eq!(vals, [3.0, 2.0, 1.0]);
-        assert_eq!(vecs[0].map(f64::abs), [0.0, 1.0, 0.0]);
-        let (vals, vecs) = symmetric_eigen([[2.0, 1.0, 0.0], [1.0, 2.0, 0.0], [0.0, 0.0, 0.5]]);
-        assert!((vals[0] - 3.0).abs() < 1e-12 && (vals[1] - 1.0).abs() < 1e-12);
+    fn jacobi_diagonalises_a_diagonal_and_a_rotated_matrix() {
+        let (vals, vecs) = jacobi([[1.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 2.0]]);
+        assert_eq!(vals, [1.0, 3.0, 2.0]);
+        assert_eq!(vecs, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        let (vals, vecs) = jacobi([[2.0, 1.0, 0.0], [1.0, 2.0, 0.0], [0.0, 0.0, 0.5]]);
+        let big = (0..3).max_by(|&i, &j| vals[i].total_cmp(&vals[j])).unwrap();
+        assert!((vals[big] - 3.0).abs() < 1e-12);
         let s = std::f64::consts::FRAC_1_SQRT_2;
-        assert!((vecs[0][0].abs() - s).abs() < 1e-12 && (vecs[0][1].abs() - s).abs() < 1e-12);
+        assert!((vecs[0][big].abs() - s).abs() < 1e-12 && (vecs[1][big].abs() - s).abs() < 1e-12);
     }
 
     #[test]
     fn a_tilted_square_has_its_area_in_its_plane() {
-        // unit square in a plane tilted about x
+        // unit square in a plane tilted about x, centred
         let (c, s) = (0.6, 0.8);
         let sq = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, c, s], [0.0, c, s]];
-        let (o, u, w) = best_fit_plane(&sq);
-        let area = polygon_area(&project(&sq, o, u, w));
-        assert!((area - 1.0).abs() < 1e-12, "{area}");
-        assert!((hull_measures(&project(&sq, o, u, w)).0 - 1.0).abs() < 1e-12);
+        let mid = [0.5, c / 2.0, s / 2.0];
+        let centred: Vec<[f64; 3]> = sq
+            .iter()
+            .map(|p| [0, 1, 2].map(|k| p[k] - mid[k]))
+            .collect();
+        let vt = right_singular(&centred);
+        // the normal comes last, the plane's two directions first
+        assert!(((vt[2][1] * -s + vt[2][2] * c).abs() - 1.0).abs() < 1e-12);
+        let plane = project(&centred, [0.0; 3], vt[0], vt[1]);
+        assert!((polygon_area(&plane) - 1.0).abs() < 1e-12);
+        assert!((hull_measures(&plane).0 - 1.0).abs() < 1e-12);
     }
 
     #[test]

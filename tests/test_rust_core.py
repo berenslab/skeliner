@@ -607,12 +607,11 @@ class TestFindOrganelles:
                 for kwargs in ({}, {"non_main_mask": non_main, "max_hole_size": 50}):
                     kwargs = {**kwargs, **geometry}
                     args = (faces, verts, areas, st.outward_dots, main)
-                    tail = (pre._svd_rows,)
                     rust = _rs.pre.pocket_organelles(
-                        *args, _rs.mesh.Topology(faces, len(verts)), *tail, **kwargs
+                        *args, _rs.mesh.Topology(faces, len(verts)), **kwargs
                     )
                     python = python_pre.pocket_organelles(
-                        *args, python_mesh.Topology(faces, len(verts)), *tail, **kwargs
+                        *args, python_mesh.Topology(faces, len(verts)), **kwargs
                     )
                     assert_parity(rust, python, name)
                 iso_args = (
@@ -634,34 +633,6 @@ class TestFindOrganelles:
         # the flask's pocket behind its two mouths, the sphere's fragment
         assert found["mouths"] >= 2 and min(found.values()) > 0, found
 
-    def test_a_callback_s_error_is_raised_as_itself(self):
-        # it once panicked in the binding (pyo3's PanicException, which
-        # `except Exception` does not catch)
-        mesh = _flask()
-        st = pre.compute_mesh_stats(mesh, None)
-        faces = np.asarray(mesh.faces, dtype=np.int64)
-        verts = np.asarray(mesh.vertices, dtype=np.float64)
-        args = (faces, verts, np.asarray(mesh.area_faces), st.outward_dots)
-        topology = _rs.mesh.Topology(faces, len(verts))
-        calls = []
-
-        def svd_fails(x, full_matrices):
-            calls.append((len(x), full_matrices))
-            raise RuntimeError("no SVD here")
-
-        geometry = {
-            "centers": np.asarray(mesh.triangles_center, dtype=np.float64),
-            "normals": np.asarray(mesh.face_normals, dtype=np.float64),
-        }
-        for fn, kwargs in (
-            (_rs.pre.pocket_mouths, {}),
-            (_rs.pre.pocket_organelles, geometry),
-        ):
-            calls.clear()
-            with pytest.raises(RuntimeError, match="no SVD here"):
-                fn(*args, st.main_face_mask, topology, svd_fails, **kwargs)
-            assert len(calls) == 1  # no call back after the first failure
-
     def test_a_hole_bigger_than_its_fold_and_outside_the_cell_is_left(self):
         """A hole walled in by pocket is a fold's inside if it is no bigger
         than the pocket it touches, or lies inside the cell.  A soma's
@@ -682,13 +653,10 @@ class TestFindOrganelles:
                 "normals": np.asarray(mesh.face_normals, dtype=np.float64),
             }
             rust = _rs.pre.pocket_organelles(
-                *args, _rs.mesh.Topology(faces, len(verts)), pre._svd_rows, **geometry
+                *args, _rs.mesh.Topology(faces, len(verts)), **geometry
             )
             python = python_pre.pocket_organelles(
-                *args,
-                python_mesh.Topology(faces, len(verts)),
-                pre._svd_rows,
-                **geometry,
+                *args, python_mesh.Topology(faces, len(verts)), **geometry
             )
             assert_parity(rust, python)
             return rust
@@ -769,16 +737,10 @@ class TestFindOrganelles:
                 "normals": np.asarray(mesh.face_normals, dtype=np.float64),
             }
             rust = _rs.pre.pocket_organelles(
-                *args,
-                _rs.mesh.Topology(faces64, len(verts64)),
-                pre._svd_rows,
-                **geometry,
+                *args, _rs.mesh.Topology(faces64, len(verts64)), **geometry
             )
             python = python_pre.pocket_organelles(
-                *args,
-                python_mesh.Topology(faces64, len(verts64)),
-                pre._svd_rows,
-                **geometry,
+                *args, python_mesh.Topology(faces64, len(verts64)), **geometry
             )
             assert_parity(rust, python)
             pocket = rust[0]
@@ -872,7 +834,6 @@ class TestFindOrganelles:
             np.zeros(len(c), dtype=np.int64),
             0,
             np.asarray(mesh.face_adjacency, dtype=np.int64),
-            pre._svd_rows,
             5,
         )
         rust = _rs.pre.find_organelles(*args)
@@ -1385,6 +1346,59 @@ class TestParallelPatches:
 
 class TestPythonPath:
     """The ``mesh`` crate's Python twins compute what the Rust ones do."""
+
+    def test_a_degenerate_faces_outline_opens_nothing(self):
+        """A rim loop through collinear points — a zero-area face's outline —
+        encloses nothing, though its projection rounds to a speck (1.1e-12
+        here): an opening of that size once made a pocket of a flap."""
+        from skeliner.python import pre as python_pre
+
+        line = np.array(
+            [
+                [697724.0, 958735.0, 845926.0],
+                [697868.0, 958849.0, 845722.0],
+                [697964.0, 958925.0, 845586.0],
+            ]
+        )
+        square = np.array([[0.0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0]]) + 5e5
+        verts = np.vstack([line, square])
+        ring = [(0, 1), (1, 2), (0, 2)]
+        box = [(3, 4), (4, 5), (5, 6), (3, 6)]
+        assert python_pre.rim_enclosed_area(ring, verts) == 0.0
+        assert abs(python_pre.rim_enclosed_area(ring + box, verts) - 100.0) < 1e-9
+
+    def test_right_singular_vectors_are_numpys_up_to_signs(self):
+        """The fits' SVD: the same bits on both paths (no LAPACK), and numpy's
+        right singular vectors up to their signs wherever the singular values
+        part — rims nearly flat as a mouth's, and clouds of every scale."""
+        from skeliner.python import mesh as python_mesh
+
+        from ._parity import assert_parity
+
+        rng = np.random.default_rng(29)
+        compared = 0
+        for trial in range(160):
+            k = int(rng.choice([3, 4, 9, 40, 600, 9000]))
+            scale = 10.0 ** rng.uniform(-3, 5)
+            if trial % 4 == 0:  # a rim: a tilted, wobbly ring
+                t = np.linspace(0, 2 * np.pi, k, endpoint=False)
+                ring = np.c_[2 * np.cos(t), np.sin(t), 0.01 * rng.normal(size=k)]
+                x = ring @ np.linalg.qr(rng.normal(size=(3, 3)))[0] * scale
+            else:
+                x = rng.normal(size=(k, 3)) * rng.uniform(0.1, 5, 3) * scale
+            x = x - x.mean(axis=0) if trial % 3 else x  # centred, or not
+            rust = _rs.mesh.right_singular(x)
+            assert_parity(rust, python_mesh.right_singular(x))
+            _, sv, vt = np.linalg.svd(x)
+            for i in range(3):
+                gap = min(abs(sv[i] - sv[j]) for j in range(3) if j != i)
+                if gap > 1e-3 * sv[0]:
+                    assert abs(abs(rust[i] @ vt[i]) - 1) < 1e-10, (trial, i)
+                    compared += 1
+        assert compared > 300
+        for kernel in (_rs.mesh, python_mesh):
+            with pytest.raises(ValueError, match=r"expected \(X, 3\) array"):
+                kernel.right_singular(np.zeros((4, 2)))
 
     def test_topology(self, dirty_mesh, reference_mesh):
         from skeliner.python import mesh as python_mesh
