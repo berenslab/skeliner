@@ -423,51 +423,58 @@ fn pocket_arrays(
 
 /// `skeliner.pre.find_pocket_mouths` on arrays and the mesh's `topology`:
 /// each pocket's mouth edges, pockets in the order of their lowest face.
+/// `centers` and `normals` cast the rays that tell the faces looking into
+/// the cell.
 #[pyfunction]
 #[pyo3(signature = (
-    faces, vertices, areas, outward_dots, main_face_mask, topology,
-    *, min_pocket_size=5, min_fold_ratio=3.0, non_main_mask=None,
+    faces, vertices, outward_dots, main_face_mask, topology,
+    *, centers, normals, min_pocket_size=5, min_fold_ratio=3.0,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn pocket_mouths<'py>(
     py: Python<'py>,
     faces: PyReadonlyArray2<'py, i64>,
     vertices: PyReadonlyArray2<'py, f64>,
-    areas: numpy::PyReadonlyArray1<'py, f64>,
     outward_dots: numpy::PyReadonlyArray1<'py, f64>,
     main_face_mask: numpy::PyReadonlyArray1<'py, bool>,
     topology: PyRef<'py, crate::mesh::PyTopology>,
+    centers: PyReadonlyArray2<'py, f64>,
+    normals: PyReadonlyArray2<'py, f64>,
     min_pocket_size: usize,
     min_fold_ratio: f64,
-    non_main_mask: Option<numpy::PyReadonlyArray1<'py, bool>>,
 ) -> PyResult<Vec<Vec<(u32, u32)>>> {
     let topo = &topology.inner;
-    let (tris, verts, areas, dots, main, non_main) = pocket_arrays(
-        &faces,
-        &vertices,
-        areas,
-        outward_dots,
-        main_face_mask,
-        non_main_mask,
-        topo,
-    )?;
+    let verts = rows3("V", &vertices)?;
+    let (tris, _) = checked_faces(&faces, Some(verts.len()))?;
+    let nf = tris.len();
+    if topo.n_faces() != nf {
+        return Err(PyValueError::new_err("the topology is not of these faces"));
+    }
+    let dots = per_face(outward_dots, nf, "outward_dots")?;
+    let main = per_face(main_face_mask, nf, "main_face_mask")?;
     let params = ::pre::organelles::PocketParams {
         min_pocket_size,
         min_fold_ratio,
         ..Default::default()
     };
-    // the pocket kernels read no centres or normals
+    let (centers, normals) = (rows3("F", &centers)?, rows3("F", &normals)?);
+    if centers.len() != tris.len() || normals.len() != tris.len() {
+        return Err(PyValueError::new_err(
+            "centers and normals need one row per face",
+        ));
+    }
+    // the mouths read no areas
     let surface = ::pre::organelles::Surface {
         topo,
         faces: &tris,
         verts: &verts,
-        centers: &[],
-        normals: &[],
-        areas: &areas,
+        centers: &centers,
+        normals: &normals,
+        areas: &[],
         dots: &dots,
     };
-    let mouths = py
-        .detach(|| ::pre::organelles::pocket_mouths(&surface, &main, non_main.as_deref(), &params));
+    let inside = ::pre::organelles::Inside::new(&verts, &tris, &centers, &normals);
+    let mouths = py.detach(|| ::pre::organelles::pocket_mouths(&surface, &main, &params, &inside));
     Ok(mouths
         .into_iter()
         .map(|m| m.into_iter().map(|[a, b]| (a, b)).collect())
@@ -799,9 +806,11 @@ fn enclosure_pass<'py>(
 }
 
 /// `find_organelles`' last step on arrays: the faces reached from `seeds`
-/// across faces that look into the cell (a face's normal ray meets another
-/// face), over the faces' edge adjacency.
+/// across faces that look into a fold of the cell (a face's normal ray
+/// meets another face, and at most a `min_fold_ratio`-th of its view leaves
+/// the cell), over the faces' edge adjacency.
 #[pyfunction]
+#[pyo3(signature = (faces, vertices, centers, normals, seeds, min_fold_ratio=3.0))]
 fn grow_into_cell<'py>(
     py: Python<'py>,
     faces: PyReadonlyArray2<'py, i64>,
@@ -809,6 +818,7 @@ fn grow_into_cell<'py>(
     centers: PyReadonlyArray2<'py, f64>,
     normals: PyReadonlyArray2<'py, f64>,
     seeds: numpy::PyReadonlyArray1<'py, bool>,
+    min_fold_ratio: f64,
 ) -> PyResult<Bound<'py, PyArray1<bool>>> {
     let verts = rows3("V", &vertices)?;
     let (tris, _) = checked_faces(&faces, Some(verts.len()))?;
@@ -822,7 +832,7 @@ fn grow_into_cell<'py>(
     let grown = py.detach(|| {
         let topo = ::mesh::Topology::new(&tris, verts.len());
         let inside = ::pre::organelles::Inside::new(&verts, &tris, &centers, &normals);
-        ::pre::organelles::grow_into_cell(&topo, &seeds, &inside)
+        ::pre::organelles::grow_into_cell(&topo, &seeds, &inside, min_fold_ratio)
     });
     Ok(Array1::from(grown).into_pyarray(py))
 }

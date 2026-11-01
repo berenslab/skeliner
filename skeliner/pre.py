@@ -4011,24 +4011,27 @@ def find_pocket_mouths(
     min_fold_ratio: float = 3.0,
     verbose: bool = False,
     mesh_stats: MeshStats | None = None,
-    _non_main_mask: np.ndarray | None = None,
 ) -> list[list[tuple[int, int]]]:
-    """Find mouth edges — boundaries of negative-dot face clusters.
+    """Find mouth edges — boundaries of the negative-dot face clusters that
+    seed pockets.
 
     .. deprecated::
         Neither the pipeline nor the viewer uses it; it will be removed.
 
-    A valid pocket must satisfy:
-
-    1. Multiple boundary loops (not a flat patch with a single outline).
-    2. Fold ratio > *min_fold_ratio*: the pocket surface area must be
-       much larger than the mouth's enclosed planar area, indicating the
-       surface folds inward through a small opening.
+    A cluster of at least *min_pocket_size* negative-dot faces seeds a
+    pocket when it folds into the cell: at most a *min_fold_ratio*-th of
+    its faces' view, cast as rays weighted by cosine about each face's
+    normal, leaves the cell.  On a spherical cap that share is the inverse
+    of the cap's fold ratio (its area over its mouth's) from anywhere on
+    it; with 3 the cap is folded past 109.47°.  An organelle's wall,
+    however broken into concave clusters, sees the organelle around it; a
+    groove or crevice of the outer membrane sees the outside along it.
 
     Returns
     -------
     list[list[tuple[int, int]]]
-        One list of edges per pocket mouth.
+        One list of edges per pocket mouth, sorted; pockets in the order of
+        their lowest face.
     """
 
     if mesh_stats is not None and mesh_stats.outward_dots is not None:
@@ -4051,13 +4054,13 @@ def find_pocket_mouths(
     return kernels.pre.pocket_mouths(
         faces,
         np.asarray(mesh.vertices, dtype=np.float64),
-        np.asarray(mesh.area_faces, dtype=np.float64),
         np.asarray(outward_dots, dtype=np.float64),
         np.asarray(main_face_mask, dtype=bool),
         kernels.mesh.Topology(faces, len(mesh.vertices)),
+        centers=np.asarray(mesh.triangles_center, dtype=np.float64),
+        normals=np.asarray(mesh.face_normals, dtype=np.float64),
         min_pocket_size=min_pocket_size,
         min_fold_ratio=min_fold_ratio,
-        non_main_mask=_non_main_mask,
     )
 
 
@@ -4092,7 +4095,9 @@ def find_pocket_organelles(
 
     Uses mouths (boundaries of negative-dot clusters) as seeds:
 
-    1. Call :func:`find_pocket_mouths` to get mouth edges for each pocket.
+    1. Call :func:`find_pocket_mouths` to get mouth edges for each pocket:
+       the clusters that fold into the cell, at most a *min_fold_ratio*-th
+       of their view leaving it.
     2. Seed from the **negative-dot faces** of each mouth's pocket cluster.
     3. Flood-fill from seeds, stopping at mouth edges and faces with
        ``outward_dot > grow_threshold``.
@@ -4132,6 +4137,13 @@ def find_pocket_organelles(
         must be pocket faces for the hole to be filled.
     min_pocket_size : int
         Minimum negative-face cluster size to produce a mouth / be detected.
+    min_fold_ratio : float
+        A cluster folds into the cell when at most a *min_fold_ratio*-th of
+        its view (cosine-weighted rays) leaves it — on a spherical cap the
+        inverse of its area over its mouth's; with 3, a cap folded past
+        109.47°, where half its faces look across it at the cap.  Also the
+        shallow-dip check's ratio of a pocket's area to the faces ringing
+        it.
     min_cluster_size : int
         Final pocket clusters smaller than this are discarded.
     verbose : bool
@@ -4272,10 +4284,13 @@ def find_organelles(
     Returns an :class:`~skeliner.dataclass.Organelles` with two
     non-overlapping masks:
 
-    * **pocket** — membrane folds connected to the neuron surface,
-      detected via gradient-based mouth finding + flood-fill, then grown
-      on across every face that looks into the cell (its normal ray meets
-      another face), which the outer membrane, looking out, stops.
+    * **pocket** — membrane folds connected to the neuron surface: the
+      negative-dot clusters that fold into the cell (at most a third of
+      their view, rays weighted by cosine about the normals, leaves it),
+      flood-filled, then grown on across every face that looks into a fold
+      of the cell — its normal ray meets another face and at most a third
+      of its view leaves the cell — which the outer membrane stops, looking
+      out or, in a crevice, seeing the outside along it.
     * **isolated** — entire vertex-disconnected components whose
       mean outward dot is negative (fully enclosed fragments).
 
