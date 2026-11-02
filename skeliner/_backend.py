@@ -6,6 +6,9 @@ result: in Rust (``skeliner/rust/<module>/``, loaded as
 which reads like the algorithm and runs on its own. The public modules
 (``sk.pre``, ``sk.post``, …) turn meshes and skeletons into arrays, call the
 active path's function through :data:`kernels`, and turn the result back.
+
+Functions written since the Rust core is the fast one (``pre.fill_holes``)
+are Rust only: the Python path runs them in Rust too.
 """
 
 from __future__ import annotations
@@ -69,20 +72,29 @@ class backend:
 
 class _Module:
     """One module's functions on the active path. On the Rust path a
-    function the Rust core does not have yet is the Python path's."""
+    function the Rust core does not have yet is the Python path's; on the
+    Python path one it has no twin of is the Rust core's."""
 
     def __init__(self, name: str):
         self._name = name
 
     def __getattr__(self, function: str):
         if _active == "rust":
-            from skeliner import _rs
-
-            found = getattr(getattr(_rs, self._name, None), function, None)
+            found = self._rust(function)
             if found is not None:
                 return found
         python = importlib.import_module(f"skeliner.python.{self._name}")
-        return getattr(python, function)
+        found = getattr(python, function, None)
+        if found is None:
+            found = self._rust(function)
+        if found is None:
+            raise AttributeError(f"no {self._name}.{function} on either path")
+        return found
+
+    def _rust(self, function: str):
+        from skeliner import _rs
+
+        return getattr(getattr(_rs, self._name, None), function, None)
 
 
 class _Kernels:

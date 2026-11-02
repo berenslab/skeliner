@@ -6,6 +6,7 @@ pub mod breakup;
 pub mod compact;
 pub mod components;
 pub mod disconnected;
+pub mod fill;
 pub mod find_gaps;
 pub mod fusions;
 pub mod gaps;

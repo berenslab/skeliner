@@ -43,3 +43,13 @@ def test_a_function_without_rust_twin_runs_on_the_python_path(monkeypatch):
 
     monkeypatch.setattr(python_dx, "only_in_python", lambda: "python", raising=False)
     assert kernels.dx.only_in_python() == "python"
+
+
+def test_a_function_with_no_python_twin_runs_in_rust_on_both_paths():
+    from skeliner import _rs
+
+    assert kernels.pre.fill_holes is _rs.pre.fill_holes
+    with sk.backend("python"):
+        assert kernels.pre.fill_holes is _rs.pre.fill_holes
+        with pytest.raises(AttributeError, match="either path"):
+            kernels.pre.no_such_function  # noqa: B018

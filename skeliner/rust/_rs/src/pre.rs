@@ -1486,8 +1486,73 @@ impl PyZScan {
     }
 }
 
+/// What [`fill_holes`] hands back: every vertex (the lips' moved, the
+/// patches' appended), the patches' faces, and the counts.
+type FilledOut<'py> = (
+    Bound<'py, PyArray2<f64>>,
+    Bound<'py, PyArray2<i64>>,
+    Bound<'py, PyDict>,
+);
+
+/// `skeliner.pre.fill_holes` on arrays: the holes in the surface — the
+/// usable faces not `organelle` (one flag per face, or fewer: the faces
+/// after them are none) — patched with triangles about `median_edge` long
+/// and faired with their lips; loops a `soma_verts` vertex touches stay
+/// open.
+#[pyfunction]
+fn fill_holes<'py>(
+    py: Python<'py>,
+    faces: PyReadonlyArray2<'py, i64>,
+    vertices: PyReadonlyArray2<'py, f64>,
+    organelle: numpy::PyReadonlyArray1<'py, bool>,
+    soma_verts: numpy::PyReadonlyArray1<'py, i64>,
+    median_edge: f64,
+) -> PyResult<FilledOut<'py>> {
+    use ::pre::fill::Decision;
+    let verts = rows3("V", &vertices)?;
+    let (tris, nv) = checked_faces(&faces, Some(verts.len()))?;
+    let organelle = organelle.as_array().to_vec();
+    if organelle.len() > tris.len() {
+        return Err(PyValueError::new_err(
+            "organelle has more flags than there are faces",
+        ));
+    }
+    let mut soma = vec![false; nv];
+    for &v in soma_verts.as_array() {
+        let i = usize::try_from(v)
+            .ok()
+            .filter(|&i| i < nv)
+            .ok_or_else(|| PyValueError::new_err(format!("vertex index {v} is out of range")))?;
+        soma[i] = true;
+    }
+    let done = py.detach(|| ::pre::fill::fill_holes(&verts, &tris, &organelle, &soma, median_edge));
+    let count = |d: Decision| done.holes.iter().filter(|h| h.decision == d).count();
+    let tally = counts(
+        py,
+        &[
+            ("loops", done.holes.len()),
+            ("filled", count(Decision::Filled)),
+            ("off_body", count(Decision::OffBody)),
+            ("soma", count(Decision::Soma)),
+            ("non_manifold", count(Decision::NonManifold)),
+            ("tube_end", count(Decision::TubeEnd)),
+            ("untriangulable", count(Decision::Untriangulable)),
+            ("new_faces", done.faces.len()),
+            ("new_vertices", done.verts.len() - nv),
+            ("moved", done.n_moved),
+        ],
+    )?;
+    let out: Vec<[i64; 3]> = done.faces.iter().map(|f| f.map(i64::from)).collect();
+    Ok((
+        rows_to_array(&done.verts).into_pyarray(py),
+        rows_to_array(&out).into_pyarray(py),
+        tally,
+    ))
+}
+
 /// Add this module's functions and classes to `m`.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(fill_holes, m)?)?;
     m.add_function(wrap_pyfunction!(face_edge_components, m)?)?;
     m.add_function(wrap_pyfunction!(face_components, m)?)?;
     m.add_function(wrap_pyfunction!(refine_components_with_fusions, m)?)?;

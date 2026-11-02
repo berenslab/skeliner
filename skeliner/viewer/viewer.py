@@ -2560,43 +2560,6 @@ def _create_app(
             }
         )
 
-    async def do_fill_holes(request):
-        """Fill holes in the mesh."""
-        if mesh_state["mesh"] is None:
-            return JSONResponse(
-                {"ok": False, "error": "No mesh loaded"}, status_code=400
-            )
-        from skeliner.pre import fill_holes
-
-        method = request.query_params.get("method", "advancing_front")
-        dome_factor = float(request.query_params.get("dome_factor", "0.5"))
-
-        mesh = mesh_state["mesh"]
-        n_before = len(mesh.faces)
-        cached_holes = mesh_state.get("hole_loops")
-        new_mesh = await _run_with_log(
-            fill_holes,
-            mesh,
-            holes=cached_holes,
-            method=method,
-            dome_factor=dome_factor,
-            verbose=True,
-        )
-        n_after = len(new_mesh.faces)
-
-        await _apply_new_mesh(new_mesh)
-        await _clear_annotations("hole ")
-        await _log(
-            f"Fill holes: {n_before:,} → {n_after:,} faces ({n_after - n_before:,} added)"
-        )
-        return JSONResponse(
-            {
-                "ok": True,
-                "facesBefore": n_before,
-                "facesAfter": n_after,
-            }
-        )
-
     async def do_merge_selected(request):
         """Merge two components by stitching boundary loops of selected faces."""
         if mesh_state["mesh"] is None:
@@ -3047,6 +3010,7 @@ def _create_app(
             preprocess,
             mesh,
             organelles=bool(body.get("organelles", True)),
+            fill=bool(body.get("fill", True)),
             soma=mesh_state["soma"] if mesh_state["soma_by_hand"] else None,
             rescued=mesh_state["rescued"],
             released=mesh_state["released"],
@@ -5207,7 +5171,6 @@ def _create_app(
             Route("/detect_gaps", detect_gaps, methods=["POST"]),
             Route("/remove_gaps", do_remove_gaps, methods=["POST"]),
             Route("/remove_fragments", do_remove_fragments, methods=["POST"]),
-            Route("/fill_holes", do_fill_holes, methods=["POST"]),
             Route("/merge_selected", do_merge_selected, methods=["POST"]),
             Route("/remove_selected", do_remove_selected, methods=["POST"]),
             Route("/rescue_as_neurite", do_rescue_as_neurite, methods=["POST"]),

@@ -11,9 +11,11 @@ import numpy as np
 import pytest
 import trimesh
 
+import skeliner as sk
 from skeliner import pre
 from skeliner.dataclass import (
     Discarded,
+    Mesh,
     MeshComponents,
     Neurites,
     Organelles,
@@ -274,28 +276,85 @@ class TestFindHoles:
                 assert 0 <= vid < len(mesh.vertices)
 
 
-@deprecated
+def _tube_with_a_pocket(around=63, rings=30, radius=10.0):
+    """A tube round the z axis, edges about 1 long, faces wound outwards,
+    open at both ends; on its side a pocket: the faces in a window of it
+    are organelle, the vertices only they use pushed 3 in."""
+    j, i = np.meshgrid(np.arange(rings), np.arange(around), indexing="ij")
+    t = 2 * np.pi * (i + 0.5 * (j % 2)) / around
+    verts = np.c_[radius * np.cos(t).ravel(), radius * np.sin(t).ravel(), j.ravel()]
+    faces = []
+    for jj in range(rings - 1):
+        for ii in range(around):
+            a, b = jj * around + ii, jj * around + (ii + 1) % around
+            c, d = a + around, b + around
+            if jj % 2 == 0:
+                faces += [[a, b, c], [b, d, c]]
+            else:
+                faces += [[a, b, d], [a, d, c]]
+    faces = np.array(faces)
+    centre = verts[faces].mean(axis=1)
+    pocket = (np.abs(np.arctan2(centre[:, 1], centre[:, 0])) < 0.35) & (
+        np.abs(centre[:, 2] - rings / 2) < 3
+    )
+    inner = np.setdiff1d(faces[pocket], faces[~pocket])
+    verts[inner, :2] *= 1 - 3 / radius
+    z = np.zeros(len(faces), dtype=bool)
+    org = Organelles(pocket=pocket, isolated=z.copy(), expanded=z.copy())
+    return Mesh(verts, faces), org
+
+
+def _open_edges(faces) -> int:
+    """Edges of *faces* that only one of them has."""
+    e = np.sort(np.asarray(faces)[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+    _, n = np.unique(e, axis=0, return_counts=True)
+    return int((n == 1).sum())
+
+
 class TestFillHoles:
-    @pytest.mark.parametrize("method", ["advancing_front", "dome"])
-    def test_fill_reduces_holes(self, method):
-        mesh = _open_mesh(n_remove=3)
-        holes_before = pre.find_holes(mesh)
-        assert len(holes_before) > 0
+    def test_a_pocket_mouth_is_patched_on_the_tube(self):
+        mesh, org = _tube_with_a_pocket()
+        n = len(mesh.faces)
+        out = pre.fill_holes(mesh, organelles=org)
+        # the input's ids name what they did
+        assert np.array_equal(out.faces[:n], mesh.faces)
+        new = out.faces[n:]
+        assert len(new) > 0
+        # closed but for the tube's two ends, 63 edges round each
+        assert _open_edges(np.r_[mesh.faces[~org.pocket], new]) == 2 * 63
+        # on the tube, not across it: a flat lid's middle would lie 0.6 in
+        added = out.vertices[len(mesh.vertices) :]
+        assert len(added) > 0
+        assert np.abs(np.hypot(added[:, 0], added[:, 1]) - 10.0).max() < 0.2
 
-        filled = pre.fill_holes(mesh, method=method)
-        holes_after = pre.find_holes(filled)
-        assert len(holes_after) < len(holes_before)
+    def test_mesh_stats_keep_up(self):
+        mesh, org = _tube_with_a_pocket()
+        stats = pre.compute_mesh_stats(mesh)
+        out = pre.fill_holes(mesh, organelles=org, mesh_stats=stats)
+        assert len(stats.outward_dots) == len(out.faces)
 
-    def test_fill_watertight_is_noop(self):
-        mesh = _icosphere()
-        result = pre.fill_holes(mesh)
-        # Should return the same mesh (no holes to fill)
-        assert len(result.faces) == len(mesh.faces)
+    def test_the_python_path_runs_it_in_rust(self):
+        mesh, org = _tube_with_a_pocket()
+        rust = pre.fill_holes(mesh, organelles=org)
+        with sk.backend("python"):
+            python = pre.fill_holes(mesh, organelles=org)
+        assert np.array_equal(rust.faces, python.faces)
+        assert np.array_equal(rust.vertices, python.vertices)
 
-    def test_invalid_method_raises(self):
-        mesh = _open_mesh()
-        with pytest.raises(ValueError, match="Unknown method"):
-            pre.fill_holes(mesh, method="nonexistent")
+    def test_a_hole_the_soma_touches_stays_open(self):
+        mesh, org = _tube_with_a_pocket()
+        rim = np.intersect1d(mesh.faces[org.pocket], mesh.faces[~org.pocket])
+        soma = Soma.from_sphere(np.zeros(3), 1.0, verts=rim[:1])
+        out = pre.fill_holes(mesh, organelles=org, soma=soma)
+        assert len(out.faces) == len(mesh.faces)
+        assert np.array_equal(out.vertices, mesh.vertices)
+
+    def test_preprocess_fills_unless_told_not_to(self, monkeypatch):
+        mesh, org = _tube_with_a_pocket()
+        monkeypatch.setattr(pre, "find_organelles", lambda *_a, **_k: org)
+        filled, _ = pre.preprocess(mesh)
+        kept, _ = pre.preprocess(mesh, fill=False)
+        assert len(filled.faces) > len(kept.faces) == len(mesh.faces)
 
 
 # ── find_fragments / remove_fragments ────────────────────────────────
@@ -919,7 +978,6 @@ class TestFindSoma:
     "name, instead",
     [
         ("find_holes", None),
-        ("fill_holes", None),
         ("find_fragments", None),
         ("remove_fragments", None),
         ("remove_islands", None),
@@ -1085,35 +1143,6 @@ class TestRemoveFusions:
         clean = pre.remove_fusions(mesh, radius=50.0)
         # Should still have the same number of faces (no fusions to remove)
         assert len(clean.faces) == len(mesh.faces)
-
-
-# ── _ear_clip_2d ─────────────────────────────────────────────────────
-
-
-class TestEarClip2D:
-    def test_triangle(self):
-        pts = np.array([[0, 0], [1, 0], [0.5, 1]], dtype=np.float64)
-        tris = pre._ear_clip_2d(pts)
-        assert len(tris) == 1
-        assert set(tris[0]) == {0, 1, 2}
-
-    def test_square(self):
-        pts = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float64)
-        tris = pre._ear_clip_2d(pts)
-        assert len(tris) == 2
-        # Each triangle should use 3 vertices from 0..3
-        all_verts = set()
-        for t in tris:
-            assert len(t) == 3
-            all_verts.update(t)
-        assert all_verts == {0, 1, 2, 3}
-
-    def test_convex_pentagon(self):
-        angles = np.linspace(0, 2 * np.pi, 5, endpoint=False)
-        pts = np.stack([np.cos(angles), np.sin(angles)], axis=1)
-        tris = pre._ear_clip_2d(pts)
-        # n-2 triangles for a convex polygon
-        assert len(tris) == 3
 
 
 # ── _filter_small_clusters ───────────────────────────────────────────
@@ -1873,6 +1902,17 @@ class TestRealMesh:
         mask = pre.find_fragments(reference_mesh)
         assert mask.shape == (len(reference_mesh.faces),)
         assert mask.dtype == bool
+
+    def test_fill_holes_appends_and_keeps_every_id(self, reference_mesh):
+        org = pre.find_organelles(reference_mesh)
+        out = pre.fill_holes(reference_mesh, organelles=org)
+        n, nv = len(reference_mesh.faces), len(reference_mesh.vertices)
+        assert np.array_equal(out.faces[:n], reference_mesh.faces)
+        assert len(out.faces) > n, "fixture must have a hole to patch"
+        assert out.faces[n:].max() < len(out.vertices)
+        # a moved vertex moves by about an edge, not across the cell
+        moved = np.linalg.norm(out.vertices[:nv] - reference_mesh.vertices, axis=1)
+        assert moved.max() < 10 * pre._median_edge(reference_mesh)
 
     def test_find_disconnected_returns_list(self, reference_mesh):
         comps = pre.find_disconnected(reference_mesh)

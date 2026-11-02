@@ -821,6 +821,25 @@ def test_preprocess_runs_without_organelles_when_asked(rescue_client, monkeypatc
     assert seen["organelles"] is True
 
 
+def test_preprocess_fills_holes_unless_switched_off(rescue_client, monkeypatch):
+    """The Run button's fill switch reaches preprocess, on by default."""
+    from skeliner import pre
+
+    client, _, _ = rescue_client
+    seen = {}
+    run = pre.preprocess
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(pre, "preprocess", spy)
+    assert client.post("/preprocess", json={"fill": False}).status_code == 200
+    assert seen["fill"] is False
+    assert client.post("/preprocess").status_code == 200
+    assert seen["fill"] is True
+
+
 def test_break_runs_without_detected_organelles(rescue_client):
     """None detected is none there, not a step left out."""
     client, state, _ = rescue_client
