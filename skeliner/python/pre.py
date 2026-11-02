@@ -14,7 +14,6 @@ from .mesh import (
     checked_faces,
     edge_to_faces,
     face_adjacency,
-    hull_measures,
     nearest,
     non_degenerate,
     right_singular,
@@ -966,222 +965,94 @@ def find_disconnected(
     )
 
 
-def rim_enclosed_area(boundary_edges, vertices) -> float:
-    """Total planar area enclosed by the closed loops among *boundary_edges*:
-    each loop projected onto its best-fit plane (its first two right-singular
-    vectors, :func:`~skeliner.python.mesh.right_singular`), its area by the
-    shoelace formula; a piece that is not one closed loop counts nothing,
-    nor does a loop whose sum is within the rounding of its *n* points
-    (``4 n ε R²``, *R* the farthest from their mean) — a degenerate face's
-    collinear outline."""
-    if not boundary_edges:
-        return 0.0
+def _folds_in(cluster, inside, min_fold_ratio) -> bool:
+    """Does the cluster of faces *cluster* fold into the cell: does at most
+    a *min_fold_ratio*-th of its faces' view leave the cell
+    (:meth:`_Inside.escaped`)?  On a spherical cap folded to θ the
+    cosine-weighted share leaving through the mouth is (1 + cos θ) / 2 from
+    anywhere on it, the inverse of its fold ratio 2 / (1 + cos θ); at 3,
+    θ = 109.47°.  Sampled at the view's own resolution: at most as many of
+    its faces as the view has directions, evenly spaced in ascending order."""
+    faces = np.sort(np.asarray(cluster, dtype=np.intp))
+    m = min(len(faces), len(VIEW))
+    picked = faces[[i * len(faces) // m for i in range(m)]]
+    open_ = int(inside.escaped(picked).sum())
+    return open_ * min_fold_ratio <= m * len(VIEW)
 
-    vert_to_be: dict[int, list[int]] = defaultdict(list)
-    for i, e in enumerate(boundary_edges):
-        vert_to_be[e[0]].append(i)
-        vert_to_be[e[1]].append(i)
 
-    visited: set[int] = set()
-    total_area = 0.0
-
-    for start in range(len(boundary_edges)):
-        if start in visited:
+def _pocket_mouths(
+    faces,
+    outward_dots,
+    main_face_mask,
+    topology: Topology,
+    inside,
+    *,
+    min_pocket_size,
+    min_fold_ratio,
+) -> list[list[tuple[int, int]]]:
+    """:func:`pocket_mouths` with its rays' :class:`_Inside` given."""
+    faces = np.asarray(faces)
+    main = np.asarray(main_face_mask, dtype=bool)
+    neg = (np.asarray(outward_dots) < 0) & main
+    label, sizes = _mask_components(neg, topology.face_adjacency())
+    order = np.argsort(label, kind="stable")
+    bounds = np.searchsorted(label[order], np.arange(len(sizes) + 1))
+    mouths = []
+    for k in range(len(sizes)):
+        cluster = order[bounds[k] : bounds[k + 1]]
+        if len(cluster) < min_pocket_size or not _folds_in(
+            cluster, inside, min_fold_ratio
+        ):
             continue
-        comp: list[int] = []
-        queue = deque([start])
-        while queue:
-            ei = queue.popleft()
-            if ei in visited:
-                continue
-            visited.add(ei)
-            comp.append(ei)
-            for v in boundary_edges[ei]:
-                for nei in vert_to_be[v]:
-                    if nei not in visited:
-                        queue.append(nei)
-
-        # Check closed ring
-        vcount: dict[int, int] = defaultdict(int)
-        for ei in comp:
-            for v in boundary_edges[ei]:
-                vcount[v] += 1
-        if not all(c == 2 for c in vcount.values()):
-            continue
-
-        # Order vertices into a loop
-        edge_list = [boundary_edges[ei] for ei in comp]
-        adj_v: dict[int, list[int]] = defaultdict(list)
-        for a, b in edge_list:
-            adj_v[a].append(b)
-            adj_v[b].append(a)
-
-        ordered = [edge_list[0][0]]
-        while len(ordered) < len(edge_list):
-            curr = ordered[-1]
-            prev = ordered[-2] if len(ordered) > 1 else -1
-            for nb in adj_v[curr]:
-                if nb != prev:
-                    ordered.append(nb)
-                    break
-            else:
-                break
-
-        if len(ordered) < 3:
-            continue
-
-        # Project onto best-fit plane and compute area
-        pts = vertices[ordered]
-        centroid = pts.mean(axis=0)
-        centered = pts - centroid
-        vh = right_singular(centered)
-        u_ax, v_ax = vh[0], vh[1]
-        pts_2d = np.column_stack([centered @ u_ax, centered @ v_ax])
-        x, y = pts_2d[:, 0], pts_2d[:, 1]
-        s = np.sum(x[:-1] * y[1:] - x[1:] * y[:-1]) + x[-1] * y[0] - x[0] * y[-1]
-        # within the rounding of its points (two projected coordinates in each
-        # of n terms): a degenerate face's outline, which encloses nothing
-        r2 = max(float((centered * centered).sum(axis=1).max()), 0.0)
-        if abs(s) <= 4.0 * len(ordered) * _EPS * r2:
-            continue
-        total_area += 0.5 * abs(s)
-
-    return total_area
-
-
-def opening_hull_area(pts) -> float:
-    """``find_pocket_mouths``' opening when no rim loop closes: the
-    convex-hull area of *pts* centred on their mean, on the plane of their
-    first two right-singular vectors (:func:`~skeliner.python.mesh.
-    right_singular`) — 0 where
-    qhull, which scipy's ``ConvexHull`` ran, refuses them as flat
-    (:func:`~skeliner.python.mesh.hull_measures`)."""
-    pts = np.asarray(pts, dtype=np.float64)
-    total = np.zeros(3)
-    for p in pts:
-        total = total + p
-    centred = pts - total / len(pts)
-    vt = right_singular(centred)
-    plane = np.c_[
-        centred[:, 0] * vt[0][0] + centred[:, 1] * vt[0][1] + centred[:, 2] * vt[0][2],
-        centred[:, 0] * vt[1][0] + centred[:, 1] * vt[1][1] + centred[:, 2] * vt[1][2],
-    ]
-    return hull_measures(plane)[0]
+        edges = set()
+        for f in cluster.tolist():
+            a, b, d = (int(v) for v in faces[f])
+            for u, v in ((a, b), (b, d), (d, a)):
+                on = topology.get((min(u, v), max(u, v)))
+                if (
+                    on is not None
+                    and len(on) == 2
+                    and not (label[on[0]] == k and label[on[1]] == k)
+                ):
+                    edges.add((min(u, v), max(u, v)))
+        if edges:
+            mouths.append(sorted(edges))
+    return mouths
 
 
 def pocket_mouths(
     faces,
     vertices,
-    areas,
     outward_dots,
     main_face_mask,
     topology: Topology,
     *,
+    centers,
+    normals,
     min_pocket_size: int = 5,
     min_fold_ratio: float = 3.0,
-    non_main_mask=None,
 ) -> list[list[tuple[int, int]]]:
-    """Mouth edges — the boundaries of negative-dot face clusters on the
-    faces of *main_face_mask* — one list per pocket, pockets in the order of
-    their lowest face, each cluster walked breadth first from it with every
-    face's neighbours ascending.
+    """Mouth edges — the boundary edges (with one face beyond, sorted) of
+    each cluster of negative-dot faces on *main_face_mask* with at least
+    *min_pocket_size* faces that folds into the cell (:func:`_folds_in`);
+    clusters in order of their lowest face.  *vertices*, *centers* and
+    *normals* cast the rays.
 
-    A valid pocket must satisfy:
-
-    1. Multiple boundary loops (not a flat patch with a single outline).
-    2. Fold ratio > *min_fold_ratio*: the pocket surface area must be
-       much larger than the mouth's enclosed planar area, indicating the
-       surface folds inward through a small opening.
-
-    When no rim loop closes, the opening is :func:`opening_area`.
+    A cluster's own outline is no mouth: an organelle's wall breaks into
+    many concave pieces, each shallow by itself, while a groove or crevice
+    of the outer membrane is concave too.  The rays see the aperture itself:
+    a crevice open along its length sees the outside, an organelle's wall
+    sees the organelle around it.
     """
-    faces_arr = np.asarray(faces)
-    area_arr = np.asarray(areas)
-    verts_arr = np.asarray(vertices)
-    edge_to_face = topology
-    adj = topology.face_adjacency()
-
-    # Connected components of negative-dot faces on main component
-    neg = (np.asarray(outward_dots) < 0) & np.asarray(main_face_mask)
-    seen = np.zeros(len(faces_arr), dtype=bool)
-    clusters: list[list[int]] = []
-    for fi in np.flatnonzero(neg).tolist():
-        if seen[fi]:
-            continue
-        seen[fi] = True
-        cluster: list[int] = []
-        queue = deque([fi])
-        while queue:
-            curr = queue.popleft()
-            cluster.append(curr)
-            for nfi in sorted(adj.get(curr, set())):
-                if neg[nfi] and not seen[nfi]:
-                    seen[nfi] = True
-                    queue.append(nfi)
-        clusters.append(cluster)
-
-    # For each cluster, collect boundary edges and count boundary loops.
-    # A real pocket has multiple boundary loops (multiple openings).
-    # A flat concave patch has exactly one boundary loop — not a pocket.
-    mouths: list[list[tuple[int, int]]] = []
-    for cluster in clusters:
-        if len(cluster) < min_pocket_size:
-            continue
-        cset = set(cluster)
-        boundary_edges: list[tuple[int, int]] = []
-        seen_edges: set[tuple[int, int]] = set()
-        for fi in cluster:
-            f = faces_arr[fi]
-            for i in range(3):
-                e = (
-                    min(int(f[i]), int(f[(i + 1) % 3])),
-                    max(int(f[i]), int(f[(i + 1) % 3])),
-                )
-                if e in seen_edges:
-                    continue
-                seen_edges.add(e)
-                faces_on_edge = edge_to_face[e]
-                if len(faces_on_edge) == 2:
-                    other = (
-                        faces_on_edge[1]
-                        if faces_on_edge[0] in cset
-                        else faces_on_edge[0]
-                    )
-                    if other not in cset:
-                        boundary_edges.append(e)
-        if not boundary_edges:
-            continue
-
-        # Fold ratio: pocket surface area / mouth enclosed planar area.
-        # A real pocket folds inward through a small opening (high ratio).
-        # A flat patch has ratio near 1.
-        pocket_area = float(area_arr[np.sort(cluster)].sum())
-        opening_area = rim_enclosed_area(boundary_edges, verts_arr)
-        if opening_area <= 0:
-            # Boundary loops with non-manifold junctions (vertex
-            # shared by 4+ boundary edges) get discarded by
-            # rim_enclosed_area.  Fall back to the convex hull of
-            # boundary vertices: its area >= true opening area, so
-            # pocket_area / hull area is a *lower bound* on the true
-            # fold ratio — this can only recover missed mouths, never
-            # reject valid ones.
-            # Only apply on the main component — small disconnected
-            # components have degenerate boundary topology that
-            # produces false positives.
-            on_non_main = non_main_mask is not None and non_main_mask[cluster[0]]
-            if not on_non_main:
-                bverts = sorted({v for e in boundary_edges for v in e})
-                if len(bverts) >= 3:
-                    opening_area = opening_hull_area(verts_arr[bverts])
-            if opening_area <= 0:
-                continue
-        fold_ratio = pocket_area / opening_area
-        if fold_ratio < min_fold_ratio:
-            continue
-
-        mouths.append(boundary_edges)
-
-    return mouths
+    return _pocket_mouths(
+        faces,
+        outward_dots,
+        main_face_mask,
+        topology,
+        _Inside(vertices, faces, centers, normals),
+        min_pocket_size=min_pocket_size,
+        min_fold_ratio=min_fold_ratio,
+    )
 
 
 def pocket_organelles(
@@ -1233,16 +1104,15 @@ def pocket_organelles(
     }
     edge_to_face = topology
     adj = topology.face_adjacency()
-    mouths = pocket_mouths(
+    inside = _Inside(vertices, faces, centers, normals)
+    mouths = _pocket_mouths(
         faces,
-        vertices,
-        areas,
         outward_dots,
         main_face_mask,
         topology,
+        inside,
         min_pocket_size=min_pocket_size,
         min_fold_ratio=min_fold_ratio,
-        non_main_mask=non_main_mask,
     )
     if not mouths:
         return np.zeros(n_faces, dtype=bool), counts
@@ -1324,7 +1194,6 @@ def pocket_organelles(
     np_visited: set[int] = set()
     hole_count = 0
     wall_of, wall_size = _mask_components(pocket, adj)
-    inside = _Inside(vertices, faces, centers, normals)
 
     for fi in non_pocket_idx:
         if fi in np_visited:
@@ -1450,6 +1319,31 @@ def _mask_components(
 #: face lying in an opening's plane does not look through it.
 FAN_CLEARANCE = 1e-6
 
+#: A face's view of the cell, sampled evenly by cosine weight: a Fibonacci
+#: spiral over the unit disc lifted onto the hemisphere about +z (Malley's
+#: method), each direction carrying the same share of the light a diffuse
+#: face would receive; the Rust kernel's ``VIEW``, digit for digit.
+VIEW = np.array(
+    [
+        [0.1767766952966369, 0.0, 0.9842509842514764],
+        [-0.225772187937548, 0.20682581839289915, 0.9519716382329886],
+        [0.03455805202455909, -0.39377117852919086, 0.9185586535436918],
+        [0.28457121982273553, 0.37117276415249045, 0.8838834764831844],
+        [-0.5222231872442845, -0.09237392870513249, 0.8477912478906585],
+        [0.4946953915278165, -0.3146847145972304, 0.8100925873009825],
+        [-0.16546592706317265, 0.6155250011016001, 0.770551750371122],
+        [-0.31556146793512924, -0.6075944041501916, 0.7288689868556626],
+        [0.6846421615837075, 0.25003021933756037, 0.6846531968814576],
+        [-0.7122560862297537, 0.294008958415681, 0.6373774391990982],
+        [0.34335449874552143, -0.7337286202617503, 0.5863019699779287],
+        [0.2537302409112575, 0.8089319902483244, 0.5303300858899106],
+        [-0.7647458919689066, -0.4431858760347419, 0.46770717334674256],
+        [0.897133983572641, -0.19723238962980807, 0.39528470752104744],
+        [-0.5475069048541611, 0.7787722318733614, 0.30618621784789707],
+        [-0.12648677292149527, -0.9760896968393356, 0.1767766952966369],
+    ]
+)
+
 
 class _Inside:
     """Whether a piece of the surface lies inside the cell: more than half
@@ -1471,6 +1365,8 @@ class _Inside:
         self._normals = np.asarray(normals, dtype=np.float64)
         self._tree = None
         self._fans = None
+        # per face: 0 not asked yet, 1 looks in, 2 looks out
+        self._looks = np.zeros(len(self._faces), dtype=np.int8)
 
     def _probe(self) -> None:
         """Build the faces' tree, and the tree of a fan to its centroid over
@@ -1518,19 +1414,85 @@ class _Inside:
 
     def looks_in(self, faces) -> np.ndarray:
         """Per face of *faces*: does its normal ray meet another face, or an
-        opening's fan?"""
+        opening's fan?  Each face's answer is kept once found."""
+        faces = np.asarray(faces, dtype=np.intp)
+        todo = np.unique(faces[self._looks[faces] == 0])
+        if len(todo):
+            self._looks[todo] = np.where(self._cast(todo, self._normals[todo]), 1, 2)
+        return self._looks[faces] == 1
+
+    def escaped(self, faces) -> np.ndarray:
+        """Per face of *faces*: how many of the :data:`VIEW` directions from
+        its centre over its outer side (the view turned so +z is its normal)
+        leave the cell — meet neither another face nor an opening's fan.  A
+        face with no normal sees all of them leave."""
+        faces = np.asarray(faces, dtype=np.intp)
+        out = np.full(len(faces), len(VIEW), dtype=np.intp)
+        n = self._normals[faces]
+        ok = ~(n == 0.0).all(axis=1)
+        if not ok.any():
+            return out
+        f, n = faces[ok], n[ok]
+        t = np.where((np.abs(n[:, 0]) < 0.9)[:, None], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0])
+        c = np.stack(
+            [
+                n[:, 1] * t[:, 2] - n[:, 2] * t[:, 1],
+                n[:, 2] * t[:, 0] - n[:, 0] * t[:, 2],
+                n[:, 0] * t[:, 1] - n[:, 1] * t[:, 0],
+            ],
+            axis=1,
+        )
+        u = (
+            c
+            / np.sqrt(c[:, 0] * c[:, 0] + c[:, 1] * c[:, 1] + c[:, 2] * c[:, 2])[
+                :, None
+            ]
+        )
+        w = np.stack(
+            [
+                n[:, 1] * u[:, 2] - n[:, 2] * u[:, 1],
+                n[:, 2] * u[:, 0] - n[:, 0] * u[:, 2],
+                n[:, 0] * u[:, 1] - n[:, 1] * u[:, 0],
+            ],
+            axis=1,
+        )
+        v = VIEW[None, :, :]
+        dirs = (v[..., 0:1] * u[:, None, :] + v[..., 1:2] * w[:, None, :]) + v[
+            ..., 2:3
+        ] * n[:, None, :]
+        blocked = self._cast(np.repeat(f, len(VIEW)), dirs.reshape(-1, 3))
+        out[ok] = len(VIEW) - blocked.reshape(-1, len(VIEW)).sum(axis=1)
+        return out
+
+    def looks_into_fold(self, faces, min_fold_ratio) -> np.ndarray:
+        """Per face of *faces*: does it look into a fold of the cell — its
+        normal ray meets another face (:meth:`looks_in`) and at most a
+        *min_fold_ratio*-th of its view leaves the cell (:meth:`escaped`)?
+        The view is cast only for a face that looks in."""
+        faces = np.asarray(faces, dtype=np.intp)
+        out = self.looks_in(faces)
+        idx = np.flatnonzero(out)
+        if len(idx):
+            out[idx] = self.escaped(faces[idx]) * min_fold_ratio <= len(VIEW)
+        return out
+
+    def _cast(self, faces, dirs) -> np.ndarray:
+        """Per ray from the centre of face ``faces[i]`` along ``dirs[i]``:
+        does it meet another face, or an opening's fan past
+        :data:`FAN_CLEARANCE`?"""
         import trimesh
 
         self._probe()
         faces = np.asarray(faces, dtype=np.intp)
+        dirs = np.asarray(dirs, dtype=np.float64)
         out = np.zeros(len(faces), dtype=bool)
         for lo in range(0, len(faces), _RAY_CHUNK):
             part = faces[lo : lo + _RAY_CHUNK]
-            origins, dirs = self._centers[part], self._normals[part]
+            origins, ways = self._centers[part], dirs[lo : lo + _RAY_CHUNK]
             tri, ray, _ = trimesh.ray.ray_triangle.ray_triangle_id(
                 self._tris,
                 origins,
-                dirs,
+                ways,
                 triangles_normal=self._normals,
                 tree=self._tree,
                 multiple_hits=True,
@@ -1540,13 +1502,13 @@ class _Inside:
                 _, ray, loc = trimesh.ray.ray_triangle.ray_triangle_id(
                     self._fans,
                     origins,
-                    dirs,
+                    ways,
                     triangles_normal=self._fan_normals,
                     tree=self._fan_tree,
                     multiple_hits=True,
                 )
                 if len(ray):
-                    far = ((loc - origins[ray]) * dirs[ray]).sum(axis=1) > FAN_CLEARANCE
+                    far = ((loc - origins[ray]) * ways[ray]).sum(axis=1) > FAN_CLEARANCE
                     out[lo + ray[far]] = True
         return out
 
@@ -1558,11 +1520,12 @@ class _Inside:
 
 
 def _grow_into_cell(
-    adj: dict[int, set[int]], seeds: np.ndarray, inside: _Inside
+    adj: dict[int, set[int]], seeds: np.ndarray, inside: _Inside, min_fold_ratio
 ) -> np.ndarray:
-    """The faces reached from *seeds* across faces that look into the cell,
-    over the edge adjacency *adj*; only the faces next to the growth are
-    cast a ray, each once, a ring at a time."""
+    """The faces reached from *seeds* across faces that look into a fold of
+    the cell (:meth:`_Inside.looks_into_fold`), over the edge adjacency
+    *adj*; only the faces next to the growth are judged, each once, a ring
+    at a time."""
     grown = np.asarray(seeds, dtype=bool).copy()
     # judged faces, grown or not: whether a face looks in never changes
     seen = grown.copy()
@@ -1575,15 +1538,18 @@ def _grow_into_cell(
                     seen[g] = True
                     ring.append(g)
         ring = np.asarray(ring, dtype=np.intp)
-        front = ring[inside.looks_in(ring)]
+        front = ring[inside.looks_into_fold(ring, min_fold_ratio)]
         grown[front] = True
     return grown
 
 
-def grow_into_cell(faces, vertices, centers, normals, seeds) -> np.ndarray:
+def grow_into_cell(
+    faces, vertices, centers, normals, seeds, min_fold_ratio: float = 3.0
+) -> np.ndarray:
     """``find_organelles``' last step on arrays: the faces reached from
-    *seeds* across faces that look into the cell (a face's normal ray meets
-    another face), over the faces' edge adjacency."""
+    *seeds* across faces that look into a fold of the cell — a face's normal
+    ray meets another face and at most a *min_fold_ratio*-th of its view
+    leaves the cell — over the faces' edge adjacency."""
     vertices = rows3("V", vertices)
     faces, _ = checked_faces(faces, len(vertices))
     centers = rows3("F", centers)
@@ -1595,6 +1561,7 @@ def grow_into_cell(faces, vertices, centers, normals, seeds) -> np.ndarray:
         Topology(faces, len(vertices)).face_adjacency(),
         seeds,
         _Inside(vertices, faces, centers, normals),
+        min_fold_ratio,
     )
 
 
@@ -1937,8 +1904,13 @@ def find_organelles(
     # ── 5. The membrane goes on into the cell past where the outward dots
     #       stopped the flood; the outer membrane, looking out, stops it.
     found = pocket | isolated
+    # pocket_organelles' own min_fold_ratio, as the Rust kernel passes its
+    # pocket parameters' to the growth
     grown = _grow_into_cell(
-        topo.face_adjacency(), found, _Inside(vertices, faces, centers, normals)
+        topo.face_adjacency(),
+        found,
+        _Inside(vertices, faces, centers, normals),
+        min_fold_ratio=3.0,
     )
     n_grown = int((grown & ~found).sum())
     pocket = grown & ~isolated

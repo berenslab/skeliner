@@ -551,7 +551,7 @@
                     <button
                         id="preprocessBtn"
                         style="margin-left: 4px"
-                        title="Run pre.preprocess(): parallel patches → organelles → soma → fusions → disconnected → gaps → break up mesh.&#10;Keeps rescued fragments. Leaves the mesh uncompacted — press Compact after if you want it."
+                        title="Run pre.preprocess(): parallel patches → organelles → soma → fusions → disconnected → gaps → fill holes → break up mesh.&#10;Keeps rescued fragments. Leaves the mesh uncompacted — press Compact after if you want it."
                     >
                         Run
                     </button>
@@ -562,6 +562,12 @@
                         title="Off for meshes that trace no organelles (hemibrain's): Run does not look for them, and no face is an organelle."
                     >
                         <input type="checkbox" id="runOrganelles" checked /> organelles
+                    </label>
+                    <label
+                        style="margin-left: 6px; color: #888"
+                        title="Patch the holes in the surface (fill_holes) before the mesh is broken up: the organelles' mouths and the mesh's own openings, so each neurite is a tube again. Off leaves them open."
+                    >
+                        <input type="checkbox" id="runFill" checked /> fill holes
                     </label>
                 </div>
             </div>
@@ -2440,9 +2446,10 @@
 
             async function runPreprocess() {
                 const organelles = document.getElementById("runOrganelles").checked;
+                const fill = document.getElementById("runFill").checked;
                 await _runAction(
                     document.getElementById("preprocessBtn"),
-                    () => _postJSON("/preprocess", { organelles }),
+                    () => _postJSON("/preprocess", { organelles, fill }),
                 );
             }
 

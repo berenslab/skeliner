@@ -6,7 +6,6 @@ import time
 import warnings
 from collections import Counter, defaultdict, deque
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -24,9 +23,6 @@ from skeliner.dataclass import (
     Soma,
     mesh_args,
 )
-
-if TYPE_CHECKING:
-    from scipy.spatial import KDTree
 
 __all__ = [
     "apply_reassignment",
@@ -285,676 +281,110 @@ def _find_holes(mesh: Mesh, verbose: bool) -> list[list[int]]:
     return loops
 
 
-def _ear_clip_2d(pts_2d: np.ndarray) -> list[tuple[int, int, int]]:
-    """Ear-clipping triangulation of a 2D polygon.
-
-    Parameters
-    ----------
-    pts_2d : np.ndarray
-        (N, 2) ordered polygon vertices.
-
-    Returns
-    -------
-    list[tuple[int, int, int]]
-        Triangle vertex indices into *pts_2d*.
-    """
-    n = len(pts_2d)
-    if n < 3:
-        return []
-    if n == 3:
-        return [(0, 1, 2)]
-
-    # Ensure CCW winding
-    indices = list(range(n))
-    signed_area = 0.0
-    for i in range(n):
-        j = (i + 1) % n
-        signed_area += pts_2d[i, 0] * pts_2d[j, 1]
-        signed_area -= pts_2d[j, 0] * pts_2d[i, 1]
-    if signed_area < 0:
-        indices = indices[::-1]
-
-    def _cross(o, a, b):
-        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
-
-    def _pt_in_tri(p, a, b, c):
-        d1, d2, d3 = _cross(p, a, b), _cross(p, b, c), _cross(p, c, a)
-        return not ((d1 < 0 or d2 < 0 or d3 < 0) and (d1 > 0 or d2 > 0 or d3 > 0))
-
-    def _is_ear(idxs, i):
-        m = len(idxs)
-        p_i, c_i, n_i = (i - 1) % m, i, (i + 1) % m
-        a, b, c = pts_2d[idxs[p_i]], pts_2d[idxs[c_i]], pts_2d[idxs[n_i]]
-        if _cross(a, b, c) <= 0:
-            return False
-        for j in range(m):
-            if j in (p_i, c_i, n_i):
-                continue
-            if _pt_in_tri(pts_2d[idxs[j]], a, b, c):
-                return False
-        return True
-
-    triangles: list[tuple[int, int, int]] = []
-    for _ in range(n * n):
-        m = len(indices)
-        if m == 3:
-            triangles.append((indices[0], indices[1], indices[2]))
-            break
-        if m < 3:
-            break
-        ear_found = False
-        for i in range(m):
-            if _is_ear(indices, i):
-                p_i, n_i = (i - 1) % m, (i + 1) % m
-                triangles.append((indices[p_i], indices[i], indices[n_i]))
-                indices.pop(i)
-                ear_found = True
-                break
-        if not ear_found:
-            for i in range(1, m - 1):
-                triangles.append((indices[0], indices[i], indices[i + 1]))
-            break
-
-    return triangles
-
-
-def _fill_single_hole(
-    mesh: Mesh,
-    loop: list[int],
-    target_edge: float,
-    vert_offset: int,
-    vtree: "KDTree | None" = None,
-    vert_to_faces: list[list[int]] | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Fill one boundary loop with curvature-aware tessellation.
-
-    Returns (new_vertices (N,3), new_faces (M,3)).
-    Face indices use original mesh indices for boundary vertices
-    and ``vert_offset + i`` for newly created vertices.
-    """
-    from scipy.interpolate import RBFInterpolator
-    from scipy.spatial import KDTree
-
-    verts = mesh.vertices
-    boundary_pts = verts[loop]
-    n_bnd = len(loop)
-
-    # ── Local 2D frame via SVD ────────────────────────────────────────
-    centroid_3d = boundary_pts.mean(axis=0)
-    centered = boundary_pts - centroid_3d
-    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
-    u_ax, v_ax, n_ax = Vt[0], Vt[1], Vt[2]
-
-    bnd_2d = centered @ np.column_stack([u_ax, v_ax])
-    bnd_h = centered @ n_ax
-
-    # ── RBF surface from boundary + nearby mesh vertices ──────────────
-    if vtree is None:
-        vtree = KDTree(verts)
-    nearby: set[int] = set()
-    for vi in loop:
-        nearby.update(vtree.query_ball_point(verts[vi], 3.0 * target_edge))
-    nearby -= set(loop)
-
-    if nearby:
-        nrb_centered = verts[sorted(nearby)] - centroid_3d
-        nrb_2d = nrb_centered @ np.column_stack([u_ax, v_ax])
-        nrb_h = nrb_centered @ n_ax
-        # Filter: keep only nearby vertices that project OUTSIDE the
-        # boundary polygon in 2D.  Vertices from the opposite side of
-        # a tube project inside and cause RBF overshoot (spikes).
-        n_poly = len(bnd_2d)
-        inside = np.zeros(len(nrb_2d), dtype=bool)
-        px, py = nrb_2d[:, 0], nrb_2d[:, 1]
-        j = n_poly - 1
-        for ii in range(n_poly):
-            xi, yi = bnd_2d[ii]
-            xj, yj = bnd_2d[j]
-            cond = ((yi > py) != (yj > py)) & (
-                px < (xj - xi) * (py - yi) / (yj - yi + 1e-30) + xi
-            )
-            inside ^= cond
-            j = ii
-        outside = ~inside
-        nrb_2d = nrb_2d[outside]
-        nrb_h = nrb_h[outside]
-        if len(nrb_2d) > 0:
-            rbf_pts = np.vstack([bnd_2d, nrb_2d])
-            rbf_vals = np.concatenate([bnd_h, nrb_h])
-        else:
-            rbf_pts = bnd_2d
-            rbf_vals = bnd_h
-    else:
-        rbf_pts = bnd_2d
-        rbf_vals = bnd_h
-
-    try:
-        rbf = RBFInterpolator(rbf_pts, rbf_vals, kernel="thin_plate_spline")
-    except np.linalg.LinAlgError:
-        rbf = None
-
-    # ── Ear-clip triangulation in 2D ──────────────────────────────────
-    tri_list = _ear_clip_2d(bnd_2d)
-
-    # ── Refine by longest-edge bisection ──────────────────────────────
-    # Boundary edges (shared with original mesh) must not be split to
-    # avoid T-junctions.
-    bnd_edge_set: set[tuple[int, int]] = set()
-    for idx in range(n_bnd):
-        a, b = idx, (idx + 1) % n_bnd
-        bnd_edge_set.add((min(a, b), max(a, b)))
-
-    pts: list[np.ndarray] = list(bnd_2d)
-    faces = [list(t) for t in tri_list]
-    threshold = target_edge * 1.5
-    edge_midpoints: dict[tuple[int, int], int] = {}
-
-    for _ in range(200):
-        new_faces: list[list[int]] = []
-        changed = False
-        for f in faces:
-            i, j, k = f
-            pi, pj, pk = pts[i], pts[j], pts[k]
-            edges_sorted = sorted(
-                [
-                    (float(np.linalg.norm(pj - pi)), i, j),
-                    (float(np.linalg.norm(pk - pj)), j, k),
-                    (float(np.linalg.norm(pi - pk)), k, i),
-                ],
-                reverse=True,
-            )
-            split_done = False
-            for elen, va, vb in edges_sorted:
-                if elen <= threshold:
-                    break
-                ekey = (min(va, vb), max(va, vb))
-                if ekey in bnd_edge_set:
-                    continue
-                if ekey in edge_midpoints:
-                    mi = edge_midpoints[ekey]
-                else:
-                    mi = len(pts)
-                    pts.append((pts[va] + pts[vb]) / 2.0)
-                    edge_midpoints[ekey] = mi
-                vc = [v for v in (i, j, k) if v != va and v != vb][0]
-                new_faces.append([va, mi, vc])
-                new_faces.append([mi, vb, vc])
-                split_done = True
-                changed = True
-                break
-            if not split_done:
-                new_faces.append(f)
-        faces = new_faces
-        if not changed:
-            break
-
-    pts_arr = np.array(pts)
-    faces_arr = np.array(faces, dtype=np.intp)
-    n_new = len(pts_arr) - n_bnd
-
-    # ── Map new 2D points → 3D via RBF height ────────────────────────
-    if n_new > 0:
-        new_2d = pts_arr[n_bnd:]
-        if rbf is not None:
-            new_h = np.clip(rbf(new_2d), bnd_h.min(), bnd_h.max())
-        else:
-            # Fallback: inverse-distance weighted interpolation from boundary
-            dists = np.linalg.norm(
-                new_2d[:, np.newaxis, :] - bnd_2d[np.newaxis, :, :], axis=2
-            )
-            weights = 1.0 / np.maximum(dists, 1e-10) ** 2
-            new_h = (weights * bnd_h[np.newaxis, :]).sum(axis=1) / weights.sum(axis=1)
-        new_3d = (
-            centroid_3d
-            + new_2d[:, 0:1] * u_ax
-            + new_2d[:, 1:2] * v_ax
-            + new_h[:, np.newaxis] * n_ax
-        )
-    else:
-        new_3d = np.empty((0, 3))
-
-    # ── Remap face indices ────────────────────────────────────────────
-    loop_arr = np.array(loop, dtype=np.intp)
-    remapped = np.empty_like(faces_arr)
-    bnd_mask = faces_arr < n_bnd
-    remapped[bnd_mask] = loop_arr[faces_arr[bnd_mask]]
-    remapped[~bnd_mask] = vert_offset + (faces_arr[~bnd_mask] - n_bnd)
-
-    # ── Consistent face orientation ───────────────────────────────────
-    local_v = np.vstack([boundary_pts, new_3d]) if n_new > 0 else boundary_pts
-    tri_normals = np.cross(
-        local_v[faces_arr[:, 1]] - local_v[faces_arr[:, 0]],
-        local_v[faces_arr[:, 2]] - local_v[faces_arr[:, 0]],
-    )
-    # Find adjacent faces via vert_to_faces index (fast) or fallback
-    adj_fi: list[int] = []
-    if vert_to_faces is not None:
-        seen: set[int] = set()
-        for vi in loop:
-            for fi in vert_to_faces[vi]:
-                if fi not in seen:
-                    adj_fi.append(fi)
-                    seen.add(fi)
-                    if len(seen) > 50:  # enough for a good reference normal
-                        break
-            if len(seen) > 50:
-                break
-    else:
-        loop_set = set(loop)
-        _good = _non_degenerate(mesh.faces)
-        adj_fi = [
-            fi
-            for fi, face in enumerate(mesh.faces)
-            if _good[fi] and set(int(v) for v in face) & loop_set
-        ]
-    if adj_fi:
-        ref_n = mesh.face_normals[adj_fi].mean(axis=0)
-        if np.dot(tri_normals.mean(axis=0), ref_n) < 0:
-            remapped = remapped[:, ::-1]
-
-    return new_3d, remapped
-
-
-def _fill_advancing_front(
-    loop: list[int],
-    vertices: np.ndarray,
-    face_normals: np.ndarray,
-    vert_to_faces: list[list[int]] | None = None,
-) -> np.ndarray:
-    """Fill a boundary loop using advancing front.
-
-    Repeatedly picks the sharpest angle on the boundary and closes it
-    with a triangle. No new vertices are created — only existing
-    boundary vertices are used.
-
-    Returns (M, 3) int array of new faces.
-    """
-    n = len(loop)
-    if n < 3:
-        return np.empty((0, 3), dtype=np.int64)
-    if n == 3:
-        tri = np.array([[loop[0], loop[1], loop[2]]], dtype=np.int64)
-        # Orient consistently with neighbors
-        if vert_to_faces is not None:
-            ref_fi = []
-            for vi in loop[:1]:
-                ref_fi.extend(vert_to_faces[vi][:5])
-            if ref_fi:
-                ref_n = face_normals[ref_fi].mean(axis=0)
-                v0, v1, v2 = vertices[loop[0]], vertices[loop[1]], vertices[loop[2]]
-                tri_n = np.cross(v1 - v0, v2 - v0)
-                if np.dot(tri_n, ref_n) < 0:
-                    tri = tri[:, ::-1]
-        return tri
-
-    # Determine consistent winding from adjacent mesh faces
-    flip = False
-    if vert_to_faces is not None:
-        ref_fi = []
-        for vi in loop[:3]:
-            ref_fi.extend(vert_to_faces[vi][:5])
-        if ref_fi:
-            ref_n = face_normals[ref_fi].mean(axis=0)
-            v0, v1, v2 = vertices[loop[0]], vertices[loop[1]], vertices[loop[2]]
-            tri_n = np.cross(v1 - v0, v2 - v0)
-            if np.dot(tri_n, ref_n) < 0:
-                flip = True
-
-    # Work with a mutable list of boundary vertex indices
-    bnd = list(loop)
-    new_faces = []
-
-    for _ in range(n * 2):  # safety limit
-        m = len(bnd)
-        if m < 3:
-            break
-        if m == 3:
-            if flip:
-                new_faces.append([bnd[0], bnd[2], bnd[1]])
-            else:
-                new_faces.append([bnd[0], bnd[1], bnd[2]])
-            break
-
-        # Find the ear with the smallest interior angle
-        # (sharpest corner = best triangle to close)
-        best_i = -1
-        best_angle = float("inf")
-
-        for i in range(m):
-            p = vertices[bnd[(i - 1) % m]]
-            c = vertices[bnd[i]]
-            n_pt = vertices[bnd[(i + 1) % m]]
-
-            e1 = p - c
-            e2 = n_pt - c
-            len1 = np.linalg.norm(e1)
-            len2 = np.linalg.norm(e2)
-            if len1 < 1e-10 or len2 < 1e-10:
-                best_i = i
-                best_angle = 0
-                break
-            cos_a = np.dot(e1, e2) / (len1 * len2)
-            cos_a = np.clip(cos_a, -1, 1)
-            angle = np.arccos(cos_a)
-
-            if angle < best_angle:
-                best_angle = angle
-                best_i = i
-
-        if best_i < 0:
-            break
-
-        # Create triangle at this ear
-        prev_i = (best_i - 1) % m
-        next_i = (best_i + 1) % m
-        if flip:
-            new_faces.append([bnd[prev_i], bnd[next_i], bnd[best_i]])
-        else:
-            new_faces.append([bnd[prev_i], bnd[best_i], bnd[next_i]])
-
-        # Remove the vertex from the boundary
-        bnd.pop(best_i)
-
-    if not new_faces:
-        return np.empty((0, 3), dtype=np.int64)
-    return np.array(new_faces, dtype=np.int64)
-
-
-def _fill_dome(
-    loop: list[int],
-    vertices: np.ndarray,
-    face_normals: np.ndarray,
-    vert_to_faces: list[list[int]] | None = None,
-    dome_factor: float = 0.5,
-    vert_offset: int = 0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Fill a boundary loop with a convex dome cap.
-
-    Creates a center vertex pushed outward along the average boundary
-    normal, with concentric rings for larger holes.
-
-    Returns ``(new_vertices (K, 3), new_faces (M, 3))``.  Face indices
-    use original mesh indices for boundary vertices and
-    ``vert_offset + i`` for newly created vertices.
-    """
-    n = len(loop)
-    if n < 3:
-        return np.empty((0, 3)), np.empty((0, 3), dtype=np.int64)
-
-    boundary_pts = vertices[loop]
-    centroid = boundary_pts.mean(axis=0)
-
-    # ── Outward normal from adjacent faces ────────────────────────────
-    avg_normal = None
-    if vert_to_faces is not None:
-        adj_normals = []
-        for vi in loop:
-            for fi in vert_to_faces[vi]:
-                adj_normals.append(face_normals[fi])
-        if adj_normals:
-            avg_normal = np.mean(adj_normals, axis=0)
-            norm = np.linalg.norm(avg_normal)
-            if norm > 1e-10:
-                avg_normal = avg_normal / norm
-            else:
-                avg_normal = None
-
-    if avg_normal is None:
-        centered = boundary_pts - centroid
-        _, _, Vt = np.linalg.svd(centered, full_matrices=False)
-        avg_normal = Vt[2]
-        if vert_to_faces is not None and vert_to_faces[loop[0]]:
-            ref = face_normals[vert_to_faces[loop[0]][0]]
-            if np.dot(avg_normal, ref) < 0:
-                avg_normal = -avg_normal
-
-    # ── Small holes: flat fill (no dome needed) ───────────────────────
-    if n == 3:
-        tri = np.array([[loop[0], loop[1], loop[2]]], dtype=np.int64)
-        v0, v1, v2 = vertices[loop[0]], vertices[loop[1]], vertices[loop[2]]
-        tri_n = np.cross(v1 - v0, v2 - v0)
-        if np.dot(tri_n, avg_normal) < 0:
-            tri = tri[:, ::-1]
-        return np.empty((0, 3)), tri
-
-    # ── Dome geometry ─────────────────────────────────────────────────
-    radii = np.linalg.norm(boundary_pts - centroid, axis=1)
-    avg_radius = float(radii.mean())
-    dome_height = avg_radius * dome_factor
-
-    # Intermediate rings for larger holes (better triangle quality)
-    n_rings = max(0, (n - 4) // 15)
-
-    new_verts_list: list[np.ndarray] = []
-    ring_indices: list[list[int]] = []
-
-    for r in range(1, n_rings + 1):
-        t = r / (n_rings + 1)  # 0 → boundary, 1 → center
-        frac = 1.0 - t  # radial fraction
-        h = dome_height * (1.0 - frac * frac)  # parabolic profile
-        ring_pts = centroid + (boundary_pts - centroid) * frac + avg_normal * h
-        base = vert_offset + len(new_verts_list)
-        ring_indices.append(list(range(base, base + n)))
-        for pt in ring_pts:
-            new_verts_list.append(pt)
-
-    # Center vertex
-    center = centroid + avg_normal * dome_height
-    center_idx = vert_offset + len(new_verts_list)
-    new_verts_list.append(center)
-
-    # ── Triangulation ─────────────────────────────────────────────────
-    faces: list[list[int]] = []
-    prev = loop  # original vertex indices
-
-    # Boundary → rings (quad strips → 2 triangles each)
-    for ring in ring_indices:
-        for i in range(n):
-            j = (i + 1) % n
-            faces.append([prev[i], prev[j], ring[j]])
-            faces.append([prev[i], ring[j], ring[i]])
-        prev = ring
-
-    # Last ring (or boundary) → center fan
-    for i in range(n):
-        j = (i + 1) % n
-        faces.append([prev[i], prev[j], center_idx])
-
-    new_verts = np.array(new_verts_list)
-
-    # ── Consistent orientation ────────────────────────────────────────
-    def _pt(idx: int) -> np.ndarray:
-        return vertices[idx] if idx < vert_offset else new_verts[idx - vert_offset]
-
-    f0 = faces[0]
-    tri_n = np.cross(_pt(f0[1]) - _pt(f0[0]), _pt(f0[2]) - _pt(f0[0]))
-    if np.dot(tri_n, avg_normal) < 0:
-        faces = [[f[1], f[0], f[2]] for f in faces]
-
-    return new_verts, np.array(faces, dtype=np.int64)
-
-
-@_deprecated()
 @mesh_args()
 def fill_holes(
     mesh: Mesh,
     *,
-    holes: list[list[int]] | None = None,
-    method: str = "advancing_front",
-    max_perimeter_mult: float | None = None,
-    dome_factor: float = 0.5,
+    organelles: Organelles | None = None,
+    soma: Soma | None = None,
+    mesh_stats: MeshStats | None = None,
     verbose: bool = False,
 ) -> Mesh:
-    """Fill holes in the mesh.
+    """Close the holes in the cell's surface — the organelles' mouths and
+    the mesh's own openings — so that each neurite is a tube again, and the
+    geodesic shells :func:`~skeliner.skeletonize` bins go round it whole.
 
-    .. deprecated::
-        Neither the pipeline nor the viewer uses it; it will be removed.
+    The surface is the usable faces that are no organelle.  A hole is a
+    loop of its border that lies on its mesh component's body (its largest
+    piece), that no soma vertex touches (:func:`break_up_mesh` cuts the soma
+    out along its junctions next), and that opens the side of the surface
+    rather than ending it: the faces along it face the way the loop spans
+    more than a random direction would, where round a tube's cut end they
+    face across it.
+
+    Each hole gets a patch of triangles about as long as the median edge:
+    the loop triangulated with the least folding (Liepa 2003: the largest
+    dihedral angle, then the area), refined until no triangle is long
+    against the median edge, and faired with the surface round it.  The
+    patch and the hole's lip — its loop, where the organelle happened to
+    end, and the rings round it that dip into the mouth — take the shape of
+    least thin-plate energy with the surface beyond held, so the patch
+    continues the tube, curved as the tube is, instead of a flat lid or a
+    sag into the mouth.  The lip is found against that smooth shape: the
+    band round the hole is faired first, and the rings from the loop out
+    that lie below it on average are the lip.
+
+    The patch shares the loop's vertices, and the organelle stays in the
+    mesh behind it.  Rust only: the Python path runs the Rust core here.
 
     Parameters
     ----------
     mesh : Mesh
-        Input mesh (typically after ``remove_organelles``).
-    holes : list[list[int]] or None
-        Pre-computed boundary loops from :func:`find_holes`.  If
-        provided, detection is skipped and these loops are used directly.
-    method : str, default "advancing_front"
-        Filling method:
-        - ``"advancing_front"`` — fast, closes boundary edges one by one
-          by picking the sharpest angle. No new vertices. Works for all
-          hole sizes.
-        - ``"dome"`` — fills with a convex dome cap pushed outward along
-          the boundary normal. Creates new vertices (center + optional
-          concentric rings). Fast, O(n). Best for neurite tip holes.
-        - ``"rbf"`` — projects to 2D, ear-clips, refines, lifts with RBF.
-          Better surface quality for small planar holes but slow and fails
-          for large curved holes.
-    max_perimeter_mult : float or None
-        Skip holes whose perimeter exceeds this multiple of the median
-        edge length.  ``None`` = no limit (fill all holes).
-        Default ``None`` for advancing_front/dome, ``50.0`` for rbf.
-    dome_factor : float, default 0.5
-        Height of dome as fraction of hole radius (only for ``"dome"``).
-        0 = flat, 0.5 = gentle dome, 1.0 = hemisphere.
+        Input mesh.
+    organelles : Organelles or None
+        From :func:`find_organelles`; None for none.  Faces appended since
+        (the stitches of :func:`remove_gaps`) are no organelle.
+    soma : Soma or None
+        From :func:`find_soma`; the holes its vertices touch stay open.
+    mesh_stats : MeshStats or None
+        Kept in step: ``outward_dots`` gets a value for each new face (1,
+        facing out, as :func:`remove_gaps` gives its stitches) and the
+        topology is dropped.
     verbose : bool, default False
-        Print progress.
+        Print what was patched.
 
     Returns
     -------
     Mesh
-        Mesh with holes filled.
+        The patches' faces appended and the lips' vertices moved; every
+        face and vertex id of *mesh* names what it did.
     """
-    if holes is not None:
-        loops = holes
-        if verbose:
-            print(f"[skeliner.pre] Using provided holes ({len(loops)} loops)")
-    else:
-        loops = _find_holes(mesh, verbose)
-    if not loops:
-        return mesh
+    if verbose:
+        print("[skeliner.pre] Filling holes …")
+        _t0 = time.perf_counter()
 
-    target_edge = _median_edge(mesh)
-
-    # Default max_perimeter depends on method
-    if max_perimeter_mult is None:
-        if method == "rbf":
-            max_perimeter_mult = 50.0
-        # advancing_front: no limit
-    max_perimeter = (
-        max_perimeter_mult * target_edge
-        if max_perimeter_mult is not None
-        else float("inf")
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    organelle = (
+        np.zeros(0, dtype=bool) if organelles is None else np.asarray(organelles.mask)
     )
+    soma_verts = (
+        np.zeros(0, dtype=np.int64)
+        if soma is None or soma.verts is None
+        else np.asarray(soma.verts, dtype=np.int64)
+    )
+    verts, new_faces, tally = kernels.pre.fill_holes(
+        faces,
+        np.asarray(mesh.vertices, dtype=np.float64),
+        organelle[: len(faces)],
+        soma_verts,
+        _median_edge(mesh),
+    )
+    out = Mesh(verts, np.vstack([faces, new_faces]))
+
+    n_added = len(new_faces)
+    if mesh_stats is not None:
+        if n_added and mesh_stats.outward_dots is not None:
+            mesh_stats.outward_dots = np.concatenate(
+                [
+                    mesh_stats.outward_dots,
+                    np.ones(n_added, dtype=mesh_stats.outward_dots.dtype),
+                ]
+            )
+        mesh_stats.invalidate_topology()
 
     if verbose:
+        dt = time.perf_counter() - _t0
+        open_ = tally["loops"] - tally["filled"]
         print(
-            f"[skeliner.pre] Method: {method}, target edge: {target_edge:.1f}"
-            + (
-                f", max perimeter: {max_perimeter:.0f}"
-                if max_perimeter < float("inf")
-                else ", no perimeter limit"
-            )
+            f"[skeliner.pre] fill_holes: {tally['filled']:,} of "
+            f"{tally['loops']:,} loops patched (+{n_added:,}f, "
+            f"+{tally['new_vertices']:,}v, {tally['moved']:,}v moved); "
+            f"{open_:,} left open: {tally['off_body']:,} off the body, "
+            f"{tally['soma']:,} at the soma, {tally['tube_end']:,} tube ends, "
+            f"{tally['untriangulable'] + tally['non_manifold']:,} cracks "
+            f"({dt:.1f}s)"
         )
-
-    # Pre-build vert_to_faces for orientation (skip degenerate faces)
-    _good = _non_degenerate(mesh.faces)
-    vert_to_faces: list[list[int]] = [[] for _ in range(len(mesh.vertices))]
-    for fi, face in enumerate(mesh.faces):
-        if _good[fi]:
-            for v in face:
-                vert_to_faces[int(v)].append(fi)
-
-    # Filter loops by perimeter
-    valid_loops: list[list[int]] = []
-    n_skipped = 0
-    for loop in loops:
-        pts = mesh.vertices[loop]
-        perimeter = float(
-            np.linalg.norm(np.diff(np.vstack([pts, pts[:1]]), axis=0), axis=1).sum()
-        )
-        if perimeter > max_perimeter:
-            n_skipped += 1
-        else:
-            valid_loops.append(loop)
-
-    if verbose:
-        print(
-            f"[skeliner.pre] Filling {len(valid_loops)} holes"
-            + (f" (skipped {n_skipped} too large)" if n_skipped else "")
-        )
-
-    if method == "advancing_front":
-        new_faces: list[np.ndarray] = []
-        for loop in valid_loops:
-            nf = _fill_advancing_front(
-                loop, mesh.vertices, mesh.face_normals, vert_to_faces
-            )
-            if len(nf):
-                new_faces.append(nf)
-
-        if not new_faces:
-            return mesh
-
-        all_faces = np.vstack([mesh.faces] + new_faces)
-        result = Mesh(mesh.vertices, all_faces)
-
-    elif method == "dome":
-        new_verts: list[np.ndarray] = []
-        new_face_list: list[np.ndarray] = []
-        offset = len(mesh.vertices)
-
-        for loop in valid_loops:
-            nv, nf = _fill_dome(
-                loop,
-                mesh.vertices,
-                mesh.face_normals,
-                vert_to_faces,
-                dome_factor=dome_factor,
-                vert_offset=offset,
-            )
-            if len(nv) > 0:
-                new_verts.append(nv)
-            if len(nf) > 0:
-                new_face_list.append(nf)
-            offset += len(nv)
-
-        if not new_face_list:
-            return mesh
-
-        v_parts = [mesh.vertices] + new_verts
-        f_parts = [mesh.faces] + new_face_list
-        result = Mesh(np.vstack(v_parts), np.vstack(f_parts))
-
-    elif method == "rbf":
-        from scipy.spatial import KDTree
-
-        vtree = KDTree(mesh.vertices)
-        new_verts_rbf: list[np.ndarray] = []
-        new_face_rbf: list[np.ndarray] = []
-        offset = len(mesh.vertices)
-
-        for loop in valid_loops:
-            nv, nf = _fill_single_hole(
-                mesh, loop, target_edge, offset, vtree, vert_to_faces
-            )
-            new_verts_rbf.append(nv)
-            new_face_rbf.append(nf)
-            offset += len(nv)
-
-        v_parts = [mesh.vertices] + [v for v in new_verts_rbf if len(v) > 0]
-        f_parts = [mesh.faces] + [f for f in new_face_rbf if len(f) > 0]
-        result = Mesh(np.vstack(v_parts), np.vstack(f_parts))
-    else:
-        raise ValueError(
-            f"Unknown method: {method!r}. Use 'advancing_front', 'dome', or 'rbf'."
-        )
-
-    if verbose:
-        print(
-            f"[skeliner.pre] Result: {len(result.vertices):,} verts, "
-            f"{len(result.faces):,} faces"
-            + (f" ({n_skipped} holes skipped)" if n_skipped else "")
-        )
-    return result
+    return out
 
 
 # ── Merge selected faces ────────────────────────────────────────────
@@ -4011,24 +3441,27 @@ def find_pocket_mouths(
     min_fold_ratio: float = 3.0,
     verbose: bool = False,
     mesh_stats: MeshStats | None = None,
-    _non_main_mask: np.ndarray | None = None,
 ) -> list[list[tuple[int, int]]]:
-    """Find mouth edges — boundaries of negative-dot face clusters.
+    """Find mouth edges — boundaries of the negative-dot face clusters that
+    seed pockets.
 
     .. deprecated::
         Neither the pipeline nor the viewer uses it; it will be removed.
 
-    A valid pocket must satisfy:
-
-    1. Multiple boundary loops (not a flat patch with a single outline).
-    2. Fold ratio > *min_fold_ratio*: the pocket surface area must be
-       much larger than the mouth's enclosed planar area, indicating the
-       surface folds inward through a small opening.
+    A cluster of at least *min_pocket_size* negative-dot faces seeds a
+    pocket when it folds into the cell: at most a *min_fold_ratio*-th of
+    its faces' view, cast as rays weighted by cosine about each face's
+    normal, leaves the cell.  On a spherical cap that share is the inverse
+    of the cap's fold ratio (its area over its mouth's) from anywhere on
+    it; with 3 the cap is folded past 109.47°.  An organelle's wall,
+    however broken into concave clusters, sees the organelle around it; a
+    groove or crevice of the outer membrane sees the outside along it.
 
     Returns
     -------
     list[list[tuple[int, int]]]
-        One list of edges per pocket mouth.
+        One list of edges per pocket mouth, sorted; pockets in the order of
+        their lowest face.
     """
 
     if mesh_stats is not None and mesh_stats.outward_dots is not None:
@@ -4051,13 +3484,13 @@ def find_pocket_mouths(
     return kernels.pre.pocket_mouths(
         faces,
         np.asarray(mesh.vertices, dtype=np.float64),
-        np.asarray(mesh.area_faces, dtype=np.float64),
         np.asarray(outward_dots, dtype=np.float64),
         np.asarray(main_face_mask, dtype=bool),
         kernels.mesh.Topology(faces, len(mesh.vertices)),
+        centers=np.asarray(mesh.triangles_center, dtype=np.float64),
+        normals=np.asarray(mesh.face_normals, dtype=np.float64),
         min_pocket_size=min_pocket_size,
         min_fold_ratio=min_fold_ratio,
-        non_main_mask=_non_main_mask,
     )
 
 
@@ -4092,7 +3525,9 @@ def find_pocket_organelles(
 
     Uses mouths (boundaries of negative-dot clusters) as seeds:
 
-    1. Call :func:`find_pocket_mouths` to get mouth edges for each pocket.
+    1. Call :func:`find_pocket_mouths` to get mouth edges for each pocket:
+       the clusters that fold into the cell, at most a *min_fold_ratio*-th
+       of their view leaving it.
     2. Seed from the **negative-dot faces** of each mouth's pocket cluster.
     3. Flood-fill from seeds, stopping at mouth edges and faces with
        ``outward_dot > grow_threshold``.
@@ -4132,6 +3567,13 @@ def find_pocket_organelles(
         must be pocket faces for the hole to be filled.
     min_pocket_size : int
         Minimum negative-face cluster size to produce a mouth / be detected.
+    min_fold_ratio : float
+        A cluster folds into the cell when at most a *min_fold_ratio*-th of
+        its view (cosine-weighted rays) leaves it — on a spherical cap the
+        inverse of its area over its mouth's; with 3, a cap folded past
+        109.47°, where half its faces look across it at the cap.  Also the
+        shallow-dip check's ratio of a pocket's area to the faces ringing
+        it.
     min_cluster_size : int
         Final pocket clusters smaller than this are discarded.
     verbose : bool
@@ -4272,10 +3714,13 @@ def find_organelles(
     Returns an :class:`~skeliner.dataclass.Organelles` with two
     non-overlapping masks:
 
-    * **pocket** — membrane folds connected to the neuron surface,
-      detected via gradient-based mouth finding + flood-fill, then grown
-      on across every face that looks into the cell (its normal ray meets
-      another face), which the outer membrane, looking out, stops.
+    * **pocket** — membrane folds connected to the neuron surface: the
+      negative-dot clusters that fold into the cell (at most a third of
+      their view, rays weighted by cosine about the normals, leaves it),
+      flood-filled, then grown on across every face that looks into a fold
+      of the cell — its normal ray meets another face and at most a third
+      of its view leaves the cell — which the outer membrane stops, looking
+      out or, in a crevice, seeing the outside along it.
     * **isolated** — entire vertex-disconnected components whose
       mean outward dot is negative (fully enclosed fragments).
 
@@ -5275,6 +4720,7 @@ def preprocess(
     *,
     organelles: bool = True,
     soma: Soma | None = None,
+    fill: bool = True,
     rescued=None,
     released=None,
     claim_min_faces: int = 0,
@@ -5291,8 +4737,9 @@ def preprocess(
       4. find_soma (unless *soma* is given)
       5. find_fusions → find_disconnected → find_gaps
       6. remove_gaps → remove_fusions
-      7. break_up_mesh
-      8. compact_mesh (optional)
+      7. fill_holes (unless *fill* is False)
+      8. break_up_mesh
+      9. compact_mesh (optional)
 
     Each ``find_*`` step is skipped if it returns nothing.
 
@@ -5308,15 +4755,18 @@ def preprocess(
         A soma to take instead of :func:`find_soma`'s: one assigned by hand
         where it found none.  Its ``verts`` name this mesh's vertices,
         which the step before it (parallel patches) keeps.
+    fill : bool, default True
+        Patch the holes in the surface (:func:`fill_holes`) before the mesh
+        is broken up; False leaves them open.
     rescued : array-like of int, optional
         Face ids the caller has declared arbor, passed through to
-        :func:`break_up_mesh` in step 7.  The neurite/discarded split is
+        :func:`break_up_mesh` in step 8.  The neurite/discarded split is
         re-derived from scratch here, so an override that is not fed back
         in is undone by the run.
     released : array-like of int, optional
-        Lasso-drawn arbor claims, likewise passed through to step 7.
+        Lasso-drawn arbor claims, likewise passed through to step 8.
     claim_min_faces : int, default 0
-        Passed to :func:`break_up_mesh` in step 7.
+        Passed to :func:`break_up_mesh` in step 8.
     compact : bool, default False
         If True, run :func:`compact_mesh` as a final step to drop
         unreferenced vertices and degenerate faces.  This invalidates
@@ -5329,8 +4779,8 @@ def preprocess(
     Returns
     -------
     mesh : Mesh
-        Cleaned mesh (gaps stitched, fusions removed, optionally
-        compacted).
+        Cleaned mesh (gaps stitched, fusions removed, holes patched,
+        optionally compacted).
     components : MeshComponents
         Classified pieces: soma, organelles, neurites, discarded.
     """
@@ -5408,7 +4858,17 @@ def preprocess(
         if fusions:
             mesh = remove_fusions(mesh, fusions=fusions, mesh_stats=mesh_stats)
 
-    # 7. Break up mesh
+    # 7. Holes — the organelles' mouths and the mesh's own openings
+    #    patched, so that the neurites cut out next are tubes
+    with _timed("↳  fill holes", verbose=verbose) as log:
+        if fill:
+            n_before = len(mesh.faces)
+            mesh = fill_holes(mesh, organelles=org, soma=soma, mesh_stats=mesh_stats)
+            log(f"+{len(mesh.faces) - n_before:,} faces")
+        else:
+            log("none: fill=False")
+
+    # 8. Break up mesh
     with _timed("↳  break up mesh", verbose=verbose) as log:
         components = break_up_mesh(
             mesh,
@@ -5420,7 +4880,7 @@ def preprocess(
         )
         log(f"{len(components.neurites)} neurites")
 
-    # 8. Compact (optional — remaps everything in MeshComponents)
+    # 9. Compact (optional — remaps everything in MeshComponents)
     if compact:
         with _timed("↳  compact mesh", verbose=verbose):
             mesh, components = compact_mesh(mesh, components=components)

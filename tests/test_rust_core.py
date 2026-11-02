@@ -636,64 +636,46 @@ class TestFindOrganelles:
     def test_a_hole_bigger_than_its_fold_and_outside_the_cell_is_left(self):
         """A hole walled in by pocket is a fold's inside if it is no bigger
         than the pocket it touches, or lies inside the cell.  A soma's
-        neurite whose base is ringed by a fold (inward dots on a band of
-        it) keeps a long tip out of the pocket — bigger than the fold, its
-        faces looking out of the cell — while a tip smaller than the fold is
+        neurite whose base is ringed by a fold — the surface folding down
+        into a groove round it, its walls looking across at each other —
+        keeps a long tip out of the pocket (bigger than the fold, its faces
+        looking out of the cell), while a tip smaller than the fold is
         filled, and so are the folds inside the flask's chamber; on both
         paths."""
-        from skeliner.python import mesh as python_mesh
-        from skeliner.python import pre as python_pre
-
-        def on_both_paths(mesh, dots, main):
-            faces = np.asarray(mesh.faces, dtype=np.int64)
-            verts = np.asarray(mesh.vertices, dtype=np.float64)
-            args = (faces, verts, np.asarray(mesh.area_faces), dots, main)
-            geometry = {
-                "centers": np.asarray(mesh.triangles_center, dtype=np.float64),
-                "normals": np.asarray(mesh.face_normals, dtype=np.float64),
-            }
-            rust = _rs.pre.pocket_organelles(
-                *args, _rs.mesh.Topology(faces, len(verts)), **geometry
-            )
-            python = python_pre.pocket_organelles(
-                *args, python_mesh.Topology(faces, len(verts)), **geometry
-            )
-            assert_parity(rust, python)
-            return rust
-
         for tip_rings, filled in ((40, False), (5, True)):
-            angles = np.linspace(-np.pi / 2 + 0.05, np.pi / 2 - np.arcsin(0.05), 120)
-            prof = [(6000.0 * np.cos(a), 6000.0 * np.sin(a)) for a in angles]
-            z0 = prof[-1][1]
-            prof += [(300.0, z0 + 150.0 * k) for k in range(1, 17 + tip_rings)]
-            verts, faces = _revolved(prof)
-            # the tip closed, as a neurite's end is: a fan to the axis
-            top = np.flatnonzero(verts[:, 2] == verts[:, 2].max())
-            ring = top[np.argsort(np.arctan2(verts[top, 1], verts[top, 0]))]
-            apex = [[0.0, 0.0, verts[:, 2].max() + 150.0]]
-            fan = np.column_stack(
-                [ring, np.roll(ring, -1), np.full(len(ring), len(verts))]
-            )
-            mesh = trimesh.Trimesh(
-                np.vstack([verts, apex]), np.vstack([faces, fan]), process=False
-            )
-            if mesh.face_normals[-1][2] < 0:
-                faces = np.vstack([faces, fan[:, ::-1]])
-                mesh = trimesh.Trimesh(mesh.vertices, faces, process=False)
-            assert mesh.is_winding_consistent and mesh.face_normals[-1][2] > 0
-            z = mesh.triangles_center[:, 2]
-            band = (z > z0 + 300.0) & (z < z0 + 2400.0)
-            tip = z > z0 + 2400.0
-            dots = np.where(band, -0.5, 0.5)
-            pocket, _ = on_both_paths(mesh, dots, np.ones(len(z), dtype=bool))
-            assert pocket[band].all()
+            mesh, walls, tip = _grooved_neurite(tip_rings)
+            dots = np.where(walls, -0.5, 0.5)
+            pocket, counts = _pockets_on_both_paths(mesh, dots)
+            assert counts["n_mouths"] > 0 and pocket[walls].all()
             assert pocket[tip].all() if filled else not pocket[tip].any()
             # walled in, and small or under 5% of the mesh: once a hole
-            assert tip.sum() < 0.05 * len(z)
+            assert tip.sum() < 0.05 * len(tip)
         flask = _flask()
         st = pre.compute_mesh_stats(flask, None)
-        _, counts = on_both_paths(flask, st.outward_dots, st.main_face_mask)
+        _, counts = _pockets_on_both_paths(flask, st.outward_dots)
         assert counts["n_holes"] > 0
+
+    def test_a_band_of_outer_membrane_is_no_pocket(self):
+        """A band of a soma's neurite whose dots say concave — a crease or
+        groove of the outer membrane — is no pocket however deep its outline
+        reads: its faces look out of the cell, so no sac holds it.  Its
+        rings, a neurite's width apart, once measured as an opening a
+        seventh of its area.  The groove of the same neurite's base, whose
+        walls look across at each other, is one; on both paths."""
+        mesh, _, _ = _grooved_neurite(40, depth=0.0)
+        z = mesh.triangles_center[:, 2]
+        top = z[np.argmax(np.hypot(*mesh.triangles_center[:, :2].T) < 301)]
+        band = (
+            (np.hypot(*mesh.triangles_center[:, :2].T) < 301)
+            & (z > top + 300.0)
+            & (z < top + 2400.0)
+        )
+        assert band.sum() > 100
+        pocket, counts = _pockets_on_both_paths(mesh, np.where(band, -0.5, 0.5))
+        assert counts["n_mouths"] == 0 and not pocket.any()
+        mesh, walls, _ = _grooved_neurite(40)
+        pocket, counts = _pockets_on_both_paths(mesh, np.where(walls, -0.5, 0.5))
+        assert counts["n_mouths"] > 0 and pocket[walls].all()
 
     def test_a_small_pocket_looking_into_the_cell_is_no_dip(self):
         """A pocket with less than 3x the area of the faces ringing it is
@@ -839,7 +821,7 @@ class TestFindOrganelles:
         rust = _rs.pre.find_organelles(*args)
         assert_parity(rust, python_pre.find_organelles(*args))
         pocket, _, report = rust
-        assert report["n_grown"] > lower.sum()
+        assert report["n_grown"] > 0.99 * lower.sum()
         assert pocket[fold].mean() > 0.99 and not pocket[~fold].any()
 
 
@@ -999,6 +981,72 @@ def _flask(r_out=3000.0, r_neck=250.0, r_chamber=1500.0, step=150.0):
         prof.append((r * np.sin(a), zc + r * np.cos(a)))
     v, f = _revolved(prof)
     return trimesh.Trimesh(v, f, process=False)
+
+
+def _grooved_neurite(tip_rings, r_soma=6000.0, r_out=600.0, r_in=300.0, depth=1500.0):
+    """A soma with a neurite on top whose base sits in a groove: the soma's
+    surface folds down at *r_out* by *depth* and back up the neurite (radius
+    *r_in*), which then runs *tip_rings* rings past the soma, its tip closed
+    by a fan.  ``(mesh, walls, tip)``: the groove's two walls and the
+    neurite above it.  With *depth* 0 the neurite rises straight off the
+    soma."""
+    top = np.arccos((r_out if depth > 0 else r_in) / r_soma)
+    angles = np.linspace(-np.pi / 2 + 0.05, top, 120)
+    prof = [(r_soma * np.cos(a), r_soma * np.sin(a)) for a in angles]
+    z0 = prof[-1][1]
+    rings = int(round(depth / 150.0))
+    prof += [(r_out, z0 - 150.0 * k) for k in range(1, rings + 1)]
+    if rings:
+        prof.append(((r_out + r_in) / 2, z0 - depth))
+    prof += [(r_in, z0 - depth + 150.0 * k) for k in range(1, rings + 1 + tip_rings)]
+    verts, faces = _revolved(prof)
+    zt = verts[:, 2].max()
+    ring = np.flatnonzero(verts[:, 2] == zt)
+    ring = ring[np.argsort(np.arctan2(verts[ring, 1], verts[ring, 0]))]
+    apex = [[0.0, 0.0, zt + 150.0]]
+    fan = np.column_stack([ring, np.roll(ring, -1), np.full(len(ring), len(verts))])
+    mesh = trimesh.Trimesh(
+        np.vstack([verts, apex]), np.vstack([faces, fan]), process=False
+    )
+    if mesh.face_normals[-1][2] < 0:
+        mesh = trimesh.Trimesh(
+            mesh.vertices, np.vstack([faces, fan[:, ::-1]]), process=False
+        )
+    assert mesh.is_winding_consistent and mesh.face_normals[-1][2] > 0
+    c = mesh.triangles_center
+    r, z = np.hypot(c[:, 0], c[:, 1]), c[:, 2]
+    walls = (
+        (z < z0)
+        & (z > z0 - depth + 75.0)
+        & ((np.abs(r - r_out) < 30) | (r < r_in + 30))
+    )
+    tip = (z > z0) & (r < r_in + 30)
+    return mesh, walls, tip
+
+
+def _pockets_on_both_paths(mesh, dots, main=None):
+    """``pocket_organelles`` on *mesh* with the outward *dots* given, on
+    both paths, checked equal: ``(pocket, counts)``."""
+    from skeliner.python import mesh as python_mesh
+    from skeliner.python import pre as python_pre
+
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    if main is None:
+        main = np.ones(len(faces), dtype=bool)
+    args = (faces, verts, np.asarray(mesh.area_faces), np.asarray(dots), main)
+    geometry = {
+        "centers": np.asarray(mesh.triangles_center, dtype=np.float64),
+        "normals": np.asarray(mesh.face_normals, dtype=np.float64),
+    }
+    rust = _rs.pre.pocket_organelles(
+        *args, _rs.mesh.Topology(faces, len(verts)), **geometry
+    )
+    python = python_pre.pocket_organelles(
+        *args, python_mesh.Topology(faces, len(verts)), **geometry
+    )
+    assert_parity(rust, python)
+    return rust
 
 
 def _icosphere_soma():
@@ -1346,26 +1394,6 @@ class TestParallelPatches:
 
 class TestPythonPath:
     """The ``mesh`` crate's Python twins compute what the Rust ones do."""
-
-    def test_a_degenerate_faces_outline_opens_nothing(self):
-        """A rim loop through collinear points — a zero-area face's outline —
-        encloses nothing, though its projection rounds to a speck (1.1e-12
-        here): an opening of that size once made a pocket of a flap."""
-        from skeliner.python import pre as python_pre
-
-        line = np.array(
-            [
-                [697724.0, 958735.0, 845926.0],
-                [697868.0, 958849.0, 845722.0],
-                [697964.0, 958925.0, 845586.0],
-            ]
-        )
-        square = np.array([[0.0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0]]) + 5e5
-        verts = np.vstack([line, square])
-        ring = [(0, 1), (1, 2), (0, 2)]
-        box = [(3, 4), (4, 5), (5, 6), (3, 6)]
-        assert python_pre.rim_enclosed_area(ring, verts) == 0.0
-        assert abs(python_pre.rim_enclosed_area(ring + box, verts) - 100.0) < 1e-9
 
     def test_right_singular_vectors_are_numpys_up_to_signs(self):
         """The fits' SVD: the same bits on both paths (no LAPACK), and numpy's

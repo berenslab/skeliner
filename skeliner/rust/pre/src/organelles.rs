@@ -190,27 +190,6 @@ pub fn enclosure_pass(
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_degenerate_faces_outline_encloses_nothing() {
-        // a zero-area face's corners, collinear, whose projection rounds to
-        // a speck (1.1e-12 without the rounding test), and a 10 x 10 square
-        let line = [
-            [697724.0, 958735.0, 845926.0],
-            [697868.0, 958849.0, 845722.0],
-            [697964.0, 958925.0, 845586.0],
-        ];
-        let square = [
-            [0.0, 0.0, 0.0],
-            [10.0, 0.0, 0.0],
-            [10.0, 10.0, 0.0],
-            [0.0, 10.0, 0.0],
-        ];
-        let loops = [crate::fits::centred(&line), crate::fits::centred(&square)];
-        let vts: Vec<_> = loops.iter().map(|l| right_singular(l)).collect();
-        assert_eq!(rim_area(&loops[..1], &vts[..1]), 0.0);
-        assert!((rim_area(&loops, &vts) - 100.0).abs() < 1e-9);
-    }
-
     fn yes(_: &[u32]) -> bool {
         true
     }
@@ -378,12 +357,76 @@ mod tests {
         for (faces, all) in [(&inward, true), (&f, false)] {
             let (c, n) = centres_and_normals(&v, faces);
             let topo = Topology::new(faces, v.len());
-            let grown = grow_into_cell(&topo, &seeds, &Inside::new(&v, faces, &c, &n));
+            let grown = grow_into_cell(&topo, &seeds, &Inside::new(&v, faces, &c, &n), 3.0);
             assert!(grown[0]);
             assert_eq!(
                 grown.iter().filter(|&&g| g).count(),
                 if all { 8 } else { 1 }
             );
+        }
+    }
+
+    /// Two strips 1 wide and 10 long, `gap` apart, each wound to face the
+    /// other; faces `4j` and `4j + 1` are the near strip's row `j`.
+    fn facing_strips(gap: f64) -> (Vec<[f64; 3]>, Vec<[u32; 3]>) {
+        let mut v = Vec::new();
+        for z in [0.0, gap] {
+            for j in 0..=10 {
+                v.push([0.0, f64::from(j), z]);
+                v.push([1.0, f64::from(j), z]);
+            }
+        }
+        let at = |s: u32, j: u32, i: u32| s * 22 + 2 * j + i;
+        let mut f = Vec::new();
+        for j in 0..10 {
+            f.push([at(0, j, 0), at(0, j, 1), at(0, j + 1, 1)]);
+            f.push([at(0, j, 0), at(0, j + 1, 1), at(0, j + 1, 0)]);
+            f.push([at(1, j, 0), at(1, j + 1, 1), at(1, j, 1)]);
+            f.push([at(1, j, 0), at(1, j + 1, 0), at(1, j + 1, 1)]);
+        }
+        (v, f)
+    }
+
+    #[test]
+    fn the_growth_stops_where_a_face_s_view_is_open_though_its_normal_meets_the_cell() {
+        // far apart, a strip's every normal ray meets the other strip, yet
+        // nearly all of its view leaves: a crevice, which the growth does not
+        // cross; close together (a flat cisterna) the view is the other
+        // strip, and the growth takes the whole near strip
+        for (gap, grown_all) in [(4.0, false), (0.05, true)] {
+            let (v, f) = facing_strips(gap);
+            let (c, n) = centres_and_normals(&v, &f);
+            let inside = Inside::new(&v, &f, &c, &n);
+            let near: Vec<usize> = (0..f.len()).filter(|k| k % 4 < 2).collect();
+            assert!(near.iter().all(|&k| inside.looks_in(k)));
+            let mut seeds = vec![false; f.len()];
+            seeds[20] = true;
+            let grown = grow_into_cell(&Topology::new(&f, v.len()), &seeds, &inside, 3.0);
+            let n_near = near.iter().filter(|&&k| grown[k]).count();
+            assert_eq!(n_near, if grown_all { near.len() } else { 1 }, "gap {gap}");
+        }
+    }
+
+    #[test]
+    fn a_closed_cavity_s_view_never_leaves_it_and_a_convex_body_s_always_does() {
+        let (v, f) = octahedron();
+        let inward: Vec<[u32; 3]> = f.iter().map(|&[a, b, c]| [a, c, b]).collect();
+        let (c, n) = centres_and_normals(&v, &inward);
+        let inside = Inside::new(&v, &inward, &c, &n);
+        assert!((0..8).all(|k| inside.escaped(k) == 0));
+        let cluster: Vec<u32> = (0..8).collect();
+        assert!(folds_in(&cluster, &inside, 3.0));
+        let (c, n) = centres_and_normals(&v, &f);
+        let inside = Inside::new(&v, &f, &c, &n);
+        assert!((0..8).all(|k| inside.escaped(k) == VIEW.len()));
+        assert!(!folds_in(&cluster, &inside, 3.0));
+    }
+
+    #[test]
+    fn the_view_is_unit_directions_over_the_outer_side() {
+        for d in VIEW {
+            assert!(((d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) - 1.0).abs() < 1e-12);
+            assert!(d[2] > 0.0);
         }
     }
 
@@ -401,18 +444,16 @@ mod tests {
     }
 }
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use mesh::Topology;
 use mesh::components::LowestRootSets;
-use mesh::geometry::{numpy_sum, right_singular};
+use mesh::geometry::numpy_sum;
 use mesh::ray::TriangleBvh;
 use mesh::spatial::{KdTree, Sum};
 use rayon::prelude::*;
-
-use crate::fits::{centred, hull_area_on};
 
 /// Whether a piece of the surface lies inside the cell: more than half its
 /// faces look into it, the ray from a face's centre along its normal (out
@@ -423,35 +464,67 @@ use crate::fits::{centred, hull_area_on};
 /// rays: one leaving through it meets the cell's continuation there,
 /// which the mesh lacks, while a neurite's outer membrane by a cut still
 /// looks out ([`FAN_CLEARANCE`]).  The faces' tree and the fans' are
-/// built on first use.
+/// built on first use, and each face's answer is kept once found.
 pub struct Inside<'a> {
     verts: &'a [[f64; 3]],
     faces: &'a [[u32; 3]],
     centers: &'a [[f64; 3]],
     normals: &'a [[f64; 3]],
     probe: OnceLock<(TriangleBvh, TriangleBvh)>,
+    /// per face: 0 not asked yet, 1 looks in, 2 looks out
+    looks: Vec<AtomicU8>,
 }
 
 /// How far a ray travels before an opening's fan counts, in mesh units: a
 /// face lying in an opening's plane does not look through it.
 pub const FAN_CLEARANCE: f64 = 1e-6;
 
+/// A face's view of the cell, sampled evenly by cosine weight: a
+/// Fibonacci spiral over the unit disc lifted onto the hemisphere about +z
+/// (Malley's method), each direction carrying the same share of the light a
+/// diffuse face would receive.
+pub const VIEW: [[f64; 3]; 16] = [
+    [0.1767766952966369, 0.0, 0.9842509842514764],
+    [-0.225772187937548, 0.20682581839289915, 0.9519716382329886],
+    [
+        0.03455805202455909,
+        -0.39377117852919086,
+        0.9185586535436918,
+    ],
+    [0.28457121982273553, 0.37117276415249045, 0.8838834764831844],
+    [
+        -0.5222231872442845,
+        -0.09237392870513249,
+        0.8477912478906585,
+    ],
+    [0.4946953915278165, -0.3146847145972304, 0.8100925873009825],
+    [-0.16546592706317265, 0.6155250011016001, 0.770551750371122],
+    [
+        -0.31556146793512924,
+        -0.6075944041501916,
+        0.7288689868556626,
+    ],
+    [0.6846421615837075, 0.25003021933756037, 0.6846531968814576],
+    [-0.7122560862297537, 0.294008958415681, 0.6373774391990982],
+    [0.34335449874552143, -0.7337286202617503, 0.5863019699779287],
+    [0.2537302409112575, 0.8089319902483244, 0.5303300858899106],
+    [
+        -0.7647458919689066,
+        -0.4431858760347419,
+        0.46770717334674256,
+    ],
+    [0.897133983572641, -0.19723238962980807, 0.39528470752104744],
+    [-0.5475069048541611, 0.7787722318733614, 0.30618621784789707],
+    [
+        -0.12648677292149527,
+        -0.9760896968393356,
+        0.1767766952966369,
+    ],
+];
+
 /// A ray costs microseconds, so this many are worth casting across the
 /// pool (`threads::MIN_PARALLEL` is for items costing nanoseconds).
 const RAYS_PARALLEL: usize = 256;
-
-/// Fits of a rim's or a boundary's points (microseconds each): at once
-/// from this many.
-const FITS_PARALLEL: usize = 256;
-
-/// Each of `xs`' right singular vectors ([`right_singular`]), in order.
-fn right_singular_each(xs: &[&[[f64; 3]]]) -> Vec<[[f64; 3]; 3]> {
-    if xs.len() >= FITS_PARALLEL {
-        threads::install(|| xs.par_iter().map(|x| right_singular(x)).collect())
-    } else {
-        xs.iter().map(|x| right_singular(x)).collect()
-    }
-}
 
 impl<'a> Inside<'a> {
     pub fn new(
@@ -466,6 +539,7 @@ impl<'a> Inside<'a> {
             centers,
             normals,
             probe: OnceLock::new(),
+            looks: (0..faces.len()).map(|_| AtomicU8::new(0)).collect(),
         }
     }
 
@@ -567,10 +641,62 @@ impl<'a> Inside<'a> {
     /// Does face `f` look into the cell: does its normal ray meet another
     /// face, or an opening's fan?
     pub fn looks_in(&self, f: usize) -> bool {
+        match self.looks[f].load(Ordering::Relaxed) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
         let (faces, fans) = self.probe();
         let (o, d) = (self.centers[f], self.normals[f]);
-        faces.hits_past(o, d, f64::NEG_INFINITY, Some(f))
-            || fans.hits_past(o, d, FAN_CLEARANCE, None)
+        let l = faces.hits_past(o, d, f64::NEG_INFINITY, Some(f))
+            || fans.hits_past(o, d, FAN_CLEARANCE, None);
+        self.looks[f].store(if l { 1 } else { 2 }, Ordering::Relaxed);
+        l
+    }
+
+    /// How many of the [`VIEW`] directions from face `f`'s centre over its
+    /// outer side (the view turned so +z is its normal) leave the cell: their
+    /// ray meets neither another face nor an opening's fan.  A face with no
+    /// normal sees all of them leave.
+    pub fn escaped(&self, f: usize) -> usize {
+        let n = self.normals[f];
+        if n == [0.0; 3] {
+            return VIEW.len();
+        }
+        let t = if n[0].abs() < 0.9 {
+            [1.0, 0.0, 0.0]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        let c = [
+            n[1] * t[2] - n[2] * t[1],
+            n[2] * t[0] - n[0] * t[2],
+            n[0] * t[1] - n[1] * t[0],
+        ];
+        let l = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+        let u = [c[0] / l, c[1] / l, c[2] / l];
+        let w = [
+            n[1] * u[2] - n[2] * u[1],
+            n[2] * u[0] - n[0] * u[2],
+            n[0] * u[1] - n[1] * u[0],
+        ];
+        let (faces, fans) = self.probe();
+        let o = self.centers[f];
+        VIEW.iter()
+            .filter(|v| {
+                let d = [0, 1, 2].map(|k| v[0] * u[k] + v[1] * w[k] + v[2] * n[k]);
+                !faces.hits_past(o, d, f64::NEG_INFINITY, Some(f))
+                    && !fans.hits_past(o, d, FAN_CLEARANCE, None)
+            })
+            .count()
+    }
+
+    /// Does face `f` look into a fold of the cell: does its normal ray meet
+    /// another face ([`Self::looks_in`]), and at most a `min_fold_ratio`-th
+    /// of its view leave the cell ([`Self::escaped`])?  The view is cast only
+    /// for a face that looks in.
+    pub fn looks_into_fold(&self, f: usize, min_fold_ratio: f64) -> bool {
+        self.looks_in(f) && self.escaped(f) as f64 * min_fold_ratio <= VIEW.len() as f64
     }
 
     /// Does the piece of faces `piece` lie inside the cell: do more than
@@ -587,12 +713,19 @@ impl<'a> Inside<'a> {
     }
 }
 
-/// The faces reached from `seeds` across faces that look into the cell
-/// ([`Inside::looks_in`]), over `topo`'s edge adjacency: an organelle's
-/// membrane goes on into the cell past where its outward dots stopped the
-/// flood, and the outer membrane, looking out, stops it.  Only the faces
-/// next to the growth are cast a ray, each once, a ring at a time.
-pub fn grow_into_cell(topo: &Topology, seeds: &[bool], inside: &Inside<'_>) -> Vec<bool> {
+/// The faces reached from `seeds` across faces that look into a fold of the
+/// cell ([`Inside::looks_into_fold`]), over `topo`'s edge adjacency: an
+/// organelle's membrane goes on into the cell past where its outward dots
+/// stopped the flood, and the outer membrane stops it — looking out, or,
+/// in a crevice whose normal ray meets the process beside it, seeing more
+/// than a `min_fold_ratio`-th of its view leave the cell.  Only the faces
+/// next to the growth are judged, each once, a ring at a time.
+pub fn grow_into_cell(
+    topo: &Topology,
+    seeds: &[bool],
+    inside: &Inside<'_>,
+    min_fold_ratio: f64,
+) -> Vec<bool> {
     let mut grown = seeds.to_vec();
     // judged faces, grown or not: whether a face looks in never changes
     let mut seen = seeds.to_vec();
@@ -611,10 +744,11 @@ pub fn grow_into_cell(topo: &Topology, seeds: &[bool], inside: &Inside<'_>) -> V
                 }
             }
         }
+        let judge = |&g: &usize| inside.looks_into_fold(g, min_fold_ratio);
         let looks: Vec<bool> = if ring.len() >= RAYS_PARALLEL {
-            threads::install(|| ring.par_iter().map(|&g| inside.looks_in(g)).collect())
+            threads::install(|| ring.par_iter().map(judge).collect())
         } else {
-            ring.iter().map(|&g| inside.looks_in(g)).collect()
+            ring.iter().map(judge).collect()
         };
         front = ring
             .into_iter()
@@ -891,114 +1025,6 @@ pub fn structural_masks(
     (mask, non_main, n_structural)
 }
 
-/// The simple closed loops among `edges`, each loop's points in order
-/// round it and centred on their mean: what `skeliner.pre._rim_enclosed_area`
-/// fits a plane to.
-pub fn rim_loops(edges: &[[u32; 2]], verts: &[[f64; 3]]) -> Vec<Vec<[f64; 3]>> {
-    let mut edges_at: HashMap<u32, Vec<usize>> = HashMap::new();
-    for (i, e) in edges.iter().enumerate() {
-        edges_at.entry(e[0]).or_default().push(i);
-        edges_at.entry(e[1]).or_default().push(i);
-    }
-    let mut visited = vec![false; edges.len()];
-    let mut loops = Vec::new();
-    for start in 0..edges.len() {
-        if visited[start] {
-            continue;
-        }
-        let mut comp = Vec::new();
-        let mut queue = VecDeque::from([start]);
-        while let Some(ei) = queue.pop_front() {
-            if visited[ei] {
-                continue;
-            }
-            visited[ei] = true;
-            comp.push(ei);
-            for v in edges[ei] {
-                for &nei in &edges_at[&v] {
-                    if !visited[nei] {
-                        queue.push_back(nei);
-                    }
-                }
-            }
-        }
-        let mut degree: HashMap<u32, usize> = HashMap::new();
-        for &ei in &comp {
-            for v in edges[ei] {
-                *degree.entry(v).or_default() += 1;
-            }
-        }
-        if degree.values().any(|&d| d != 2) {
-            continue;
-        }
-        let mut adj: HashMap<u32, Vec<u32>> = HashMap::new();
-        for &ei in &comp {
-            let [a, b] = edges[ei];
-            adj.entry(a).or_default().push(b);
-            adj.entry(b).or_default().push(a);
-        }
-        let mut ordered = vec![edges[comp[0]][0]];
-        while ordered.len() < comp.len() {
-            let curr = ordered[ordered.len() - 1];
-            let prev = (ordered.len() > 1).then(|| ordered[ordered.len() - 2]);
-            match adj[&curr].iter().find(|&&nb| Some(nb) != prev) {
-                Some(&nb) => ordered.push(nb),
-                None => break,
-            }
-        }
-        if ordered.len() < 3 {
-            continue;
-        }
-        let pts: Vec<[f64; 3]> = ordered.iter().map(|&v| verts[v as usize]).collect();
-        let n_pts = pts.len() as f64;
-        let mut mean = [0.0f64; 3];
-        for p in &pts {
-            for k in 0..3 {
-                mean[k] += p[k];
-            }
-        }
-        let mean = mean.map(|m| m / n_pts);
-        loops.push(
-            pts.iter()
-                .map(|p| [p[0] - mean[0], p[1] - mean[1], p[2] - mean[2]])
-                .collect(),
-        );
-    }
-    loops
-}
-
-/// `skeliner.pre._rim_enclosed_area`: the planar area enclosed by the
-/// [`rim_loops`], each projected onto the plane of the first two of its
-/// right-singular vectors `vts`.  A loop whose shoelace sum is within the
-/// rounding of its `n` points — `4 n ε R²`, `R` the farthest from their
-/// mean: two projected coordinates in each of `n` terms — encloses nothing:
-/// a degenerate face's outline, collinear, whose area is zero but whose
-/// projection rounds to a speck that made an opening of nothing.
-pub fn rim_area(loops: &[Vec<[f64; 3]>], vts: &[[[f64; 3]; 3]]) -> f64 {
-    let mut total = 0.0;
-    for (centred, vh) in loops.iter().zip(vts) {
-        let dot = |a: &[f64; 3], b: &[f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-        let p2: Vec<[f64; 2]> = centred
-            .iter()
-            .map(|c| [dot(c, &vh[0]), dot(c, &vh[1])])
-            .collect();
-        let n = p2.len();
-        let terms: Vec<f64> = (0..n - 1)
-            .map(|i| p2[i][0] * p2[i + 1][1] - p2[i + 1][0] * p2[i][1])
-            .collect();
-        let s = numpy_sum(&terms) + p2[n - 1][0] * p2[0][1] - p2[0][0] * p2[n - 1][1];
-        let r2 = centred
-            .iter()
-            .map(|c| c[0] * c[0] + c[1] * c[1] + c[2] * c[2])
-            .fold(0.0, f64::max);
-        if s.abs() <= 4.0 * n as f64 * f64::EPSILON * r2 {
-            continue;
-        }
-        total += 0.5 * s.abs();
-    }
-    total
-}
-
 /// Knobs of pocket detection, as `skeliner.pre.find_pocket_organelles`
 /// names them.
 #[derive(Debug, Clone, Copy)]
@@ -1026,104 +1052,78 @@ impl Default for PocketParams {
     }
 }
 
-/// `skeliner.pre.find_pocket_mouths`: the boundary edges of each cluster
-/// of negative-dot faces on `main_mask` that folds inward through a small
-/// opening (pocket area over opening area at least `min_fold_ratio`).
+/// `skeliner.pre.find_pocket_mouths`: the boundary edges (with one face
+/// beyond, sorted) of each cluster of negative-dot faces on `main_mask`
+/// with at least `min_pocket_size` faces that folds into the cell
+/// ([`folds_in`]); clusters in order of their lowest face.
 pub fn pocket_mouths(
     s: &Surface<'_>,
     main_mask: &[bool],
-    non_main: Option<&[bool]>,
     params: &PocketParams,
+    inside: &Inside<'_>,
 ) -> Vec<Vec<[u32; 2]>> {
     let neg = |f: usize| s.dots[f] < 0.0 && main_mask[f];
     let (clusters, of) = components_where(s, neg);
-    // each cluster big enough: its boundary edges (each where first met in
-    // the cluster's order), its area and its rim's loops, all at once
-    struct Rim {
-        first: u32,
-        boundary: Vec<[u32; 2]>,
-        area: f64,
-        loops: Vec<Vec<[f64; 3]>>,
+    let clusters: Vec<&Vec<u32>> = clusters
+        .iter()
+        .filter(|c| c.len() >= params.min_pocket_size)
+        .collect();
+    if clusters.is_empty() {
+        return Vec::new();
     }
-    let rims: Vec<Rim> = threads::install(|| {
+    inside.prepare();
+    threads::install(|| {
         clusters
             .par_iter()
-            .filter(|c| c.len() >= params.min_pocket_size)
+            .filter(|c| folds_in(c, inside, params.min_fold_ratio))
             .filter_map(|cluster| {
                 let first = cluster[0];
-                let member = |f: u32| of[f as usize] == first;
-                let mut boundary: Vec<[u32; 2]> = Vec::new();
-                for &f in cluster {
-                    let ids = s.topo.face_edges(f as usize);
-                    for (k, e) in face_edge_keys(&s.faces[f as usize]).into_iter().enumerate() {
-                        let on = match ids {
-                            // the keys' column pairs are the topology's
-                            Some(ids) => s.topo.edge_faces(ids[k] as usize),
-                            None => faces_on(s, e),
-                        };
-                        if on.len() == 2 {
-                            let other = if member(on[0]) { on[1] } else { on[0] };
-                            if !member(other) {
-                                boundary.push(e);
-                            }
+                let mut edges: Vec<[u32; 2]> = Vec::new();
+                for &f in cluster.iter() {
+                    for e in face_edge_keys(&s.faces[f as usize]) {
+                        let on = faces_on(s, e);
+                        if on.len() == 2
+                            && (of[on[0] as usize] != first || of[on[1] as usize] != first)
+                        {
+                            edges.push(e);
                         }
                     }
                 }
-                // an edge met twice is a face's repeated vertex pair
-                let mut met = HashSet::with_capacity(boundary.len());
-                boundary.retain(|e| met.insert(*e));
-                if boundary.is_empty() {
-                    return None;
-                }
-                let mut members = cluster.clone();
-                members.sort_unstable();
-                let areas: Vec<f64> = members.iter().map(|&f| s.areas[f as usize]).collect();
-                Some(Rim {
-                    first,
-                    area: numpy_sum(&areas),
-                    loops: rim_loops(&boundary, s.verts),
-                    boundary,
-                })
+                edges.sort_unstable();
+                edges.dedup();
+                (!edges.is_empty()).then_some(edges)
             })
             .collect()
-    });
+    })
+}
 
-    // the rims' planes, every loop's at once
-    let loops: Vec<&[[f64; 3]]> = rims
-        .iter()
-        .flat_map(|r| r.loops.iter().map(Vec::as_slice))
-        .collect();
-    let vts = right_singular_each(&loops);
-    let mut at = 0;
-    let mut openings: Vec<f64> = rims
-        .iter()
-        .map(|r| {
-            at += r.loops.len();
-            rim_area(&r.loops, &vts[at - r.loops.len()..at])
-        })
-        .collect();
-    // no rim encloses anything: the boundary's hull instead
-    let hulls: Vec<(usize, Vec<[f64; 3]>)> = rims
-        .iter()
-        .enumerate()
-        .filter(|&(i, r)| openings[i] <= 0.0 && !non_main.is_some_and(|m| m[r.first as usize]))
-        .filter_map(|(i, r)| {
-            let bverts: BTreeSet<u32> = r.boundary.iter().flatten().copied().collect();
-            (bverts.len() >= 3).then(|| {
-                let pts: Vec<[f64; 3]> = bverts.iter().map(|&v| s.verts[v as usize]).collect();
-                (i, centred(&pts))
-            })
-        })
-        .collect();
-    let pts: Vec<&[[f64; 3]]> = hulls.iter().map(|(_, c)| c.as_slice()).collect();
-    for ((i, c), vt) in hulls.iter().zip(right_singular_each(&pts)) {
-        openings[*i] = hull_area_on(c, vt);
-    }
-    rims.into_iter()
-        .zip(openings)
-        .filter(|(r, opening)| !(*opening <= 0.0 || r.area / opening < params.min_fold_ratio))
-        .map(|(r, _)| r.boundary)
-        .collect()
+/// Does the cluster of faces `cluster` fold into the cell: does at most a
+/// `min_fold_ratio`-th of its faces' view leave the cell ([`Inside::escaped`],
+/// [`VIEW`] directions a face)?
+///
+/// A face sees each patch of a sphere it lies on in proportion to the
+/// patch's area when its view is weighted by cosine (the diffuse view factor
+/// inside a sphere is uniform), so from anywhere on a spherical cap folded to
+/// θ the share leaving through the mouth is the missing area's,
+/// (1 + cos θ) / 2 — the inverse of the cap's fold ratio, its area over its
+/// mouth's, 2 / (1 + cos θ).  At 3, θ = 109.47° (cos θ = −1/3): half the
+/// cap's faces look across it at the cap.  The rays see the aperture
+/// itself, whatever the mouth's shape, and the mesh's openings are closed for
+/// them: a groove or crevice of the outer membrane, open along its length,
+/// sees the outside; an organelle's wall, however broken into concave
+/// pieces, sees the organelle around it.
+///
+/// The cluster's view is sampled at the view's own resolution: at most as
+/// many of its faces as the view has directions, evenly spaced in ascending
+/// order, each looking every way of the view.
+fn folds_in(cluster: &[u32], inside: &Inside<'_>, min_fold_ratio: f64) -> bool {
+    let mut faces = cluster.to_vec();
+    faces.sort_unstable();
+    let m = faces.len().min(VIEW.len());
+    let open: usize = (0..m)
+        .map(|i| inside.escaped(faces[i * faces.len() / m] as usize))
+        .sum();
+    open as f64 * min_fold_ratio <= (m * VIEW.len()) as f64
 }
 
 /// What [`pocket_organelles`] found, with the tallies the verbose report
@@ -1150,7 +1150,7 @@ pub fn pocket_organelles(
     inside: &Inside<'_>,
 ) -> Pockets {
     let n = s.faces.len();
-    let mouths = pocket_mouths(s, main_mask, non_main, params);
+    let mouths = pocket_mouths(s, main_mask, params, inside);
     let mut out = Pockets {
         mask: vec![false; n],
         n_mouths: mouths.len(),
@@ -1395,7 +1395,7 @@ pub fn find_organelles(
     let found: Vec<bool> = (0..pocket.len())
         .map(|f| pocket[f] || isolated.mask[f])
         .collect();
-    let grown = grow_into_cell(s.topo, &found, &inside);
+    let grown = grow_into_cell(s.topo, &found, &inside, params.min_fold_ratio);
     let n_grown = grown.iter().zip(&found).filter(|&(&g, &f)| g && !f).count();
     let pocket = (0..pocket.len())
         .map(|f| grown[f] && !isolated.mask[f])
