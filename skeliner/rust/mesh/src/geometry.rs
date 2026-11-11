@@ -67,6 +67,16 @@ pub fn edge_lengths(vertices: &[[f64; 3]], edges: &[[u32; 2]]) -> Vec<f64> {
     })
 }
 
+/// `x`'s cosine and sine as numpy's `cos` and `sin` give them: libm's, each
+/// its own call.  Asked for both of one value, LLVM calls macOS's fused
+/// `__sincos_stret` instead, which rounds about one angle in 200 an ulp
+/// away from `sin` or `cos` (index 79 of a 134-point ring's angles, a
+/// stitch's tube) — the argument hidden from the second call keeps them
+/// apart.
+pub fn cos_sin(x: f64) -> (f64, f64) {
+    (x.cos(), std::hint::black_box(x).sin())
+}
+
 /// Orders floats as numpy's sort does: `-0.0` equal to `0.0`, and every NaN,
 /// whatever its sign bit, after every number.  `f64::total_cmp` puts `-0.0`
 /// first and a NaN with its sign bit set — what x86 makes of `0.0 / 0.0` —
@@ -331,6 +341,29 @@ pub fn hull_equations(points: &[[f64; 2]]) -> Option<Vec<[f64; 3]>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[inline(never)]
+    fn cos_alone(x: f64) -> f64 {
+        x.cos()
+    }
+
+    #[inline(never)]
+    fn sin_alone(x: f64) -> f64 {
+        x.sin()
+    }
+
+    #[test]
+    fn cos_sin_are_libm_s_own() {
+        // a stitch tube's ring angles, numpy's linspace(-pi, pi, n, False);
+        // on macOS a fused sincos rounds n = 134's angle 79 apart
+        for n in [30, 64, 134, 256] {
+            let step = 2.0 * std::f64::consts::PI / n as f64;
+            for i in 0..n {
+                let a = i as f64 * step + -std::f64::consts::PI;
+                assert_eq!(cos_sin(a), (cos_alone(a), sin_alone(a)), "{n}: {i}");
+            }
+        }
+    }
 
     #[test]
     fn pairwise_sum_of_short_and_long_arrays() {

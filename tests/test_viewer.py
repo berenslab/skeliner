@@ -173,6 +173,41 @@ def test_a_soma_is_assigned_on_a_freshly_loaded_cell(reassign_client):
     assert np.allclose(state["soma"].center, soma.center)
 
 
+def test_preprocess_looks_for_no_soma_when_switched_off(reassign_client, monkeypatch):
+    # the Run button's soma switch, for a cell with none in the mesh: off,
+    # preprocess is told so and a soma by hand goes with the run; on (the
+    # default) it is the hand soma or find_soma's again
+    from skeliner import pre
+
+    client, state, _ = reassign_client
+    state["soma"] = None
+    state["organelles"] = None
+    state["neurites"] = None
+    state["discarded"] = None
+    faces = np.asarray(state["mesh"].faces)
+    z = state["mesh"].vertices[faces].mean(axis=1)[:, 2]
+    sel = np.flatnonzero(np.abs(z) <= 100.0).tolist()
+    r = client.post("/reassign_preview", json={"faces": sel, "to": "soma"})
+    assert r.status_code == 200, r.json()
+    assert client.post("/reassign_apply").json()["ok"]
+    assert state["soma_by_hand"], "fixture: a soma by hand to drop"
+
+    seen = {}
+    run = pre.preprocess
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(pre, "preprocess", spy)
+    r = client.post("/preprocess", json={"organelles": False, "soma": False})
+    assert r.json()["ok"]
+    assert seen["soma"] is False
+    assert state["soma"] is None and not state["soma_by_hand"]
+    assert client.post("/preprocess", json={"organelles": False}).json()["ok"]
+    assert seen["soma"] is None
+
+
 @pytest.mark.parametrize(
     "body, expected",
     [
@@ -2103,6 +2138,29 @@ def test_an_eyewire_ctm_drop_is_a_mesh_its_components_follow(
     results = r.json()["results"]
     assert [(x["name"], x["ok"]) for x in results] == [
         ("mesh.ctm", True),
+        ("components.npz", True),
+    ]
+    assert drop_client.get("/loaded").json()["mesh"]["nFaces"] == len(mesh.faces)
+    assert _neurite_labels(drop_client)
+
+
+def test_a_mesh_npz_drop_is_a_mesh_its_components_follow(
+    drop_client, drop_files, tmp_path
+):
+    """A mesh saved as ``.npz`` is told from the other ``.npz`` files by its
+    arrays and applied first, as an OBJ is, though ``components.npz`` sorts
+    ahead of ``mesh.npz``."""
+    import skeliner as sk
+
+    mesh_path, comp_path, _ = drop_files
+    mesh = sk.io.load_mesh(mesh_path)
+    npz_path = tmp_path / "mesh.npz"
+    sk.io.save_mesh(mesh, npz_path)
+
+    r = drop_client.post("/upload_batch", files=_as_batch(comp_path, npz_path))
+    assert r.status_code == 200, r.text
+    assert [(x["name"], x["ok"]) for x in r.json()["results"]] == [
+        ("mesh.npz", True),
         ("components.npz", True),
     ]
     assert drop_client.get("/loaded").json()["mesh"]["nFaces"] == len(mesh.faces)

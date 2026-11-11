@@ -1284,6 +1284,63 @@ fn break_up_classify<'py>(
     Ok((comps, kinds))
 }
 
+/// `skeliner.pre.break_up_mesh`'s walls to give back
+/// (`::pre::breakup::severed_walls`): the organelle faces between a piece
+/// [`break_up_classify`] found cut off from its component's body, not
+/// trapped (`pieces`, `kinds`), and that body.  A wall with a face `fixed`
+/// (drawn by hand) stays, and so does a `claimed` piece's.  Face ids,
+/// ascending.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn break_up_severed_walls<'py>(
+    py: Python<'py>,
+    faces: PyReadonlyArray2<'py, i64>,
+    n_vertices: usize,
+    usable: numpy::PyReadonlyArray1<'py, bool>,
+    organelle: numpy::PyReadonlyArray1<'py, bool>,
+    claimed: numpy::PyReadonlyArray1<'py, bool>,
+    fixed: numpy::PyReadonlyArray1<'py, bool>,
+    pieces: Vec<numpy::PyReadonlyArray1<'py, i64>>,
+    kinds: numpy::PyReadonlyArray1<'py, u8>,
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
+    use ::pre::breakup::Piece;
+    let (tris, n) = checked_faces(&faces, Some(n_vertices))?;
+    let flags = |name: &str, a: &numpy::PyReadonlyArray1<'py, bool>| -> PyResult<Vec<bool>> {
+        let v = a.as_array().to_vec();
+        if v.len() != tris.len() {
+            return Err(PyValueError::new_err(format!(
+                "{name} needs one value per face"
+            )));
+        }
+        Ok(v)
+    };
+    let (usable, organelle) = (flags("usable", &usable)?, flags("organelle", &organelle)?);
+    let (claimed, fixed) = (flags("claimed", &claimed)?, flags("fixed", &fixed)?);
+    let pieces: Vec<Vec<u32>> = pieces
+        .iter()
+        .map(|p| face_ids(p, tris.len()))
+        .collect::<PyResult<_>>()?;
+    let kinds: Vec<Piece> = kinds
+        .as_array()
+        .iter()
+        .map(|&k| match k {
+            0 => Ok(Piece::Candidate),
+            1 => Ok(Piece::Trapped),
+            2 => Ok(Piece::Soma),
+            _ => Err(PyValueError::new_err(format!("no piece kind {k}"))),
+        })
+        .collect::<PyResult<_>>()?;
+    if kinds.len() != pieces.len() {
+        return Err(PyValueError::new_err("kinds needs one value per piece"));
+    }
+    let walls = py.detach(|| {
+        ::pre::breakup::severed_walls(
+            &tris, n, &usable, &organelle, &claimed, &fixed, &pieces, &kinds,
+        )
+    });
+    Ok(Array1::from_iter(walls.into_iter().map(i64::from)).into_pyarray(py))
+}
+
 /// What [`find_soma_ring_cutoff`] hands back: the index of the fit that
 /// stands, the soma's vertices, the cutoff ring and the last ring.
 type SomaOut<'py> = (usize, Bound<'py, PyArray1<i64>>, usize, usize);
@@ -1389,7 +1446,7 @@ struct PyZScan {
 #[pymethods]
 impl PyZScan {
     #[new]
-    #[pyo3(signature = (vertices, grid_res, z_tol, min_void_r, max_shift))]
+    #[pyo3(signature = (vertices, grid_res, z_tol, min_void_r, max_shift, near=None))]
     fn new(
         py: Python<'_>,
         vertices: PyReadonlyArray2<'_, f64>,
@@ -1397,6 +1454,7 @@ impl PyZScan {
         z_tol: f64,
         min_void_r: Option<f64>,
         max_shift: f64,
+        near: Option<[f64; 3]>,
     ) -> PyResult<Self> {
         let verts = rows3("V", &vertices)?;
         let p = ::pre::nucleus::ZParams {
@@ -1404,6 +1462,7 @@ impl PyZScan {
             z_tol,
             min_void_r,
             max_shift,
+            near,
         };
         Ok(Self {
             inner: py.detach(|| ::pre::nucleus::ZScan::new(&verts, p)),
@@ -1577,6 +1636,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(remove_gaps, m)?)?;
     m.add_function(wrap_pyfunction!(remove_fusions, m)?)?;
     m.add_function(wrap_pyfunction!(break_up_classify, m)?)?;
+    m.add_function(wrap_pyfunction!(break_up_severed_walls, m)?)?;
     m.add_function(wrap_pyfunction!(find_soma_ring_cutoff, m)?)?;
     m.add_class::<PyZScan>()?;
     Ok(())

@@ -473,6 +473,19 @@ def face_adjacency(
     return adj
 
 
+def hole_neighbours(
+    edge_to_faces: dict[tuple[int, int], list[int]],
+) -> dict[int, list[int]]:
+    """Vertex → the vertices it shares an edge of one face with: the
+    mesh's holes, edge to edge."""
+    out: dict[int, list[int]] = defaultdict(list)
+    for (u, v), fis in edge_to_faces.items():
+        if len(fis) == 1:
+            out[u].append(v)
+            out[v].append(u)
+    return dict(out)
+
+
 def border_edges(
     sel: set[int],
     edge_to_faces: dict[tuple[int, int], list[int]],
@@ -519,7 +532,14 @@ def border_loops(
     only on which edges are on the border.  *faces* as in
     :func:`border_edges`.
     """
-    edges = border_edges(sel, edge_to_faces, faces)
+    return loops_of_edges(border_edges(sel, edge_to_faces, faces))
+
+
+def loops_of_edges(edges) -> list[list[int]]:
+    """Closed loops through *edges* (``(low, high)`` pairs), traced as
+    :func:`border_loops` traces a border: each from its smallest vertex, at
+    a choice to the smallest unvisited neighbour, a walk that cannot close
+    dropped.  Fewer than three edges give no loops."""
     if len(edges) < 3:
         return []
 
@@ -558,6 +578,66 @@ def border_loops(
     return loops
 
 
+def cycles_of_edges(edges) -> list[list[int]]:
+    """The simple cycles through *edges* (``(low, high)`` pairs), every edge
+    in at most one.  Dangling paths are pruned first (no cycle runs through
+    an end with one edge); then each walk starts at the smallest vertex
+    with an edge left, steps along its smallest unused edge, and cuts a
+    cycle off whenever it comes back to a vertex already on it; a walk that
+    runs out of edges leaves its open end unlooped, and what dangles is
+    pruned again.  Where every vertex has two edges these are the loops
+    :func:`loops_of_edges` traces; at a pinch — a vertex where two loops
+    touch — both come out, where :func:`loops_of_edges` can trace
+    neither."""
+    adj: dict[int, set[int]] = defaultdict(set)
+    for a, b in edges:
+        adj[int(a)].add(int(b))
+        adj[int(b)].add(int(a))
+    loops: list[list[int]] = []
+    while True:
+        _prune_dangling(adj)
+        start = min((v for v, nbs in adj.items() if nbs), default=None)
+        if start is None:
+            break
+        walk = [start]
+        # each vertex on the walk, at its place in it
+        on = {start: 0}
+        cur = start
+        while adj[cur]:
+            nxt = min(adj[cur])
+            adj[cur].discard(nxt)
+            adj[nxt].discard(cur)
+            at = on.get(nxt)
+            if at is not None:
+                cycle = [nxt, *walk[at + 1 :]]
+                del walk[at + 1 :]
+                for v in cycle[1:]:
+                    del on[v]
+                loops.append(cycle)
+                if nxt == start and len(walk) == 1:
+                    break
+            else:
+                on[nxt] = len(walk)
+                walk.append(nxt)
+            cur = nxt
+    return loops
+
+
+def _prune_dangling(adj: dict[int, set[int]]) -> None:
+    """Remove, end by end, every path that dangles from *adj*: a vertex
+    with one edge left loses it, which may leave its neighbour with one."""
+    ends = [v for v, nbs in adj.items() if len(nbs) == 1]
+    while ends:
+        v = ends.pop()
+        if len(adj[v]) != 1:
+            continue
+        (w,) = adj[v]
+        adj[v].clear()
+        adj[w].discard(v)
+        if len(adj[w]) == 1:
+            ends.append(w)
+
+
 class Topology:
     """Edge → face incidence of a mesh, read like the dict
     :func:`edge_to_faces` builds — which it is.
@@ -571,6 +651,7 @@ class Topology:
         self._faces, self._n_vertices = checked_faces(faces, n_vertices)
         self._map = dict(edge_to_faces(self._faces))
         self._adj: dict[int, set[int]] | None = None
+        self._holes: dict[int, list[int]] | None = None
 
     @property
     def n_faces(self) -> int:
@@ -644,6 +725,20 @@ class Topology:
         """Closed loops along the border of the faces in *sel*."""
         return border_loops(set(int(f) for f in sel), self._map, self._faces)
 
+    def hole_neighbours(self) -> dict[int, list[int]]:
+        """:func:`hole_neighbours` of this mesh (built once)."""
+        if self._holes is None:
+            self._holes = hole_neighbours(self._map)
+        return self._holes
+
+    def rim_loops(self, sel) -> list[list[int]]:
+        """The rim of the faces in *sel* (``skeliner.python.pre.rim_loops``)."""
+        from . import pre
+
+        return pre.rim_loops(
+            set(int(f) for f in sel), self._map, self._faces, self.hole_neighbours()
+        )
+
     def expand_tip(self, tip, target_verts=6, max_iters=20, max_eat_factor=30):
         """``skeliner.pre._expand_tip_to_good_rim`` on this mesh:
         ``(selection, longest loop or None)``."""
@@ -657,6 +752,7 @@ class Topology:
             max_iters=max_iters,
             max_eat_factor=max_eat_factor,
             faces=self._faces,
+            hole_nbrs=self.hole_neighbours(),
         )
 
     def expand_selection_per_group(
@@ -674,13 +770,18 @@ class Topology:
             max_iters=max_iters,
             max_eat_factor=max_eat_factor,
             faces=self._faces,
+            hole_nbrs=self.hole_neighbours(),
         )
 
-    def sever_cost(self, sel, budget: int) -> int:
-        """``skeliner.pre._sever_cost`` on this mesh."""
+    def sever_cost(self, sel, budget: int, rejoined=None) -> int:
+        """``skeliner.pre._sever_cost`` on this mesh; the piece holding a
+        face of *rejoined* (the bridge's other tip) is joined back, not
+        stranded."""
         from . import pre
 
-        return pre.sever_cost(set(int(f) for f in sel), self.face_adjacency(), budget)
+        return pre.sever_cost(
+            set(int(f) for f in sel), self.face_adjacency(), budget, rejoined or ()
+        )
 
 
 def nearest(tree: _KDTree, points) -> tuple[np.ndarray, np.ndarray]:

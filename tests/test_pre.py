@@ -146,6 +146,25 @@ def _subdivided_tube(sections=16, height=1000.0):
     return _cylinder_at(50.0, height, 0.0, sections).subdivide().subdivide()
 
 
+def _open_tube(z_center, open_at, sections=16):
+    """``_subdivided_tube``'s tube at *z_center*, its end at z = *open_at*
+    left open: a neurite the segmentation cut (``4 * sections`` edges of
+    one face)."""
+    t = _cylinder_at(50.0, 1000.0, z_center, sections).subdivide().subdivide()
+    on_end = np.isclose(t.vertices[t.faces][:, :, 2], open_at).all(axis=1)
+    t = trimesh.Trimesh(t.vertices, t.faces[~on_end], process=False)
+    t.remove_unreferenced_vertices()
+    return t
+
+
+def _edge_uses(mesh):
+    """How many faces each edge of *mesh* has (its non-degenerate faces)."""
+    f = np.asarray(mesh.faces)
+    f = np.sort(f[_non_degenerate(f)], axis=1)
+    e = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [0, 2]]])
+    return np.unique(e, axis=0, return_counts=True)[1]
+
+
 def _band(mesh, lo, hi):
     """Faces whose centroid z falls in [lo, hi] — an annulus around a tube."""
     z = mesh.vertices[mesh.faces].mean(axis=1)[:, 2]
@@ -769,6 +788,159 @@ class TestRemoveGaps:
         assert (edge_uses(out) <= 2).all()
         assert (edge_uses(out) == 1).sum() == (edge_uses(mesh) == 1).sum()
 
+    def test_tips_on_open_ends_are_bridged_round_the_ends_on_both_paths(self):
+        # Two tubes end to end, the facing ends open (a neurite the
+        # segmentation cut): a tip there takes faces off the end, and its
+        # border with the other faces runs open from hole to hole.  Its rim
+        # takes in the rest of the end, so the bridge joins the two ends
+        # and closes both.
+        from skeliner import _rs
+
+        mesh = _combine([_open_tube(-600.0, -100.0), _open_tube(600.0, 100.0)])
+        assert (_edge_uses(mesh) == 1).sum() == 2 * 64
+        gaps = pre.find_gaps(mesh, **NO_CAP)
+        assert len(gaps) == 1
+        topo = _rs.mesh.Topology(np.asarray(mesh.faces, np.int64), len(mesh.vertices))
+        open_at = {
+            int(v)
+            for v in np.flatnonzero(np.isclose(np.abs(mesh.vertices[:, 2]), 100.0))
+        }
+        for tip in gaps[0][:2]:
+            assert not topo.border_loops(tip)
+            assert len(topo.rim_loops(tip)) == 1
+            # no ring is peeled: the tip as found, the end round it its rim
+            sel, rim = pre._expand_tip_to_good_rim(tip, topo, None)
+            assert sel == set(tip)
+            assert len(set(rim) & open_at) > 32
+        out, python = both(pre.remove_gaps, mesh, gaps=gaps)
+        assert_parity(np.asarray(out.vertices), np.asarray(python.vertices))
+        assert_parity(np.asarray(out.faces), np.asarray(python.faces))
+        labels, _ = pre._face_edge_components(out)
+        assert len(set(labels.tolist()) - {-2}) == 1
+        assert (_edge_uses(out) <= 2).all()
+        assert (_edge_uses(out) == 1).sum() == 0
+
+    def test_a_rim_round_an_open_end_pairs_with_a_capped_tip_on_both_paths(self):
+        # An open end facing a capped tube: the open end's rim is the whole
+        # end, the cap's — grown to its first rim of six vertices — more
+        # than five times shorter than a pair takes.  The capped side is
+        # grown on until its rim reaches a fifth of the end's, and the pair
+        # is bridged.
+        from skeliner import _rs
+        from skeliner.python import pre as python_pre
+
+        capped = _cylinder_at(50.0, 1000.0, 600.0, 16).subdivide().subdivide()
+        mesh = _combine([_open_tube(-600.0, -100.0, sections=32), capped])
+        gaps = pre.find_gaps(mesh, **NO_CAP)
+        assert len(gaps) == 1
+        faces = np.asarray(mesh.faces, np.int64)
+        topo = _rs.mesh.Topology(faces, len(mesh.vertices))
+        tips = gaps[0][:2]
+        peeled = [pre._expand_tip_to_good_rim(t, topo, None) for t in tips]
+        short, long_ = sorted(len(rim) for _, rim in peeled)
+        assert long_ > 5 * short
+        as_dict = pre._edge_to_faces(mesh)
+        adj = pre._face_adjacency(mesh, as_dict)
+        pair = python_pre.paired(tips, peeled, as_dict, adj, faces=faces)
+        assert min(len(rim) for _, rim in pair) * 5 >= long_
+        assert pre._validate_loop_pair(pair[0][1], pair[1][1]) is None
+        out, python = both(pre.remove_gaps, mesh, gaps=gaps)
+        assert_parity(np.asarray(out.vertices), np.asarray(python.vertices))
+        assert_parity(np.asarray(out.faces), np.asarray(python.faces))
+        labels, _ = pre._face_edge_components(out)
+        assert len(set(labels.tolist()) - {-2}) == 1
+        assert (_edge_uses(out) <= 2).all()
+
+    def test_a_bridge_left_with_nothing_to_meet_yields_on_both_paths(self):
+        # Two bridges landing side by side on main's flank, each decided on
+        # its own: the long tube's patch on main takes every face along the
+        # stub's loop there, so the stub's tube would end on nothing.  The
+        # bridge winning back more (the long tube's) is built; the stub's
+        # is not, the stub left apart rather than hung on a dangling tube.
+        main = _subdivided_tube()
+        turn = trimesh.transformations.rotation_matrix(np.pi / 2, [0, 1, 0])
+        long_ = _cylinder_at(30.0, 600.0, 0.0, 16).subdivide()
+        long_.apply_transform(turn)
+        long_.vertices[:, 0] += 400.0
+        stub = _cylinder_at(10.0, 100.0, 0.0, 8).subdivide()
+        stub.apply_transform(turn)
+        stub.vertices[:, 0] += 110.0
+        stub.vertices[:, 1] += 45.0
+        mesh = _combine([main, long_, stub])
+        n_main, n_long = len(main.faces), len(long_.faces)
+        centres = mesh.triangles_center
+
+        def near(point, lo, hi, k):
+            d = np.linalg.norm(centres[lo:hi] - np.asarray(point), axis=1)
+            return (lo + np.argsort(d, kind="stable")[:k]).tolist()
+
+        # the stub's tip on main one face; the long tube's the three rings
+        # of faces round it, which hold the stub's patch and the faces
+        # round that
+        stub_tip = near((50.0, 0.0, 0.0), 0, n_main, 1)
+        adj = pre._face_adjacency(mesh)
+        long_tip = set(stub_tip)
+        for _ in range(3):
+            long_tip |= {g for f in long_tip for g in adj[f]}
+        gaps = [
+            (
+                sorted(long_tip),
+                near((100.0, 0.0, 0.0), n_main, n_main + n_long, 8),
+                50.0,
+                -1,
+                0,
+            ),
+            (
+                stub_tip,
+                near((60.0, 45.0, 0.0), n_main + n_long, len(mesh.faces), 6),
+                20.0,
+                -1,
+                1,
+            ),
+        ]
+        out, python = both(pre.remove_gaps, mesh, gaps=gaps)
+        assert_parity(np.asarray(out.vertices), np.asarray(python.vertices))
+        assert_parity(np.asarray(out.faces), np.asarray(python.faces))
+        labels, _ = pre._face_edge_components(out)
+        stub_faces = np.arange(n_main + n_long, len(mesh.faces))
+        # the long tube joined to main, the stub whole and apart
+        assert labels[0] == labels[n_main]
+        assert len(set(labels[stub_faces].tolist())) == 1
+        assert labels[0] != labels[stub_faces[0]]
+        assert len(set(labels[labels >= 0].tolist())) == 2
+
+    def test_with_the_fusions_a_bridge_wins_back_what_their_walls_cut_off(
+        self, monkeypatch
+    ):
+        # Two halves of one tube glued only by a band of fusion faces: as
+        # one face-edge component, a bridge between them wins back nothing;
+        # split along the fusion wall, as find_gaps bridged them, it wins
+        # back the smaller half — what remove_fusions would cut off.
+        mesh = _subdivided_tube()
+        band = sorted(_band(mesh, -250.0, 0.0))  # a whole row of faces
+        assert band
+        seen = []
+
+        def spy(_mesh, _gaps, labels):
+            seen.append(labels)
+            return None, 0, 0, 0
+
+        monkeypatch.setattr(pre, "_bridge_gaps", spy)
+        z = mesh.triangles_center[:, 2]
+        fa, fb = int(np.argmax(z)), int(np.argmin(z))
+        gaps = [([fa], [fb], 1.0, -1, 0)]
+        pre.remove_gaps(mesh, gaps=gaps)
+        pre.remove_gaps(mesh, gaps=gaps, fusions=[band])
+        unsplit, split = seen
+        assert unsplit is None  # labelled in the kernel, on first need
+        raw, _ = pre._face_edge_components(mesh)
+        assert pre._rescue_size(raw, Counter(raw.tolist()), fa, fb) == 0
+        assert (split[band] == -3).all()
+        halves = Counter(split[split >= 0].tolist())
+        assert len(halves) == 2
+        won = pre._rescue_size(split, Counter(split.tolist()), fa, fb)
+        assert won == min(halves.values()) > 0
+
     def test_tips_that_grow_onto_the_same_rim_are_not_stitched(self):
         # Both sides of a gap end on one rim when the pieces are still glued
         # together; stitching it to itself would fold a zero-length tube of
@@ -778,6 +950,26 @@ class TestRemoveGaps:
         result = pre.remove_gaps(mesh, gaps=[(fa, list(fa), dist, ca, ca)])
         assert np.array_equal(result.faces, mesh.faces)
         assert len(result.vertices) == len(mesh.vertices)
+
+
+class TestMergeSelectedFaces:
+    def test_a_lasso_over_two_open_ends_joins_them_on_both_paths(self):
+        # The viewer's merge on two tubes whose facing ends are open, half
+        # of each end lassoed: a group's border with the other faces runs
+        # open from hole to hole, but it takes faces off the end, so its rim
+        # is the end, and the two are stitched end to end.
+        mesh = _combine([_open_tube(-600.0, -100.0), _open_tube(600.0, 100.0)])
+        tri = mesh.vertices[mesh.faces]
+        on_end = np.isclose(np.abs(tri[:, :, 2]), 100.0).any(axis=1)
+        lasso = np.flatnonzero(on_end & (tri[:, :, 0].mean(axis=1) > 0.0)).tolist()
+        assert not pre._trace_border_loops(set(lasso), pre._edge_to_faces(mesh))
+        out, python = both(pre.merge_selected_faces, mesh, lasso)
+        assert_parity(np.asarray(out.vertices), np.asarray(python.vertices))
+        assert_parity(np.asarray(out.faces), np.asarray(python.faces))
+        labels, _ = pre._face_edge_components(out)
+        assert len(set(labels[labels >= 0].tolist())) == 1
+        assert (_edge_uses(out) <= 2).all()
+        assert (_edge_uses(out) == 1).sum() == 0
 
 
 # ── _sever_cost ───────────────────────────────────────────────────────
@@ -924,6 +1116,32 @@ class TestFindNucleusCenter:
         found = pre.find_nucleus_center(body)
         assert np.abs(found["center"]).max() < 500.0
 
+    def test_a_point_picks_the_chain_nearest_it_on_both_paths(self):
+        # a hollow column broken by a gap with no vertices: two runs past
+        # the void minimum, the longer below; a point on the upper one
+        # picks it, a point on the lower one changes nothing
+        a = np.linspace(0.0, 2 * np.pi, 400, endpoint=False)
+
+        def rings(z0, n):
+            return np.concatenate(
+                [
+                    np.c_[r * np.cos(a), r * np.sin(a), np.full(len(a), z0 + 100.0 * k)]
+                    for k in range(n)
+                    for r in (3000.0, 3100.0)
+                ]
+            )
+
+        cloud = Mesh(np.r_[rings(0.0, 30), rings(3800.0, 20)], np.empty((0, 3)))
+        alone = both(pre.find_nucleus_center, cloud)
+        up = both(pre.find_nucleus_center, cloud, near=[0.0, 3000.0, 4600.0])
+        down = both(pre.find_nucleus_center, cloud, near=(0.0, 3000.0, 1500.0))
+        for found in (*alone, *down):
+            assert found["z_range"][1] < 3000.0, found["z_range"]
+        for found in up:
+            assert found["z_range"][0] > 3600.0, found["z_range"]
+        for pair in (alone, up, down):
+            assert_parity(pair[0]["slices"], pair[1]["slices"])
+
 
 # ── find_soma ─────────────────────────────────────────
 
@@ -946,6 +1164,20 @@ class TestFindSoma:
             expanded=np.zeros(n, bool),
         )
         assert both(pre.find_soma, ball, organelles=every) == (None, None)
+
+    def test_a_point_keeps_the_soma_it_points_at_and_no_other(self):
+        """A click on the membrane, on the nucleus or beside the soma finds
+        it as without the click; a soma farther from the click than it is
+        long is none."""
+        ball = trimesh.creation.icosphere(subdivisions=3, radius=3000.0)
+        alone = pre.find_soma(ball)
+        assert alone is not None, "fixture: a soma to find"
+        length = 2.0 * alone.axes.max()
+        for point in (ball.vertices[7], np.zeros(3), [0.9 * length, 0.0, 0.0]):
+            for got in both(pre.find_soma, ball, near=point):
+                assert np.array_equal(got.verts, alone.verts)
+        far = [1.1 * length, 0.0, 0.0]
+        assert both(pre.find_soma, ball, near=far) == (None, None)
 
     def test_the_rings_grow_on_the_outline_not_on_a_surface_inside_it(self):
         """A slice whose seeds lie mostly on a surface inside the membrane,
@@ -1632,15 +1864,29 @@ class TestSomaAbsorption:
         assert int(c.organelles.expanded.sum()) == len(pieces[1])
         assert len(c.neurites) == 1
 
-    def test_a_neurite_cut_off_by_a_thin_band_is_no_organelle(self):
+    def test_a_neurite_cut_off_by_a_thin_band_is_joined_back_across_it(self):
         # one row of the side strands the rest of the tube: bigger than the
-        # band and looking out of the cell, a neurite, not a fold's inside
+        # band and looking out of the cell, arbor the band severed, not a
+        # fold's inside — the band, touching both, joins it back, and is
+        # no organelle any more
         mesh, org = _tube_cut_by_an_organelle_band(100.0, 190.0)
         pieces = _arbor_pieces(mesh, None, org)
         assert len(pieces) == 2 and len(pieces[1]) > int(org.mask.sum())
         c = pre.break_up_mesh(mesh, None, org)
-        assert int(c.organelles.expanded.sum()) == 0
-        assert sorted(len(x) for x in c.neurites) == sorted(len(x) for x in pieces)
+        assert not c.organelles.mask.any()
+        (neurite,) = c.neurites
+        band = np.flatnonzero(org.mask)
+        assert set(neurite.tolist()) == set(np.concatenate([*pieces, band]).tolist())
+        # an organelle drawn by hand stays one, and the piece stays apart
+        drawn = Organelles(
+            pocket=org.pocket,
+            isolated=org.isolated,
+            expanded=org.expanded,
+            manual=org.mask.copy(),
+        )
+        kept = pre.break_up_mesh(mesh, None, drawn)
+        assert np.array_equal(kept.organelles.mask, org.mask)
+        assert sorted(len(x) for x in kept.neurites) == sorted(len(x) for x in pieces)
 
 
 # ── rescuing a discarded fragment ────────────────────────────────────
@@ -1854,6 +2100,49 @@ class TestRescued:
         _, got = pre.preprocess(mesh, organelles=False, soma=soma)
         assert np.isin(soma.verts, got.soma.verts).all()
         assert len(got.neurites) == 1
+
+    def test_a_full_preprocess_told_there_is_no_soma_runs_as_when_none_is_found(
+        self, monkeypatch
+    ):
+        # soma=False takes the path find_soma's None takes, without asking
+        # find_soma: a cell whose soma lies outside the volume is not forced
+        # one out of a swelling of its arbor
+        mesh, soma, _ = _ball_with_stub(height=160.0)
+        _, given = pre.preprocess(mesh, organelles=False, soma=soma)
+        assert given.soma is not None, "fixture: the soma must change the run"
+
+        monkeypatch.setattr(pre, "find_soma", lambda *_a, **_k: None)
+        want_mesh, want = pre.preprocess(mesh, organelles=False)
+
+        def no(*_a, **_k):
+            raise AssertionError("find_soma ran though the cell has no soma")
+
+        monkeypatch.setattr(pre, "find_soma", no)
+        got_mesh, got = pre.preprocess(mesh, organelles=False, soma=False)
+        assert got.soma is None
+        assert np.array_equal(got_mesh.vertices, want_mesh.vertices)
+        assert np.array_equal(got_mesh.faces, want_mesh.faces)
+        assert [x.tolist() for x in got.neurites] == [x.tolist() for x in want.neurites]
+        assert [x.tolist() for x in got.discarded] == [
+            x.tolist() for x in want.discarded
+        ]
+
+    def test_a_full_preprocess_looks_for_the_soma_at_a_point(self):
+        # an annotation: the soma found there is kept, and none is made of
+        # a point no soma found holds
+        ball = trimesh.creation.icosphere(subdivisions=3, radius=3000.0)
+        _, found = pre.preprocess(ball, organelles=False)
+        assert found.soma is not None, "fixture: a soma to find"
+        _, at = pre.preprocess(ball, organelles=False, soma=ball.vertices[0])
+        assert np.array_equal(at.soma.verts, found.soma.verts)
+        _, off = pre.preprocess(ball, organelles=False, soma=(30000.0, 0.0, 0.0))
+        assert off.soma is None
+
+    def test_a_full_preprocess_refuses_a_soma_it_cannot_read(self):
+        mesh, _, _ = _ball_with_stub()
+        for what in ("none", [1.0, 2.0]):
+            with pytest.raises(TypeError, match="soma is a Soma"):
+                pre.preprocess(mesh, soma=what)
 
     def test_preprocess_without_organelles_takes_none_out(self):
         """For a mesh that traces none: the surface find_organelles would

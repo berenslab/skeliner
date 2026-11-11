@@ -33,12 +33,20 @@ pub fn border_edges(t: &Topology, sel: &[u32]) -> Vec<[u32; 2]> {
 /// a choice, steps to the smallest unvisited neighbour; a walk that cannot
 /// close is dropped.  Fewer than three border edges give no loops.
 pub fn border_loops(t: &Topology, sel: &[u32]) -> Vec<Vec<u32>> {
-    let border = border_edges(t, sel);
+    loops_of_edges(&border_edges(t, sel))
+}
+
+/// Closed loops through `edges` (`[low, high]` pairs), as vertex sequences,
+/// traced as [`border_loops`] traces a border: each from its smallest
+/// vertex, at a choice to the smallest unvisited neighbour, a walk that
+/// cannot close dropped.  Fewer than three edges give no loops.
+pub fn loops_of_edges(edges: &[[u32; 2]]) -> Vec<Vec<u32>> {
+    let border = edges;
     if border.len() < 3 {
         return Vec::new();
     }
     let mut adj: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
-    for &[a, b] in &border {
+    for &[a, b] in border {
         adj.entry(a).or_default().insert(b);
         adj.entry(b).or_default().insert(a);
     }
@@ -76,9 +84,129 @@ pub fn border_loops(t: &Topology, sel: &[u32]) -> Vec<Vec<u32>> {
     loops
 }
 
+/// The simple cycles through `edges` (`[low, high]` pairs), every edge in
+/// at most one.  Dangling paths are pruned first (no cycle runs through an
+/// end with one edge); then each walk starts at the smallest vertex with an
+/// edge left, steps along its smallest unused edge, and cuts a cycle off
+/// whenever it comes back to a vertex already on it; a walk that runs out
+/// of edges leaves its open end unlooped, and what dangles is pruned again.
+/// Where every vertex has two edges these are the loops [`loops_of_edges`]
+/// traces; at a pinch — a vertex where two loops touch — both come out,
+/// where [`loops_of_edges`] can trace neither.
+pub fn cycles_of_edges(edges: &[[u32; 2]]) -> Vec<Vec<u32>> {
+    let mut adj: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    for &[a, b] in edges {
+        adj.entry(a).or_default().insert(b);
+        adj.entry(b).or_default().insert(a);
+    }
+    let mut loops = Vec::new();
+    loop {
+        prune_dangling(&mut adj);
+        let Some(start) = adj.iter().find(|(_, n)| !n.is_empty()).map(|(&v, _)| v) else {
+            break;
+        };
+        let mut walk = vec![start];
+        // each vertex on the walk, at its place in it
+        let mut on: BTreeMap<u32, usize> = BTreeMap::from([(start, 0)]);
+        let mut cur = start;
+        while let Some(next) = adj.get(&cur).and_then(|n| n.first().copied()) {
+            adj.get_mut(&cur).expect("on an edge").remove(&next);
+            adj.get_mut(&next).expect("on an edge").remove(&cur);
+            if let Some(&at) = on.get(&next) {
+                let mut cycle = vec![next];
+                cycle.extend(walk.split_off(at + 1));
+                for v in &cycle[1..] {
+                    on.remove(v);
+                }
+                loops.push(cycle);
+                if next == start && walk.len() == 1 {
+                    break;
+                }
+            } else {
+                on.insert(next, walk.len());
+                walk.push(next);
+            }
+            cur = next;
+        }
+    }
+    loops
+}
+
+/// Remove, end by end, every path that dangles from `adj`: a vertex with
+/// one edge left loses it, which may leave its neighbour with one.
+fn prune_dangling(adj: &mut BTreeMap<u32, BTreeSet<u32>>) {
+    let mut ends: Vec<u32> = adj
+        .iter()
+        .filter(|(_, n)| n.len() == 1)
+        .map(|(&v, _)| v)
+        .collect();
+    while let Some(v) = ends.pop() {
+        let Some(w) = adj
+            .get(&v)
+            .filter(|n| n.len() == 1)
+            .and_then(|n| n.first().copied())
+        else {
+            continue;
+        };
+        adj.get_mut(&v).expect("an end").clear();
+        let nw = adj.get_mut(&w).expect("on an edge");
+        nw.remove(&v);
+        if nw.len() == 1 {
+            ends.push(w);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cycles_are_the_traced_loops_where_every_vertex_has_two_edges() {
+        let (faces, n) = grid();
+        let t = Topology::new(&faces, n);
+        for sel in [
+            vec![8, 9],
+            vec![8],
+            (0..18).filter(|f| *f != 8 && *f != 9).collect(),
+        ] {
+            let edges = border_edges(&t, &sel);
+            assert_eq!(cycles_of_edges(&edges), loops_of_edges(&edges));
+        }
+    }
+
+    #[test]
+    fn a_pinch_gives_both_loops() {
+        // two triangles touching at vertex 2: 0-1-2 and 2-3-4
+        let edges = [[0, 1], [0, 2], [1, 2], [2, 3], [2, 4], [3, 4]];
+        assert!(loops_of_edges(&edges).len() < 2);
+        assert_eq!(cycles_of_edges(&edges), [vec![0, 1, 2], vec![2, 3, 4]]);
+        // the walk meets the pinch mid-loop: 0-1-2-3 and 1-4-5
+        let edges = [[0, 1], [1, 2], [2, 3], [0, 3], [1, 4], [4, 5], [1, 5]];
+        let mut lobes: Vec<Vec<u32>> = cycles_of_edges(&edges);
+        for lp in &mut lobes {
+            lp.sort_unstable();
+        }
+        lobes.sort();
+        assert_eq!(lobes, [vec![0, 1, 2, 3], vec![1, 4, 5]]);
+    }
+
+    #[test]
+    fn an_open_path_has_no_cycle() {
+        assert!(cycles_of_edges(&[[0, 1], [1, 2], [2, 3]]).is_empty());
+        // a loop with a tail: the loop alone
+        let edges = [[0, 1], [1, 2], [0, 2], [2, 3]];
+        assert_eq!(cycles_of_edges(&edges), [vec![0, 1, 2]]);
+    }
+
+    #[test]
+    fn a_walk_never_spends_a_loop_on_a_tail() {
+        // The loop 2-5-6-7 with tails 0-2 and 5-1.  Unpruned, the walk from
+        // 0 comes in at 2, steps to 5, and at 5 the smaller step is the
+        // tail to 1: it dead-ends there having spent the loop's edge 2-5.
+        let edges = [[0, 2], [2, 5], [5, 6], [6, 7], [2, 7], [1, 5]];
+        assert_eq!(cycles_of_edges(&edges), [vec![2, 5, 6, 7]]);
+    }
 
     /// A 4x4 grid of vertices, 18 triangles, faces numbered row by row.
     fn grid() -> (Vec<[u32; 3]>, usize) {

@@ -279,8 +279,10 @@ def _patches(mesh, rng, n=12):
 
 class TestBorderLoops:
     def test_topology_and_dict_agree(self, dirty_mesh, reference_mesh):
+        from skeliner.python import pre as python_pre
+
         rng = np.random.default_rng(3)
-        n_loops = 0
+        n_loops = n_through_holes = 0
         for mesh in _meshes(dirty_mesh, reference_mesh):
             faces = np.asarray(mesh.faces)
             topo = _rs.mesh.Topology(faces.astype(np.int64), len(mesh.vertices))
@@ -290,10 +292,15 @@ class TestBorderLoops:
                 n_loops += len(loops)
                 assert loops == pre._trace_border_loops(sel, as_dict, faces)
                 assert loops == pre._trace_border_loops(sel, as_dict)
+                rims = topo.rim_loops(sel)
+                n_through_holes += rims != loops
+                assert rims == python_pre.rim_loops(sel, as_dict, faces)
+                assert rims == python_pre.rim_loops(sel, as_dict)
                 assert pre._removal_would_sever(
                     sel, topo, faces
                 ) == pre._removal_would_sever(sel, as_dict, faces)
         assert n_loops > 20
+        assert n_through_holes > 5
 
     def test_tip_expansion_topology_and_dict_agree(self, dirty_mesh, reference_mesh):
         rng = np.random.default_rng(5)
@@ -324,12 +331,29 @@ class TestGapStitchSelection:
             adj = pre._face_adjacency(mesh, pre._edge_to_faces(mesh))
             sels = list(_patches(mesh, rng, n=6))
             if mesh is tube:
-                sels.append(set(np.flatnonzero(_band(mesh, -40.0, 40.0)).tolist()))
+                # a whole row of the tube's faces: an annulus that strands
+                # the shorter end
+                annulus = _band(mesh, -250.0, 0.0)
+                assert pre._sever_cost(annulus, adj, 10**9) > 0
+                sels.append(annulus)
             for sel in sels:
-                for budget in (0, 5, 100, 10**9):
-                    cost = pre._sever_cost(sel, None, budget, topology=topo)
-                    assert cost == pre._sever_cost(sel, adj, budget)
-                    costs.add(cost)
+                # the bridge's other tip somewhere on the mesh, or nowhere
+                for rejoined in ((), (int(rng.integers(len(mesh.faces))),)):
+                    for budget in (0, 5, 100, 10**9):
+                        cost = pre._sever_cost(
+                            sel, None, budget, topology=topo, rejoined=rejoined
+                        )
+                        assert cost == pre._sever_cost(
+                            sel, adj, budget, rejoined=rejoined
+                        )
+                        costs.add(cost)
+            if mesh is tube:
+                # the annulus' smaller side joined back when it holds the tip
+                small = min(
+                    (f for f in range(len(mesh.faces)) if f not in annulus),
+                    key=lambda f: mesh.triangles_center[f, 2],
+                )
+                assert pre._sever_cost(annulus, adj, 10**9, rejoined=[small]) == 0
         assert len(costs) > 3
 
     def test_expand_selection_per_group_topology_and_dict_agree(
@@ -1218,7 +1242,7 @@ class TestFindSomaViaRingCutoff:
             "peak_r": 2000.0,
             "slices": np.zeros((0, 4)),
         }
-        monkeypatch.setattr(pre, "find_nucleus_center", lambda _mesh: nucleus)
+        monkeypatch.setattr(pre, "find_nucleus_center", lambda _mesh, **_k: nucleus)
         monkeypatch.setattr(
             Soma,
             "fit",
@@ -1455,6 +1479,7 @@ class TestPythonPath:
                 loops = rs.border_loops(sel)
                 n_loops += len(loops)
                 assert py.border_loops(sel) == loops
+                assert py.rim_loops(sel) == rs.rim_loops(sel)
                 for budget in (0, 5, 10**9):
                     assert py.sever_cost(sel, budget) == rs.sever_cost(sel, budget)
             for _ in range(5):

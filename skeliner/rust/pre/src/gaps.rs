@@ -3,7 +3,13 @@
 use std::collections::BTreeSet;
 
 use mesh::Topology;
-use mesh::loops::border_loops;
+use mesh::loops::{border_edges, cycles_of_edges};
+
+/// Whether two of `loops` share a vertex: the rim pinches there.
+fn pinched(loops: &[Vec<u32>]) -> bool {
+    let mut seen: BTreeSet<u32> = BTreeSet::new();
+    loops.iter().flatten().any(|&v| !seen.insert(v))
+}
 
 /// The first longest of `loops`, as Python's `max(loops, key=len)` picks.
 fn first_longest(loops: &[Vec<u32>]) -> Option<&Vec<u32>> {
@@ -12,21 +18,75 @@ fn first_longest(loops: &[Vec<u32>]) -> Option<&Vec<u32>> {
         .reduce(|a, b| if b.len() > a.len() { b } else { a })
 }
 
-fn loops_of(t: &Topology, sel: &BTreeSet<u32>) -> Vec<Vec<u32>> {
+/// The rim of `sel`: the closed loops along the border of what removing it
+/// leaves.  That border is the edges between `sel` and the faces outside
+/// it and, where `sel` takes faces off a hole in the mesh (an edge of one
+/// face), the rest of that hole's edges.  A tip on an open end — a neurite
+/// the segmentation cut, gaping at the piece across the gap — has its rim
+/// round the end: by the edges to outside faces alone its border runs open
+/// from hole to hole and closes no loop.  A selection that takes no face
+/// off a hole has the border loops of its own faces; one touching a hole
+/// only at a vertex leaves the hole whole.
+///
+/// The loops are the border's simple cycles ([`cycles_of_edges`]): where
+/// the border pinches — touches itself at a vertex, as when a patch meets a
+/// hole at a vertex besides the edges it takes off it — each lobe is a
+/// loop, so a patch that cuts a flap off at the pinch has two, as one that
+/// wraps a tube does.  Traced as one walk, a pinched border gave no loop or
+/// one lobe, and a patch that severed passed for one that does not.
+pub fn rim_loops(t: &Topology, sel: &BTreeSet<u32>) -> Vec<Vec<u32>> {
     let faces: Vec<u32> = sel.iter().copied().collect();
-    border_loops(t, &faces)
-        .into_iter()
-        .filter(|lp| lp.len() >= 3)
-        .collect()
+    let mut edges: BTreeSet<[u32; 2]> = border_edges(t, &faces).into_iter().collect();
+    let open = |e: usize| t.edge_faces(e).len() == 1;
+    // the selection's own edges on a hole, and the hole edges joined to
+    // them through shared vertices
+    let mut hole: BTreeSet<usize> = sel
+        .iter()
+        .filter_map(|&f| t.face_edges(f as usize))
+        .flatten()
+        .map(|e| e as usize)
+        .filter(|&e| open(e))
+        .collect();
+    let mut walk: Vec<u32> = hole.iter().flat_map(|&e| t.edges()[e]).collect();
+    let mut seen: BTreeSet<u32> = BTreeSet::new();
+    while let Some(v) = walk.pop() {
+        if !seen.insert(v) {
+            continue;
+        }
+        for &g in t.vertex_faces(v as usize) {
+            for e in t.face_edges(g as usize).into_iter().flatten() {
+                let e = e as usize;
+                let [a, b] = t.edges()[e];
+                if (a == v || b == v) && open(e) && hole.insert(e) {
+                    walk.push(if a == v { b } else { a });
+                }
+            }
+        }
+    }
+    for e in hole {
+        if !sel.contains(&t.edge_faces(e)[0]) {
+            edges.insert(t.edges()[e]);
+        }
+    }
+    let edges: Vec<[u32; 2]> = edges.into_iter().collect();
+    cycles_of_edges(&edges)
 }
 
-/// Grow `tip` by rings of edge neighbours until its longest border loop
-/// has `target_verts` vertices (`skeliner.pre._expand_tip_to_good_rim`).
+/// Grow `tip` by rings of edge neighbours until its longest rim loop
+/// ([`rim_loops`]) has `target_verts` vertices and the rim is clean — no
+/// two of its loops share a vertex (`skeliner.pre._expand_tip_to_good_rim`).
+/// A pinched rim, two lobes touching at a vertex, would leave the lobe the
+/// tube does not take hanging by that vertex: a sliver stranded, which the
+/// next ring takes in.
 ///
 /// Stops after `max_iters` rings, when a ring adds nothing, or before the
 /// selection passes `max(len(tip) * max_eat_factor, target_verts * 4)`
-/// faces.  Returns the selection and the longest loop of the last traced
-/// border, if any border had one.
+/// faces.  Returns a selection and the longest loop of its rim: the first
+/// whose rim is good, else the last whose rim had a loop — the loop is
+/// always the rim of the selection that comes with it — else the last
+/// selection and no loop.  (Grown past its last loop — a speck swallowed
+/// whole — the selection would take away the faces the loop's tube was to
+/// meet.)
 pub fn expand_tip_to_good_rim(
     t: &Topology,
     tip: &[u32],
@@ -39,14 +99,15 @@ pub fn expand_tip_to_good_rim(
         return (sel, None);
     }
     let max_size = (sel.len() * max_eat_factor).max(target_verts * 4);
-    let mut best: Option<Vec<u32>> = None;
+    let mut best: Option<(BTreeSet<u32>, Vec<u32>)> = None;
     for _ in 0..max_iters {
-        let loops = loops_of(t, &sel);
+        let loops = rim_loops(t, &sel);
         if let Some(biggest) = first_longest(&loops) {
-            best = Some(biggest.clone());
-            if biggest.len() >= target_verts {
-                return (sel, best);
+            if biggest.len() >= target_verts && !pinched(&loops) {
+                let lp = biggest.clone();
+                return (sel, Some(lp));
             }
+            best = Some((sel.clone(), biggest.clone()));
         }
         let mut next = sel.clone();
         for &f in &sel {
@@ -57,11 +118,14 @@ pub fn expand_tip_to_good_rim(
         }
         sel = next;
     }
-    (sel, best)
+    match best {
+        Some((at, lp)) => (at, Some(lp)),
+        None => (sel, None),
+    }
 }
 
 /// Expand each edge-connected group of `sel` on its own, then trace the
-/// merged selection's border (`skeliner.pre._expand_selection_per_group`).
+/// merged selection's rim (`skeliner.pre._expand_selection_per_group`).
 pub fn expand_selection_per_group(
     t: &Topology,
     sel: &[u32],
@@ -95,18 +159,20 @@ pub fn expand_selection_per_group(
         let (grown, _) = expand_tip_to_good_rim(t, &group, target_verts, max_iters, max_eat_factor);
         expanded.extend(grown);
     }
-    let loops = loops_of(t, &expanded);
+    let loops = rim_loops(t, &expanded);
     (expanded, loops)
 }
 
-/// How many faces removing `sel` would strand, capped at `budget`
+/// How many faces removing `sel` would strand, capped at `budget + 1`
 /// (`skeliner.pre._sever_cost`).
 ///
-/// Everything but the largest piece left over is stranded.  Each piece is
-/// grown from the faces bordering `sel`, lowest first, and abandoned once it
-/// passes `budget`; a second such piece means the cost exceeds the budget,
-/// reported as `budget + 1`.
-pub fn sever_cost(t: &Topology, sel: &BTreeSet<u32>, budget: usize) -> usize {
+/// The pieces left are walked whole from the faces bordering `sel`, lowest
+/// first.  Everything is stranded but the largest piece, which stays, and
+/// the piece holding a face of `rejoined` — the bridge's other tip, which
+/// the bridge joins back: two parts glued only by fusion faces lie in one
+/// face-edge component, and peeling a tip off one can cut the other off
+/// across the glue.
+pub fn sever_cost(t: &Topology, sel: &BTreeSet<u32>, budget: usize, rejoined: &[u32]) -> usize {
     let mut seeds: BTreeSet<u32> = BTreeSet::new();
     for &f in sel {
         seeds.extend(
@@ -118,53 +184,42 @@ pub fn sever_cost(t: &Topology, sel: &BTreeSet<u32>, budget: usize) -> usize {
     if seeds.is_empty() {
         return 0;
     }
-    let mut seen: BTreeSet<u32> = BTreeSet::new();
-    let mut closed: Vec<usize> = Vec::new();
-    let mut n_over = 0;
+    let rejoined: BTreeSet<u32> = rejoined.iter().copied().collect();
+    let mut seen = vec![false; t.n_faces()];
+    for &f in sel {
+        seen[f as usize] = true;
+    }
+    // each piece's size, and whether it holds the other tip
+    let mut pieces: Vec<(usize, bool)> = Vec::new();
     for &seed in &seeds {
-        if seen.contains(&seed) {
+        if seen[seed as usize] {
             continue;
         }
+        seen[seed as usize] = true;
         let mut stack = vec![seed];
-        seen.insert(seed);
-        let mut size = 0;
-        let mut over = false;
+        let (mut size, mut holds) = (0usize, false);
         while let Some(u) = stack.pop() {
             size += 1;
-            if size > budget {
-                over = true;
-                // u is popped but not yet walked; the drain below walks it
-                stack.push(u);
-                break;
-            }
+            holds |= rejoined.contains(&u);
             for v in t.face_neighbors(u as usize) {
-                if !sel.contains(&v) && seen.insert(v) {
+                if !seen[v as usize] {
+                    seen[v as usize] = true;
                     stack.push(v);
                 }
             }
         }
-        if over {
-            n_over += 1;
-            if n_over >= 2 {
-                return budget + 1;
-            }
-            // drain the rest of this piece so its faces are not revisited
-            while let Some(u) = stack.pop() {
-                for v in t.face_neighbors(u as usize) {
-                    if !sel.contains(&v) && seen.insert(v) {
-                        stack.push(v);
-                    }
-                }
-            }
-        } else {
-            closed.push(size);
-        }
+        pieces.push((size, holds));
     }
-    let total: usize = closed.iter().sum();
-    if n_over > 0 {
-        return total;
-    }
-    total - closed.iter().copied().max().unwrap_or(0)
+    let total: usize = pieces.iter().map(|p| p.0).sum();
+    let stay = (0..pieces.len())
+        .max_by_key(|&i| (pieces[i].0, std::cmp::Reverse(i)))
+        .expect("a piece per seed");
+    let other = pieces
+        .iter()
+        .enumerate()
+        .find(|&(i, p)| p.1 && i != stay)
+        .map_or(0, |(_, p)| p.0);
+    (total - pieces[stay].0 - other).min(budget + 1)
 }
 
 /// Faces a stitch between faces `fa` and `fb` wins back
@@ -239,14 +294,106 @@ mod tests {
     }
 
     #[test]
+    fn a_pinched_rim_does_not_end_the_growth() {
+        // Square (0,2) takes the open end's edge 2-3, and face 11
+        // ([5, 14, 13]) touches the end at vertex 5: the rim is the end round
+        // to 5 and the triangle round face 11, two loops sharing vertex 5.
+        let t = tube(10, 8);
+        let mut tip = square(0, 2, 8).to_vec();
+        tip.push(11);
+        let first: BTreeSet<u32> = tip.iter().copied().collect();
+        let rims = rim_loops(&t, &first);
+        assert!(pinched(&rims));
+        assert!(first_longest(&rims).unwrap().len() >= 6);
+        let (sel, lp) = expand_tip_to_good_rim(&t, &tip, 6, 20, 30);
+        assert!(sel.len() > tip.len());
+        let rims = rim_loops(&t, &sel);
+        assert!(!pinched(&rims));
+        assert_eq!(first_longest(&rims), lp.as_ref());
+    }
+
+    #[test]
+    fn a_speck_swallowed_whole_keeps_the_patch_its_loop_rims() {
+        // A tetrahedron from one face: its rim is a triangle, short of six;
+        // the next ring takes the whole speck, which has no rim.  The loop
+        // comes back with the face it rims, not with the whole speck.
+        let faces = [[0, 1, 2], [0, 3, 1], [1, 3, 2], [0, 2, 3]];
+        let t = Topology::new(&faces, 4);
+        let (sel, lp) = expand_tip_to_good_rim(&t, &[0], 6, 20, 30);
+        assert_eq!(sel, BTreeSet::from([0]));
+        assert_eq!(rim_loops(&t, &sel), [lp.unwrap()]);
+    }
+
+    fn squares(at: &[(u32, u32)], around: u32) -> Vec<u32> {
+        at.iter().flat_map(|&(r, i)| square(r, i, around)).collect()
+    }
+
+    fn sorted(lp: &[u32]) -> Vec<u32> {
+        let mut s = lp.to_vec();
+        s.sort_unstable();
+        s
+    }
+
+    #[test]
+    fn a_tip_on_an_open_end_has_the_end_in_its_rim() {
+        // Two squares on the tube's open end (ring 0's vertices 0..8): their
+        // border with the other faces runs from 2 to 4, open, and closes no
+        // loop; with the end's six other edges it is one rim.
+        let t = tube(10, 8);
+        let tip = squares(&[(0, 2), (0, 3)], 8);
+        let faces: Vec<u32> = tip.clone();
+        assert!(mesh::loops::border_loops(&t, &faces).is_empty());
+        let (sel, lp) = expand_tip_to_good_rim(&t, &tip, 6, 20, 30);
+        assert_eq!(sel, tip.iter().copied().collect());
+        assert_eq!(sorted(&lp.unwrap()), [0, 1, 2, 4, 5, 6, 7, 10, 11, 12]);
+    }
+
+    #[test]
+    fn a_tip_touching_an_open_end_at_a_vertex_leaves_the_end_whole() {
+        // face 5, [2, 11, 10], has vertex 2 on the open end but no edge
+        let t = tube(10, 8);
+        let sel = BTreeSet::from([5]);
+        assert_eq!(rim_loops(&t, &sel), [[2, 10, 11]]);
+        assert_eq!(rim_loops(&t, &sel), mesh::loops::border_loops(&t, &[5]));
+    }
+
+    #[test]
+    fn a_band_cutting_a_flap_off_an_open_end_has_two_rims() {
+        // Up column 2 from the end, across ring 3, down column 5: the band
+        // cuts columns 3 and 4 of rings 0..3 off, a flap of 12 faces round
+        // the end's edges 3-4-5. Its border is two open paths, end to end;
+        // the rim is the flap's loop and the rest's.
+        let t = tube(10, 8);
+        let mut at: Vec<(u32, u32)> = (0..4).flat_map(|r| [(r, 2), (r, 5)]).collect();
+        at.extend([(3, 3), (3, 4)]);
+        let sel: BTreeSet<u32> = squares(&at, 8).into_iter().collect();
+        let faces: Vec<u32> = sel.iter().copied().collect();
+        assert!(mesh::loops::border_loops(&t, &faces).is_empty());
+        let mut rims: Vec<Vec<u32>> = rim_loops(&t, &sel).iter().map(|l| sorted(l)).collect();
+        rims.sort();
+        assert_eq!(
+            rims,
+            [
+                vec![0, 1, 2, 6, 7, 10, 14, 18, 22, 26, 30, 34, 35, 36, 37, 38],
+                vec![3, 4, 5, 11, 13, 19, 21, 27, 28, 29],
+            ]
+        );
+        assert_eq!(sever_cost(&t, &sel, 1000, &[]), 12);
+    }
+
+    #[test]
     fn an_annulus_strands_the_far_side() {
         let t = tube(10, 6);
         // ring 4 of the tube
         let sel: BTreeSet<u32> = (48..60).collect();
         // 48 faces below, 60 above: the smaller side is stranded
-        assert_eq!(sever_cost(&t, &sel, 1000), 48);
+        assert_eq!(sever_cost(&t, &sel, 1000, &[]), 48);
         // a budget too small for either side reports budget + 1
-        assert_eq!(sever_cost(&t, &sel, 10), 11);
+        assert_eq!(sever_cost(&t, &sel, 10, &[]), 11);
+        // the side below holding the bridge's other tip is joined back
+        assert_eq!(sever_cost(&t, &sel, 1000, &[3]), 0);
+        // the other tip on the side that stays strands the side below
+        assert_eq!(sever_cost(&t, &sel, 1000, &[100]), 48);
     }
 
     #[test]
@@ -255,14 +402,14 @@ mod tests {
         // five, larger than the budget and the only piece: nothing strands.
         let faces: Vec<[u32; 3]> = (0..7).map(|k| [k, k + 1, k + 2]).collect();
         let t = Topology::new(&faces, 9);
-        assert_eq!(sever_cost(&t, &BTreeSet::from([0, 6]), 2), 0);
+        assert_eq!(sever_cost(&t, &BTreeSet::from([0, 6]), 2, &[]), 0);
     }
 
     #[test]
     fn a_cap_strands_nothing() {
         let t = tube(10, 6);
         let sel: BTreeSet<u32> = (0..12).collect();
-        assert_eq!(sever_cost(&t, &sel, 1000), 0);
+        assert_eq!(sever_cost(&t, &sel, 1000, &[]), 0);
     }
 
     #[test]

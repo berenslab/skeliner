@@ -417,7 +417,7 @@
     </head>
     <body>
         <div id="canvas-container"></div>
-        <div id="empty-hint">Drop mesh (.obj, .ply, .stl, .ctm) or skeleton (.swc, .npz) here</div>
+        <div id="empty-hint">Drop mesh (.obj, .ply, .stl, .ctm, .npz) or skeleton (.swc, .npz) here</div>
         <div id="drop-overlay">Drop file to load</div>
         <div id="log-status" style="display:none;position:absolute;bottom:14px;left:50%;background:rgba(0,0,0,0.7);color:#aaa;padding:6px 12px;border-radius:4px;font-size:11px;font-family:monospace;z-index:200;white-space:nowrap;pointer-events:none;transition:opacity 0.3s;max-width:40%;overflow:hidden;text-overflow:ellipsis"></div>
         <div id="lasso-rect"></div>
@@ -562,6 +562,12 @@
                         title="Off for meshes that trace no organelles (hemibrain's): Run does not look for them, and no face is an organelle."
                     >
                         <input type="checkbox" id="runOrganelles" checked /> organelles
+                    </label>
+                    <label
+                        style="margin-left: 6px; color: #888"
+                        title="Off for a cell with no soma in the mesh (a piece of arbor whose soma lies outside the volume): Run does not look for one, and every piece is arbor."
+                    >
+                        <input type="checkbox" id="runSoma" checked /> soma
                     </label>
                     <label
                         style="margin-left: 6px; color: #888"
@@ -1119,7 +1125,7 @@
                     contactInfo = contactData;
                     startContactView(contactData);
                     document.getElementById("empty-hint").textContent =
-                        "Drop mesh A, then mesh B (.obj, .ply, .stl, .ctm), and their contact sites (.npz) if you have them";
+                        "Drop mesh A, then mesh B (.obj, .ply, .stl, .ctm, .npz), and their contact sites (.npz) if you have them";
                     for (const id of ['info', 'controls', 'detect-panel', 'loaded-panel']) {
                         const el = document.getElementById(id);
                         if (el) el.style.display = 'none';
@@ -2446,10 +2452,11 @@
 
             async function runPreprocess() {
                 const organelles = document.getElementById("runOrganelles").checked;
+                const soma = document.getElementById("runSoma").checked;
                 const fill = document.getElementById("runFill").checked;
                 await _runAction(
                     document.getElementById("preprocessBtn"),
-                    () => _postJSON("/preprocess", { organelles, fill }),
+                    () => _postJSON("/preprocess", { organelles, soma, fill }),
                 );
             }
 

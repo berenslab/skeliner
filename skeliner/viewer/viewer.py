@@ -7,7 +7,8 @@ Usage:
     skeliner view-contacts A.obj B.obj   # two meshes and where they touch
 
 Launches a local web server with a Three.js viewer. Supports:
-  - Mesh files: .obj, .ply, .stl and EyeWire 1's .ctm (always in nm)
+  - Mesh files: .obj, .ply, .stl, EyeWire 1's .ctm and skeliner's mesh .npz
+                (always in nm)
   - Skeleton files: .swc (always in µm → converted to nm),
                     .npz (unit from metadata)
 
@@ -216,14 +217,30 @@ _TIER_SKELETON = 2
 _TIER_ANNOTATION = 3
 
 #: The files a drop reads as a mesh, with :func:`skeliner.io.load_mesh`;
-#: ``.ctm`` is EyeWire 1's format.
+#: ``.ctm`` is EyeWire 1's format.  A mesh ``.npz`` is told from the other
+#: ``.npz`` by its arrays (:func:`_is_mesh_file`).
 _MESH_SUFFIXES = (".obj", ".ply", ".stl", ".ctm")
+
+
+def _is_mesh_data(path: Path) -> bool:
+    """Check if an npz file holds a mesh (``save_mesh_npz``)."""
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            return "vertices" in data and "faces" in data
+    except Exception:
+        return False
+
+
+def _is_mesh_file(path: Path) -> bool:
+    """Whether a drop reads *path* as a mesh."""
+    suffix = path.suffix.lower()
+    return suffix in _MESH_SUFFIXES or (suffix == ".npz" and _is_mesh_data(path))
 
 
 def _upload_tier(path: Path) -> int:
     """Which tier *path* belongs to; lower tiers are applied first."""
     suffix = path.suffix.lower()
-    if suffix in _MESH_SUFFIXES:
+    if _is_mesh_file(path):
         return _TIER_MESH
     if suffix == ".swc":
         return _TIER_SKELETON
@@ -748,7 +765,7 @@ def _create_app(
                 paths.append(tmp_path)
         finally:
             await form.close()
-        meshes = sorted(p for p in paths if p.suffix.lower() in _MESH_SUFFIXES)
+        meshes = sorted(p for p in paths if _is_mesh_file(p))
         site_files = [
             p for p in paths if p.suffix.lower() == ".npz" and _is_contact_sites(p)
         ]
@@ -972,7 +989,7 @@ def _create_app(
         suffix = tmp_path.suffix.lower()
 
         try:
-            if suffix in _MESH_SUFFIXES:
+            if _is_mesh_file(tmp_path):
                 mesh = load_mesh(tmp_path)
                 print(
                     f"Uploaded mesh: {len(mesh.vertices):,} verts, {len(mesh.faces):,} faces"
@@ -2984,7 +3001,8 @@ def _create_app(
         in order by the server, so the viewer and the library cannot drift
         into two pipelines wearing one name.  Its soma comes from
         ``find_soma``, as the Soma button's does — unless the soma is the
-        user's, assigned or edited by hand, which it takes instead.
+        user's, assigned or edited by hand, which it takes instead, or the
+        soma switch is off: the cell has none, and none is looked for.
 
         Left uncompacted.  ``compact_mesh`` reindexes faces, and annotations,
         the rescue list and every loaded skeleton are all stated in face ids;
@@ -3002,6 +3020,7 @@ def _create_app(
         n_before = len(mesh.faces)
         body = await _body_of(request)
         floor = _claim_floor(body)
+        no_soma = not bool(body.get("soma", True))
 
         # An override the user has already made is input to this run, not a
         # casualty of it — break_up_mesh re-derives the neurite/discarded
@@ -3011,7 +3030,13 @@ def _create_app(
             mesh,
             organelles=bool(body.get("organelles", True)),
             fill=bool(body.get("fill", True)),
-            soma=mesh_state["soma"] if mesh_state["soma_by_hand"] else None,
+            soma=(
+                False
+                if no_soma
+                else mesh_state["soma"]
+                if mesh_state["soma_by_hand"]
+                else None
+            ),
             rescued=mesh_state["rescued"],
             released=mesh_state["released"],
             claim_min_faces=floor,
@@ -3028,6 +3053,9 @@ def _create_app(
         mesh_state["mesh_stats"] = None
         mesh_state["gap_clusters"] = None
         out = await _publish_components(components)
+        if no_soma:
+            # the run said the cell has none: a soma by hand went with it
+            mesh_state["soma_by_hand"] = False
         await _log(
             f"Preprocess: {n_before:,} → {len(new_mesh.faces):,} faces, "
             f"{out['nNeurites']} neurites, {out['nDiscarded']} discarded"

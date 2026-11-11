@@ -6,6 +6,7 @@ import time
 import warnings
 from collections import Counter, defaultdict, deque
 from contextlib import contextmanager
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -23,6 +24,9 @@ from skeliner.dataclass import (
     Soma,
     mesh_args,
 )
+
+if TYPE_CHECKING:
+    from numpy.typing import ArrayLike
 
 __all__ = [
     "apply_reassignment",
@@ -176,6 +180,12 @@ def _main_component(
     if len(comp) == 0:
         return int(largest)
     return int(np.bincount(comp).argmax())
+
+
+def _no_soma(soma) -> bool:
+    """*soma* is False: the cell has none, so none is looked for — where
+    None leaves it to :func:`find_soma`."""
+    return isinstance(soma, (bool, np.bool_)) and not soma
 
 
 @_deprecated()
@@ -427,28 +437,29 @@ def _sever_cost(
     budget: int,
     *,
     topology=None,
+    rejoined=(),
 ) -> int:
-    """How many faces removing *sel* would strand, capped at ``budget``.
+    """How many faces removing *sel* would strand, capped at ``budget + 1``.
 
     :func:`_removal_would_sever` only says a sever is *possible* — two
-    border loops mean the patch wraps the surface.  It says nothing about
+    rim loops mean the patch wraps the surface.  It says nothing about
     the cost, and the two differ by orders of magnitude: on 564241053 an
     annulus stranded 13,438 faces, on 554656742 a 22-face patch of the
     same shape stranded **4**.  Deciding on the loop count alone throws
     away good bridges to avoid trivial ones.
 
-    Everything but the largest surviving piece is stranded.  Each piece
-    is grown separately and abandoned once it passes ``budget``, so the
-    work is bounded by the answer rather than by the mesh: at most one
-    piece can exceed the budget and still be the largest, and if two do
-    the cost already exceeds it.  Returns ``budget + 1`` in that case.
+    The pieces left are walked whole.  Everything is stranded but the
+    largest piece, which stays, and the piece holding a face of
+    *rejoined* — the bridge's other tip, which the bridge joins back: two
+    parts glued only by fusion faces lie in one face-edge component, and
+    peeling a tip off one can cut the other off across the glue.
 
     With a ``Topology`` (of either path) as *topology* it does it and
     *face_adj* is not read.
     """
     if topology is not None:
-        return topology.sever_cost(sel, budget)
-    return _sever_cost_py(sel, face_adj, budget)
+        return topology.sever_cost(sel, budget, rejoined)
+    return _sever_cost_py(sel, face_adj, budget, rejoined)
 
 
 _sever_cost_py = _py_pre.sever_cost
@@ -467,18 +478,27 @@ def _expand_tip_to_good_rim(
     max_eat_factor: int = 30,
     faces: np.ndarray | None = None,
 ) -> tuple[set[int], list[int] | None]:
-    """Iteratively peel BFS rings from *tip* until its border has at least
-    *target_verts* vertices.
+    """Iteratively peel BFS rings from *tip* until its rim has at least
+    *target_verts* vertices and does not pinch.
 
-    Returns ``(expanded_tip, best_loop)``. ``best_loop`` is the largest
-    border loop found at the final tip (``None`` if no loop ever traced).
+    Returns ``(expanded_tip, best_loop)``: the first expansion whose rim is
+    good and its largest loop, else the last expansion whose rim had a loop
+    and that loop — the loop is always the rim of the expansion returned
+    with it — else the last expansion and ``None``.
 
-    The initial tip from :func:`find_gaps` can produce a degenerate
-    "rim" (e.g. 3 verts when the tip is a tongue attached at a single
-    triangle). Each expansion step adds the next BFS ring of
-    edge-neighbors and re-traces the border. Expansion is capped at
-    ``len(tip) * max_eat_factor`` faces to avoid swallowing the entire
-    component.  *faces* is passed to :func:`_trace_border_loops`.  Given a
+    The rim is the border of what removing the tip leaves: its border with
+    the other faces and, where the tip takes faces off a hole in the mesh,
+    the rest of that hole — so a tip on an open end, a neurite the
+    segmentation cut, has its rim round the end.  Its loops are the
+    border's simple cycles; where two of them touch at a vertex (the rim
+    pinches), the lobe the tube would not take hangs by that vertex, so the
+    expansion goes on.  The initial tip from
+    :func:`find_gaps` can produce a degenerate "rim" (e.g. 3 verts when the
+    tip is a tongue attached at a single triangle). Each expansion step
+    adds the next BFS ring of edge-neighbors and re-traces the rim.
+    Expansion is capped at ``len(tip) * max_eat_factor`` faces to avoid
+    swallowing the entire component.  *faces* is the array the dict was
+    built from, so only the tip's own edges are examined.  Given a
     ``Topology`` (of either path) it does it and *face_adj* is not read.
     """
     if hasattr(edge_to_faces, "expand_tip"):  # a Topology, of either path
@@ -509,7 +529,7 @@ def _expand_selection_per_group(
 ) -> tuple[set[int], list[list[int]]]:
     """Split *sel* into edge-connected sub-groups, expand each
     independently with :func:`_expand_tip_to_good_rim`, then re-trace
-    the border loops on the merged expanded selection.
+    the rim of the merged expanded selection.
 
     This is the user-driven merge analogue of the per-side expansion
     in :func:`remove_gaps`. Expanding each connected sub-selection on
@@ -894,6 +914,7 @@ def find_soma(
     organelles: Organelles | None = None,
     verbose: bool = False,
     mesh_stats: MeshStats | None = None,
+    near=None,
 ) -> Soma | None:
     """Find the soma by its ring cutoff: rings of vertices grown over the
     surface from the nucleus widen through the soma and narrow into the
@@ -921,6 +942,16 @@ def find_soma(
     All thresholds are derived from the mesh.  It was
     ``find_soma_via_ring_cutoff``, now a deprecated alias.
 
+    Given *near* — where the soma is, roughly, from an annotation — the soma
+    found is kept if it lies within its own length of the point.  If it
+    lies elsewhere, the nucleus chain nearest the point (of those the mesh
+    lets through) is tried instead, and its soma kept if it lies at the
+    point; else there is none.  So the point never moves a soma that lies
+    at it; it takes find_soma off a wrong place (a swelling of the arbor
+    the scan would otherwise take, while the soma itself is cut away by the
+    volume's edge); and it does not make one of a soma the mesh cannot give
+    — for that, a soma by hand (``preprocess(soma=)``).
+
     Parameters
     ----------
     mesh : Mesh
@@ -934,13 +965,19 @@ def find_soma(
     mesh_stats : MeshStats or None
         From :func:`compute_mesh_stats`.  Reuses ``face_comp`` and
         ``main_ci`` to skip redundant component detection.
+    near : (3,) array-like or None
+        A point on or in the soma, in the mesh's units: a click on its
+        membrane or its nucleus.  A soma lies at the point when its centre
+        is within its own length — twice its longest semi-axis — of it: a
+        click on the soma or beside it.
 
     Returns
     -------
     Soma or None
         Fitted ellipsoidal soma, or *None* if no nucleus is found, too
-        few indicators exist, or fewer than four of the vertices it claims
-        lie on anything but organelle faces.
+        few indicators exist, fewer than four of the vertices it claims
+        lie on anything but organelle faces, or, given *near*, no soma
+        lies at the point.
     """
     if verbose:
         print("[skeliner.pre] Finding soma …")
@@ -953,20 +990,30 @@ def find_soma(
 
     # ── 1. Find soma centre via nucleus detection ──────────────
     nuc = find_nucleus_center(mesh)
-    if nuc is None:
+    found, why = None, "no nucleus found"
+    if nuc is not None:
+        found = _soma_from(mesh, nuc, labels, main, organelles)
+        why = "none off the organelles"
+    if near is not None and nuc is not None:
+        near = np.asarray(near, dtype=np.float64).reshape(3)
+        if found is None or not _at(found[0], near):
+            # the soma lies elsewhere: the nucleus chain nearest the point
+            # instead, if it is another
+            led = find_nucleus_center(mesh, near=near)
+            if led is None or np.array_equal(led["slices"], nuc["slices"]):
+                found = None
+            else:
+                nuc, found = led, _soma_from(mesh, led, labels, main, organelles)
+                if found is not None and not _at(found[0], near):
+                    found = None
+            why = f"none within its own length of {near.round(0).tolist()}"
+    if found is None:
         if verbose:
             dt = time.perf_counter() - _t0
-            print(f"[skeliner.pre] Soma: no nucleus found ({dt:.1f}s)")
+            print(f"[skeliner.pre] Soma: {why} ({dt:.1f}s)")
         return None
+    soma, cutoff, max_ring = found
     center = nuc["center"]
-
-    soma, cutoff, max_ring = _ring_cutoff_soma(mesh, nuc, labels, main, organelles)
-    if len(soma.verts) < 4:
-        # it let go of what it claimed: only organelle faces held those
-        if verbose:
-            dt = time.perf_counter() - _t0
-            print(f"[skeliner.pre] Soma: none off the organelles ({dt:.1f}s)")
-        return None
 
     if verbose:
         dt = time.perf_counter() - _t0
@@ -990,6 +1037,25 @@ def find_soma(
         "slices": nuc["slices"],
     }
     return soma
+
+
+def _soma_from(mesh, nuc, labels, main, organelles):
+    """The soma :func:`_ring_cutoff_soma` grows from nucleus *nuc*, with its
+    cutoff and last ring; None when it let go of what it claimed — only
+    organelle faces held those."""
+    soma, cutoff, max_ring = _ring_cutoff_soma(mesh, nuc, labels, main, organelles)
+    if len(soma.verts) < 4:
+        return None
+    return soma, cutoff, max_ring
+
+
+def _at(soma: Soma, point: np.ndarray) -> bool:
+    """Whether *point*, a click where the soma is, points at *soma*: it lies
+    no farther from the soma's centre than the soma is long (twice its
+    longest semi-axis) — on the soma, or beside it.  A soma farther than
+    that is another structure, the click a soma that is not there."""
+    d = np.asarray(point, dtype=np.float64) - np.asarray(soma.center, dtype=np.float64)
+    return bool(np.sqrt(d @ d) <= 2.0 * float(np.max(soma.axes)))
 
 
 def _ring_cutoff_soma(
@@ -1198,6 +1264,16 @@ def break_up_mesh(
     A component carrying a face named in *rescued* skips all three
     demotions and is a neurite regardless.
 
+    A piece cut off from its mesh component's body by organelle faces
+    alone, yet no organelle's inside — bigger than the organelles walling
+    it and looking out of the cell — is arbor a ring of folds severed at a
+    junction.  Across each wall touching both it and the body, the faces
+    on a shortest path from one to the other — where the two come closest,
+    round a fold's mouth rather than down into it — leave the organelles
+    (an organelle drawn by hand stays), and the pieces are found again, so
+    it is the body's arbor once more rather than a discard or a neurite of
+    its own.
+
     The discard threshold is auto-inferred: components are sorted by
     size descending; once the cumulative face count reaches 95% of
     the total, the remaining components are discarded — but for those
@@ -1225,6 +1301,14 @@ def break_up_mesh(
     "missed soma" classification is skipped, and every reachable
     non-organelle component flows straight into the neurite/discarded
     split.
+
+    Only faces with three distinct vertices and an area are sorted.  A
+    degenerate face — zero area, or a vertex twice; segmentation meshes
+    carry some — joins no piece, so a face that is no organelle and not
+    the soma's (two of its vertices soma vertices) can be in none of the
+    four: about 0.03% of an EyeWire 2 cell's faces.  It weighs nothing in
+    an area and binds no skeleton bin; given to a neurite, its zero-length
+    edges could join what a cut keeps apart.
 
     Parameters
     ----------
@@ -1304,17 +1388,42 @@ def break_up_mesh(
     usable = _usable_face_mask(mesh)
     soma_face = soma_face_mask(faces, soma.verts if soma is not None else None)
 
-    components, kinds = _break_up_pieces(
-        faces,
-        verts,
+    def pieces():
+        return _break_up_pieces(
+            faces,
+            verts,
+            usable,
+            organelles.mask,
+            soma_face,
+            claimed_face,
+            soma is not None,
+            centers=mesh.triangles_center,
+            normals=mesh.face_normals,
+        )
+
+    components, kinds = pieces()
+    # Arbor a ring of folds severed — cut off from its mesh component's
+    # body, yet bigger than the organelles walling it and looking out of
+    # the cell — is joined back across its walls that touch the body; an
+    # organelle drawn by hand stays one.
+    walls = kernels.pre.break_up_severed_walls(
+        np.asarray(faces, dtype=np.int64),
+        len(verts),
         usable,
         organelles.mask,
-        soma_face,
         claimed_face,
-        soma is not None,
-        centers=mesh.triangles_center,
-        normals=mesh.face_normals,
+        np.asarray(organelles.manual, dtype=bool),
+        components,
+        np.asarray(kinds, dtype=np.uint8),
     )
+    if len(walls):
+        organelles = Organelles(
+            pocket=_cleared(organelles.pocket, walls),
+            isolated=_cleared(organelles.isolated, walls),
+            expanded=_cleared(organelles.expanded, walls),
+            manual=organelles.manual,
+        )
+        components, kinds = pieces()
     if soma is not None:
         kinds = _neurites_left_out(
             components, kinds, faces, verts, soma, usable & soma_face
@@ -1409,6 +1518,8 @@ def break_up_mesh(
             parts.append(f"claimed {n_claimed}")
         if n_trapped:
             parts.append(f"trapped +{n_trapped:,}f")
+        if len(walls):
+            parts.append(f"rejoined across {len(walls):,} organelle faces")
         if n_soma_absorbed:
             parts.append(f"soma +{n_soma_absorbed:,}f")
         print(f"[skeliner.pre] break_up_mesh: {', '.join(parts)} ({dt:.1f}s)")
@@ -2740,7 +2851,7 @@ def find_disconnected(
     mesh: Mesh,
     *,
     verbose: bool = False,
-    soma: Soma | None = None,
+    soma: Soma | bool | None = None,
     organelles: Organelles | None = None,
     mesh_stats: MeshStats | None = None,
     fusions: list[list[int]] | None = None,
@@ -2758,8 +2869,10 @@ def find_disconnected(
         Input mesh.
     verbose : bool, default False
         Print summary.
-    soma : Soma or None
-        Pre-computed soma from any ``find_soma_via_*`` function.
+    soma : Soma, False or None
+        The cell's soma (:func:`find_soma`'s, or one by hand); False when
+        the cell has none, so none is looked for; None finds it with
+        :func:`find_soma`.
     organelles : Organelles or None
         Pre-computed organelles from :func:`find_organelles`.
         Components that are entirely organelle are skipped.
@@ -2793,7 +2906,9 @@ def find_disconnected(
     if fusions:
         labels, main = _refine_components_with_fusions(mesh, labels, main, fusions)
     # Locate soma so we can exclude components inside it
-    if soma is None:
+    if _no_soma(soma):
+        soma = None
+    elif soma is None:
         soma = find_soma(
             mesh,
             organelles=organelles,
@@ -2848,7 +2963,7 @@ def find_gaps(
     *,
     tip_rings: int = 3,
     verbose: bool = False,
-    soma: Soma | None = None,
+    soma: Soma | bool | None = None,
     disconnected: list[list[int]] | None = None,
     organelles: Organelles | None = None,
     mesh_stats: MeshStats | None = None,
@@ -2877,9 +2992,10 @@ def find_gaps(
         collect as tip faces on each side of a gap.
     verbose : bool, default False
         Print summary.
-    soma : Soma or None
-        Pre-computed soma from any ``find_soma_via_*`` function; found
-        when neither it nor *disconnected* is given.
+    soma : Soma, False or None
+        The cell's soma (:func:`find_soma`'s, or one by hand); False when
+        the cell has none, so none is looked for; None finds it with
+        :func:`find_soma` when *disconnected* is not given either.
     disconnected : list[list[int]] or None
         Pre-computed disconnected components from :func:`find_disconnected`.
     fusions : list[list[int]] or None
@@ -2981,7 +3097,9 @@ def find_gaps(
         labels, main = _refine_components_with_fusions(mesh, labels, main, fusions)
     # found here when find_disconnected would find it, so both name the
     # same main component
-    if soma is None and disconnected is None:
+    if _no_soma(soma):
+        soma = None
+    elif soma is None and disconnected is None:
         soma = find_soma(mesh, organelles=organelles, mesh_stats=mesh_stats)
     main = _main_component(mesh, labels, main, soma)
 
@@ -2991,7 +3109,7 @@ def find_gaps(
     else:
         disc = find_disconnected(
             mesh,
-            soma=soma,
+            soma=False if soma is None else soma,
             organelles=organelles,
             mesh_stats=mesh_stats,
             fusions=fusions,
@@ -3057,10 +3175,11 @@ def remove_gaps(
     mesh: Mesh,
     *,
     verbose: bool = False,
-    soma: Soma | None = None,
+    soma: Soma | bool | None = None,
     gaps: list | None = None,
     organelles: Organelles | None = None,
     mesh_stats: MeshStats | None = None,
+    fusions: list[list[int]] | None = None,
 ) -> Mesh:
     """Bridge all detected gaps in a single mesh rebuild.
 
@@ -3074,11 +3193,21 @@ def remove_gaps(
         Input mesh.
     verbose : bool, default False
         Print progress.
-    soma : Soma or None
-        Pre-computed soma.
+    soma : Soma, False or None
+        The cell's soma, for :func:`find_gaps` when *gaps* is not given;
+        False when the cell has none.
     gaps : list or None
         Pre-computed gaps from :func:`find_gaps`.  Tuning knobs live on
         that function; call it yourself and pass the result here.
+    fusions : list[list[int]] or None
+        Fusion clusters from :func:`find_fusions`, as :func:`find_gaps`
+        was given them.  What a bridge wins back — weighed against the
+        faces peeling its tips would strand — is then counted on the
+        components :func:`find_gaps` bridged, split along the fusion
+        walls: a bridge between two parts glued only by fusion faces wins
+        back the smaller part, which :func:`remove_fusions` will cut off.
+        Without them it is counted on the face-edge components, where
+        such a bridge wins back nothing.
 
     Returns
     -------
@@ -3096,6 +3225,7 @@ def remove_gaps(
             soma=soma,
             organelles=organelles,
             mesh_stats=mesh_stats,
+            fusions=fusions,
         )
 
     if not gaps:
@@ -3106,7 +3236,11 @@ def remove_gaps(
 
     labels = None
     if mesh_stats is not None and mesh_stats.face_comp is not None:
-        labels = mesh_stats.face_comp
+        labels, main = mesh_stats.face_comp, mesh_stats.main_ci
+    if fusions:
+        if labels is None:
+            labels, main = _face_edge_components(mesh)
+        labels, _ = _refine_components_with_fusions(mesh, labels, main, fusions)
     result, n_bridged, n_removed, n_skipped = _bridge_gaps(mesh, gaps, labels)
     if result is None:
         if verbose:
@@ -3147,8 +3281,9 @@ def _bridge_gaps(mesh, gaps, labels):
     or would strand more than they win back, and stitch the rest in one
     rebuild: ``(mesh or None, n_bridged, n_removed, n_skipped)``.
 
-    *labels* are the raw face-edge components rescue sizes are read from
-    (computed on first need when None).  Each loop is fitted by
+    *labels* are the components rescue sizes are read from — face-edge
+    components, split along fusion walls when :func:`remove_gaps` has the
+    fusions — computed on first need when None.  Each loop is fitted by
     :func:`_fit_loop_circle`, called back from the Rust core.
     """
     verts = np.asarray(mesh.vertices, dtype=np.float64)
@@ -4611,7 +4746,10 @@ def compact_mesh(
     return_maps: bool = False,
     verbose: bool = False,
 ) -> tuple[Mesh, MeshComponents] | tuple[Mesh, MeshComponents, np.ndarray, np.ndarray]:
-    """Remove degenerate faces, drop unreferenced vertices, reindex.
+    """Remove the faces the removals collapsed (``[v, v, v]``), drop
+    unreferenced vertices, reindex.  The mesh's own degenerate faces (zero
+    area, or a vertex twice) stay: dropping one would open a slit where it
+    joins two faces.
 
     Call once at the end of preprocessing, after all face removals.
     Remaps all face/vertex-indexed data inside *components*.
@@ -4719,7 +4857,7 @@ def preprocess(
     mesh: Mesh,
     *,
     organelles: bool = True,
-    soma: Soma | None = None,
+    soma: "Soma | bool | ArrayLike | None" = None,
     fill: bool = True,
     rescued=None,
     released=None,
@@ -4734,7 +4872,7 @@ def preprocess(
       1. find_parallel_patches → remove_parallel_patches
       2. compute_mesh_stats
       3. find_organelles (unless *organelles* is False)
-      4. find_soma (unless *soma* is given)
+      4. find_soma (unless *soma* is a Soma or False)
       5. find_fusions → find_disconnected → find_gaps
       6. remove_gaps → remove_fusions
       7. fill_holes (unless *fill* is False)
@@ -4751,10 +4889,21 @@ def preprocess(
         False for a mesh that traces no organelles (hemibrain's): what
         :func:`find_organelles` would flag there is fragments and patches
         of the cell, so it is not run and no face is an organelle.
-    soma : Soma or None
-        A soma to take instead of :func:`find_soma`'s: one assigned by hand
-        where it found none.  Its ``verts`` name this mesh's vertices,
-        which the step before it (parallel patches) keeps.
+    soma : Soma, point, bool or None, default None
+        What is known of the soma.  None or True: :func:`find_soma` looks
+        for one.  A point ``(x, y, z)`` in the mesh's units — where the soma
+        is, roughly, from an annotation (a click on its membrane or its
+        nucleus): :func:`find_soma` looks for it there (``near=``) and keeps
+        only a soma within its own length of the point, so a cell whose soma
+        the mesh cannot give gets none rather than one somewhere else.
+        False: the cell has
+        none in the mesh — a piece of arbor whose soma lies outside the
+        volume, say — so none is looked for and the run goes on as when
+        :func:`find_soma` finds none, rather than risk a soma made of a
+        swelling of the arbor.  A :class:`Soma`: taken instead of
+        :func:`find_soma`'s — one assigned by hand where it found none, or
+        where the data cannot give one.  Its ``verts`` name this mesh's
+        vertices, which the step before it (parallel patches) keeps.
     fill : bool, default True
         Patch the holes in the surface (:func:`fill_holes`) before the mesh
         is broken up; False leaves them open.
@@ -4769,7 +4918,8 @@ def preprocess(
         Passed to :func:`break_up_mesh` in step 8.
     compact : bool, default False
         If True, run :func:`compact_mesh` as a final step to drop
-        unreferenced vertices and degenerate faces.  This invalidates
+        unreferenced vertices and the faces the removals collapsed (the
+        mesh's degenerate faces stay).  This invalidates
         original mesh indices, so external data tied to them (e.g.
         viewer annotations) will need to be remapped.  Skeletonization
         works correctly on uncompacted meshes.
@@ -4784,6 +4934,17 @@ def preprocess(
     components : MeshComponents
         Classified pieces: soma, organelles, neurites, discarded.
     """
+    near = None
+    if not (soma is None or isinstance(soma, (Soma, bool, np.bool_))):
+        try:
+            near = np.asarray(soma, dtype=np.float64).reshape(3)
+        except (TypeError, ValueError):
+            raise TypeError(
+                f"soma is a Soma, a point (x, y, z), True, False or None, not {soma!r}"[
+                    :200
+                ]
+            ) from None
+        soma = None
     if verbose:
         print(
             f"[skeliner.pre] starting preprocessing "
@@ -4817,12 +4978,17 @@ def preprocess(
 
     # 4. Soma
     with _timed("↳  find soma", verbose=verbose) as log:
-        if soma is not None:
+        if isinstance(soma, Soma):
             log(f"given: center={soma.center.round(0).tolist()}")
+        elif soma is not None and not soma:
+            soma = None
+            log("none: soma=False")
         else:
-            soma = find_soma(mesh, organelles=org, mesh_stats=mesh_stats)
+            soma = find_soma(mesh, organelles=org, mesh_stats=mesh_stats, near=near)
             if soma is not None:
                 log(f"center={soma.center.round(0).tolist()}")
+            elif near is not None:
+                log(f"none holding {near.round(0).tolist()}")
             else:
                 log("no soma detected")
 
@@ -4831,10 +4997,12 @@ def preprocess(
         fusions = find_fusions(mesh, mesh_stats=mesh_stats)
         log(f"{len(fusions)} fusions")
 
+    # the soma is settled: none is none from here on, not a cue to look again
+    settled = False if soma is None else soma
     with _timed("↳  find disconnected", verbose=verbose) as log:
         disconnected = find_disconnected(
             mesh,
-            soma=soma,
+            soma=settled,
             organelles=org,
             mesh_stats=mesh_stats,
             fusions=fusions,
@@ -4844,14 +5012,14 @@ def preprocess(
     with _timed("↳  find & remove gaps", verbose=verbose) as log:
         gaps = find_gaps(
             mesh,
-            soma=soma,
+            soma=settled,
             disconnected=disconnected,
             mesh_stats=mesh_stats,
             fusions=fusions,
         )
         log(f"{len(gaps)} gaps")
         if gaps:
-            mesh = remove_gaps(mesh, gaps=gaps, mesh_stats=mesh_stats)
+            mesh = remove_gaps(mesh, gaps=gaps, mesh_stats=mesh_stats, fusions=fusions)
 
     # 6. Fusions
     with _timed("↳  remove fusions", verbose=verbose):
@@ -4911,6 +5079,7 @@ def find_nucleus_center(
     z_tol: float | None = None,
     max_shift: float = 3000.0,
     min_void_r: float | None = None,
+    near=None,
     verbose: bool = False,
 ) -> dict | None:
     """Locate the nucleus center from the mesh geometry alone.
@@ -4968,6 +5137,12 @@ def find_nucleus_center(
         stand out has no nucleus.  A fixed size cannot do this: EyeWire 2's
         500 nm let the lumens of hemibrain's and EyeWire 1's thick neurites
         pass.
+    near : (3,) array-like or None
+        A point on or in the soma, in the mesh's units — an annotation.
+        Of the chains past the void minimum, the one nearest it is the
+        nucleus (a level's void centre nearest the point), not the longest.
+        It changes nothing else: a cell whose voids do not let a chain
+        through has no nucleus, wherever the point is.
     verbose : bool
         Print progress.
 
@@ -5000,7 +5175,9 @@ def find_nucleus_center(
             f" grid {grid_res:.0f} nm, slab ±{z_tol:.0f} nm"
         )
 
-    raw, best, center = _z_scan(verts, grid_res, z_tol, min_void_r, max_shift)
+    raw, best, center = _z_scan(
+        verts, grid_res, z_tol, min_void_r, max_shift, near=near
+    )
 
     if best is None:
         if verbose:
@@ -5052,6 +5229,7 @@ def _z_scan(
     min_void_r: float | None = None,
     max_shift: float = 3000.0,
     retry_broken: bool = True,
+    near=None,
 ) -> tuple[list[tuple], list[int] | None, np.ndarray | None]:
     """Shared Z-scan: cluster + void detection + spatial coherence.
 
@@ -5065,13 +5243,18 @@ def _z_scan(
        borrows the convex hull from the nearest good neighbor to close
        the gap and recover the void.
 
+    The chain is the longest past the void minimum, or, given *near* (a
+    point on or in the soma), the one nearest it.
+
     Returns ``(raw, best_run, nucleus_center)`` where *raw* is the
     per-Z-level data ``[(z, cx, cy, void_r, void_xy, vert_indices,
     soma_mask), ...]``, *best_run* is the indices into *raw* of the
     nucleus chain (or None), and *nucleus_center* is ``(3,)`` or None.
     """
     verts = np.asarray(verts, dtype=np.float64)
-    scan = kernels.pre.ZScan(verts, grid_res, z_tol, min_void_r, max_shift)
+    if near is not None:
+        near = tuple(float(x) for x in np.asarray(near, dtype=np.float64).reshape(3))
+    scan = kernels.pre.ZScan(verts, grid_res, z_tol, min_void_r, max_shift, near)
     if scan.best is not None and retry_broken:
         # Pass 2 needs the convex hull of each chain end's soma cluster.
         hulls = []
