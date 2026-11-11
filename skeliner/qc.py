@@ -5,9 +5,9 @@ preprocess`, then :func:`~skeliner.skeletonize` with its components) leaves
 most of them right and some with a defect worth fixing by hand, and nobody
 opens thousands of cells to find which.  This module writes down, cell by
 cell, what the run decided and what its outputs measure (:func:`report`,
-:func:`save_report`), collects the reports of many cells into one table
-(:func:`collect`, :func:`save_table`) and lists the cells to look at, each
-with its reasons (:func:`triage`).
+:func:`save_report`), draws it (:func:`plot`), collects the reports of many
+cells into one table (:func:`collect`, :func:`save_table`) and lists the
+cells to look at, each with its reasons (:func:`triage`).
 
 A report holds facts and measurements, never a verdict: what is unusual
 depends on the cells a cell is compared with, so :func:`triage` decides —
@@ -21,11 +21,17 @@ many to look at is the caller's to say.
         skel = sk.skeletonize(mesh, components=comps)
         rep = sk.qc.report(mesh, comps, skel, meta={"cell": path.parent.name})
         sk.qc.save_report(rep, path.parent / "qc.json")
+        if rep["flags"]:  # a picture for each cell with a fact
+            sk.qc.plot(mesh, comps, skel, report=rep, path=path.parent / "qc.png")
 
     rows = sk.qc.collect(root)  # every report under the folder, a row each
     sk.qc.save_table(rows, root / "qc.csv")
     for cell in sk.qc.triage(rows, top=50):
         print(cell["cell"], [r["reason"] for r in cell["reasons"]])
+
+A report and a picture need the mesh and the components *together*, as
+``preprocess`` returned them: components saved beside a cleaned mesh name
+its faces, not the raw mesh's, and both functions refuse a mismatched pair.
 """
 
 from __future__ import annotations
@@ -591,8 +597,11 @@ _COLORS = {
     "arbor": (0.80, 0.80, 0.80),
     "soma": (0.9, 0.5, 0.9),
     "discarded": (0.85, 0.08, 0.08),
+    # in a zoomed row, the discarded pieces it is not about
+    "discarded_other": (1.0, 0.68, 0.68),
     "bridge": (1.0, 0.55, 0.0),
-    "skeleton": (0.15, 0.15, 0.15),
+    "bounds": (0.2, 0.4, 1.0),
+    "skeleton": (0.45, 0.45, 0.45),
 }
 _VIEWS = ("xy", "xz", "zy")
 
@@ -642,10 +651,13 @@ def plot(
     Returns
     -------
     matplotlib.figure.Figure
-        Not held by pyplot — a loop over thousands of cells keeps none of
-        them alive — and shown by Jupyter when it is a cell's value.
+        Made by pyplot and closed before it is returned: Jupyter draws it
+        once, as the cell's value (a figure pyplot still held would be drawn
+        a second time when the cell ends), ``fig = qc.plot(...)`` draws
+        nothing until ``fig`` is shown, and a loop over thousands of cells
+        keeps none of them alive.
     """
-    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
 
     faces = np.asarray(mesh.faces, dtype=np.int64)
     verts = np.asarray(mesh.vertices, dtype=np.float64)
@@ -673,8 +685,10 @@ def plot(
         key=lambda s: -s["faces"],
     )
     bridges = [s for s in sites if s["kind"] == "bridge"]
+    edges = [s for s in sites if s["kind"] == "bounds"]
+    points = [s for s in sites if s["kind"] == "soma_point"]
 
-    fig = Figure(figsize=(14, 10 + 4.5 * len(lost)), layout="constrained")
+    fig = plt.figure(figsize=(14, 10 + 4.5 * len(lost)), layout="constrained")
     subs = fig.subfigures(
         1 + len(lost), 1, height_ratios=[10] + [4.5] * len(lost), squeeze=False
     )[:, 0]
@@ -706,11 +720,30 @@ def plot(
                 mec=_COLORS["bridge"],
                 ms=7,
             )
+        for s in edges:
+            _ring(ax, s, ix, iy, max(s["extent"], 8 * px), _COLORS["bounds"], "")
+        for s in points:
+            ax.plot(
+                s["position"][ix],
+                s["position"][iy],
+                "*",
+                color=_COLORS["soma"],
+                mec="black",
+                ms=14,
+            )
         for s in lost:
             _ring(ax, s, ix, iy, max(s["extent"], 8 * px))
     key = subs[0].add_subplot(grid[0, 1])
     key.axis("off")
-    key.text(0, 1, _key(rep, lost), va="top", ha="left", fontsize=9, wrap=True)
+    key.text(
+        0,
+        1,
+        _key(rep, lost, bool(edges), bool(points)),
+        va="top",
+        ha="left",
+        fontsize=9,
+        wrap=True,
+    )
 
     for sub, s in zip(subs[1:], lost):
         piece = verts[np.unique(faces[pieces[s["index"]]])]
@@ -721,8 +754,15 @@ def plot(
             bhi = np.maximum(bhi, soma.center + reach)
         pad = 0.1 * float(np.max(bhi - blo))
         blo, bhi = blo - pad, bhi + pad
+        # this piece red, the other discarded ones pale
+        this_v = np.zeros(len(verts), dtype=bool)
+        this_v[faces[pieces[s["index"]]].ravel()] = True
+        zoom = layers[:2] + [
+            (gone_v, _COLORS["discarded_other"]),
+            (this_v, _COLORS["discarded"]),
+        ]
         for ax, view in zip(sub.subplots(1, 3), _VIEWS):
-            _draw_view(ax, view, verts, layers, blo, bhi, pixels // 2)
+            _draw_view(ax, view, verts, zoom, blo, bhi, pixels // 2)
             _overlay(ax, view, soma, skeleton)
             ix, iy = _view_axes(view)
             ax.set_xlim(blo[ix], bhi[ix])
@@ -735,17 +775,19 @@ def plot(
         )
     if path is not None:
         fig.savefig(path, dpi=dpi)
+    plt.close(fig)
     return fig
 
 
-def _key(rep: dict, lost: list) -> str:
-    """The sheet's corner: the cell, its facts, the colours."""
+def _key(rep: dict, lost: list, edges: bool, points: bool) -> str:
+    """The sheet's corner: the cell, its facts as triage words them, the
+    colours."""
     lines = []
     name = (rep.get("meta") or {}).get("cell")
     if name:
         lines.append(str(name))
     for f in rep.get("flags", []):
-        lines.append(FLAGS.get(f, f))
+        lines.append(_fact(f, rep.get("summary") or {})[0])
     for s in lost:
         lines.append(f"  piece {s['index']}: {s['faces']:,} faces")
     if not rep.get("flags"):
@@ -753,9 +795,13 @@ def _key(rep: dict, lost: list) -> str:
     lines += [
         "",
         "grey: the arbor   magenta: the soma",
-        "red: discarded (ringed: a neurite)",
+        "red: discarded (ringed and numbered: a neurite)",
         "orange ring: a bridge",
     ]
+    if edges:
+        lines.append("blue ring: where the cell meets the volume's edge")
+    if points:
+        lines.append("star: the soma point given, no soma there")
     return "\n".join(lines)
 
 
@@ -820,26 +866,24 @@ def _overlay(ax, view, soma, skeleton) -> None:
             LineCollection(
                 nodes[np.asarray(skeleton.edges)],
                 colors=[_COLORS["skeleton"]],
-                linewidths=0.4,
+                linewidths=0.3,
             )
         )
 
 
-def _ring(ax, site, ix, iy, radius) -> None:
-    """A discarded neurite circled and numbered."""
+def _ring(ax, site, ix, iy, radius, color=None, label=None) -> None:
+    """A site circled — a discarded neurite by default, numbered with its
+    index in the report."""
     from matplotlib.patches import Circle
 
+    color = _COLORS["discarded"] if color is None else color
+    label = f"{site['index']}" if label is None else label
     x, y = site["position"][ix], site["position"][iy]
-    ax.add_patch(
-        Circle((x, y), radius, fill=False, edgecolor=_COLORS["discarded"], lw=1.2)
-    )
-    ax.annotate(
-        f"{site['index']}",
-        (x + radius, y + radius),
-        color=_COLORS["discarded"],
-        fontsize=9,
-        fontweight="bold",
-    )
+    ax.add_patch(Circle((x, y), radius, fill=False, edgecolor=color, lw=1.2))
+    if label:
+        ax.annotate(
+            label, (x + radius, y + radius), color=color, fontsize=9, fontweight="bold"
+        )
 
 
 # ── many cells ────────────────────────────────────────────────────────
@@ -911,6 +955,19 @@ def save_table(rows: Sequence[dict], path: str | Path) -> None:
         out.writeheader()
         for row in rows:
             out.writerow({k: _cell(row.get(k)) for k in columns})
+
+
+def _fact(flag: str, summary: dict) -> tuple[str, float | None]:
+    """A fact in words, with its value: a soma missing where the cell meets
+    the volume's edge says so; a discarded neurite says the largest."""
+    what = FLAGS.get(flag, flag)
+    if flag == "no_soma" and summary.get("touches_bounds"):
+        what += " (the cell meets the volume's edge)"
+    column, words = FLAG_VALUES.get(flag, (None, None))
+    value = _number(summary.get(column)) if column else None
+    if value is not None:
+        what += f" ({words.format(value)})"
+    return what, value
 
 
 def _cell(v) -> str:
@@ -992,15 +1049,9 @@ def triage(
     kind = {flag: i for i, flag in enumerate(FLAGS)}
     for row in rows:
         for flag in row.get("flags") or ():
-            what = FLAGS.get(flag, flag)
-            edge = flag == "no_soma" and bool(row.get("touches_bounds"))
-            if edge:
-                what += " (the cell meets the volume's edge)"
-            column, words = FLAG_VALUES.get(flag, (None, None))
-            value = _number(row.get(column)) if column else None
-            if value is not None:
-                what += f" ({words.format(value)})"
+            what, value = _fact(flag, row)
             add(row, what, value)
+            edge = flag == "no_soma" and bool(row.get("touches_bounds"))
             key = (kind.get(flag, len(kind)), edge, -(value or 0.0))
             first[row["cell"]] = min(first.get(row["cell"], key), key)
 
