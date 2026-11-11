@@ -319,6 +319,11 @@
                 display: none;
                 z-index: 100;
             }
+            /* A lasso started on a highlighted face takes faces out. */
+            #lasso-rect.removing {
+                border-color: #f66;
+                background: rgba(255, 70, 70, 0.1);
+            }
             /* Contact mode: one panel for both cells and their sites. */
             #contact-panel {
                 position: absolute;
@@ -456,8 +461,8 @@
               <summary>Shortcuts (S)</summary>
               <div>Click: select</div>
               <div>Dbl-click: select annotation</div>
-              <div>Shift+click: highlight</div>
-              <div>Shift+drag: lasso</div>
+              <div>Shift+click: highlight / unhighlight</div>
+              <div>Shift+drag: lasso; from a highlighted face, unhighlight</div>
               <div>G: grab (drag to move)</div>
               <div>T: rotate (drag to rotate)</div>
               <div>S: toggle shortcuts</div>
@@ -4666,11 +4671,39 @@
             }
 
             // ── Lasso (rectangle) selection ───────────────────────────────────
+            /**
+             * Whether the surface under screen point (x, y) is highlighted:
+             * the nearest face the ray meets on the kept side of the clip
+             * plane, the side the lasso takes faces from.
+             */
+            function onHighlight(x, y) {
+                if (!meshObj || manualHighlightFaces.size === 0) return false;
+                mouse.x = (x / window.innerWidth) * 2 - 1;
+                mouse.y = -(y / window.innerHeight) * 2 + 1;
+                raycaster.setFromCamera(mouse, camera);
+                for (const hit of raycaster.intersectObject(meshObj)) {
+                    if (clipPlane.distanceToPoint(hit.point) < 0) continue;
+                    return manualHighlightFaces.has(hit.faceIndex);
+                }
+                return false;
+            }
+
+            /**
+             * Shift+drag a rectangle over the surface.  Where the drag starts
+             * decides what it does, as shift-click does for one face: started
+             * on a highlighted face it takes the highlighted faces under the
+             * rectangle out of the highlight — so its edge can be trimmed by
+             * a rectangle that spills past it — and started anywhere else it
+             * adds the faces under the rectangle.  The rectangle turns red
+             * once the drag is one that takes faces out.
+             */
             function setupLassoSelection() {
                 const rect = document.getElementById("lasso-rect");
                 let dragging = false;
                 let startX = 0,
                     startY = 0;
+                // whether the drag takes faces out; null until it is a drag
+                let removing = null;
 
                 renderer.domElement.addEventListener("pointerdown", (e) => {
                     if (!e.shiftKey || e.button !== 0) return;
@@ -4678,6 +4711,8 @@
                     // Prevent orbit controls from handling shift+drag
                     controls.enabled = false;
                     dragging = true;
+                    removing = null;
+                    rect.classList.remove("removing");
                     startX = e.clientX;
                     startY = e.clientY;
                     rect.style.left = startX + "px";
@@ -4691,6 +4726,14 @@
 
                 window.addEventListener("pointermove", (e) => {
                     if (!dragging) return;
+                    // Past the click threshold this is a drag, and the face it
+                    // started on decides what it does — looked up only now,
+                    // so a shift-click does not pay for a second raycast.
+                    const far = Math.abs(e.clientX - startX) >= 5 || Math.abs(e.clientY - startY) >= 5;
+                    if (removing === null && far) {
+                        removing = onHighlight(startX, startY);
+                        rect.classList.toggle("removing", removing);
+                    }
                     const x = Math.min(startX, e.clientX);
                     const y = Math.min(startY, e.clientY);
                     const w = Math.abs(e.clientX - startX);
@@ -4722,32 +4765,36 @@
                     suppressClickAfterDrag();
 
                     if (!meshGeometry) return;
+                    if (removing === null) removing = onHighlight(startX, startY);
                     const posAttr = meshGeometry.getAttribute("position");
                     const nFaces = posAttr.count / 3;
 
-                    // Project each face centroid to screen and check if inside rectangle
+                    // Whether face i's centroid, on the kept side of the clip
+                    // plane, projects inside the rectangle
                     const vp = new THREE.Vector3();
-                    let count = 0;
-                    for (let i = 0; i < nFaces; i++) {
+                    const inRect = (i) => {
                         const base = i * 9;
                         vp.set(
                             (posAttr.array[base] + posAttr.array[base + 3] + posAttr.array[base + 6]) / 3,
                             (posAttr.array[base + 1] + posAttr.array[base + 4] + posAttr.array[base + 7]) / 3,
                             (posAttr.array[base + 2] + posAttr.array[base + 5] + posAttr.array[base + 8]) / 3,
                         );
-
-                        // Check clip plane
-                        if (clipPlane.distanceToPoint(vp) < 0) continue;
-
-                        // Project to screen
+                        if (clipPlane.distanceToPoint(vp) < 0) return false;
                         vp.project(camera);
                         const sx = (vp.x * 0.5 + 0.5) * window.innerWidth;
                         const sy = (-vp.y * 0.5 + 0.5) * window.innerHeight;
+                        return sx >= x0 && sx <= x1 && sy >= y0 && sy <= y1 && vp.z >= 0 && vp.z <= 1;
+                    };
 
-                        if (sx >= x0 && sx <= x1 && sy >= y0 && sy <= y1 && vp.z >= 0 && vp.z <= 1) {
-                            if (!inScope(i)) continue;
-                            manualHighlightFaces.add(i);
-                            count++;
+                    if (removing) {
+                        // Deselecting is always allowed, as for shift-click: a
+                        // narrowed scope must never trap faces in the selection.
+                        for (const i of Array.from(manualHighlightFaces)) {
+                            if (inRect(i)) manualHighlightFaces.delete(i);
+                        }
+                    } else {
+                        for (let i = 0; i < nFaces; i++) {
+                            if (inRect(i) && inScope(i)) manualHighlightFaces.add(i);
                         }
                     }
 
