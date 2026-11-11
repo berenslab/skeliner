@@ -8,6 +8,8 @@
 //! whose soma ring is broken get a second look inside the convex hull of the
 //! chain's end.
 
+use std::collections::HashMap;
+
 use mesh::geometry::{arange, numpy_sum};
 use mesh::raster::{dilate3, enclosed, fill_holes, label, sq_distance_to};
 use rayon::prelude::*;
@@ -443,19 +445,66 @@ fn nucleus_chain(
     best.map(|b| b.1)
 }
 
+/// The deep parts of voids seen from above: their cells' centres, each
+/// level's on its own grid, filed by the cell of a common grid they fall
+/// in.
+struct FromAbove {
+    grid_res: f64,
+    cells: HashMap<(i64, i64), Vec<[f64; 2]>>,
+}
+
+impl FromAbove {
+    fn new<'a>(parts: impl Iterator<Item = &'a [[f64; 2]]>, grid_res: f64) -> FromAbove {
+        let mut out = FromAbove {
+            grid_res,
+            cells: HashMap::new(),
+        };
+        for &p in parts.flatten() {
+            let k = out.key(p);
+            out.cells.entry(k).or_default().push(p);
+        }
+        out
+    }
+
+    fn key(&self, p: [f64; 2]) -> (i64, i64) {
+        let g = self.grid_res;
+        ((p[0] / g).floor() as i64, (p[1] / g).floor() as i64)
+    }
+
+    /// Whether a cell of `part` overlaps one of these: their centres less
+    /// than a cell apart on both axes.
+    fn meets(&self, part: &[[f64; 2]]) -> bool {
+        let g = self.grid_res;
+        part.iter().any(|&p| {
+            let (i, j) = self.key(p);
+            (i - 1..=i + 1).any(|a| {
+                (j - 1..=j + 1).any(|b| {
+                    self.cells.get(&(a, b)).is_some_and(|qs| {
+                        qs.iter()
+                            .any(|q| (p[0] - q[0]).abs() < g && (p[1] - q[1]).abs() < g)
+                    })
+                })
+            })
+        })
+    }
+}
+
 /// The biggest void anywhere else in the cell than its body, when the
 /// body's void beats it.  The candidate is the chain of voided levels
 /// holding the cell's biggest void, its peak the first level with that
 /// void; its reach is its widest section's radius past the farthest of its
 /// centres from the peak's, in XY.  The body is every level within that
-/// reach of the peak's void centre, and above or below it, within its XY
-/// reach, every level whose section is still at least half the widest — a
-/// ring doubled from its exit's is the body, as the soma's stub erosion has
-/// it — so a tall soma stays whole and a neurite leaving it straight up or
-/// down counts as elsewhere.  A nucleus is the cell's one void a neurite
-/// cannot hold: the peak must beat the biggest void elsewhere by more than
-/// the grid resolves (a cell: each radius is uncertain by half of one);
-/// `None` when it does not — no nucleus.
+/// reach of the peak's void centre, and every other level whose section is
+/// still at least half the widest — a ring doubled from its exit's is the
+/// body, as the soma's stub erosion has it — and whose void lies within the
+/// reach in XY, or over or under the candidate's void: its deep part
+/// overlapping, seen from above, a candidate level's.  So a tall soma
+/// stays whole, and so does a long or lobed nucleus, whose deepest point
+/// wanders from one end to the other between levels; a neurite leaving the
+/// soma straight up or down counts as elsewhere.  A nucleus is the cell's
+/// one void a neurite cannot hold: the peak must beat the biggest void
+/// elsewhere by more than the grid resolves (a cell: each radius is
+/// uncertain by half of one); `None` when it does not — no nucleus.
 fn void_floor(levels: &[Level], grid_res: f64, max_shift: f64) -> Option<f64> {
     let peak = |c: &[usize]| c.iter().map(|&i| levels[i].void_r).fold(0.0, f64::max);
     let mut cand: Option<Vec<usize>> = None;
@@ -477,13 +526,18 @@ fn void_floor(levels: &[Level], grid_res: f64, max_shift: f64) -> Option<f64> {
         .fold(0.0, f64::max);
     let widest = cand.iter().map(|&i| levels[i].sec_r).fold(0.0, f64::max);
     let foot = widest + spread;
+    let void = FromAbove::new(
+        cand.iter().filter_map(|&i| levels[i].void_xy.as_deref()),
+        grid_res,
+    );
     let other = levels
         .iter()
         .filter(|l| {
             let (dx, dy, dz) = (l.cx - px, l.cy - py, l.z - pz);
             let flat = (dx * dx + dy * dy).sqrt();
-            let body = (dx * dx + dy * dy + dz * dz).sqrt() <= foot
-                || (flat <= foot && 2.0 * l.sec_r >= widest);
+            let over = flat <= foot || l.void_xy.as_deref().is_some_and(|d| void.meets(d));
+            let body =
+                (dx * dx + dy * dy + dz * dz).sqrt() <= foot || (over && 2.0 * l.sec_r >= widest);
             l.void_r > 0.0 && !l.cx.is_nan() && !body
         })
         .map(|l| l.void_r)
@@ -979,5 +1033,67 @@ mod tests {
         rings(&mut twins, [20000.0, 0.0, 3000.0], 600.0, 20);
         let scan = ZScan::new(&twins, p);
         assert!(scan.min_void_r.is_none() && scan.best.is_none());
+    }
+
+    /// The outline of two overlapping hollow discs — radii `r` (left,
+    /// right), centres `l` apart on the x axis — as rings of vertices, each
+    /// twice 100 apart as [`rings`] has them, stacked 100 apart over `n`
+    /// levels from `z`.
+    fn lobes(verts: &mut Vec<[f64; 3]>, z: f64, n: usize, r: [f64; 2], l: f64) {
+        let c = [-l / 2.0, l / 2.0];
+        for zi in 0..n {
+            for w in [0.0, 100.0] {
+                for side in 0..2 {
+                    let (rs, ro) = (r[side] + w, r[1 - side] + w);
+                    for k in 0..400 {
+                        let a = k as f64 * std::f64::consts::TAU / 400.0;
+                        let (x, y) = (c[side] + rs * a.cos(), rs * a.sin());
+                        // the arc inside the other disc is no outline
+                        if (x - c[1 - side]).hypot(y) >= ro {
+                            verts.push([x, y, z + zi as f64 * 100.0]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A long nucleus whose deepest point changes end half-way up — two
+    /// overlapping hollows, the left one wider below, the right one above
+    /// — is one body: its chain breaks where the deepest point jumps, but
+    /// the upper part's void lies over the lower part's, so it is no void
+    /// elsewhere for the lower part to beat.
+    #[test]
+    fn a_long_nucleus_is_one_body() {
+        let p = ZParams {
+            grid_res: 200.0,
+            z_tol: 150.0,
+            min_void_r: None,
+            max_shift: 3000.0,
+            near: None,
+        };
+        let mut verts = Vec::new();
+        lobes(&mut verts, 0.0, 15, [2200.0, 1800.0], 3600.0);
+        lobes(&mut verts, 1500.0, 15, [1800.0, 2150.0], 3600.0);
+        let scan = ZScan::new(&verts, p);
+        // the deepest point at the left end below and the right end above,
+        // a chain's link apart, its voids within a grid cell of each other
+        let voided: Vec<&Level> = scan.levels.iter().filter(|l| l.void_r > 0.0).collect();
+        let peak = |right: bool| {
+            voided
+                .iter()
+                .filter(|l| (l.cx > 0.0) == right)
+                .map(|l| l.void_r)
+                .fold(0.0, f64::max)
+        };
+        let (left, right) = (peak(false), peak(true));
+        assert!(
+            right > 0.0 && left > right && left - right <= 200.0,
+            "{left} {right}"
+        );
+        let c = scan.center().expect("a nucleus");
+        assert!(c[0].abs() < 3600.0 && c[1].abs() < 1000.0, "{c:?}");
+        // nothing else in the cell: the minimum is a grid cell
+        assert_eq!(scan.min_void_r, Some(200.0));
     }
 }

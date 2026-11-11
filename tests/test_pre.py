@@ -1142,6 +1142,40 @@ class TestFindNucleusCenter:
         for pair in (alone, up, down):
             assert_parity(pair[0]["slices"], pair[1]["slices"])
 
+    def test_a_long_nucleus_is_one_body_on_both_paths(self):
+        # two overlapping hollows 3.6 um apart, the left one wider below,
+        # the right one above: the deepest point changes end half-way up
+        # and the chain breaks there, but the upper part's void lies over
+        # the lower part's — the same nucleus, no void elsewhere to beat
+        a = np.linspace(0.0, 2 * np.pi, 400, endpoint=False)
+
+        def lobes(z0, radii):
+            out = []
+            centres = (-1800.0, 1800.0)
+            for k in range(15):
+                for w in (0.0, 100.0):
+                    for side in (0, 1):
+                        r, ro = radii[side] + w, radii[1 - side] + w
+                        x = centres[side] + r * np.cos(a)
+                        y = r * np.sin(a)
+                        keep = np.hypot(x - centres[1 - side], y) >= ro
+                        z = np.full(keep.sum(), z0 + 100.0 * k)
+                        out.append(np.c_[x[keep], y[keep], z])
+            return np.concatenate(out)
+
+        v = np.r_[lobes(0.0, (2200.0, 1800.0)), lobes(1500.0, (1800.0, 2150.0))]
+        raw = pre._z_scan(v, retry_broken=False)[0]
+        # the fixture: the deepest point at either end, within a cell
+        left = max(r[3] for r in raw if r[3] > 0 and r[1] < 0)
+        right = max(r[3] for r in raw if r[3] > 0 and r[1] > 0)
+        assert 0 < left - right <= 200.0, (left, right)
+        cloud = Mesh(v, np.empty((0, 3)))
+        found = both(pre.find_nucleus_center, cloud)
+        for f in found:
+            assert np.abs(f["center"][:2]).max() < 3600.0, f["center"]
+        assert_parity(found[0]["slices"], found[1]["slices"])
+        assert_parity(*both(pre._z_scan, v))
+
 
 # ── find_soma ─────────────────────────────────────────
 

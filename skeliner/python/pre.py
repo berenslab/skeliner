@@ -5160,6 +5160,32 @@ def z_slice_void(
     return cx, cy, void_r, void_xy
 
 
+def _from_above(parts: list[np.ndarray], grid_res: float) -> dict:
+    """The cells of the void deep parts *parts* (``(M, 2)`` cell centres,
+    each level's on its own grid) seen from above, filed by the cell of a
+    common grid they fall in."""
+    cells: dict[tuple[int, int], list[tuple[float, float]]] = {}
+    for part in parts:
+        for x, y in part.tolist():
+            key = (math.floor(x / grid_res), math.floor(y / grid_res))
+            cells.setdefault(key, []).append((x, y))
+    return cells
+
+
+def _meets_from_above(cells: dict, part: np.ndarray, grid_res: float) -> bool:
+    """Whether a cell of the deep part *part* overlaps one of *cells*
+    (:func:`_from_above`): their centres less than a cell apart on both
+    axes."""
+    for x, y in part.tolist():
+        i, j = math.floor(x / grid_res), math.floor(y / grid_res)
+        for a in (i - 1, i, i + 1):
+            for b in (j - 1, j, j + 1):
+                for qx, qy in cells.get((a, b), ()):
+                    if abs(x - qx) < grid_res and abs(y - qy) < grid_res:
+                        return True
+    return False
+
+
 class ZScan:
     """The Z-level scan of a mesh's vertices that finds the nucleus: per
     level, the largest cluster of the vertices near it and the void inside
@@ -5309,15 +5335,18 @@ class ZScan:
         holding the cell's biggest void, its peak the first level with that
         void; its reach is its widest section's radius past the farthest of
         its centres from the peak's, in XY.  The body is every level within
-        that reach of the peak's void centre, and above or below it, within
-        its XY reach, every level whose section is still at least half the
-        widest — a ring doubled from its exit's is the body, as the soma's
-        stub erosion has it — so a tall soma stays whole and a neurite
-        leaving it straight up or down counts as elsewhere.  A nucleus is
-        the cell's one void a neurite cannot hold: the peak must beat the
-        biggest void elsewhere by more than the grid resolves (a cell: each
-        radius is uncertain by half of one); None when it does not — no
-        nucleus."""
+        that reach of the peak's void centre, and every other level whose
+        section is still at least half the widest — a ring doubled from its
+        exit's is the body, as the soma's stub erosion has it — and whose
+        void lies within the reach in XY, or over or under the candidate's
+        void: its deep part overlapping, seen from above, a candidate
+        level's (:func:`_meets_from_above`).  So a tall soma stays whole,
+        and so does a long or lobed nucleus, whose deepest point wanders
+        from one end to the other between levels; a neurite leaving the soma
+        straight up or down counts as elsewhere.  A nucleus is the cell's
+        one void a neurite cannot hold: the peak must beat the biggest void
+        elsewhere by more than the grid resolves (a cell: each radius is
+        uncertain by half of one); None when it does not — no nucleus."""
         raw, sec = self._raw, self._sec
         cand, peak = None, 0.0
         for run in self._chains(sys.float_info.min):
@@ -5335,11 +5364,18 @@ class ZScan:
 
         widest = max(sec[i] for i in cand)
         foot = widest + max(off(i) for i in cand)
+        void = _from_above(
+            [raw[i][4] for i in cand if raw[i][4] is not None], self._grid_res
+        )
 
         def body(i):
             dx, dy, dz = raw[i][1] - px, raw[i][2] - py, raw[i][0] - pz
             near = math.sqrt(dx * dx + dy * dy + dz * dz) <= foot
-            return near or (off(i) <= foot and 2.0 * sec[i] >= widest)
+            over = off(i) <= foot or (
+                raw[i][4] is not None
+                and _meets_from_above(void, raw[i][4], self._grid_res)
+            )
+            return near or (over and 2.0 * sec[i] >= widest)
 
         other = max(
             (
