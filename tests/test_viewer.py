@@ -883,6 +883,114 @@ def test_preprocess_drops_the_caches_keyed_to_the_replaced_mesh(rescue_client):
     assert state["fusion_clusters"] is None
 
 
+def test_the_components_saved_carry_the_record_of_the_run(rescue_client, tmp_path):
+    """What the run decided is the session's until a new run or a new cell;
+    Break re-derives the split, not the mesh the run made, so it keeps it,
+    and the components the page saves (and compacts) carry it."""
+    from skeliner.io import load_components_npz
+
+    client, state, speck = rescue_client
+    assert client.post("/preprocess").status_code == 200
+    record = state["record"]
+    assert record is not None and record["soma"]["asked"] in ("find", "given")
+
+    assert client.post("/break_up_mesh").status_code == 200
+    assert state["record"] is record
+    saved = tmp_path / "c.npz"
+    saved.write_bytes(client.get("/export_components").content)
+    assert load_components_npz(saved).record == record
+
+    assert client.post("/compact_mesh").status_code == 200
+    assert state["record"] == record
+
+
+def test_a_qc_report_dropped_lists_its_sites_as_markers(rescue_client, tmp_path):
+    """sk.qc.report's sites become markers about the session's centroid, each
+    as large as what it marks (a median edge at least) and said in words; the
+    soma is left to the components; a second report replaces the first's
+    markers and leaves the others."""
+    client, state, speck = rescue_client
+    centroid = np.asarray(state["centroid"], dtype=float)
+    rep = {
+        "qc": 1,
+        "skeliner": "test",
+        "meta": {"cell": "x"},
+        "summary": {"median_edge": 10.0},
+        "flags": ["no_soma"],
+        "sites": [
+            {
+                "kind": "bridge",
+                "position": [100.0, 0.0, 0.0],
+                "extent": 30.0,
+                "length": 60.0,
+                "edges": 6.0,
+                "relative": 0.5,
+                "a": [70.0, 0.0, 0.0],
+                "b": [130.0, 0.0, 0.0],
+                "pieces": [None, 10],
+            },
+            {
+                "kind": "discarded",
+                "position": [0.0, 0.0, 400.0],
+                "extent": 2.0,
+                "index": 0,
+                "faces": 12,
+                "at_soma": False,
+                "at_organelle": True,
+                "arbor_distance": None,
+                "reach": None,
+            },
+            {"kind": "soma", "position": [0.0, 0.0, 0.0], "extent": 500.0},
+        ],
+    }
+    other = {"position": [1.0, 2.0, 3.0], "radius": 5.0, "label": "mine"}
+    state_ann = client.get("/annotations").json()
+    state_ann["markers"] = [other]
+    (tmp_path / "ann.json").write_text(json.dumps(state_ann))
+    client.post(
+        "/upload", files={"file": ("ann.json", (tmp_path / "ann.json").read_bytes())}
+    )
+
+    upload = {"file": ("qc.json", json.dumps(rep).encode())}
+    assert client.post("/upload", files=upload).json() == {
+        "ok": True,
+        "type": "qc",
+        "name": "qc.json",
+        "sites": 2,
+        "flags": ["no_soma"],
+    }
+    markers = client.get("/annotations").json()["markers"]
+    assert markers[0] == other
+    bridge, piece = markers[1:]
+    assert (bridge["qc"], piece["qc"]) == ("bridge", "discarded")
+    np.testing.assert_allclose(bridge["position"], np.array([100.0, 0, 0]) - centroid)
+    assert (bridge["radius"], piece["radius"]) == (30.0, 10.0)
+    assert bridge["label"] == (
+        "qc: bridge, 60 long (6 median edges, 0.5× the piece it joins)"
+    )
+    assert piece["label"] == "qc: discarded piece 0, 12 faces, at an organelle"
+
+    rep["sites"] = rep["sites"][:1]
+    again = {"file": ("qc.json", json.dumps(rep).encode())}
+    assert client.post("/upload", files=again).json()["sites"] == 1
+    markers = client.get("/annotations").json()["markers"]
+    assert [m.get("qc") for m in markers] == [None, "bridge"]
+
+
+def test_a_qc_report_needs_its_mesh_first(tmp_path, monkeypatch):
+    from starlette.testclient import TestClient
+
+    from skeliner.viewer import viewer as viewer_mod
+
+    monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
+    rep = {"qc": 1, "summary": {}, "flags": [], "sites": []}
+    with TestClient(_create_app(port=8915)) as client:
+        r = client.post(
+            "/upload", files={"file": ("qc.json", json.dumps(rep).encode())}
+        )
+    assert r.status_code == 400 and "mesh" in r.json()["error"]
+
+
 def test_preprocess_leaves_the_mesh_uncompacted(rescue_client):
     """Compaction reindexes faces, and the rescue list, the annotations
     and any loaded skeleton are all stated in face ids.  /compact_mesh

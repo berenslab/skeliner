@@ -2172,6 +2172,68 @@ class TestRescued:
         _, off = pre.preprocess(ball, organelles=False, soma=(30000.0, 0.0, 0.0))
         assert off.soma is None
 
+    def test_the_record_says_how_the_soma_was_settled(self):
+        ball = trimesh.creation.icosphere(subdivisions=3, radius=3000.0)
+        point = [float(x) for x in ball.vertices[0]]
+        far = [30000.0, 0.0, 0.0]
+        mesh, soma, _ = _ball_with_stub(height=160.0)
+        for m, kw, want in [
+            (ball, {}, {"asked": "find", "point": None, "found": True}),
+            (ball, {"soma": point}, {"asked": "point", "point": point, "found": True}),
+            (ball, {"soma": far}, {"asked": "point", "point": far, "found": False}),
+            (mesh, {"soma": soma}, {"asked": "given", "point": None, "found": True}),
+            (mesh, {"soma": False}, {"asked": "off", "point": None, "found": False}),
+        ]:
+            _, c = pre.preprocess(m, organelles=False, **kw)
+            assert c.record["soma"] == want, kw
+
+    def test_the_record_places_each_bridge(self, monkeypatch):
+        # the gaps find_gaps hands preprocess, one entry each: where the two
+        # tips are, the gap, the pieces joined (None the body), and the
+        # smaller piece's box diagonal — find_gaps' own measure of its size
+        mesh = _two_cylinders(separation=1500.0)
+        real, seen = pre.find_gaps, []
+
+        def find_gaps(m, **kw):
+            seen.extend(real(m, **kw, **NO_CAP))
+            return seen
+
+        monkeypatch.setattr(pre, "find_gaps", find_gaps)
+        _, c = pre.preprocess(mesh, organelles=False, soma=False)
+        assert len(seen) == 1, "fixture: one gap to bridge"
+        fa, fb, d, ia, ib = seen[0]
+        (b,) = c.record["bridges"]
+        v = np.asarray(mesh.vertices)
+        f = np.asarray(mesh.faces)
+        np.testing.assert_allclose(b["a"], v[f[fa]].reshape(-1, 3).mean(0))
+        np.testing.assert_allclose(b["b"], v[f[fb]].reshape(-1, 3).mean(0))
+        assert b["length"] == d
+        half = len(mesh.faces) // 2
+        assert sorted(b["pieces"], key=lambda x: x is None) == [half, None]
+        far = v[f[half:]].reshape(-1, 3)
+        assert b["diag"] == pytest.approx(np.linalg.norm(far.max(0) - far.min(0)))
+        assert c.record["disconnected"] == {"pieces": 1, "faces": half}
+        assert c.record["median_edge"] == pytest.approx(
+            float(np.median(trimesh.Trimesh(v, f, process=False).edges_unique_length))
+        )
+
+    def test_the_record_is_plain_json_and_survives_compaction(self):
+        import json
+
+        mesh, org = _tube_with_speck()
+        _, c = pre.preprocess(mesh)
+        _, cc = pre.preprocess(mesh, compact=True)
+        assert json.loads(json.dumps(c.record)) == c.record
+        assert cc.record == c.record
+        assert c.record["input"] == {
+            "vertices": len(mesh.vertices),
+            "faces": len(mesh.faces),
+        }
+        assert c.record["fill"]["asked"] is True
+        assert c.record["overrides"] == {"rescued": 0, "released": 0}
+        _, kept = pre.preprocess(mesh, rescued=c.discarded[0])
+        assert kept.record["overrides"]["rescued"] == len(c.discarded[0])
+
     def test_a_full_preprocess_refuses_a_soma_it_cannot_read(self):
         mesh, _, _ = _ball_with_stub()
         for what in ("none", [1.0, 2.0]):

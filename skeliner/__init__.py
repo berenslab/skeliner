@@ -1,7 +1,7 @@
 import importlib
 from importlib.metadata import PackageNotFoundError, version
 
-from . import batch, dx, io, pair, post, pre
+from . import batch, dx, io, pair, post, pre, qc
 from .dataclass import Mesh, Skeleton, Soma, register_skeleton_methods
 from .pre import preprocess
 from ._backend import backend
@@ -54,6 +54,7 @@ __all__ = [
     "post",
     "pair",
     "pre",
+    "qc",
     "plot",
     "viewer",
     "preprocess",

@@ -882,7 +882,9 @@ def save_components_npz(
 ) -> None:
     """Write a :class:`MeshComponents` to a single ``.npz`` archive.
 
-    Packs soma, organelles, neurites, and discarded into one file.
+    Packs soma, organelles, neurites, and discarded into one file, and the
+    record of the :func:`~skeliner.pre.preprocess` run that made them, if
+    any (as JSON).
     """
     path = Path(path)
     if not path.suffix:
@@ -928,6 +930,9 @@ def save_components_npz(
     payload["n_discarded"] = np.array(len(components.discarded.components))
     for i, comp in enumerate(components.discarded.components):
         payload[f"discarded_{i}"] = np.asarray(comp, dtype=np.int64)
+
+    if components.record is not None:
+        payload["record"] = _json_encode_meta(components.record)
 
     save_fn = np.savez_compressed if compress else np.savez
     save_fn(path, **payload)
@@ -987,8 +992,14 @@ def load_components_npz(path: str | Path) -> MeshComponents:
             [z[f"discarded_{i}"].astype(np.int64) for i in range(n_d)]
         )
 
+        record = _json_decode_meta(z["record"]) if "record" in z else None
+
     return MeshComponents(
-        soma=soma, organelles=organelles, neurites=neurites, discarded=discarded
+        soma=soma,
+        organelles=organelles,
+        neurites=neurites,
+        discarded=discarded,
+        record=record,
     )
 
 
@@ -996,7 +1007,7 @@ def load_components_npz(path: str | Path) -> MeshComponents:
 # --- Mesh Contact Sites ---
 # --------------------------
 
-# --- shared helpers (feel free to move to serde.py if you prefer) -----
+# --- shared helpers -----
 
 
 def _json_encode_meta(meta: dict) -> np.ndarray:

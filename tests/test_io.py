@@ -324,6 +324,25 @@ def test_organelles_npz_backward_compat(tmp_path):
     assert np.array_equal(loaded.expanded, np.zeros(nF, dtype=bool))
 
 
+def test_components_npz_keep_the_record_of_the_run(tmp_path):
+    """What preprocess decided goes with the components into the file and
+    back; components no run made have none, before and after."""
+    import trimesh
+
+    from skeliner.io import load_components_npz, save_components_npz
+
+    ball = trimesh.creation.icosphere(subdivisions=3, radius=3000.0)
+    _, comps = sk.pre.preprocess(ball, organelles=False)
+    assert comps.record is not None
+    save_components_npz(comps, tmp_path / "c.npz")
+    assert load_components_npz(tmp_path / "c.npz").record == comps.record
+
+    bare = sk.pre.break_up_mesh(ball, comps.soma, None)
+    assert bare.record is None
+    save_components_npz(bare, tmp_path / "bare.npz")
+    assert load_components_npz(tmp_path / "bare.npz").record is None
+
+
 # ------------------------------------------------------------------------
 #  MeshStats NPZ round-trip
 # ------------------------------------------------------------------------

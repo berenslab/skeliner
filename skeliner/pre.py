@@ -140,6 +140,57 @@ def _median_edge(mesh) -> float:
     return float(mesh._get("median_edge", lambda: np.median(mesh.edges_unique_length)))
 
 
+def _faces_center(mesh, faces) -> list[float] | None:
+    """The mean of *faces*' vertices: where a run's record places them."""
+    f = np.asarray(faces, dtype=np.int64)
+    if not len(f):
+        return None
+    tri = np.asarray(mesh.vertices)[np.asarray(mesh.faces)[f]]
+    return [float(x) for x in tri.reshape(-1, 3).mean(axis=0)]
+
+
+def _faces_diag(mesh, faces) -> float:
+    """The diagonal of the box round *faces*' vertices — a piece's size as
+    :func:`find_gaps` measures it for its bridging cap."""
+    f = np.asarray(faces, dtype=np.int64)
+    if not len(f):
+        return 0.0
+    v = np.asarray(mesh.vertices)[np.unique(np.asarray(mesh.faces)[f])]
+    return float(np.linalg.norm(v.max(axis=0) - v.min(axis=0)))
+
+
+#: :func:`find_gaps`' cap by default, in median edges: a gap this short
+#: always bridges, one this long never does.
+_BRIDGE_FLOOR_EDGES = 8.0
+_BRIDGE_CEILING_EDGES = 75.0
+
+
+def _bridge_reach(diag: float, median_edge: float, ratio: float = 1.0) -> float:
+    """How far :func:`find_gaps` bridges a piece of box diagonal *diag* by
+    default: its size (times *ratio*, ``max_bridge_ratio``), but always the
+    floor of 8 median edges and never past the ceiling of 75."""
+    return min(
+        _BRIDGE_CEILING_EDGES * median_edge,
+        max(_BRIDGE_FLOOR_EDGES * median_edge, ratio * diag),
+    )
+
+
+def _bridge_record(mesh, gap, disconnected) -> dict:
+    """One bridge as :func:`preprocess` records it: where its two tips are,
+    the gap's length, the pieces it joins (their faces; None for the body
+    the soma lies on), and the smaller of those pieces' box diagonals —
+    the size :func:`find_gaps` caps a bridge by."""
+    fa, fb, d, ia, ib = gap
+    diags = [_faces_diag(mesh, disconnected[i]) for i in (ia, ib) if i >= 0]
+    return {
+        "a": _faces_center(mesh, fa),
+        "b": _faces_center(mesh, fb),
+        "length": float(d),
+        "pieces": [None if i < 0 else len(disconnected[i]) for i in (ia, ib)],
+        "diag": min(diags) if diags else None,
+    }
+
+
 def _face_edge_components(mesh: Mesh) -> tuple[np.ndarray, int]:
     """Connected components of faces using edge adjacency.
 
@@ -3138,8 +3189,12 @@ def find_gaps(
         float(fusion_clearance) if fusion_clearance is not None else 10.0 * median_edge,
         6.0 * median_edge,
         float(max_bridge_ratio),
-        float(min_bridge_gap) if min_bridge_gap is not None else 8.0 * median_edge,
-        float(max_bridge_dist) if max_bridge_dist is not None else 75.0 * median_edge,
+        float(min_bridge_gap)
+        if min_bridge_gap is not None
+        else _BRIDGE_FLOOR_EDGES * median_edge,
+        float(max_bridge_dist)
+        if max_bridge_dist is not None
+        else _BRIDGE_CEILING_EDGES * median_edge,
         kiss_radius * median_edge,
         float(kiss_penalty),
         int(relay_min_faces),
@@ -4840,6 +4895,8 @@ def compact_mesh(
             swc_types=None if src_types is None else list(src_types),
         ),
         discarded=Discarded(_remap_face_list(components.discarded)),
+        # positions and counts, no face ids: valid as it is
+        record=components.record,
     )
 
     if return_maps:
@@ -4932,8 +4989,18 @@ def preprocess(
         Cleaned mesh (gaps stitched, fusions removed, holes patched,
         optionally compacted).
     components : MeshComponents
-        Classified pieces: soma, organelles, neurites, discarded.
+        Classified pieces: soma, organelles, neurites, discarded.  Its
+        ``record`` says what the run decided on the way — how the soma was
+        settled, and where it cut parallel patches and fusions, bridged
+        gaps and filled holes — for :func:`~skeliner.qc.report`.
     """
+    from . import __version__
+
+    record = {
+        "version": 1,
+        "skeliner": __version__,
+        "input": {"vertices": len(mesh.vertices), "faces": len(mesh.faces)},
+    }
     near = None
     if not (soma is None or isinstance(soma, (Soma, bool, np.bool_))):
         try:
@@ -4956,6 +5023,15 @@ def preprocess(
     # 1. Parallel patches
     with _timed("↳  find & remove parallel patches", verbose=verbose):
         patches = find_parallel_patches(mesh)
+        record["parallel_patches"] = [
+            {
+                "center": _faces_center(mesh, p["faces"]),
+                "diag": _faces_diag(mesh, p["faces"]),
+                "faces": len(p["faces"]),
+                "axis": int(p["axis"]),
+            }
+            for p in patches
+        ]
         if patches:
             mesh = remove_parallel_patches(mesh, patches=patches)
 
@@ -4975,15 +5051,23 @@ def preprocess(
         else:
             org = Organelles.empty(len(mesh.faces))
             log("none: organelles=False")
+        record["organelles"] = {
+            "looked": bool(organelles),
+            "pocket": int(org.pocket.sum()),
+            "isolated": int(org.isolated.sum()),
+        }
 
     # 4. Soma
     with _timed("↳  find soma", verbose=verbose) as log:
         if isinstance(soma, Soma):
+            asked = "given"
             log(f"given: center={soma.center.round(0).tolist()}")
         elif soma is not None and not soma:
+            asked = "off"
             soma = None
             log("none: soma=False")
         else:
+            asked = "find" if near is None else "point"
             soma = find_soma(mesh, organelles=org, mesh_stats=mesh_stats, near=near)
             if soma is not None:
                 log(f"center={soma.center.round(0).tolist()}")
@@ -4991,11 +5075,24 @@ def preprocess(
                 log(f"none holding {near.round(0).tolist()}")
             else:
                 log("no soma detected")
+        record["soma"] = {
+            "asked": asked,
+            "point": None if near is None else [float(x) for x in near],
+            "found": soma is not None,
+        }
 
     # 5. Fusions → disconnected → gaps
     with _timed("↳  find fusions", verbose=verbose) as log:
         fusions = find_fusions(mesh, mesh_stats=mesh_stats)
         log(f"{len(fusions)} fusions")
+        record["fusions"] = [
+            {
+                "center": _faces_center(mesh, f),
+                "diag": _faces_diag(mesh, f),
+                "faces": len(f),
+            }
+            for f in fusions
+        ]
 
     # the soma is settled: none is none from here on, not a cue to look again
     settled = False if soma is None else soma
@@ -5008,6 +5105,10 @@ def preprocess(
             fusions=fusions,
         )
         log(f"{len(disconnected)} disconnected components")
+        record["disconnected"] = {
+            "pieces": len(disconnected),
+            "faces": int(sum(len(d) for d in disconnected)),
+        }
 
     with _timed("↳  find & remove gaps", verbose=verbose) as log:
         gaps = find_gaps(
@@ -5018,6 +5119,10 @@ def preprocess(
             fusions=fusions,
         )
         log(f"{len(gaps)} gaps")
+        # find_gaps took the median edge (kept on the mesh) when there was a
+        # piece to bridge; with none the record needs no scale
+        record["median_edge"] = _median_edge(mesh) if disconnected else None
+        record["bridges"] = [_bridge_record(mesh, g, disconnected) for g in gaps]
         if gaps:
             mesh = remove_gaps(mesh, gaps=gaps, mesh_stats=mesh_stats, fusions=fusions)
 
@@ -5029,12 +5134,13 @@ def preprocess(
     # 7. Holes — the organelles' mouths and the mesh's own openings
     #    patched, so that the neurites cut out next are tubes
     with _timed("↳  fill holes", verbose=verbose) as log:
+        n_before = len(mesh.faces)
         if fill:
-            n_before = len(mesh.faces)
             mesh = fill_holes(mesh, organelles=org, soma=soma, mesh_stats=mesh_stats)
             log(f"+{len(mesh.faces) - n_before:,} faces")
         else:
             log("none: fill=False")
+        record["fill"] = {"asked": bool(fill), "faces": len(mesh.faces) - n_before}
 
     # 8. Break up mesh
     with _timed("↳  break up mesh", verbose=verbose) as log:
@@ -5047,6 +5153,11 @@ def preprocess(
             claim_min_faces=claim_min_faces,
         )
         log(f"{len(components.neurites)} neurites")
+        record["overrides"] = {
+            "rescued": 0 if rescued is None else len(rescued),
+            "released": 0 if released is None else len(released),
+        }
+        components.record = record
 
     # 9. Compact (optional — remaps everything in MeshComponents)
     if compact:

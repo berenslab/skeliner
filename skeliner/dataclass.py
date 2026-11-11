@@ -635,12 +635,20 @@ class MeshComponents:
     at the soma and organelle boundaries.  Only *soma* and *organelles*
     are stored inputs; *neurites* and *discarded* are derived from them
     by :func:`~skeliner.pre.break_up_mesh`.
+
+    *record* is what :func:`~skeliner.pre.preprocess` decided on the way
+    to these components — how the soma was settled, and where it cut
+    parallel patches and fusions, bridged gaps and filled holes — as a
+    plain dict of numbers and positions (no face ids, so compaction leaves
+    it valid).  None for components made any other way.
+    :func:`~skeliner.qc.report` reads it; it is saved with the components.
     """
 
     soma: "Soma | None"
     organelles: Organelles
     neurites: Neurites
     discarded: Discarded
+    record: "dict | None" = None
 
     def rescue_discarded(self, indices: int | list[int]) -> None:
         """Move discarded fragments to neurites, in place.
