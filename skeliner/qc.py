@@ -22,7 +22,7 @@ many to look at is the caller's to say.
         rep = sk.qc.report(mesh, comps, skel, meta={"cell": path.parent.name})
         sk.qc.save_report(rep, path.parent / "qc.json")
 
-    rows = sk.qc.collect(sorted(root.glob("*/qc.json")))
+    rows = sk.qc.collect(root)  # every report under the folder, a row each
     sk.qc.save_table(rows, root / "qc.csv")
     for cell in sk.qc.triage(rows, top=50):
         print(cell["cell"], [r["reason"] for r in cell["reasons"]])
@@ -44,6 +44,7 @@ __all__ = [
     "MEASURES",
     "collect",
     "load_report",
+    "plot",
     "report",
     "save_report",
     "save_table",
@@ -76,8 +77,14 @@ MEASURES: dict[str, str] = {
 FLAGS: dict[str, str] = {
     "no_soma": "no soma found",
     "no_soma_at_point": "no soma at the point given",
+    "discarded_neurite": "a neurite at the soma discarded for its size — rescue it?",
     "skeleton_forest": "the skeleton is more than one tree",
     "skeleton_loops": "the skeleton has loops",
+}
+
+#: A fact's value: the summary column it is read from, and how it is said.
+FLAG_VALUES: dict[str, tuple[str, str]] = {
+    "discarded_neurite": ("discarded_neurite_largest", "the largest {:,.0f} faces"),
 }
 
 
@@ -135,7 +142,8 @@ def report(
         ``qc`` (the layout's version), ``skeliner``, ``meta``; ``summary``,
         one flat row of numbers (None where one does not apply — no bridge,
         no skeleton); ``flags``, the facts (``no_soma``,
-        ``no_soma_at_point``, ``skeleton_forest``, ``skeleton_loops``); and
+        ``no_soma_at_point``, ``discarded_neurite``, ``skeleton_forest``,
+        ``skeleton_loops``); and
         ``sites``, each place worth a look: its ``kind``, ``position`` and
         ``extent`` (the radius of what it covers), in the mesh's units, and
         what was measured there.  Dropped into the viewer with the cell's
@@ -146,6 +154,7 @@ def report(
 
     faces = np.asarray(mesh.faces, dtype=np.int64)
     verts = np.asarray(mesh.vertices, dtype=np.float64)
+    _check_pair(faces, verts, components)
     me = _median_edge(mesh)
     summary: dict[str, Any] = {
         "faces": len(faces),
@@ -160,7 +169,7 @@ def report(
     if rec is not None:
         _from_record(rec, summary, sites)
     _soma(components, rec, summary, flags, sites)
-    _surface(faces, verts, me, components, skeleton, summary, sites)
+    _surface(mesh, faces, verts, me, components, skeleton, summary, flags, sites)
     if skeleton is not None:
         _skeleton(skeleton, components.soma is not None, summary, flags, sites)
     if bounds is not None:
@@ -176,6 +185,44 @@ def report(
             "sites": sites,
         }
     )
+
+
+_report = report
+
+
+def _check_pair(faces, verts, components) -> None:
+    """Refuse components made on another mesh: they name its faces and
+    vertices, and read against this one say nothing true.  A run's
+    organelle masks hold a value for every face of its mesh; its soma's
+    vertices lie where the soma is."""
+    n_mask = len(components.organelles.mask)
+    hint = (
+        " — pass the mesh they were made with (preprocess' own; saved as"
+        " mesh_cleaned.obj beside components.npz, not the raw mesh.obj)"
+    )
+    if n_mask != len(faces):
+        raise ValueError(
+            f"these components were made on a mesh of {n_mask:,} faces; this "
+            f"one has {len(faces):,}{hint}"
+        )
+    soma = components.soma
+    if soma is None or soma.verts is None or not len(soma.verts):
+        return
+    sv = np.asarray(soma.verts, dtype=np.int64)
+    if sv.max() >= len(verts):
+        raise ValueError(
+            f"the soma names vertex {int(sv.max()):,}; this mesh has "
+            f"{len(verts):,}{hint}"
+        )
+    off = float(np.linalg.norm(verts[sv].mean(axis=0) - soma.center))
+    if off > soma.equiv_radius:
+        raise ValueError(
+            f"the soma's vertices lie {off:.4g} from its centre on this mesh, "
+            f"farther than its radius ({soma.equiv_radius:.4g}): its vertex ids "
+            f"name other vertices here{hint}; an OBJ read back can renumber "
+            "them where it merges a seam — sk.io.save_mesh_npz keeps a mesh "
+            "exactly"
+        )
 
 
 def _from_record(rec: dict, summary: dict, sites: list) -> None:
@@ -267,13 +314,23 @@ def _soma(components, rec, summary: dict, flags: list, sites: list) -> None:
         flags.append("no_soma")
 
 
-def _surface(faces, verts, me, components, skeleton, summary, sites) -> None:
+def _surface(
+    mesh, faces, verts, me, components, skeleton, summary, flags, sites
+) -> None:
     """The organelles' share, and the discarded pieces in three kinds: cut
     off at the soma (touching it), cut off by organelles (touching one, not
     the soma), and loose (touching neither: a piece of the mesh left
     unbridged), the last with how far from the arbor against the reach it
-    would be bridged across."""
-    from .pre import _bridge_reach
+    would be bridged across.  A piece at the soma that stands out of it like
+    a neurite — :func:`~skeliner.pre.break_up_mesh`'s own test for keeping
+    a stub out of the soma — was dropped for its size alone: a fact."""
+    from .pre import (
+        _bridge_reach,
+        _out_of_soma,
+        _soma_edge_keys,
+        _usable_face_mask,
+        soma_face_mask,
+    )
 
     n_f, n_v = len(faces), len(verts)
     org = np.zeros(n_f, dtype=bool)
@@ -288,10 +345,11 @@ def _surface(faces, verts, me, components, skeleton, summary, sites) -> None:
     summary["discarded"] = len(pieces)
     summary["discarded_share"] = float(sizes.sum()) / n_f if n_f else None
     summary["discarded_largest"] = int(sizes.max()) if len(sizes) else None
-    for kind in ("soma", "organelle", "reach"):
+    for kind in ("soma", "neurite", "organelle", "reach"):
         summary[f"discarded_{kind}_largest"] = None
         summary[f"discarded_{kind}_share"] = None
     summary["discarded_at_soma"] = 0
+    summary["discarded_neurites"] = 0 if components.soma is not None else None
     summary["discarded_at_organelle"] = 0
     summary["discarded_within_reach"] = None
     if not pieces:
@@ -323,6 +381,20 @@ def _surface(faces, verts, me, components, skeleton, summary, sites) -> None:
     largest("soma", at_soma)
     largest("organelle", at_org)
 
+    # at the soma: does it stand out of it like a neurite?
+    out_of: dict[int, tuple] = {}
+    if soma is not None and at_soma.any():
+        soma_faces = _usable_face_mask(mesh) & soma_face_mask(faces, soma.verts)
+        keys = _soma_edge_keys(faces, soma_faces, n_v)
+        for i in np.flatnonzero(at_soma).tolist():
+            out_of[i] = _out_of_soma(faces[pieces[i]], verts, soma, keys)
+    neurite = np.array([out_of.get(i, (False,))[0] for i in range(len(pieces))])
+    if soma is not None:
+        summary["discarded_neurites"] = int(neurite.sum())
+        largest("neurite", neurite)
+    if neurite.any():
+        flags.append("discarded_neurite")
+
     # each piece's box, the size find_gaps caps a bridge by
     p3 = verts[pf].reshape(-1, 3)
     pv = np.repeat(piece, 3)
@@ -353,19 +425,25 @@ def _surface(faces, verts, me, components, skeleton, summary, sites) -> None:
     for i in range(len(pieces)):
         if not (at_soma[i] or at_org[i] or near[i]):
             continue
-        sites.append(
-            {
-                "kind": "discarded",
-                "position": centre[i],
-                "extent": diag[i] / 2,
-                "index": i,
-                "faces": int(sizes[i]),
-                "at_soma": bool(at_soma[i]),
-                "at_organelle": bool(at_org[i]),
-                "arbor_distance": None if far is None else float(far[i]),
-                "reach": None if reach is None else float(reach[i]),
-            }
-        )
+        site = {
+            "kind": "discarded",
+            "position": centre[i],
+            "extent": diag[i] / 2,
+            "index": i,
+            "faces": int(sizes[i]),
+            "at_soma": bool(at_soma[i]),
+            "at_organelle": bool(at_org[i]),
+            "arbor_distance": None if far is None else float(far[i]),
+            "reach": None if reach is None else float(reach[i]),
+        }
+        if i in out_of:
+            # how far it stands out of the soma, and its junction's radius
+            site.update(
+                neurite=bool(out_of[i][0]),
+                out_of_soma=out_of[i][1],
+                junction=out_of[i][2],
+            )
+        sites.append(site)
 
 
 def _skeleton(skel, has_soma: bool, summary, flags, sites) -> None:
@@ -491,36 +569,334 @@ def save_report(rep: dict, path: str | Path) -> None:
 
 def load_report(path: str | Path) -> dict:
     """Read a report :func:`save_report` wrote."""
-    rep = json.loads(Path(path).read_text(encoding="utf-8"))
-    if rep.get("qc") != SCHEMA:
-        raise ValueError(
-            f"{path}: a qc report of layout {rep.get('qc')!r}, not {SCHEMA}"
-        )
+    return _checked(json.loads(Path(path).read_text(encoding="utf-8")), path)
+
+
+def _is_report(data) -> bool:
+    return isinstance(data, dict) and {"qc", "summary", "sites"} <= data.keys()
+
+
+def _checked(rep, path) -> dict:
+    if not isinstance(rep, dict) or rep.get("qc") != SCHEMA:
+        got = rep.get("qc") if isinstance(rep, dict) else None
+        raise ValueError(f"{path}: a qc report of layout {got!r}, not {SCHEMA}")
     return rep
+
+
+# ── a picture of one cell ─────────────────────────────────────────────
+
+#: The picture's colours: the arbor grey, the soma the viewer's magenta,
+#: whatever was discarded red, bridges orange.
+_COLORS = {
+    "arbor": (0.80, 0.80, 0.80),
+    "soma": (0.9, 0.5, 0.9),
+    "discarded": (0.85, 0.08, 0.08),
+    "bridge": (1.0, 0.55, 0.0),
+    "skeleton": (0.15, 0.15, 0.15),
+}
+_VIEWS = ("xy", "xz", "zy")
+
+
+@mesh_args()
+def plot(
+    mesh,
+    components,
+    skeleton=None,
+    *,
+    report: dict | None = None,
+    path: str | Path | None = None,
+    pixels: int = 800,
+    dpi: int = 150,
+):
+    """What may be wrong with one cell, drawn — to judge it without opening
+    the viewer.
+
+    The cell in three views (xy, xz, zy): the arbor grey, the soma magenta
+    with its ellipsoid's outline, every discarded piece red; a neurite
+    discarded at the soma (a fact of the report) circled and numbered as in
+    the report, bridges ringed orange, the skeleton as lines.  Below, one
+    row of the same three views for each discarded neurite, largest first,
+    zoomed on the piece and the soma it was cut from.  A view is an image of
+    the pixels the mesh's vertices fall in, painted in that order, so a
+    cell of millions of faces draws in a second or two.
+
+    Parameters
+    ----------
+    mesh, components
+        The pair :func:`~skeliner.pre.preprocess` returned, compacted or
+        not; refused if the components were made on another mesh (the raw
+        one, say).
+    skeleton : Skeleton, optional
+        Drawn as lines.
+    report : dict, optional
+        :func:`report`'s for this cell (its sites and facts); made here when
+        not given.
+    path : str or Path, optional
+        Where to save the figure — PNG, PDF, SVG …, by the suffix.
+    pixels : int
+        The whole-cell views' resolution along their longer side (half of it
+        for a zoomed view).
+    dpi : int
+        For the saved file.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        Not held by pyplot — a loop over thousands of cells keeps none of
+        them alive — and shown by Jupyter when it is a cell's value.
+    """
+    from matplotlib.figure import Figure
+
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    _check_pair(faces, verts, components)
+    rep = report if report is not None else _report(mesh, components, skeleton)
+
+    soma = components.soma
+    pieces = [np.asarray(p, dtype=np.int64) for p in components.discarded]
+    soma_v = np.zeros(len(verts), dtype=bool)
+    if soma is not None and soma.verts is not None:
+        soma_v[np.asarray(soma.verts, dtype=np.int64)] = True
+    gone_v = np.zeros(len(verts), dtype=bool)
+    if pieces:
+        gone_v[faces[np.concatenate(pieces)].ravel()] = True
+    # painted in this order, the last on top
+    layers = [
+        (np.ones(len(verts), dtype=bool), _COLORS["arbor"]),
+        (soma_v, _COLORS["soma"]),
+        (gone_v, _COLORS["discarded"]),
+    ]
+
+    sites = rep.get("sites", [])
+    lost = sorted(
+        (s for s in sites if s["kind"] == "discarded" and s.get("neurite")),
+        key=lambda s: -s["faces"],
+    )
+    bridges = [s for s in sites if s["kind"] == "bridge"]
+
+    fig = Figure(figsize=(14, 10 + 4.5 * len(lost)), layout="constrained")
+    subs = fig.subfigures(
+        1 + len(lost), 1, height_ratios=[10] + [4.5] * len(lost), squeeze=False
+    )[:, 0]
+
+    # the whole cell, an orthographic sheet: xz above xy, zy beside it, each
+    # as large as the cell is along its axes (a flat cell's edge-on views
+    # kept readable, a sixth of the face view at least)
+    lo, hi = verts.min(axis=0), verts.max(axis=0)
+    ext = np.maximum(hi - lo, 1e-9)
+    side = max(ext[2], ext[:2].max() / 6)
+    grid = subs[0].add_gridspec(
+        2, 2, width_ratios=[ext[0], side], height_ratios=[side, ext[1]]
+    )
+    sheet = {
+        "xz": subs[0].add_subplot(grid[0, 0]),
+        "xy": subs[0].add_subplot(grid[1, 0]),
+        "zy": subs[0].add_subplot(grid[1, 1]),
+    }
+    for view, ax in sheet.items():
+        px = _draw_view(ax, view, verts, layers, lo, hi, pixels)
+        _overlay(ax, view, soma, skeleton)
+        ix, iy = _view_axes(view)
+        for s in bridges:
+            ax.plot(
+                s["position"][ix],
+                s["position"][iy],
+                "o",
+                mfc="none",
+                mec=_COLORS["bridge"],
+                ms=7,
+            )
+        for s in lost:
+            _ring(ax, s, ix, iy, max(s["extent"], 8 * px))
+    key = subs[0].add_subplot(grid[0, 1])
+    key.axis("off")
+    key.text(0, 1, _key(rep, lost), va="top", ha="left", fontsize=9, wrap=True)
+
+    for sub, s in zip(subs[1:], lost):
+        piece = verts[np.unique(faces[pieces[s["index"]]])]
+        blo, bhi = piece.min(axis=0), piece.max(axis=0)
+        if soma is not None:
+            reach = float(np.max(soma.axes))
+            blo = np.minimum(blo, soma.center - reach)
+            bhi = np.maximum(bhi, soma.center + reach)
+        pad = 0.1 * float(np.max(bhi - blo))
+        blo, bhi = blo - pad, bhi + pad
+        for ax, view in zip(sub.subplots(1, 3), _VIEWS):
+            _draw_view(ax, view, verts, layers, blo, bhi, pixels // 2)
+            _overlay(ax, view, soma, skeleton)
+            ix, iy = _view_axes(view)
+            ax.set_xlim(blo[ix], bhi[ix])
+            ax.set_ylim(blo[iy], bhi[iy])
+        sub.suptitle(
+            f"discarded piece {s['index']}: {s['faces']:,} faces, standing "
+            f"{_short(s['out_of_soma'])} out of the soma (its junction's radius "
+            f"{_short(s['junction'])})",
+            fontsize=10,
+        )
+    if path is not None:
+        fig.savefig(path, dpi=dpi)
+    return fig
+
+
+def _key(rep: dict, lost: list) -> str:
+    """The sheet's corner: the cell, its facts, the colours."""
+    lines = []
+    name = (rep.get("meta") or {}).get("cell")
+    if name:
+        lines.append(str(name))
+    for f in rep.get("flags", []):
+        lines.append(FLAGS.get(f, f))
+    for s in lost:
+        lines.append(f"  piece {s['index']}: {s['faces']:,} faces")
+    if not rep.get("flags"):
+        lines.append("no fact")
+    lines += [
+        "",
+        "grey: the arbor   magenta: the soma",
+        "red: discarded (ringed: a neurite)",
+        "orange ring: a bridge",
+    ]
+    return "\n".join(lines)
+
+
+def _view_axes(view: str) -> tuple[int, int]:
+    return "xyz".index(view[0]), "xyz".index(view[1])
+
+
+def _draw_view(ax, view, verts, layers, lo, hi, pixels) -> float:
+    """The vertices inside the box *lo*–*hi*, seen along the axis *view*
+    leaves out, as an image: each pixel the colour of the last layer with a
+    vertex in it.  Returns a pixel's size."""
+    ix, iy = _view_axes(view)
+    x0, x1, y0, y1 = lo[ix], hi[ix], lo[iy], hi[iy]
+    span = max(x1 - x0, y1 - y0) or 1.0
+    nx = max(1, int(round(pixels * (x1 - x0) / span)))
+    ny = max(1, int(round(pixels * (y1 - y0) / span)))
+    inside = ((verts >= lo) & (verts <= hi)).all(axis=1)
+    img = np.ones((ny, nx, 3))
+    for mask, color in layers:
+        sel = mask & inside
+        if not sel.any():
+            continue
+        hits, _, _ = np.histogram2d(
+            verts[sel, iy],
+            verts[sel, ix],
+            bins=(ny, nx),
+            range=(
+                (y0, y1 if y1 > y0 else y0 + 1.0),
+                (x0, x1 if x1 > x0 else x0 + 1.0),
+            ),
+        )
+        img[hits > 0] = color
+    ax.imshow(img, extent=(x0, x1, y0, y1), origin="lower", interpolation="nearest")
+    ax.set_xlabel(view[0])
+    ax.set_ylabel(view[1])
+    ax.set_aspect("equal")
+    # a few short ticks: "600k" over "600000" side by side
+    from matplotlib.ticker import EngFormatter, MaxNLocator
+
+    for axis in (ax.xaxis, ax.yaxis):
+        axis.set_major_locator(MaxNLocator(4))
+        axis.set_major_formatter(EngFormatter(sep=""))
+    return span / pixels
+
+
+def _overlay(ax, view, soma, skeleton) -> None:
+    """The soma's ellipsoid outline and the skeleton's edges."""
+    from matplotlib.collections import LineCollection
+
+    from .plot import _soma_ellipse2d
+
+    if soma is not None:
+        ell = _soma_ellipse2d(soma, view)
+        ell.set_fill(False)
+        ell.set_edgecolor(_COLORS["soma"])
+        ell.set_linewidth(1.0)
+        ax.add_patch(ell)
+    if skeleton is not None and len(skeleton.edges):
+        ix, iy = _view_axes(view)
+        nodes = np.asarray(skeleton.nodes, dtype=np.float64)[:, [ix, iy]]
+        ax.add_collection(
+            LineCollection(
+                nodes[np.asarray(skeleton.edges)],
+                colors=[_COLORS["skeleton"]],
+                linewidths=0.4,
+            )
+        )
+
+
+def _ring(ax, site, ix, iy, radius) -> None:
+    """A discarded neurite circled and numbered."""
+    from matplotlib.patches import Circle
+
+    x, y = site["position"][ix], site["position"][iy]
+    ax.add_patch(
+        Circle((x, y), radius, fill=False, edgecolor=_COLORS["discarded"], lw=1.2)
+    )
+    ax.annotate(
+        f"{site['index']}",
+        (x + radius, y + radius),
+        color=_COLORS["discarded"],
+        fontsize=9,
+        fontweight="bold",
+    )
 
 
 # ── many cells ────────────────────────────────────────────────────────
 
 
-def collect(reports: Iterable[dict | str | Path]) -> list[dict]:
+def collect(reports: "str | Path | dict | Iterable[str | Path | dict]") -> list[dict]:
     """One row per cell: its ``meta``, its ``summary`` and its ``flags``.
 
-    *reports* are reports or paths of saved ones.  A report whose meta
-    names no ``cell`` is named after its file's folder (``<cell>/qc.json``)
-    or, given in memory, its place in the list.
+    Parameters
+    ----------
+    reports
+        A folder — every report under it, at any depth, in path order (a
+        JSON file there that is no report, a run's own notes, say, is
+        passed over) — a report's file, a report, or a list of these::
+
+            rows = sk.qc.collect("runs/batch1")
+
+    Returns
+    -------
+    list of dict
+        One per report: ``cell``, the rest of its ``meta``, its summary's
+        columns and ``flags``.  A report whose meta names no ``cell`` is
+        named after its file — after its folder when the file is
+        ``qc.json`` (``<cell>/qc.json``) — or, given in memory, its place in
+        the list.
     """
     rows = []
-    for i, item in enumerate(reports):
-        if isinstance(item, dict):
-            rep, name = item, str(i)
-        else:
-            rep, name = load_report(item), Path(item).parent.name
+    for i, (rep, name) in enumerate(_reports(reports)):
         meta = dict(rep.get("meta") or {})
-        row = {"cell": str(meta.pop("cell", name)), **meta}
+        row = {"cell": str(meta.pop("cell", name if name is not None else i)), **meta}
         row.update(rep["summary"])
         row["flags"] = list(rep.get("flags", []))
         rows.append(row)
     return rows
+
+
+def _reports(item) -> Iterable[tuple[dict, str | None]]:
+    """Each report *item* holds, with the name its file gives it."""
+    if isinstance(item, dict):
+        yield item, None
+        return
+    if isinstance(item, (str, Path)):
+        path = Path(item)
+        if path.is_dir():
+            for f in sorted(path.rglob("*.json")):
+                data = json.loads(f.read_text(encoding="utf-8"))
+                if _is_report(data):
+                    yield _checked(data, f), _name(f)
+            return
+        yield load_report(path), _name(path)
+        return
+    for x in item:
+        yield from _reports(x)
+
+
+def _name(path: Path) -> str:
+    return path.parent.name if path.name == "qc.json" else path.stem
 
 
 def save_table(rows: Sequence[dict], path: str | Path) -> None:
@@ -543,13 +919,15 @@ def _cell(v) -> str:
     if isinstance(v, (list, tuple)):
         return "; ".join(_cell(x) for x in v)
     if isinstance(v, dict) and "reason" in v:
-        if v.get("rank") is None:
-            return str(v["reason"])
-        return f"{v['reason']} ({_short(v['value'])}, {v['rank']}/{v['of']})"
+        if v.get("rank") is not None:
+            return f"{v['reason']} ({_short(v['value'])}, {v['rank']}/{v['of']})"
+        return str(v["reason"])  # a fact says its value in its own words
     return str(v)
 
 
 def _short(v) -> str:
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and abs(v) >= 1e4:
+        return f"{v:,.0f}"
     return f"{v:.4g}" if isinstance(v, float) else str(v)
 
 
@@ -562,12 +940,19 @@ def triage(
 ) -> list[dict]:
     """The cells to look at, each with its reasons.
 
-    A reason is a fact (a flag of its report: no soma found, none at the
-    point given, a skeleton of more than one tree or with loops), or, with
-    *top*, a measure in which the cell is among the *top* most extreme of
-    the cells collected (of its group, with *by*).  No threshold decides:
-    what is extreme is set by the other cells, and how many to look at by
-    *top* — the time there is to look.
+    A reason is a fact — a flag of its report: no soma found, none at the
+    point given, a neurite at the soma discarded for its size (one to
+    rescue by hand: it stands out of the soma as
+    :func:`~skeliner.pre.break_up_mesh` tells a neurite from a patch of the
+    soma), a skeleton of more than one tree or with loops — or, with *top*,
+    a measure in which the cell is among the *top* most extreme of the
+    cells collected (of its group, with *by*): the longest bridges, the
+    largest shares cut out as fusions or parallel patches, the largest
+    discarded pieces, the longest stems.  No threshold decides: a fact is
+    the cell's own, what is extreme is set by the other cells, and how many
+    to look at by *top* — the time there is to look.  So ``triage(rows)``
+    lists the facts alone, and ``triage(rows, top=20)`` the facts and the
+    twenty most unusual cells per measure.
 
     Parameters
     ----------
@@ -601,12 +986,23 @@ def triage(
             {"reason": reason, "value": value, "rank": rank, "of": of}
         )
 
+    # a cell's facts in FLAGS' order: a soma missing inside the volume
+    # before one the volume's edge explains, the larger value first
+    first: dict[str, tuple] = {}
+    kind = {flag: i for i, flag in enumerate(FLAGS)}
     for row in rows:
         for flag in row.get("flags") or ():
             what = FLAGS.get(flag, flag)
-            if flag == "no_soma" and row.get("touches_bounds"):
+            edge = flag == "no_soma" and bool(row.get("touches_bounds"))
+            if edge:
                 what += " (the cell meets the volume's edge)"
-            add(row, what)
+            column, words = FLAG_VALUES.get(flag, (None, None))
+            value = _number(row.get(column)) if column else None
+            if value is not None:
+                what += f" ({words.format(value)})"
+            add(row, what, value)
+            key = (kind.get(flag, len(kind)), edge, -(value or 0.0))
+            first[row["cell"]] = min(first.get(row["cell"], key), key)
 
     if top:
         groups: dict[Any, list[dict]] = {}
@@ -623,7 +1019,8 @@ def triage(
     def order(entry):
         ranks = [r["rank"] for r in entry["reasons"] if r["rank"] is not None]
         facts = sum(r["rank"] is None for r in entry["reasons"])
-        return (-facts, min(ranks, default=math.inf), -len(ranks))
+        fact = first.get(entry["cell"], (len(kind),))
+        return (-facts, fact, min(ranks, default=math.inf), -len(ranks))
 
     return sorted(found.values(), key=order)
 

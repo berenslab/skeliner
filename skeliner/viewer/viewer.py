@@ -274,7 +274,9 @@ def _qc_label(s: dict) -> str:
         return f"parallel patch cut, {s['faces']} faces"
     if kind == "discarded":
         parts = [f"discarded piece {s['index']}, {s['faces']} faces"]
-        if s.get("at_soma"):
+        if s.get("neurite"):
+            parts.append("a neurite at the soma — rescue it?")
+        elif s.get("at_soma"):
             parts.append("at the soma")
         if s.get("at_organelle"):
             parts.append("at an organelle")

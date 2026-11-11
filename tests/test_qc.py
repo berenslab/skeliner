@@ -17,7 +17,14 @@ from skeliner.dataclass import (
     Soma,
 )
 
-from .test_pre import NO_CAP, _combine, _subdivided_tube, _two_cylinders
+from .test_pre import (
+    NO_CAP,
+    _arbor_pieces,
+    _ball_with_stub,
+    _combine,
+    _subdivided_tube,
+    _two_cylinders,
+)
 
 
 def _ball():
@@ -153,6 +160,87 @@ def test_a_discarded_piece_is_placed_by_what_cut_it_off():
     assert loose["arbor_distance"] <= loose["reach"]
 
 
+def test_a_neurite_discarded_at_the_soma_is_a_fact():
+    """A process standing out of the soma, discarded (the 95% rule drops a
+    real stub where one neurite holds the rest): a fact, by break_up_mesh's
+    own test for a neurite against a patch of the soma — and triage lists
+    it with no top.  A stump that does not stand out is no such fact."""
+    for height, want in ((160.0, True), (40.0, False)):
+        mesh, soma, org = _ball_with_stub(height=height)
+        (stub,) = _arbor_pieces(mesh, soma, org)
+        comps = MeshComponents(
+            soma=soma,
+            organelles=org,
+            neurites=Neurites([]),
+            discarded=Discarded([stub]),
+        )
+        rep = qc.report(mesh, comps, meta={"cell": f"h{height:g}"})
+        s = rep["summary"]
+        (site,) = _sites(rep, "discarded")
+        assert site["at_soma"] and site["neurite"] is want, height
+        assert s["discarded_neurites"] == int(want)
+        assert ("discarded_neurite" in rep["flags"]) is want
+        if want:
+            assert s["discarded_neurite_largest"] == len(stub)
+            assert site["out_of_soma"] > 3 * site["junction"]
+            (cell,) = qc.triage(qc.collect([rep]))
+            (reason,) = cell["reasons"]
+            assert reason["reason"] == (
+                f"{qc.FLAGS['discarded_neurite']} (the largest {len(stub):,} faces)"
+            )
+            assert reason["value"] == len(stub) and reason["rank"] is None
+        else:
+            assert s["discarded_neurite_largest"] is None
+            assert qc.triage(qc.collect([rep])) == []
+
+
+def _stub_components(height):
+    mesh, soma, org = _ball_with_stub(height=height)
+    (stub,) = _arbor_pieces(mesh, soma, org)
+    comps = MeshComponents(
+        soma=soma, organelles=org, neurites=Neurites([]), discarded=Discarded([stub])
+    )
+    return mesh, comps
+
+
+def test_a_plot_draws_the_cell_and_zooms_on_each_discarded_neurite(tmp_path):
+    """The whole cell as an orthographic sheet (xz, xy, zy and the key), then
+    a row of three views for each discarded neurite; saved where asked.  A
+    stump no fact names gets no row of its own."""
+    mesh, comps = _stub_components(160.0)
+    rep = qc.report(mesh, comps, meta={"cell": "c9"})
+    fig = qc.plot(mesh, comps, report=rep, path=tmp_path / "c9.png")
+    assert len(fig.axes) == 4 + 3
+    key = fig.axes[3].texts[0].get_text()
+    assert key.startswith("c9\n" + qc.FLAGS["discarded_neurite"])
+    assert f"piece 0: {len(comps.discarded[0]):,} faces" in key
+    assert (tmp_path / "c9.png").stat().st_size > 0
+    assert fig.subfigs[1]._suptitle.get_text().startswith("discarded piece 0:")
+
+    mesh, comps = _stub_components(40.0)
+    fig = qc.plot(mesh, comps)
+    assert len(fig.axes) == 4
+    assert "no fact" in fig.axes[3].texts[0].get_text()
+
+
+def test_a_report_or_plot_refuses_components_of_another_mesh():
+    """Components name faces and vertices of the mesh they were made on;
+    read against another — the raw mesh beside the cleaned one — they say
+    nothing true, so both refuse, saying which mesh to pass."""
+    mesh, comps = _stub_components(160.0)
+    other = trimesh.creation.icosphere(subdivisions=3, radius=100.0)
+    for fn in (qc.report, qc.plot):
+        with pytest.raises(ValueError, match="made on a mesh of"):
+            fn(other, comps)
+    # as many faces, but the soma's vertices are not where its fit put them
+    # (another frame, another cell of the same size)
+    moved = trimesh.Trimesh(
+        np.asarray(mesh.vertices) + [10000.0, 0.0, 0.0], mesh.faces, process=False
+    )
+    with pytest.raises(ValueError, match="vertex ids"):
+        qc.report(moved, comps)
+
+
 def test_the_skeleton_says_its_trees_loops_and_stems():
     ball = _ball()
     _, comps = pre.preprocess(ball, organelles=False)
@@ -240,6 +328,57 @@ def test_collect_makes_a_row_a_cell_named_by_its_meta_or_its_folder(tmp_path):
         {"cell": "a", "type": "t1", "bridges": 1, "flags": []},
         {"cell": "c7", "bridges": 2, "flags": []},
     ]
+
+
+def test_collect_takes_a_folder_of_reports(tmp_path):
+    """A run's folder, as handed to it: every report under it in path order
+    (a cell's folder, or a file of its own name), what is no report passed
+    over; one file or a string path as well — never a path read as the
+    characters of its name."""
+    run = tmp_path / "run"
+    for cell, n in (("c2", 2), ("c1", 1)):
+        (run / cell).mkdir(parents=True)
+        rep = _rep(cell, bridges=n)
+        del rep["meta"]["cell"]
+        qc.save_report(rep, run / cell / "qc.json")
+    flat = _rep("x", bridges=3)
+    del flat["meta"]["cell"]
+    qc.save_report(flat, run / "c3.json")
+    (run / "meta.json").write_text(json.dumps({"started": "now"}))
+    (run / "qc.csv").write_text("not, a, report\n")
+
+    want = [
+        {"cell": "c1", "bridges": 1, "flags": []},
+        {"cell": "c2", "bridges": 2, "flags": []},
+        {"cell": "c3", "bridges": 3, "flags": []},
+    ]
+    assert qc.collect(run) == want
+    assert qc.collect(str(run)) == want
+    assert qc.collect(str(run / "c1" / "qc.json")) == want[:1]
+    assert qc.collect([run / "c3.json", str(run / "c2")]) == [want[2], want[1]]
+
+    old = _rep("o")
+    old["qc"] = 0
+    (run / "old.json").write_text(json.dumps(old))
+    with pytest.raises(ValueError, match="layout 0"):
+        qc.collect(run)
+
+
+def test_triage_orders_the_facts_by_kind_then_by_size():
+    """No soma inside the volume, then at its edge; then the discarded
+    neurites, the largest first — whatever order the rows came in."""
+    rows = qc.collect(
+        [
+            _rep("n1", ["discarded_neurite"], discarded_neurite_largest=500),
+            _rep("edge", ["no_soma"], touches_bounds=True),
+            _rep("n2", ["discarded_neurite"], discarded_neurite_largest=7000),
+            _rep("inside", ["no_soma"], touches_bounds=False),
+            _rep("ok", bridge_longest_edges=3.0),
+        ]
+    )
+    got = qc.triage(rows)
+    assert [t["cell"] for t in got] == ["inside", "edge", "n2", "n1"]
+    assert [r["value"] for t in got[2:] for r in t["reasons"]] == [7000, 500]
 
 
 def test_triage_puts_facts_first_then_the_most_extreme(tmp_path):

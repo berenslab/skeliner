@@ -1272,7 +1272,11 @@ def soma_face_mask(
     faces = np.asarray(faces)
     if soma_verts is None or len(soma_verts) == 0:
         return np.zeros(len(faces), dtype=bool)
-    return np.isin(faces, np.asarray(soma_verts)).sum(axis=1) >= 2
+    sv = np.asarray(soma_verts, dtype=np.int64)
+    # a vertex mask, indexed once: np.isin sorts every face's vertices
+    is_soma = np.zeros(max(int(faces.max(initial=-1)), int(sv.max())) + 1, dtype=bool)
+    is_soma[sv] = True
+    return is_soma[faces].sum(axis=1) >= 2
 
 
 def _build_org_output(
@@ -1599,40 +1603,53 @@ _NEURITE_ASPECT = 3.0
 
 def _neurites_left_out(components, kinds, faces, verts, soma, soma_faces):
     """*kinds* with every soma piece that stands out of the soma like a
-    neurite a candidate again (:data:`_NEURITE_REACH`,
-    :data:`_NEURITE_ASPECT`): its farthest vertex outside the soma's
-    ellipsoid by more than half the soma's equivalent radius, and by more
-    than three times the radius of its junction — the mean distance from
-    their centroid of the vertices of the edges it shares with the soma
-    faces, which is a ring's radius however the ring is triangulated."""
+    neurite (:func:`_out_of_soma`) a candidate again."""
     soma_ids = np.flatnonzero(np.asarray(kinds) == _PIECE_SOMA)
     if len(soma_ids) == 0:
         return kinds
     kinds = np.array(kinds)
-    width = len(verts) + 1
-
-    def edges(fs):
-        e = np.sort(
-            np.concatenate([fs[:, [0, 1]], fs[:, [1, 2]], fs[:, [2, 0]]]), axis=1
-        )
-        return e, e[:, 0] * width + e[:, 1]
-
-    soma_keys = np.unique(edges(faces[soma_faces])[1])
+    keys = _soma_edge_keys(faces, soma_faces, len(verts))
     for k in soma_ids:
-        comp = faces[components[k]]
-        reach = float(soma.distance_to_surface(verts[np.unique(comp)]).max())
-        if reach <= _NEURITE_REACH * soma.equiv_radius:
-            continue
-        e, keys = edges(comp)
-        ring = verts[np.unique(e[np.isin(keys, soma_keys)])]
-        junction = (
-            np.linalg.norm(ring - ring.mean(axis=0), axis=1).mean()
-            if len(ring)
-            else 0.0
-        )
-        if reach > _NEURITE_ASPECT * junction:
+        if _out_of_soma(faces[components[k]], verts, soma, keys)[0]:
             kinds[k] = _PIECE_CANDIDATE
     return kinds
+
+
+def _edge_keys(tri: np.ndarray, width: int) -> tuple[np.ndarray, np.ndarray]:
+    """The edges of the faces *tri* (vertex triples), each sorted, and each
+    as one integer key."""
+    e = np.sort(
+        np.concatenate([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]]), axis=1
+    )
+    return e, e[:, 0] * width + e[:, 1]
+
+
+def _soma_edge_keys(faces, soma_faces, n_verts: int) -> np.ndarray:
+    """The keys (:func:`_edge_keys`) of the soma faces' edges, for
+    :func:`_out_of_soma`."""
+    return np.unique(_edge_keys(np.asarray(faces)[soma_faces], n_verts + 1)[1])
+
+
+def _out_of_soma(tri, verts, soma, soma_keys) -> tuple[bool, float, float | None]:
+    """Whether a piece (its faces' vertex triples *tri*) stands out of the
+    soma like a neurite (:data:`_NEURITE_REACH`, :data:`_NEURITE_ASPECT`):
+    its farthest vertex outside the soma's ellipsoid by more than half the
+    soma's equivalent radius, and by more than three times the radius of
+    its junction — the mean distance from their centroid of the vertices of
+    the edges it shares with the soma faces (*soma_keys*), which is a ring's
+    radius however the ring is triangulated.  With how far it reaches out,
+    and the junction's radius (None when the reach alone says no)."""
+    reach = float(soma.distance_to_surface(verts[np.unique(tri)]).max())
+    if reach <= _NEURITE_REACH * soma.equiv_radius:
+        return False, reach, None
+    e, keys = _edge_keys(tri, len(verts) + 1)
+    ring = verts[np.unique(e[np.isin(keys, soma_keys)])]
+    junction = (
+        float(np.linalg.norm(ring - ring.mean(axis=0), axis=1).mean())
+        if len(ring)
+        else 0.0
+    )
+    return reach > _NEURITE_ASPECT * junction, reach, junction
 
 
 # What :func:`_break_up_pieces` makes of a piece.
