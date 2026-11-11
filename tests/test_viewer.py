@@ -208,6 +208,65 @@ def test_preprocess_looks_for_no_soma_when_switched_off(reassign_client, monkeyp
     assert seen["soma"] is None
 
 
+def test_preprocess_looks_for_the_soma_at_the_soma_point(reassign_client, monkeypatch):
+    # the page's soma point (a click on the soma, the mesh's frame) is
+    # preprocess(soma=point); the switch off still means no soma, and a soma
+    # by hand is taken as it is; a point that is no point is refused
+    from skeliner import pre
+
+    client, state, _ = reassign_client
+    hand = state["soma"]  # the tube's band, for the soma by hand below
+    seen = {}
+    run = pre.preprocess
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(pre, "preprocess", spy)
+    point = [0.0, 50.0, 0.0]
+    state["soma_by_hand"] = False
+    body = {"organelles": False, "somaPoint": point}
+    assert client.post("/preprocess", json=body).json()["ok"]
+    assert isinstance(seen["soma"], np.ndarray)
+    np.testing.assert_array_equal(seen["soma"], point)
+
+    assert client.post("/preprocess", json={**body, "soma": False}).json()["ok"]
+    assert seen["soma"] is False
+
+    state["soma"] = hand
+    state["soma_by_hand"] = True
+    assert client.post("/preprocess", json=body).json()["ok"]
+    assert seen["soma"] is hand
+
+    # a NaN on the page is sent as null (JSON.stringify)
+    for bad in ([1.0, 2.0], [1.0, "x", 3.0], [1.0, None, 3.0]):
+        r = client.post("/preprocess", json={**body, "somaPoint": bad})
+        assert r.status_code == 400 and "somaPoint" in r.json()["error"]
+
+
+def test_the_soma_button_looks_at_the_soma_point(reassign_client, monkeypatch):
+    # Soma (ring cutoff) with the page's soma point is find_soma(near=); a
+    # soma that does not lie there is none, said so
+    from skeliner import pre
+
+    client, _, _ = reassign_client
+    seen = {}
+
+    def find(*_a, **kwargs):
+        seen.update(kwargs)
+        return None
+
+    monkeypatch.setattr(pre, "find_soma", find)
+    body = {"method": "ring_cutoff", "somaPoint": [1.0, 2.0, 3.0]}
+    r = client.post("/detect_soma", json=body).json()
+    np.testing.assert_array_equal(seen["near"], [1.0, 2.0, 3.0])
+    assert not r["ok"] and r["error"] == "No soma found at the point"
+
+    r = client.post("/detect_soma", json={"method": "ring_cutoff"}).json()
+    assert seen["near"] is None and r["error"] == "No soma found"
+
+
 @pytest.mark.parametrize(
     "body, expected",
     [

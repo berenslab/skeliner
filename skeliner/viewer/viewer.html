@@ -265,7 +265,56 @@
                 border-color: #d98cd9 !important;
                 color: #fff;
             }
-            /* Scope chips — which components a lasso is allowed to touch. */
+            /* One row per group, its name in a column of its own, so the
+               rows' buttons start at one edge.  9ch holds the longest
+               name, "Skeleton:". */
+            #detect-panel .row-label {
+                display: inline-block;
+                min-width: 9ch;
+                color: #888;
+            }
+            /* The Run row's switches: options of Run, set off from each
+               other and from it. */
+            #detect-panel .run-opt {
+                margin-left: 8px;
+                color: #888;
+                cursor: pointer;
+            }
+            /* A row as long as the data makes it — a chip per component, a
+               message, the track name — takes the panel's width instead of
+               setting it (width 0, stretched back to 100%), so the button
+               rows decide how wide the panel is. */
+            #detect-panel .fit-row {
+                width: 0;
+                min-width: 100%;
+            }
+            /* In a flex row the space after the name is gone; 1ch puts it
+               back, so the first button lines up with the other rows'. */
+            #detect-panel .fit-row > .row-label {
+                margin-right: 1ch;
+            }
+            /* Under the footer's buttons: what Skeletonize reads and what
+               changed since the skeleton was made.  One line high even
+               when empty, so the buttons above never move. */
+            #skelStatus {
+                min-height: 1.4em;
+                margin-top: 3px;
+                font-size: 11px;
+                line-height: 1.4;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            /* Scope chips — which components a lasso is allowed to touch.
+               One per component, and a cell has as many neurites as it
+               has, so they wrap at the panel's width. */
+            #scopeChips {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: baseline;
+                row-gap: 3px;
+                white-space: nowrap;
+            }
             #scopeChips button {
                 padding: 2px 8px;
                 margin-left: 4px;
@@ -323,6 +372,30 @@
             #lasso-rect.removing {
                 border-color: #f66;
                 background: rgba(255, 70, 70, 0.1);
+            }
+            /* The soma point: picking it, and set (the pin's colour). */
+            #somaPinBtn {
+                margin-left: 2px;
+                padding: 0 3px;
+            }
+            #somaPinBtn svg {
+                width: 12px;
+                height: 12px;
+                vertical-align: -2px;
+            }
+            #somaPinBtn[data-picking="1"] {
+                border-color: #e64fe6 !important;
+                background: #3a2a4a !important;
+            }
+            #somaPinBtn[data-set="1"] {
+                color: #e64fe6;
+            }
+            #somaPinClear {
+                margin-left: 1px;
+                padding: 0 4px;
+            }
+            canvas.picking-soma {
+                cursor: crosshair;
             }
             /* Contact mode: one panel for both cells and their sites. */
             #contact-panel {
@@ -496,7 +569,7 @@
                  fourth mode; the ones that work on every object live in the
                  footer at the bottom of the panel instead. -->
             <div style="white-space: nowrap">
-                <span style="color: #888">Edit:</span>
+                <span class="row-label">Edit:</span>
                 <button
                     id="modeMeshBtn"
                     class="mode-btn"
@@ -524,9 +597,12 @@
                 </button>
             </div>
 
+            <!-- One row per group.  Detect and Remove name the same defects
+                 in the same order, so with the names in one column each
+                 Remove button sits under its Detect button. -->
             <div id="mesh-rows">
                 <div style="white-space: nowrap; margin-top: 4px">
-                    <span style="color: #888">Detect:</span>
+                    <span class="row-label">Detect:</span>
                     <button id="detectParallelBtn" style="margin-left:4px">Parallel</button>
                     <button id="detectOrganellesBtn" style="margin-left: 4px">Organelles</button>
                     <button id="detectFusionsBtn" style="margin-left: 4px">Fusions</button>
@@ -535,22 +611,26 @@
                     <button id="detectDisconnectedBtn" style="margin-left: 4px">Disconnected</button>
                 </div>
                 <div style="white-space: nowrap; margin-top: 4px">
-                    <span style="color: #888">Remove:</span>
+                    <span class="row-label">Remove:</span>
                     <button id="removeParallelBtn" style="margin-left: 4px">Parallel</button>
                     <button id="removeOrganellesBtn" style="margin-left: 4px">Organelles</button>
                     <button id="removeFusionsBtn" style="margin-left: 4px">Fusions</button>
                     <button id="removeGapsBtn" style="margin-left: 4px">Gaps</button>
-                    <span style="color: #888; margin-left: 12px">Mesh:</span>
+                </div>
+                <div style="white-space: nowrap; margin-top: 4px">
+                    <span class="row-label">Mesh:</span>
                     <button id="hlMerge" style="margin-left: 4px">Merge</button>
                     <button id="hlRemove" style="margin-left: 4px">Remove</button>
                     <button id="breakUpMeshBtn" style="margin-left: 4px">Break</button>
                     <button id="compactMeshBtn" style="margin-left: 4px">Compact</button>
-                    <!-- Every button on these two rows, in one call — so it
-                         reads as their summary, at the end of them, rather
-                         than as a step of its own before them. -->
+                </div>
+                <!-- Every row above in one call — last, so it reads as their
+                     summary rather than as a step of its own before them.
+                     Its switches follow it on the same row. -->
+                <div style="white-space: nowrap; margin-top: 4px">
                     <span
-                        style="color: #888; margin-left: 12px"
-                        title="pre.preprocess() — the two rows above in one call, in pipeline order"
+                        class="row-label"
+                        title="pre.preprocess() — the rows above in one call, in pipeline order"
                         >Auto:</span
                     >
                     <button
@@ -563,19 +643,26 @@
                     <!-- Not remembered across loads: a pipeline switch left
                          off from another dataset would change every run. -->
                     <label
-                        style="margin-left: 6px; color: #888"
+                        class="run-opt"
                         title="Off for meshes that trace no organelles (hemibrain's): Run does not look for them, and no face is an organelle."
                     >
                         <input type="checkbox" id="runOrganelles" checked /> organelles
                     </label>
                     <label
-                        style="margin-left: 6px; color: #888"
+                        class="run-opt"
                         title="Off for a cell with no soma in the mesh (a piece of arbor whose soma lies outside the volume): Run does not look for one, and every piece is arbor."
                     >
                         <input type="checkbox" id="runSoma" checked /> soma
                     </label>
+                    <!-- Held by the page like the switches; a new cell forgets
+                         it, an edit or a run keeps it. -->
+                    <button
+                        id="somaPinBtn"
+                        title="Where the soma is: press, then click the soma on the mesh. Run and the Soma button look for the soma there (find_soma near=) — a soma the mesh cannot give stays none; assign one by hand instead (Mesh Comp. → Reassign → Soma). A soma assigned by hand is taken as it is. Esc cancels."
+                        ><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s7-7.2 7-12a7 7 0 1 0-14 0c0 4.8 7 12 7 12z"/><circle cx="12" cy="10" r="2.5"/></svg></button
+                    ><button id="somaPinClear" title="Forget the soma point" style="display: none">×</button>
                     <label
-                        style="margin-left: 6px; color: #888"
+                        class="run-opt"
                         title="Patch the holes in the surface (fill_holes) before the mesh is broken up: the organelles' mouths and the mesh's own openings, so each neurite is a tube again. Off leaves them open."
                     >
                         <input type="checkbox" id="runFill" checked /> fill holes
@@ -584,11 +671,13 @@
             </div>
 
             <div id="components-rows" style="display: none">
-                <div style="white-space: nowrap; margin-top: 4px">
-                    <span style="color: #888" title="Only faces of a lit component can be picked">Scope:</span>
+                <div class="fit-row" style="display: flex; align-items: baseline; margin-top: 4px">
+                    <span class="row-label" title="Only faces of a lit component can be picked">Scope:</span>
                     <span id="scopeChips"></span>
-                    <button id="scopeAllBtn" style="margin-left: 10px">All</button>
-                    <button id="scopeNoneBtn" style="margin-left: 4px">None</button>
+                    <span style="white-space: nowrap">
+                        <button id="scopeAllBtn" style="margin-left: 10px">All</button>
+                        <button id="scopeNoneBtn" style="margin-left: 4px">None</button>
+                    </span>
                 </div>
                 <div style="white-space: nowrap; margin-top: 4px">
                     <span style="color: #888">Reassign selection to:</span>
@@ -642,7 +731,7 @@
 
             <div id="skeleton-rows" style="display: none">
                 <div style="white-space: nowrap; margin-top: 4px">
-                    <span style="color: #888" title="Which loaded skeleton the bin and edge edits below act on">Editing:</span>
+                    <span class="row-label" title="Which loaded skeleton the bin and edge edits below act on">Editing:</span>
                     <select id="binSkelSel" style="font-size: 11px; margin-left: 4px"></select>
                     <label
                         style="margin-left: 10px"
@@ -654,7 +743,7 @@
                     <button id="binClearBtn" style="margin-left: 10px">Clear</button>
                 </div>
                 <div style="white-space: nowrap; margin-top: 4px">
-                    <span style="color: #888">Bins:</span>
+                    <span class="row-label">Bins:</span>
                     <button
                         id="binMergeBtn"
                         style="margin-left: 4px"
@@ -701,7 +790,7 @@
                      visibility and remove for free — and focusing one selects
                      its bin, which is what arms the verbs above. -->
                 <div style="white-space: nowrap; margin-top: 4px">
-                    <span style="color: #888" title="List candidates as markers to look at. Nothing here changes the skeleton.">Find:</span>
+                    <span class="row-label" title="List candidates as markers to look at. Nothing here changes the skeleton.">Find:</span>
                     <select id="dxKindSel" style="font-size: 11px; margin-left: 4px">
                         <!-- Named after the dx function each one runs, and
                              ordered as dx.__skeleton__ orders them: the one
@@ -721,10 +810,7 @@
                     <button id="dxRunBtn" style="margin-left: 6px">List</button>
                     <span id="dxStatus" style="margin-left: 8px; color: #888"></span>
                 </div>
-                <div
-                    id="binReadout"
-                    style="margin-top: 4px; color: #888; white-space: nowrap; overflow-x: auto"
-                >
+                <div id="binReadout" class="fit-row" style="margin-top: 4px; color: #888">
                     Click a node, or the surface it owns, to select a bin.
                 </div>
                 <div
@@ -755,44 +841,47 @@
                  the mode. -->
             <div
                 id="always-rows"
-                style="
-                    white-space: nowrap;
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    margin-top: 6px;
-                    padding-top: 6px;
-                    border-top: 1px solid #3a3a3a;
-                "
+                style="margin-top: 6px; padding-top: 6px; border-top: 1px solid #3a3a3a"
             >
-                <span>
-                    <span style="color: #888">Skeleton:</span>
-                    <button
-                        id="skeletonizeBtn"
-                        style="margin-left: 4px"
-                        title="Derive a skeleton from the current mesh and components — available in every mode, since every mode changes something it is derived from"
-                    >
-                        Skeletonize
-                    </button>
-                    <button id="skelParamsBtn" style="margin-left: 4px">Set Params</button>
+                <div
+                    style="
+                        white-space: nowrap;
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: center;
+                    "
+                >
+                    <span>
+                        <span class="row-label">Skeleton:</span>
+                        <button
+                            id="skeletonizeBtn"
+                            style="margin-left: 4px"
+                            title="Derive a skeleton from the current mesh and components — available in every mode, since every mode changes something it is derived from"
+                        >
+                            Skeletonize
+                        </button>
+                        <button id="skelParamsBtn" style="margin-left: 4px">Set Params</button>
+                        <span
+                            style="color: #888; margin-left: 12px"
+                            title="Shortest path between two picked faces or two picked nodes — a fusion shows up as a path that should not exist"
+                            >Path:</span
+                        >
+                        <button id="findPathBtn" style="margin-left: 4px">Edge</button>
+                        <button id="findPathVertBtn" style="margin-left: 4px">Vertex</button>
+                    </span>
+                    <span style="margin-left: 12px">
+                        <button id="undoBtn" style="margin-right: 4px">Undo</button>
+                        <button id="saveBtn">Save</button>
+                    </span>
+                </div>
+                <div id="skelStatus" class="fit-row">
                     <span
                         id="skelTrackBadge"
-                        style="margin-left: 6px; color: #7fb3d5; font-size: 11px"
+                        style="color: #7fb3d5"
                         title="What Skeletonize will read. Preprocessed mesh components are used whenever components exist; that route ignores the soma-detection, bridging and pruning parameters, which are only read when skeletonizing from the raw mesh."
                     ></span>
                     <span id="skelStaleHint" style="margin-left: 8px; color: #e08a3c"></span>
-                    <span
-                        style="color: #888; margin-left: 12px"
-                        title="Shortest path between two picked faces or two picked nodes — a fusion shows up as a path that should not exist"
-                        >Path:</span
-                    >
-                    <button id="findPathBtn" style="margin-left: 4px">Edge</button>
-                    <button id="findPathVertBtn" style="margin-left: 4px">Vertex</button>
-                </span>
-                <span style="margin-left: 12px">
-                    <button id="undoBtn" style="margin-right: 4px">Undo</button>
-                    <button id="saveBtn">Save</button>
-                </span>
+                </div>
             </div>
         </div>
 
@@ -1146,6 +1235,7 @@
                 renderer.domElement.addEventListener("click", onClickSelect);
                 renderer.domElement.addEventListener("dblclick", onDblClickAnnotation);
                 setupLassoSelection();
+                setupSomaPin();
                 document.getElementById("hlClear").addEventListener("click", () => {
                     manualHighlightFaces.clear();
                     rebuildManualHighlight();
@@ -1543,6 +1633,12 @@
 
                 const { nVertices, nFaces, centroid } = data;
                 if (centroid) meshCentroid = centroid;
+                // the soma point belongs to the cell: kept across an edit (the
+                // mesh comes back with keepCamera), forgotten for a new one
+                if (!data.keepCamera) {
+                    if (somaPicking) setSomaPicking(false);
+                    if (somaPoint) setSomaPoint(null);
+                }
 
                 document.getElementById("nVerts").textContent = nVertices.toLocaleString();
                 document.getElementById("nFaces").textContent = nFaces.toLocaleString();
@@ -1991,6 +2087,10 @@
 
             function onClickSelect(event) {
                 if (transformMode || _suppressNextClick) return;
+                if (somaPicking && !event.shiftKey && !event.ctrlKey && !event.metaKey) {
+                    pickSomaPoint(event);
+                    return;
+                }
                 mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
                 mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
                 raycaster.setFromCamera(mouse, camera);
@@ -2384,7 +2484,7 @@
                     () => fetch("/detect_soma", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ method }),
+                        body: JSON.stringify({ method, somaPoint }),
                     }),
                 );
             }
@@ -2461,7 +2561,7 @@
                 const fill = document.getElementById("runFill").checked;
                 await _runAction(
                     document.getElementById("preprocessBtn"),
-                    () => _postJSON("/preprocess", { organelles, soma, fill }),
+                    () => _postJSON("/preprocess", { organelles, soma, fill, somaPoint }),
                 );
             }
 
@@ -4670,6 +4770,117 @@
                 );
             }
 
+            // ── The soma point ────────────────────────────────────────────────
+            // Where the soma is, as preprocess(soma=point) and find_soma(near=)
+            // take it: a click on the soma's surface, as an annotation is
+            // made, kept in the mesh's own frame (the mesh is drawn centred on
+            // meshCentroid).  Held by the page like the Run row's switches; a
+            // new cell forgets it, an edit or a run keeps it.
+            let somaPoint = null;
+            let somaPicking = false;
+            let somaPinObj = null;
+            let somaPinTex = null;
+            // Where a press started while picking: a click picks, the release
+            // of a drag that turned the view does not.
+            let somaPickDown = null;
+
+            function setupSomaPin() {
+                document
+                    .getElementById("somaPinBtn")
+                    .addEventListener("click", () => setSomaPicking(!somaPicking));
+                document.getElementById("somaPinClear").addEventListener("click", () => {
+                    setSomaPicking(false);
+                    setSomaPoint(null);
+                    showLogStatus("Soma point cleared: Run and Soma look anywhere");
+                });
+                renderer.domElement.addEventListener("pointerdown", (e) => {
+                    const plain = e.button === 0 && !e.shiftKey && !e.ctrlKey && !e.metaKey;
+                    somaPickDown = somaPicking && plain ? { x: e.clientX, y: e.clientY } : null;
+                });
+            }
+
+            function setSomaPicking(on) {
+                somaPicking = on;
+                somaPickDown = null;
+                document.getElementById("somaPinBtn").dataset.picking = on ? "1" : "0";
+                renderer.domElement.classList.toggle("picking-soma", on);
+                if (on) showLogStatus("Click the soma on the mesh (Esc cancels)");
+            }
+
+            function setSomaPoint(p) {
+                somaPoint = p;
+                document.getElementById("somaPinBtn").dataset.set = p ? "1" : "0";
+                document.getElementById("somaPinClear").style.display = p ? "" : "none";
+                drawSomaPin();
+                if (p) {
+                    const at = p.map((x) => Math.round(x)).join(", ");
+                    showLogStatus(`Soma point (${at}): Run and Soma look for the soma there`);
+                }
+            }
+
+            /** A click while picking: the surface under it is the soma point. */
+            function pickSomaPoint(event) {
+                const down = somaPickDown;
+                somaPickDown = null;
+                if (!down || Math.hypot(event.clientX - down.x, event.clientY - down.y) > 5) return;
+                if (!meshObj) return;
+                mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+                mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+                raycaster.setFromCamera(mouse, camera);
+                const hit = raycaster
+                    .intersectObject(meshObj)
+                    .find((h) => clipPlane.distanceToPoint(h.point) >= 0);
+                if (!hit) {
+                    showLogStatus("No surface there: click the soma on the mesh (Esc cancels)");
+                    return;
+                }
+                setSomaPicking(false);
+                setSomaPoint([hit.point.x, hit.point.y, hit.point.z].map((x, k) => x + meshCentroid[k]));
+            }
+
+            function somaPinTexture() {
+                if (somaPinTex) return somaPinTex;
+                const c = document.createElement("canvas");
+                c.width = c.height = 64;
+                const g = c.getContext("2d");
+                g.beginPath();
+                g.arc(32, 32, 24, 0, 2 * Math.PI);
+                g.fillStyle = "#e64fe6";
+                g.fill();
+                g.lineWidth = 8;
+                g.strokeStyle = "#ffffff";
+                g.stroke();
+                somaPinTex = new THREE.CanvasTexture(c);
+                return somaPinTex;
+            }
+
+            // A dot the same size on screen at any zoom, drawn over the surface
+            // it sits on.
+            function drawSomaPin() {
+                if (somaPinObj) {
+                    scene.remove(somaPinObj);
+                    somaPinObj.geometry.dispose();
+                    somaPinObj.material.dispose();
+                    somaPinObj = null;
+                }
+                if (!somaPoint) return;
+                const at = new Float32Array(somaPoint.map((x, k) => x - meshCentroid[k]));
+                const geo = new THREE.BufferGeometry();
+                geo.setAttribute("position", new THREE.BufferAttribute(at, 3));
+                somaPinObj = new THREE.Points(
+                    geo,
+                    new THREE.PointsMaterial({
+                        map: somaPinTexture(),
+                        size: 16,
+                        sizeAttenuation: false,
+                        transparent: true,
+                        depthTest: false,
+                    }),
+                );
+                somaPinObj.renderOrder = 999;
+                scene.add(somaPinObj);
+            }
+
             // ── Lasso (rectangle) selection ───────────────────────────────────
             /**
              * Whether the surface under screen point (x, y) is highlighted:
@@ -5794,6 +6005,8 @@
                         }
                         meshGeometry = null;
                         meshCentroid = [0, 0, 0];
+                        if (somaPicking) setSomaPicking(false);
+                        if (somaPoint) setSomaPoint(null);
                         // What was drawn on it, or picked from it, goes too.
                         dropFaceState();
                         applyAnnotations(null);
@@ -6132,6 +6345,11 @@
 
               // Transform mode keys
               if (e.key === 'Escape' && transformMode) { cancelTransform(); return; }
+              if (e.key === 'Escape' && somaPicking) {
+                  setSomaPicking(false);
+                  showLogStatus(somaPoint ? "Soma point kept" : "No soma point");
+                  return;
+              }
 
               // Axis constraints during active transform
               if (transformMode && (e.key === 'x' || e.key === 'X')) {

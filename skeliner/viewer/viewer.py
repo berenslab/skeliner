@@ -431,6 +431,23 @@ def _create_app(
         except Exception:
             return {}
 
+    def _soma_point(body) -> np.ndarray | None:
+        """Where the page says the soma is: ``somaPoint``, a click on it in
+        the mesh's own frame, as ``find_soma(near=)`` takes it — or None.
+
+        Raises ValueError for anything but three finite numbers.
+        """
+        raw = (body or {}).get("somaPoint")
+        if raw is None:
+            return None
+        try:
+            point = np.asarray(raw, dtype=np.float64).reshape(3)
+        except (TypeError, ValueError):
+            point = None
+        if point is None or not np.isfinite(point).all():
+            raise ValueError("somaPoint must be three finite numbers")
+        return point
+
     def _organelle_mask(org) -> np.ndarray | None:
         """Combined bool mask from Organelles object."""
         if org is None:
@@ -1748,20 +1765,22 @@ def _create_app(
         """Run soma detection and write result to annotations.
 
         Accepts optional JSON body ``{"method": "z_contour"}`` or
-        ``{"method": "ring_cutoff"}``.  Defaults to z_contour.
+        ``{"method": "ring_cutoff"}``.  Defaults to z_contour.  With
+        ``somaPoint`` (a click on the soma, the mesh's own frame),
+        ``ring_cutoff`` is ``find_soma(near=)``: the soma found there, or
+        none.
         """
         if mesh_state["mesh"] is None:
             return JSONResponse(
                 {"ok": False, "error": "No mesh loaded"}, status_code=400
             )
 
-        # Parse method choice from request body (POST with JSON)
-        method = "z_contour"
+        body = await _body_of(request)
+        method = body.get("method", "z_contour")
         try:
-            body = await request.json()
-            method = body.get("method", "z_contour")
-        except Exception:
-            pass
+            point = _soma_point(body)
+        except ValueError as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
         if method == "ring_cutoff":
             from skeliner.pre import find_soma as _find
@@ -1787,9 +1806,11 @@ def _create_app(
                 organelles=mesh_state.get("organelles"),
                 mesh_stats=mesh_state.get("mesh_stats"),
                 verbose=True,
+                near=point,
             )
         if soma is None:
-            return JSONResponse({"ok": False, "error": "No soma found"})
+            where = "" if point is None or method == "z_contour" else " at the point"
+            return JSONResponse({"ok": False, "error": f"No soma found{where}"})
 
         mesh_state["soma"] = soma
         mesh_state["soma_by_hand"] = False
@@ -3000,9 +3021,11 @@ def _create_app(
         This *is* ``pre.preprocess`` rather than the panel's buttons pressed
         in order by the server, so the viewer and the library cannot drift
         into two pipelines wearing one name.  Its soma comes from
-        ``find_soma``, as the Soma button's does — unless the soma is the
-        user's, assigned or edited by hand, which it takes instead, or the
-        soma switch is off: the cell has none, and none is looked for.
+        ``find_soma``, as the Soma button's does, looking near the soma
+        point when the page has one (``somaPoint``, a click on the soma) —
+        unless the soma is the user's, assigned or edited by hand, which it
+        takes instead, or the soma switch is off: the cell has none, and none
+        is looked for.
 
         Left uncompacted.  ``compact_mesh`` reindexes faces, and annotations,
         the rescue list and every loaded skeleton are all stated in face ids;
@@ -3021,6 +3044,10 @@ def _create_app(
         body = await _body_of(request)
         floor = _claim_floor(body)
         no_soma = not bool(body.get("soma", True))
+        try:
+            point = _soma_point(body)
+        except ValueError as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
         # An override the user has already made is input to this run, not a
         # casualty of it — break_up_mesh re-derives the neurite/discarded
@@ -3035,7 +3062,7 @@ def _create_app(
                 if no_soma
                 else mesh_state["soma"]
                 if mesh_state["soma_by_hand"]
-                else None
+                else point  # None: find one anywhere
             ),
             rescued=mesh_state["rescued"],
             released=mesh_state["released"],
