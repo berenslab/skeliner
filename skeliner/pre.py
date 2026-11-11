@@ -1313,7 +1313,8 @@ def break_up_mesh(
       without crossing organelle faces (topologically trapped).
     - **missed soma** — reachable, its boundary mostly soma faces, no
       bigger than the soma, and not standing out of it like a neurite.
-    - **neurite** — reachable, large enough to be a real branch.
+    - **neurite** — reachable, large enough to be a real branch, or at the
+      soma and standing out of it like one, at any size.
     - **discarded** — reachable, but too small (below auto threshold).
 
     A component carrying a face named in *rescued* skips all three
@@ -1333,7 +1334,12 @@ def break_up_mesh(
     size descending; once the cumulative face count reaches 95% of
     the total, the remaining components are discarded — but for those
     at least a quarter the size of the smallest kept, as a neuron with
-    many primary dendrites has several of a size.
+    many primary dendrites has several of a size, and for those sharing
+    an edge with the soma that stand out of it like a neurite (the test
+    below that keeps a stub from being absorbed): where a few trees hold
+    95% of the faces, a dendrite cut off at the soma is under both size
+    rules.  A piece apart from the soma is not given back this way — it
+    would be tied to the soma by a straight stem.
 
     The soma test is a *boundary* test: it measures what fraction of a
     component's outer edges are shared with soma faces, not how far the
@@ -1361,9 +1367,8 @@ def break_up_mesh(
     degenerate face — zero area, or a vertex twice; segmentation meshes
     carry some — joins no piece, so a face that is no organelle and not
     the soma's (two of its vertices soma vertices) can be in none of the
-    four: about 0.03% of an EyeWire 2 cell's faces.  It weighs nothing in
-    an area and binds no skeleton bin; given to a neurite, its zero-length
-    edges could join what a cut keeps apart.
+    four.  It weighs nothing in an area and binds no skeleton bin; given to
+    a neurite, its zero-length edges could join what a cut keeps apart.
 
     Parameters
     ----------
@@ -1543,6 +1548,19 @@ def break_up_mesh(
     neurites = neurite_candidates[:split_idx]
     discarded = neurite_candidates[split_idx:]
 
+    # --- a piece standing out of the soma like a neurite is one, at any
+    # size: the cut above is by size alone, and where a few trees hold 95%
+    # of the faces a dendrite cut off at the soma falls under it.  The test
+    # is the one that keeps such a stub from being absorbed into the soma;
+    # a piece sharing no edge with the soma is not asked — one standing
+    # apart from it would be tied to it by a straight stem.
+    n_stood_out = 0
+    if soma is not None and soma.verts is not None and discarded:
+        discarded, stood = _neurites_standing_out(discarded, faces, verts, soma, usable)
+        if stood:
+            n_stood_out = len(stood)
+            neurites = sorted(neurites + stood, key=len, reverse=True)
+
     # --- re-apply the hand overrides the threshold knows nothing about ---
     # Only here do the two claims differ.  Escaping the soma is a
     # judgement about *what the surface is* and holds at any size; being a
@@ -1569,6 +1587,8 @@ def break_up_mesh(
         parts = [f"{len(neurites)} neurites"]
         if discarded:
             parts.append(f"{len(discarded)} discarded ({n_disc_faces:,}f)")
+        if n_stood_out:
+            parts.append(f"{n_stood_out} standing out of the soma kept")
         if n_claimed:
             parts.append(f"claimed {n_claimed}")
         if n_trapped:
@@ -1637,19 +1657,40 @@ def _out_of_soma(tri, verts, soma, soma_keys) -> tuple[bool, float, float | None
     soma's equivalent radius, and by more than three times the radius of
     its junction — the mean distance from their centroid of the vertices of
     the edges it shares with the soma faces (*soma_keys*), which is a ring's
-    radius however the ring is triangulated.  With how far it reaches out,
-    and the junction's radius (None when the reach alone says no)."""
+    radius however the ring is triangulated.  A piece sharing no edge with
+    them has no junction and stands out of nothing.  With how far it
+    reaches out, and the junction's radius (None when the reach alone says
+    no, or there is no junction)."""
     reach = float(soma.distance_to_surface(verts[np.unique(tri)]).max())
     if reach <= _NEURITE_REACH * soma.equiv_radius:
         return False, reach, None
     e, keys = _edge_keys(tri, len(verts) + 1)
     ring = verts[np.unique(e[np.isin(keys, soma_keys)])]
-    junction = (
-        float(np.linalg.norm(ring - ring.mean(axis=0), axis=1).mean())
-        if len(ring)
-        else 0.0
-    )
+    if not len(ring):
+        return False, reach, None
+    junction = float(np.linalg.norm(ring - ring.mean(axis=0), axis=1).mean())
     return reach > _NEURITE_ASPECT * junction, reach, junction
+
+
+def _neurites_standing_out(pieces, faces, verts, soma, usable):
+    """*pieces* split into the rest and those that stand out of the soma
+    like a neurite (:func:`_out_of_soma`) — only a piece touching the soma
+    is asked, the soma's edges keyed once for all of them."""
+    soma_v = np.zeros(len(verts), dtype=bool)
+    soma_v[np.asarray(soma.verts, dtype=np.int64)] = True
+    keys = None
+    rest, stood = [], []
+    for comp in pieces:
+        tri = faces[comp]
+        if soma_v[tri].any():
+            if keys is None:
+                soma_faces = usable & soma_face_mask(faces, soma.verts)
+                keys = _soma_edge_keys(faces, soma_faces, len(verts))
+            if _out_of_soma(tri, verts, soma, keys)[0]:
+                stood.append(comp)
+                continue
+        rest.append(comp)
+    return rest, stood
 
 
 # What :func:`_break_up_pieces` makes of a piece.

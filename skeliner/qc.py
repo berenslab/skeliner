@@ -186,6 +186,10 @@ def report(
             "qc": SCHEMA,
             "skeliner": __version__,
             "meta": dict(meta or {}),
+            # the box asked about, an open side None (JSON has no infinity)
+            "bounds": None
+            if bounds is None
+            else [np.asarray(b, dtype=np.float64).reshape(3) for b in bounds],
             "summary": summary,
             "flags": flags,
             "sites": sites,
@@ -202,10 +206,7 @@ def _check_pair(faces, verts, components) -> None:
     organelle masks hold a value for every face of its mesh; its soma's
     vertices lie where the soma is."""
     n_mask = len(components.organelles.mask)
-    hint = (
-        " — pass the mesh they were made with (preprocess' own; saved as"
-        " mesh_cleaned.obj beside components.npz, not the raw mesh.obj)"
-    )
+    hint = " — pass the mesh preprocess returned with them, not the mesh it was given"
     if n_mask != len(faces):
         raise ValueError(
             f"these components were made on a mesh of {n_mask:,} faces; this "
@@ -672,12 +673,20 @@ def plot(
     gone_v = np.zeros(len(verts), dtype=bool)
     if pieces:
         gone_v[faces[np.concatenate(pieces)].ravel()] = True
+    # where the cell meets the volume's box, as the report measured it
+    edge_v = np.zeros(len(verts), dtype=bool)
+    if rep.get("bounds"):
+        lo_b = np.array([-np.inf if x is None else x for x in rep["bounds"][0]])
+        hi_b = np.array([np.inf if x is None else x for x in rep["bounds"][1]])
+        me = rep["summary"]["median_edge"]
+        edge_v = ((verts - lo_b <= me) | (hi_b - verts <= me)).any(axis=1)
     # painted in this order, the last on top
-    layers = [
+    base = [
         (np.ones(len(verts), dtype=bool), _COLORS["arbor"]),
         (soma_v, _COLORS["soma"]),
-        (gone_v, _COLORS["discarded"]),
+        (edge_v, _COLORS["bounds"]),
     ]
+    layers = base + [(gone_v, _COLORS["discarded"])]
 
     sites = rep.get("sites", [])
     lost = sorted(
@@ -685,7 +694,6 @@ def plot(
         key=lambda s: -s["faces"],
     )
     bridges = [s for s in sites if s["kind"] == "bridge"]
-    edges = [s for s in sites if s["kind"] == "bounds"]
     points = [s for s in sites if s["kind"] == "soma_point"]
 
     fig = plt.figure(figsize=(14, 10 + 4.5 * len(lost)), layout="constrained")
@@ -720,8 +728,6 @@ def plot(
                 mec=_COLORS["bridge"],
                 ms=7,
             )
-        for s in edges:
-            _ring(ax, s, ix, iy, max(s["extent"], 8 * px), _COLORS["bounds"], "")
         for s in points:
             ax.plot(
                 s["position"][ix],
@@ -738,7 +744,7 @@ def plot(
     key.text(
         0,
         1,
-        _key(rep, lost, bool(edges), bool(points)),
+        _key(rep, lost, bool(edge_v.any()), bool(points)),
         va="top",
         ha="left",
         fontsize=9,
@@ -757,7 +763,7 @@ def plot(
         # this piece red, the other discarded ones pale
         this_v = np.zeros(len(verts), dtype=bool)
         this_v[faces[pieces[s["index"]]].ravel()] = True
-        zoom = layers[:2] + [
+        zoom = base + [
             (gone_v, _COLORS["discarded_other"]),
             (this_v, _COLORS["discarded"]),
         ]
@@ -799,7 +805,7 @@ def _key(rep: dict, lost: list, edges: bool, points: bool) -> str:
         "orange ring: a bridge",
     ]
     if edges:
-        lines.append("blue ring: where the cell meets the volume's edge")
+        lines.append("blue: where the cell meets the volume's edge")
     if points:
         lines.append("star: the soma point given, no soma there")
     return "\n".join(lines)

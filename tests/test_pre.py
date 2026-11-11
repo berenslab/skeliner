@@ -2109,6 +2109,40 @@ class TestRescued:
         assert [len(x) for x in c.neurites] == [len(stub)]
         assert len(c.discarded) == 0
 
+    def test_a_neurite_standing_out_of_the_soma_is_kept_at_any_size(self):
+        # The 95% cut is by size alone: beside a process holding nearly all
+        # the arbor's faces, a stub standing out of the soma falls under it
+        # (and under a quarter of the smallest kept).  It is a neurite by
+        # the test that keeps a stub out of the soma; a speck apart from the
+        # soma stays discarded.
+        ball_stub, _, _ = _ball_with_stub(height=160.0)
+        long = trimesh.creation.cylinder(radius=12.0, height=3000.0, sections=24)
+        for _ in range(5):
+            long = long.subdivide()
+        long.apply_translation([0.0, 0.0, -(90.0 + 1500.0)])
+        speck = trimesh.creation.box(extents=[8.0, 8.0, 8.0])
+        speck.apply_translation([2000.0, 0.0, 0.0])
+        mesh = _combine([ball_stub, long, speck])
+        z = np.zeros(len(mesh.faces), dtype=bool)
+        org = Organelles(pocket=z.copy(), isolated=z.copy(), expanded=z.copy())
+        sv = np.flatnonzero(np.linalg.norm(mesh.vertices, axis=1) <= 105.0)
+        soma = Soma.fit(mesh.vertices[sv], verts=sv)
+
+        c = mesh.triangles_center
+        pieces = _arbor_pieces(mesh, soma, org)
+        near = [p for p in pieces if c[p, 0].max() < 1000]  # not the speck
+        (stub,) = [p for p in near if c[p, 2].mean() > 0]
+        (arbor,) = [p for p in near if c[p, 2].mean() < 0]
+        sizes = len(stub) + len(arbor) + len(speck.faces)
+        assert len(arbor) >= 0.95 * sizes and len(stub) < len(arbor) / 4, (
+            "fixture: the size rule alone must drop the stub"
+        )
+
+        got = pre.break_up_mesh(mesh, soma, org)
+        kept = [set(x.tolist()) for x in got.neurites]
+        assert set(stub.tolist()) in kept and set(arbor.tolist()) in kept
+        assert [len(x) for x in got.discarded] == [len(speck.faces)]
+
     def test_a_full_preprocess_does_not_undo_a_rescue(self):
         # Same hazard one level up: preprocess ends in break_up_mesh, so a
         # one-click re-run would re-discard what the user kept.
