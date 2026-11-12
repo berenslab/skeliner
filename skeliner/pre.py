@@ -4981,6 +4981,7 @@ def preprocess(
     released=None,
     claim_min_faces: int = 0,
     compact: bool = False,
+    chunk_boundaries: dict[int, np.ndarray] | None = None,
     verbose: bool = False,
 ) -> tuple[Mesh, MeshComponents]:
     """Run the full preprocessing pipeline in one call.
@@ -5041,6 +5042,13 @@ def preprocess(
         original mesh indices, so external data tied to them (e.g.
         viewer annotations) will need to be remapped.  Skeletonization
         works correctly on uncompacted meshes.
+    chunk_boundaries : dict or None
+        The volume's chunk boundary planes (:func:`find_chunk_boundaries`
+        of the mesh as the segmentation gave it), for step 1.  None finds
+        them on *mesh*, which is right for a mesh as given; on a mesh this
+        pipeline has already been through, the vertices the fill and the
+        stitches add turn every lattice coordinate into a "plane", so pass
+        the planes found on the raw mesh.
     verbose : bool, default False
         Print progress.
 
@@ -5083,7 +5091,7 @@ def preprocess(
 
     # 1. Parallel patches
     with _timed("↳  find & remove parallel patches", verbose=verbose):
-        patches = find_parallel_patches(mesh)
+        patches = find_parallel_patches(mesh, boundaries=chunk_boundaries)
         record["parallel_patches"] = [
             {
                 "center": _faces_center(mesh, p["faces"]),

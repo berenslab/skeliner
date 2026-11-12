@@ -19,55 +19,261 @@
                 width: 100vw;
                 height: 100vh;
             }
-            #info {
+            /* Floating panels over the canvas, each with one job: the
+               pipeline (top left), what to look at and what is drawn (the
+               inspector, top right), what is selected and what can be done
+               to it (the context bar, bottom centre), the keys as buttons
+               (tools, left edge), the session (status bar, bottom). */
+            .panel {
                 position: absolute;
-                top: 10px;
-                left: 10px;
-                background: rgba(0, 0, 0, 0.7);
+                background: rgba(0, 0, 0, 0.72);
                 padding: 8px 12px;
                 border-radius: 4px;
                 font-size: 12px;
                 line-height: 1.6;
-                pointer-events: none;
-                max-width: 400px;
             }
-            #info details { pointer-events: auto; }
-            #info details summary { cursor: pointer; list-style: none; color: #666; }
-            #info details summary::-webkit-details-marker { display: none; }
-            #info .label {
+            .panel .row {
+                white-space: nowrap;
+                margin-top: 4px;
+            }
+            .panel .row:first-child {
+                margin-top: 0;
+            }
+            .dim {
                 color: #888;
             }
-            #info .value {
-                color: #eee;
-            }
-            #controls {
-                position: absolute;
-                bottom: 10px;
-                left: 10px;
-                background: rgba(0, 0, 0, 0.7);
-                padding: 8px 12px;
-                border-radius: 4px;
-                font-size: 12px;
-            }
-            #controls label {
-                margin-right: 12px;
+            .panel label {
                 cursor: pointer;
             }
-            #controls input[type="range"] {
-                width: 120px;
+            .panel input[type="range"] {
+                width: 110px;
                 vertical-align: middle;
             }
-            #selection-info {
-                position: absolute;
+            .panel input[type="text"],
+            .panel input[type="number"],
+            .panel select {
+                font-size: 11px;
+                font-family: monospace;
+                background: #222;
+                color: #ccc;
+                border: 1px solid #555;
+                padding: 1px 3px;
+            }
+            #pipeline-panel {
+                top: 10px;
+                left: 10px;
+            }
+            #stepsDetails {
+                margin-top: 4px;
+            }
+            #stepsDetails summary {
+                cursor: pointer;
+                color: #888;
+            }
+            /* One row a defect: its name, Detect, Remove. */
+            #stepsDetails .steps {
+                display: grid;
+                grid-template-columns: max-content max-content max-content;
+                gap: 3px 6px;
+                align-items: center;
+                margin: 4px 0 2px 2ch;
+            }
+            #stepsDetails .step-name {
+                color: #888;
+            }
+            #inspector {
                 top: 10px;
                 right: 10px;
-                background: rgba(0, 0, 0, 0.7);
-                padding: 8px 12px;
-                border-radius: 4px;
+                width: 390px;
+                max-width: calc(100vw - 30px);
+                max-height: calc(100vh - 170px);
+                display: flex;
+                flex-direction: column;
+            }
+            #inspector .tabs {
+                display: flex;
+                gap: 4px;
+                margin-bottom: 6px;
+            }
+            #inspector .tab[data-active="1"] {
+                background: #3a2a4a;
+                border-color: #d98cd9;
+                color: #fff;
+            }
+            #inspector .tab-body {
+                overflow-y: auto;
+                min-height: 0;
+                flex: 1 1 auto;
+                scrollbar-width: thin;
+            }
+            #inspector .layer-head {
+                margin-top: 8px;
+                padding-top: 4px;
+                border-top: 1px solid #333;
+                color: #adf;
+            }
+            #inspector .layer-head:first-child {
+                margin-top: 0;
+                border-top: none;
+            }
+            #inspector .group-head {
+                margin-top: 6px;
+                color: #adf;
+            }
+            #inspector .group-head:first-child {
+                margin-top: 0;
+            }
+            #inspector .hint {
+                margin-top: 6px;
+                font-size: 11px;
+            }
+            #inspector .nav-row {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            #inspector .inspector-foot {
+                margin-top: 6px;
+                padding-top: 4px;
+                border-top: 1px solid #333;
+            }
+            /* The finding the camera is on. */
+            .hl-item.current {
+                background: #2a2a40;
+                outline: 1px solid #57a;
+            }
+            .hl-item.sub {
+                margin-left: 2ch;
+            }
+            #context-bar {
+                bottom: 40px;
+                left: 50%;
+                transform: translateX(-50%);
+                max-width: min(980px, calc(100vw - 40px));
+            }
+            #context-bar .ctx-row {
+                white-space: nowrap;
+                margin-top: 4px;
+            }
+            #context-bar .ctx-row:first-child {
+                margin-top: 0;
+            }
+            #context-bar .ctx-label,
+            #context-bar .ctx-opt {
+                margin-left: 12px;
+                color: #888;
+            }
+            #context-bar #hlSaveName {
+                width: 110px;
+            }
+            #context-bar #claimMinFaces {
+                width: 52px;
+            }
+            #context-bar .pending-box {
+                margin: 2px 0 4px;
+                padding: 4px 6px;
+                border-left: 2px solid #d98cd9;
+                background: #2a222a;
+                font-size: 11px;
+                line-height: 1.5;
+                max-width: 420px;
+                white-space: normal;
+            }
+            #selDetail:empty {
+                display: none;
+            }
+            /* As long as the data makes them, so they wrap instead of
+               widening the bar: what is selected, and why Rescue is or is
+               not offered. */
+            #context-bar #ctxSummary {
+                white-space: normal;
+                max-width: 560px;
+            }
+            #context-bar .ctx-hint {
+                font-size: 11px;
+                white-space: normal;
+            }
+            #status-bar {
+                position: absolute;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                padding: 4px 12px;
+                background: rgba(0, 0, 0, 0.82);
+                border-top: 1px solid #2a2a2a;
+                font-size: 11px;
+                white-space: nowrap;
+            }
+            #status-bar .label {
+                color: #888;
+            }
+            #status-bar .value {
+                color: #eee;
+            }
+            #status-bar .spacer {
+                flex: 1;
+            }
+            #status-bar #log-status {
+                max-width: 45vw;
+            }
+            #tools {
+                left: 10px;
+                top: 50%;
+                transform: translateY(-50%);
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+                padding: 6px;
+            }
+            #tools button {
+                width: 28px;
+                padding: 3px 0;
+                text-align: center;
+            }
+            #tools .tool-sep {
+                height: 4px;
+            }
+            #tools button[data-on="1"] {
+                background: #3a2a4a;
+                border-color: #d98cd9;
+                color: #fff;
+            }
+            #gizmo-host {
+                position: absolute;
+                left: 10px;
+                bottom: 36px;
+                width: 120px;
+                height: 120px;
+                pointer-events: none;
+            }
+            #help-panel {
+                position: fixed;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                z-index: 1000;
+                background: #1a1a2e;
+                border: 1px solid #555;
+                border-radius: 6px;
+                padding: 12px 16px;
                 font-size: 12px;
                 line-height: 1.6;
-                width: fit-content;
-                max-width: min(420px, calc(100vw - 30px));
+            }
+            #help-panel .help-head {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                color: #adf;
+                font-weight: bold;
+                margin-bottom: 6px;
+            }
+            #help-panel td:first-child {
+                color: #adf;
+                padding-right: 14px;
+                white-space: nowrap;
             }
             .hl-item {
                 display: flex;
@@ -121,10 +327,10 @@
                 cursor: pointer;
                 border: 1px solid #666;
             }
-            #hlList {
+            .list {
                 scrollbar-width: none;
             }
-            #hlList::-webkit-scrollbar {
+            .list::-webkit-scrollbar {
                 display: none;
             }
             input.hl-color-input {
@@ -152,30 +358,14 @@
                 border: none;
                 border-radius: 1px;
             }
-            #loaded-panel {
-                position: absolute;
-                bottom: 50px;
-                right: 10px;
-                background: rgba(0, 0, 0, 0.7);
-                padding: 8px 12px;
-                border-radius: 4px;
-                font-size: 12px;
-                line-height: 1.8;
-                max-width: 300px;
-            }
-            #loaded-panel .item {
+            #inspector .item {
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
             }
-            #loaded-panel .item button {
-                font-size: 10px;
-                cursor: pointer;
-                margin-left: 8px;
-            }
-            #loaded-panel .item .name {
+            #inspector .item .name {
                 color: #adf;
-                max-width: 200px;
+                max-width: 230px;
                 overflow: hidden;
                 text-overflow: ellipsis;
                 white-space: nowrap;
@@ -196,16 +386,9 @@
                 font-size: 24px;
                 color: #4af;
             }
-            #detect-panel {
-                position: absolute;
-                bottom: 50px;
-                left: 10px;
-                background: rgba(0, 0, 0, 0.7);
-                padding: 8px 12px;
-                border-radius: 4px;
-                font-size: 12px;
-            }
-            #detect-panel button,
+            .panel button,
+            #status-bar button,
+            #help-panel button,
             #skel-params-dialog button,
             #save-dialog button {
                 background: #2a2a3e;
@@ -220,129 +403,98 @@
                     background 0.15s,
                     border-color 0.15s;
             }
-            #detect-panel button:hover,
+            .panel button.icon-btn {
+                padding: 0;
+            }
+            .panel button:hover,
+            #status-bar button:hover,
+            #help-panel button:hover,
             #skel-params-dialog button:hover,
             #save-dialog button:hover {
                 background: #3a3a52;
                 border-color: #7af;
             }
-            #detect-panel button:active,
+            .panel button:active,
+            #status-bar button:active,
             #skel-params-dialog button:active,
             #save-dialog button:active {
                 background: #4a4a62;
             }
-            #detect-panel button:disabled {
+            .panel button:disabled,
+            #status-bar button:disabled {
                 opacity: 0.5;
                 cursor: default;
             }
-            #detect-panel button:disabled:hover {
+            .panel button:disabled:hover,
+            #status-bar button:disabled:hover {
                 background: #2a2a3e;
                 border-color: #555;
             }
-            #detect-panel button[data-state="running"] {
+            .panel button[data-state="running"],
+            #status-bar button[data-state="running"] {
                 background: #3a3020 !important;
                 border-color: #c90 !important;
             }
-            #detect-panel button[data-state="done"] {
+            .panel button[data-state="done"],
+            #status-bar button[data-state="done"] {
                 border-color: #4a8 !important;
             }
-            #detect-panel button[data-state="error"] {
+            .panel button[data-state="error"],
+            #status-bar button[data-state="error"] {
                 border-color: #a44 !important;
             }
             /* The skeleton is derived from the mesh and the components; when
                either moves under it, the button that re-derives says so.  The
                three data-state colours carry !important so a run in progress
                still wins over this. */
-            #detect-panel button[data-stale="1"] {
+            .panel button[data-stale="1"] {
                 border-color: #e08a3c;
                 color: #ffca8a;
             }
-            /* Mode selector — which stage of the workflow the panel is for.
-               A mode that can be entered without noticing is worse than no
-               mode, because the same lasso gesture then means two things. */
-            #detect-panel button.mode-btn[data-active="1"] {
-                background: #3a2a4a !important;
-                border-color: #d98cd9 !important;
-                color: #fff;
-            }
-            /* One row per group, its name in a column of its own, so the
-               rows' buttons start at one edge.  9ch holds the longest
-               name, "Skeleton:". */
-            #detect-panel .row-label {
+            /* A row's name in a column of its own, so the rows' buttons
+               start at one edge.  9ch holds the longest, "Skeleton:". */
+            .panel .row-label {
                 display: inline-block;
                 min-width: 9ch;
                 color: #888;
             }
             /* The Run row's switches: options of Run, set off from each
                other and from it. */
-            #detect-panel .run-opt {
+            .panel .run-opt {
                 margin-left: 8px;
                 color: #888;
                 cursor: pointer;
             }
-            /* A row as long as the data makes it — a chip per component, a
-               message, the track name — takes the panel's width instead of
-               setting it (width 0, stretched back to 100%), so the button
-               rows decide how wide the panel is. */
-            #detect-panel .fit-row {
+            /* A row as long as the data makes it — a message, the track
+               name — takes the panel's width instead of setting it (width
+               0, stretched back to 100%), so the button rows decide how
+               wide the panel is. */
+            .panel .fit-row {
                 width: 0;
                 min-width: 100%;
             }
-            /* In a flex row the space after the name is gone; 1ch puts it
-               back, so the first button lines up with the other rows'. */
-            #detect-panel .fit-row > .row-label {
-                margin-right: 1ch;
-            }
-            /* Under the footer's buttons: what Skeletonize reads and what
-               changed since the skeleton was made.  One line high even
-               when empty, so the buttons above never move. */
+            /* Under Skeletonize: what it reads and what changed since the
+               skeleton was made.  One line high even when empty; the panel
+               hangs from the top, so a second line moves nothing above it,
+               and the text wraps rather than widening the panel. */
             #skelStatus {
                 min-height: 1.4em;
                 margin-top: 3px;
                 font-size: 11px;
                 line-height: 1.4;
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
             }
-            /* Scope chips — which components a lasso is allowed to touch.
-               One per component, and a cell has as many neurites as it
-               has, so they wrap at the panel's width. */
-            #scopeChips {
-                display: flex;
-                flex-wrap: wrap;
-                align-items: baseline;
-                row-gap: 3px;
-                white-space: nowrap;
-            }
-            #scopeChips button {
-                padding: 2px 8px;
-                margin-left: 4px;
-                opacity: 0.4;
-            }
-            #scopeChips button[data-on="1"] {
-                opacity: 1;
-                border-color: #7af;
-            }
-            /* Some of the group lit, not all. */
-            #scopeChips button[data-on="mixed"] {
-                opacity: 0.8;
-                border-color: #57a;
-                border-style: dashed;
-            }
-            #scopeChips button.scope-expander {
-                padding: 2px 5px;
-                margin-left: 2px;
-                opacity: 0.8;
-            }
-            #scopeChips .scope-sub {
-                border-left: 1px solid #555;
+            /* A component's "pick": whether its faces can be selected. */
+            .pick-toggle {
                 margin-left: 6px;
-                padding-left: 4px;
+                font-size: 10px;
+                color: #888;
+                cursor: pointer;
+                white-space: nowrap;
             }
-            /* Not scoped to #scopeChips: the bin readout uses the same
-               swatch, and under the narrower selector it rendered as a
-               zero-sized span — a colour key with no colour in it. */
+            .pick-toggle input {
+                vertical-align: middle;
+            }
+            /* The bin readout's colour key. */
             .chip-swatch {
                 display: inline-block;
                 width: 8px;
@@ -497,7 +649,6 @@
         <div id="canvas-container"></div>
         <div id="empty-hint">Drop mesh (.obj, .ply, .stl, .ctm, .npz) or skeleton (.swc, .npz) here</div>
         <div id="drop-overlay">Drop file to load</div>
-        <div id="log-status" style="display:none;position:absolute;bottom:14px;left:50%;background:rgba(0,0,0,0.7);color:#aaa;padding:6px 12px;border-radius:4px;font-size:11px;font-family:monospace;z-index:200;white-space:nowrap;pointer-events:none;transition:opacity 0.3s;max-width:40%;overflow:hidden;text-overflow:ellipsis"></div>
         <div id="lasso-rect"></div>
         <div id="lockIndicator" style="display:none;position:fixed;top:10px;left:50%;transform:translateX(-50%);background:rgba(200,50,50,0.7);color:#fff;padding:4px 12px;border-radius:4px;font-size:12px;font-family:monospace;z-index:100;cursor:pointer;" onclick="this.style.display='none'">Camera Locked (L to unlock) x</div>
 
@@ -524,229 +675,185 @@
             <div class="cp-keys">A / B: show or hide a mesh · H: panels · X / Y / Z: view along an axis · R: from the other side</div>
         </div>
 
-        <div id="info">
-            <div><span class="label">Vertices: </span><span class="value" id="nVerts">-</span></div>
-            <div><span class="label">Faces: </span><span class="value" id="nFaces">-</span></div>
-            <div><span class="label">Skel nodes: </span><span class="value" id="nNodes">-</span></div>
-            <div><span class="label">Camera: </span><span class="value" id="camPos">-</span></div>
-            <div><span class="label">Visible faces: </span><span class="value" id="visCount">-</span></div>
-            <details id="shortcutsPanel" style="margin-top:4px;color:#666;font-size:11px;">
-              <summary>Shortcuts (S)</summary>
-              <div>Click: select</div>
-              <div>Dbl-click: select annotation</div>
-              <div>Shift+click: highlight / unhighlight</div>
-              <div>Shift+drag: lasso; from a highlighted face, unhighlight</div>
-              <div>G: grab (drag to move)</div>
-              <div>T: rotate (drag to rotate)</div>
-              <div>S: toggle shortcuts</div>
-              <div>H: toggle UI</div>
-              <div>L: lock camera</div>
-              <div>X/Y/Z: view along axis</div>
-              <div>R: flip current axis view</div>
+        <!-- The pipeline: the automatic steps in the order preprocess runs
+             them, then Skeletonize, which derives from what they leave.
+             Editing by hand is not here: it acts on a selection, so its
+             verbs are in the context bar, with the selection. -->
+        <div id="pipeline-panel" class="panel">
+            <div class="row">
+                <span
+                    class="row-label"
+                    title="pre.preprocess() — every step below in one call, in pipeline order"
+                    >Run:</span
+                >
+                <button
+                    id="preprocessBtn"
+                    title="Run pre.preprocess(): parallel patches → organelles → soma → fusions → disconnected → gaps → fill holes → break up mesh.&#10;Keeps rescued fragments. Leaves the mesh uncompacted — press Compact (Steps) after if you want it."
+                >
+                    Run
+                </button>
+                <!-- Not remembered across loads: a pipeline switch left off
+                     from another dataset would change every run. -->
+                <label
+                    class="run-opt"
+                    title="Off for meshes that trace no organelles (hemibrain's): Run does not look for them, and no face is an organelle."
+                >
+                    <input type="checkbox" id="runOrganelles" checked /> organelles
+                </label>
+                <label
+                    class="run-opt"
+                    title="Off for a cell with no soma in the mesh (a piece of arbor whose soma lies outside the volume): Run does not look for one, and every piece is arbor."
+                >
+                    <input type="checkbox" id="runSoma" checked /> soma
+                </label>
+                <!-- Held by the page like the switches; a new cell forgets
+                     it, an edit or a run keeps it. -->
+                <button
+                    id="somaPinBtn"
+                    title="Where the soma is: press, then click the soma on the mesh. Run and the Soma step look for the soma there (find_soma near=) — a soma the mesh cannot give stays none; assign one by hand instead (select its faces, then Assign → Soma). A soma assigned by hand is taken as it is. Esc cancels."
+                    ><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s7-7.2 7-12a7 7 0 1 0-14 0c0 4.8 7 12 7 12z"/><circle cx="12" cy="10" r="2.5"/></svg></button
+                ><button id="somaPinClear" title="Forget the soma point" style="display: none">×</button>
+                <label
+                    class="run-opt"
+                    title="Patch the holes in the surface (fill_holes) before the mesh is broken up: the organelles' mouths and the mesh's own openings, so each neurite is a tube again. Off leaves them open."
+                >
+                    <input type="checkbox" id="runFill" checked /> fill holes
+                </label>
+            </div>
+            <!-- What Run does, a step at a time: find a defect, look at what
+                 was found (Findings), remove it.  One row a defect, in the
+                 order Run takes them. -->
+            <details id="stepsDetails">
+                <summary title="Run's steps one at a time — detect, look at the findings, remove">Steps</summary>
+                <div class="steps">
+                    <span class="step-name">parallel patches</span>
+                    <button id="detectParallelBtn">Detect</button>
+                    <button id="removeParallelBtn">Remove</button>
+                    <span class="step-name">organelles</span>
+                    <button id="detectOrganellesBtn">Detect</button>
+                    <button id="removeOrganellesBtn">Remove</button>
+                    <span class="step-name">soma</span>
+                    <button id="detectSomaBtn">Detect</button>
+                    <span></span>
+                    <span class="step-name">fusions</span>
+                    <button id="detectFusionsBtn">Detect</button>
+                    <button id="removeFusionsBtn">Remove</button>
+                    <span class="step-name">disconnected</span>
+                    <button id="detectDisconnectedBtn">Detect</button>
+                    <span></span>
+                    <span class="step-name">gaps</span>
+                    <button id="detectGapsBtn">Detect</button>
+                    <button id="removeGapsBtn">Remove</button>
+                    <span class="step-name">components</span>
+                    <button
+                        id="breakUpMeshBtn"
+                        title="Break the mesh into soma, organelles, neurites and discarded pieces (break_up_mesh)"
+                    >
+                        Break
+                    </button>
+                    <button
+                        id="compactMeshBtn"
+                        title="Drop the faces the removals collapsed and the vertices nothing uses (compact_mesh); renumbers the faces"
+                    >
+                        Compact
+                    </button>
+                </div>
             </details>
+            <div class="row">
+                <span class="row-label">Skeleton:</span>
+                <button
+                    id="skeletonizeBtn"
+                    title="Derive a skeleton from the current mesh and components — whenever either has changed under it"
+                >
+                    Skeletonize
+                </button>
+                <button id="skelParamsBtn">Params</button>
+            </div>
+            <div id="skelStatus" class="fit-row">
+                <span
+                    id="skelTrackBadge"
+                    style="color: #7fb3d5"
+                    title="What Skeletonize will read. Preprocessed mesh components are used whenever components exist; that route ignores the soma-detection, bridging and pruning parameters, which are only read when skeletonizing from the raw mesh."
+                ></span>
+                <span id="skelStaleHint" style="margin-left: 8px; color: #e08a3c"></span>
+            </div>
         </div>
 
-        <div id="controls">
-          <span style="color:#888;">Mesh:</span>
-          <label><input type="checkbox" id="wireToggle" checked /> Wire</label>
-          <label>Opacity <input type="range" id="opacitySlider" min="0" max="100" value="50" /></label>
-          <span style="color:#555;margin:0 4px;">|</span>
-          <span style="color:#888;">Skel:</span>
-          <label><input type="checkbox" id="tubeToggle" /> Tubes</label>
-          <span style="color:#555;margin:0 4px;">|</span>
-          <span style="color:#888;">Ann:</span>
-          <label>Opacity <input type="range" id="annOpacitySlider" min="0" max="100" value="90" /></label>
-          <span style="color:#555;margin:0 4px;">|</span>
-          <label><span style="color:#888;">Pick:</span> <select id="pickTarget" style="font-size:11px;"><option value="mesh">Mesh</option></select></label>
+        <!-- The keys, as buttons that name their key. -->
+        <div id="tools" class="panel">
+            <button id="toolFocus" title="Focus the selection (F)">⌖</button>
+            <button id="toolGrab" title="Grab the selected faces, then drag to move them (G); Esc cancels">✥</button>
+            <button id="toolRotate" title="Rotate the selected faces, then drag to turn them (T); Esc cancels">⟳</button>
+            <span class="tool-sep"></span>
+            <button id="toolViewX" title="View along X (X; R flips)">X</button>
+            <button id="toolViewY" title="View along Y (Y; R flips)">Y</button>
+            <button id="toolViewZ" title="View along Z (Z; R flips)">Z</button>
+            <button id="toolLock" title="Lock the camera (L)">L</button>
+            <span class="tool-sep"></span>
+            <button id="toolHelp" title="Gestures and keys (?)">?</button>
         </div>
 
-        <div id="detect-panel">
-            <!-- Which object the rows below edit, and nothing else.  The
-                 three are the derivation chain — the mesh, the components
-                 broken out of it, the skeleton built from those — so naming
-                 them after the object states both what a row may change and
-                 what it leaves alone.  A verb parked on this row reads as a
-                 fourth mode; the ones that work on every object live in the
-                 footer at the bottom of the panel instead. -->
-            <div style="white-space: nowrap">
-                <span class="row-label">Edit:</span>
-                <button
-                    id="modeMeshBtn"
-                    class="mode-btn"
-                    style="margin-left: 4px"
-                    data-active="1"
-                    title="Change the mesh itself — its faces and vertices. Detect and remove defects one at a time, or run the whole pipeline at once."
-                >
-                    Mesh
-                </button>
-                <button
-                    id="modeCompBtn"
-                    class="mode-btn"
-                    style="margin-left: 4px"
-                    title="Change which component owns a face — soma, organelle, neurite or discarded. The geometry is left alone. Needs Break first."
-                >
-                    Mesh Comp.
-                </button>
-                <button
-                    id="modeSkelBtn"
-                    class="mode-btn"
-                    style="margin-left: 4px"
-                    title="Change the bins the neurites are partitioned into, and the edges between them — needs Skeletonize first"
-                >
-                    Skeleton
-                </button>
+        <!-- What is selected and every verb legal for it.  A verb's place is
+             the selection it consumes, so it is offered wherever that
+             selection is; nothing else decides whether it shows. -->
+        <div id="context-bar" class="panel">
+            <div id="ctxSummary" class="ctx-row">
+                <span id="ctxWhat" class="dim"></span>
+                <span id="hlCount" style="display: none">0</span>
+                <button id="hlClear" title="Select nothing (Esc)" style="display: none">Clear</button>
             </div>
-
-            <!-- One row per group.  Detect and Remove name the same defects
-                 in the same order, so with the names in one column each
-                 Remove button sits under its Detect button. -->
-            <div id="mesh-rows">
-                <div style="white-space: nowrap; margin-top: 4px">
-                    <span class="row-label">Detect:</span>
-                    <button id="detectParallelBtn" style="margin-left:4px">Parallel</button>
-                    <button id="detectOrganellesBtn" style="margin-left: 4px">Organelles</button>
-                    <button id="detectFusionsBtn" style="margin-left: 4px">Fusions</button>
-                    <button id="detectGapsBtn" style="margin-left: 4px">Gaps</button>
-                    <button id="detectSomaBtn" style="margin-left: 4px">Soma</button>
-                    <button id="detectDisconnectedBtn" style="margin-left: 4px">Disconnected</button>
-                </div>
-                <div style="white-space: nowrap; margin-top: 4px">
-                    <span class="row-label">Remove:</span>
-                    <button id="removeParallelBtn" style="margin-left: 4px">Parallel</button>
-                    <button id="removeOrganellesBtn" style="margin-left: 4px">Organelles</button>
-                    <button id="removeFusionsBtn" style="margin-left: 4px">Fusions</button>
-                    <button id="removeGapsBtn" style="margin-left: 4px">Gaps</button>
-                </div>
-                <div style="white-space: nowrap; margin-top: 4px">
-                    <span class="row-label">Mesh:</span>
-                    <button id="hlMerge" style="margin-left: 4px">Merge</button>
-                    <button id="hlRemove" style="margin-left: 4px">Remove</button>
-                    <button id="breakUpMeshBtn" style="margin-left: 4px">Break</button>
-                    <button id="compactMeshBtn" style="margin-left: 4px">Compact</button>
-                </div>
-                <!-- Every row above in one call — last, so it reads as their
-                     summary rather than as a step of its own before them.
-                     Its switches follow it on the same row. -->
-                <div style="white-space: nowrap; margin-top: 4px">
-                    <span
-                        class="row-label"
-                        title="pre.preprocess() — the rows above in one call, in pipeline order"
-                        >Auto:</span
-                    >
-                    <button
-                        id="preprocessBtn"
-                        style="margin-left: 4px"
-                        title="Run pre.preprocess(): parallel patches → organelles → soma → fusions → disconnected → gaps → fill holes → break up mesh.&#10;Keeps rescued fragments. Leaves the mesh uncompacted — press Compact after if you want it."
-                    >
-                        Run
-                    </button>
-                    <!-- Not remembered across loads: a pipeline switch left
-                         off from another dataset would change every run. -->
-                    <label
-                        class="run-opt"
-                        title="Off for meshes that trace no organelles (hemibrain's): Run does not look for them, and no face is an organelle."
-                    >
-                        <input type="checkbox" id="runOrganelles" checked /> organelles
-                    </label>
-                    <label
-                        class="run-opt"
-                        title="Off for a cell with no soma in the mesh (a piece of arbor whose soma lies outside the volume): Run does not look for one, and every piece is arbor."
-                    >
-                        <input type="checkbox" id="runSoma" checked /> soma
-                    </label>
-                    <!-- Held by the page like the switches; a new cell forgets
-                         it, an edit or a run keeps it. -->
-                    <button
-                        id="somaPinBtn"
-                        title="Where the soma is: press, then click the soma on the mesh. Run and the Soma button look for the soma there (find_soma near=) — a soma the mesh cannot give stays none; assign one by hand instead (Mesh Comp. → Reassign → Soma). A soma assigned by hand is taken as it is. Esc cancels."
-                        ><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s7-7.2 7-12a7 7 0 1 0-14 0c0 4.8 7 12 7 12z"/><circle cx="12" cy="10" r="2.5"/></svg></button
-                    ><button id="somaPinClear" title="Forget the soma point" style="display: none">×</button>
-                    <label
-                        class="run-opt"
-                        title="Patch the holes in the surface (fill_holes) before the mesh is broken up: the organelles' mouths and the mesh's own openings, so each neurite is a tube again. Off leaves them open."
-                    >
-                        <input type="checkbox" id="runFill" checked /> fill holes
-                    </label>
-                </div>
+            <div id="selDetail" class="ctx-row"></div>
+            <div id="ctxFaces" class="ctx-row" style="display: none">
+                <span class="row-label">Faces:</span>
+                <button id="hlRemove" title="Delete the selected faces from the mesh">Remove</button>
+                <button id="hlMerge" title="Merge the selected faces' vertices into one">Merge</button>
+                <button id="ctxGrab" title="Grab: drag to move the selected faces (G)">Grab</button>
+                <button id="ctxRotate" title="Rotate: drag to turn the selected faces (T)">Rotate</button>
+                <span class="ctx-label">Note:</span>
+                <input id="hlSaveName" type="text" placeholder="name" />
+                <button id="hlSaveBtn" title="Keep the selection as a note (Notes)">Save</button>
             </div>
-
-            <div id="components-rows" style="display: none">
-                <div class="fit-row" style="display: flex; align-items: baseline; margin-top: 4px">
-                    <span class="row-label" title="Only faces of a lit component can be picked">Scope:</span>
-                    <span id="scopeChips"></span>
-                    <span style="white-space: nowrap">
-                        <button id="scopeAllBtn" style="margin-left: 10px">All</button>
-                        <button id="scopeNoneBtn" style="margin-left: 4px">None</button>
-                    </span>
-                </div>
-                <div style="white-space: nowrap; margin-top: 4px">
-                    <span style="color: #888">Reassign selection to:</span>
-                    <button id="reassignSomaBtn" style="margin-left: 4px">Soma</button>
-                    <button id="reassignOrganelleBtn" style="margin-left: 4px">Organelle</button>
-                    <button
-                        id="reassignRemainderBtn"
-                        style="margin-left: 4px"
-                        title="Release from soma and organelles — connectivity decides which neurite it joins.&#10;The claim is recorded, so later re-derives will not absorb the faces back. Select the whole protrusion: the claim is honoured per connected piece, but only the faces you release stop being soma."
-                    >
-                        Neurites
-                    </button>
-                    <span id="reassignPending" style="display: none; margin-left: 12px">
-                        <button id="reassignApplyBtn">Apply</button>
-                        <button id="reassignCancelBtn" style="margin-left: 4px">Cancel</button>
-                    </span>
-                    <label
-                        style="margin-left: 12px; color: #888"
-                        title="A released piece with fewer faces than this is still taken out of the soma, but lands in Discarded instead of becoming a neurite.&#10;A lasso claims every sliver it grazes, and releasing a patch leaves isolated triangles behind, so without a floor a release makes two-face neurites. 0 keeps everything."
-                    >
-                        min faces
-                        <input
-                            type="number"
-                            id="claimMinFaces"
-                            min="0"
-                            step="1"
-                            value="16"
-                            style="
-                                width: 52px;
-                                font-size: 11px;
-                                font-family: monospace;
-                                background: #222;
-                                color: #ccc;
-                                border: 1px solid #555;
-                                padding: 1px 3px;
-                                margin-left: 4px;
-                            "
-                        />
-                    </label>
-                </div>
-                <div style="white-space: nowrap; margin-top: 4px">
-                    <span
-                        style="color: #888"
-                        title="The neurite/discarded split is an automatic size threshold. Double-click a fragment in the 3D view to select it, then promote it — the override stays in force through later re-derives."
-                        >Discarded fragments:</span
-                    >
-                    <button id="hlRescue" style="margin-left: 4px" disabled>→ Neurites</button>
-                    <span id="rescueHint" style="margin-left: 10px; color: #888"></span>
-                </div>
+            <div id="ctxPath" class="ctx-row" style="display: none">
+                <span
+                    class="row-label"
+                    title="Shortest path between two selected faces, nodes or bins — a fusion shows up as a path that should not exist"
+                    >Path:</span
+                >
+                <button id="findPathBtn" title="Along the mesh's edges (two faces), or the skeleton's (two nodes or bins)">Edge</button>
+                <button id="findPathVertBtn" title="Through the mesh's vertices (two faces), or the skeleton's (two nodes or bins)">Vertex</button>
             </div>
-
-            <div id="skeleton-rows" style="display: none">
-                <div style="white-space: nowrap; margin-top: 4px">
-                    <span class="row-label" title="Which loaded skeleton the bin and edge edits below act on">Editing:</span>
-                    <select id="binSkelSel" style="font-size: 11px; margin-left: 4px"></select>
-                    <label
-                        style="margin-left: 10px"
-                        title="The ball is the radius the bin produces; the patch is what it is computed from. Their disagreement is the defect."
-                    >
-                        <input type="checkbox" id="binShowBall" checked />
-                        radius ball
-                    </label>
-                    <button id="binClearBtn" style="margin-left: 10px">Clear</button>
-                </div>
-                <div style="white-space: nowrap; margin-top: 4px">
+            <div id="ctxComponents" class="ctx-row" style="display: none">
+                <span class="row-label" title="Which component the selected faces belong to — previewed, then applied">Assign:</span>
+                <button id="reassignSomaBtn">→ Soma</button>
+                <button id="reassignOrganelleBtn">→ Organelle</button>
+                <button
+                    id="reassignRemainderBtn"
+                    title="Release from soma and organelles — connectivity decides which neurite it joins.&#10;The claim is recorded, so later re-derives will not absorb the faces back. Select the whole protrusion: the claim is honoured per connected piece, but only the faces you release stop being soma."
+                >
+                    → Neurites
+                </button>
+                <label
+                    class="ctx-opt"
+                    title="A released piece with fewer faces than this is still taken out of the soma, but lands in Discarded instead of becoming a neurite.&#10;A lasso claims every sliver it grazes, and releasing a patch leaves isolated triangles behind, so without a floor a release makes two-face neurites. 0 keeps everything."
+                >
+                    min faces
+                    <input type="number" id="claimMinFaces" min="0" step="1" value="16" />
+                </label>
+                <button
+                    id="hlRescue"
+                    disabled
+                    title="The neurite/discarded split is an automatic size threshold. A discarded fragment the selection touches becomes a neurite, all of it — the override stays in force through later re-derives."
+                >
+                    Rescue → Neurites
+                </button>
+                <div id="rescueHint" class="dim ctx-hint"></div>
+            </div>
+            <div id="ctxBins" class="ctx-row" style="display: none">
+                <div id="binReadout" class="fit-row dim"></div>
+                <div>
                     <span class="row-label">Bins:</span>
                     <button
                         id="binMergeBtn"
-                        style="margin-left: 4px"
                         disabled
                         title="Select two or more bins — the first one you click keeps its id. Merging is direction-free: the union has the same centre and radius whichever way round it goes."
                     >
@@ -754,135 +861,90 @@
                     </button>
                     <button
                         id="binMoveBtn"
-                        style="margin-left: 4px"
                         disabled
-                        title="Shift-drag over surface owned by a neighbouring bin, then move it into the selected one."
+                        title="Select faces owned by a neighbouring bin, then move them into the selected one; faces of bins that do not touch it are left where they are."
                     >
                         Move lassoed surface
                     </button>
                     <button
                         id="binSplitBtn"
-                        style="margin-left: 4px"
                         disabled
-                        title="Shift-drag over part of the selected bin's own surface to promote it to a node of its own. The new node is joined to its parent and nothing else — use Edge to re-route from there."
+                        title="Select part of the selected bin's own surface to promote it to a node of its own. The new node is joined to its parent and nothing else — select two nodes to re-route from there."
                     >
                         Split off
                     </button>
-                    <span style="color: #888; margin-left: 12px">Edge:</span>
                     <button
                         id="edgeEditBtn"
-                        style="margin-left: 4px"
                         disabled
                         title="Select exactly two bins. Which verb this is follows from the two graphs: an edge the tree already has can be clipped, one the surface supports can be restored, one it does not is a graft across a gap."
                     >
                         Select two nodes
                     </button>
-                    <span id="skelPending" style="display: none; margin-left: 12px">
-                        <button id="skelApplyBtn">Apply</button>
-                        <button id="skelCancelBtn" style="margin-left: 4px">Cancel</button>
-                    </span>
+                    <label
+                        class="ctx-opt"
+                        title="The ball is the radius the bin produces; the patch is what it is computed from. Their disagreement is the defect."
+                    >
+                        <input type="checkbox" id="binShowBall" checked /> radius ball
+                    </label>
+                    <button id="binClearBtn">Clear</button>
                 </div>
-                <!-- Diagnostics list candidates and never edit.  Every
-                     threshold here is a heuristic with nothing validating it,
-                     so the cut is exposed rather than baked in: change it,
-                     re-run, and watch which nodes come and go.  Results land
-                     as markers, so the existing list gives focus, colour,
-                     visibility and remove for free — and focusing one selects
-                     its bin, which is what arms the verbs above. -->
-                <div style="white-space: nowrap; margin-top: 4px">
-                    <span class="row-label" title="List candidates as markers to look at. Nothing here changes the skeleton.">Find:</span>
-                    <select id="dxKindSel" style="font-size: 11px; margin-left: 4px">
-                        <!-- Named after the dx function each one runs, and
-                             ordered as dx.__skeleton__ orders them: the one
-                             invariant check first, then plain enumerations,
-                             then the heuristics.  So the list reads from
-                             "this is broken" to "this might repay a look",
-                             and the panel neither renames nor resequences
-                             what the library already settled. -->
-                        <option value="orphans">isolated nodes</option>
-                        <option value="cycles">cycles</option>
-                        <option value="degree">nodes of degree</option>
-                        <option value="twigs">short twigs</option>
-                        <option value="tips">suspicious tips</option>
-                        <option value="junctions">suspicious junctions</option>
-                    </select>
-                    <span id="dxParams" style="margin-left: 6px"></span>
-                    <button id="dxRunBtn" style="margin-left: 6px">List</button>
-                    <span id="dxStatus" style="margin-left: 8px; color: #888"></span>
-                </div>
-                <div id="binReadout" class="fit-row" style="margin-top: 4px; color: #888">
-                    Click a node, or the surface it owns, to select a bin.
-                </div>
-                <div
-                    id="skelEditSummary"
-                    style="
-                        display: none;
-                        margin-top: 4px;
-                        padding: 4px 6px;
-                        border-left: 2px solid #d98cd9;
-                        background: #2a222a;
-                        font-size: 11px;
-                        line-height: 1.5;
-                        max-width: 360px;
-                        white-space: normal;
-                    "
-                ></div>
             </div>
+            <div id="ctxPending" class="ctx-row" style="display: none">
+                <div id="reassignSummary" class="pending-box" style="display: none"></div>
+                <div id="skelEditSummary" class="pending-box" style="display: none"></div>
+                <span id="reassignPending" style="display: none">
+                    <button id="reassignApplyBtn">Apply</button>
+                    <button id="reassignCancelBtn">Cancel</button>
+                </span>
+                <span id="skelPending" style="display: none">
+                    <button id="skelApplyBtn">Apply</button>
+                    <button id="skelCancelBtn">Cancel</button>
+                </span>
+            </div>
+        </div>
 
-            <!-- Everything that works in every mode.  Skeletonize is the
-                 odd one out among the pipeline verbs: it does not change the
-                 mesh or the components, it *derives* from them, so it is
-                 wanted at the end of each of the three stages rather than
-                 inside one of them.  Path only reads.  Undo and Save are the
-                 session's.
-                 Last in the panel on purpose — the panel is anchored to its
-                 bottom edge and grows upward, so a footer keeps the same
-                 screen position while the rows above it change height with
-                 the mode. -->
-            <div
-                id="always-rows"
-                style="margin-top: 6px; padding-top: 6px; border-top: 1px solid #3a3a3a"
-            >
-                <div
-                    style="
-                        white-space: nowrap;
-                        display: flex;
-                        justify-content: space-between;
-                        align-items: center;
-                    "
-                >
-                    <span>
-                        <span class="row-label">Skeleton:</span>
-                        <button
-                            id="skeletonizeBtn"
-                            style="margin-left: 4px"
-                            title="Derive a skeleton from the current mesh and components — available in every mode, since every mode changes something it is derived from"
-                        >
-                            Skeletonize
-                        </button>
-                        <button id="skelParamsBtn" style="margin-left: 4px">Set Params</button>
-                        <span
-                            style="color: #888; margin-left: 12px"
-                            title="Shortest path between two picked faces or two picked nodes — a fusion shows up as a path that should not exist"
-                            >Path:</span
-                        >
-                        <button id="findPathBtn" style="margin-left: 4px">Edge</button>
-                        <button id="findPathVertBtn" style="margin-left: 4px">Vertex</button>
-                    </span>
-                    <span style="margin-left: 12px">
-                        <button id="undoBtn" style="margin-right: 4px">Undo</button>
-                        <button id="saveBtn">Save</button>
-                    </span>
-                </div>
-                <div id="skelStatus" class="fit-row">
-                    <span
-                        id="skelTrackBadge"
-                        style="color: #7fb3d5"
-                        title="What Skeletonize will read. Preprocessed mesh components are used whenever components exist; that route ignores the soma-detection, bridging and pruning parameters, which are only read when skeletonizing from the raw mesh."
-                    ></span>
-                    <span id="skelStaleHint" style="margin-left: 8px; color: #e08a3c"></span>
-                </div>
+        <div id="status-bar">
+            <span><span class="label">verts</span> <span class="value" id="nVerts">-</span></span>
+            <span><span class="label">faces</span> <span class="value" id="nFaces">-</span></span>
+            <span><span class="label">nodes</span> <span class="value" id="nNodes">-</span></span>
+            <span><span class="label">visible</span> <span class="value" id="visCount">-</span></span>
+            <span id="pickedInfo" class="dim"></span>
+            <span
+                id="log-status"
+                style="display: none; color: #aaa; overflow: hidden; text-overflow: ellipsis; transition: opacity 0.3s"
+            ></span>
+            <span class="spacer"></span>
+            <span class="label" title="The camera's position, in the mesh's units">camera</span>
+            <span class="value" id="camPos">-</span>
+            <button id="saveBtn">Save</button>
+            <button id="helpBtn" title="Gestures and keys (?)">?</button>
+        </div>
+
+        <div id="gizmo-host"></div>
+
+        <div id="help-panel" style="display: none">
+            <div class="help-head">
+                <span>Gestures and keys</span>
+                <button id="helpClose" class="icon-btn" title="Close (? or Esc)">x</button>
             </div>
+            <table>
+                <tr><td>drag</td><td>turn the view; right-click or Ctrl+click recentres</td></tr>
+                <tr><td>click</td><td>pick a face (its id and position); with a skeleton picked in Layers, its node or bin</td></tr>
+                <tr><td>Shift+click</td><td>select or unselect a face</td></tr>
+                <tr><td>Shift+drag</td><td>select the faces in a rectangle</td></tr>
+                <tr><td>Shift+Cmd+drag</td><td>unselect every selected face in a rectangle (Shift+Ctrl off a Mac)</td></tr>
+                <tr><td>Alt+Shift+drag</td><td>select within the component the drag starts on</td></tr>
+                <tr><td>double-click</td><td>select a whole component, finding or note</td></tr>
+                <tr><td>Esc</td><td>cancel a grab, rotate or soma pick; else select nothing</td></tr>
+                <tr><td>F</td><td>focus the selection</td></tr>
+                <tr><td>G / T</td><td>grab / rotate the selected faces (X / Y / Z constrain, Esc cancels)</td></tr>
+                <tr><td>] / [</td><td>next / previous finding</td></tr>
+                <tr><td>X / Y / Z, R</td><td>view along an axis; R from the other side</td></tr>
+                <tr><td>L</td><td>lock the camera</td></tr>
+                <tr><td>A / B</td><td>show or hide the mesh / the second mesh</td></tr>
+                <tr><td>H</td><td>hide the panels</td></tr>
+                <tr><td>? / S</td><td>this list</td></tr>
+            </table>
         </div>
 
         <div
@@ -1017,69 +1079,114 @@
             "
         ></div>
 
-        <div id="selection-info">
-            <div id="selDetail"></div>
-            <div>
-                <span class="label">Highlighted: </span><span class="value" id="hlCount">0</span>
-                <button id="hlClear" style="font-size: 11px; cursor: pointer">Clear</button>
-            </div>
-            <div
-                id="reassignSummary"
-                style="
-                    display: none;
-                    margin-top: 4px;
-                    padding: 4px 6px;
-                    border-left: 2px solid #d98cd9;
-                    background: #2a222a;
-                    font-size: 11px;
-                    line-height: 1.5;
-                    max-width: 320px;
-                    white-space: normal;
-                "
-            ></div>
-            <div id="hlSaveRow" style="display: none; margin-top: 4px">
-                <input
-                    id="hlSaveName"
-                    type="text"
-                    placeholder="annotation name"
-                    style="
-                        font-size: 11px;
-                        width: 120px;
-                        font-family: monospace;
-                        background: #222;
-                        color: #ccc;
-                        border: 1px solid #555;
-                        padding: 2px 4px;
-                    "
-                />
-                <button id="hlSaveBtn" style="font-size: 11px; cursor: pointer; margin-left: 4px">
-                    Save
+        <!-- What to look at, what was noted, what is drawn.  Every list
+             entry of the annotations lands in one of the three by the kind
+             its writer gave it. -->
+        <div id="inspector" class="panel">
+            <div class="tabs">
+                <button id="tabFindings" class="tab" data-tab="findings" data-active="1">
+                    Findings <span id="findingsCount" class="dim"></span>
                 </button>
+                <button id="tabNotes" class="tab" data-tab="notes">
+                    Notes <span id="notesCount" class="dim"></span>
+                </button>
+                <button id="tabLayers" class="tab" data-tab="layers">Layers</button>
             </div>
-            <div id="hlList" style="margin-top: 4px; max-height: 200px; overflow-y: auto"></div>
-            <div style="margin-top: 2px; display: flex; justify-content: space-between; align-items: center">
-                <div id="hlClearAllRow" style="display: none">
-                    <button id="hlHideAll" class="toggle-vis" title="hide all"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><span>All</span></button>
-                    <button id="hlClearAll" style="font-size: 10px; cursor: pointer; margin-left: 6px">
-                        Clear All
-                    </button>
-                </div>
-                <div style="margin-left: auto">
-                    <button id="showGridBtn" style="font-size: 10px; cursor: pointer">Show Grid</button>
-                    <span id="gridStatus" style="font-size: 10px; color: #aaa; margin-left: 4px"></span>
-                </div>
-            </div>
-        </div>
 
-        <div id="loaded-panel">
-            <div style="color: #888; margin-bottom: 4px">Loaded:</div>
-            <div id="loadedMesh" class="item" style="display: none">
-                <input type="color" id="meshColorPicker" class="hl-color-input" value="#8c8c99" title="Mesh color">
-                <span class="name" id="meshName">-</span>
-                <button id="toggleMesh" class="toggle-vis icon-btn" title="hide"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
-                <button id="removeMesh" class="icon-btn">x</button>
+            <div id="tab-findings" class="tab-body">
+                <!-- Checks list candidates and never edit.  Every threshold
+                     here is a heuristic with nothing validating it, so the cut
+                     is exposed rather than baked in: change it, re-run, and
+                     watch which nodes come and go.  Results land as findings,
+                     and focusing one selects its bin, which arms the bin
+                     verbs. -->
+                <div class="row">
+                    <span
+                        class="row-label"
+                        title="List candidates on the skeleton as findings. Nothing here changes the skeleton."
+                        >Check:</span
+                    >
+                    <select id="dxKindSel">
+                        <!-- Named after the dx function each one runs, and
+                             ordered as dx.__skeleton__ orders them: the one
+                             invariant check first, then plain enumerations,
+                             then the heuristics.  So the list reads from
+                             "this is broken" to "this might repay a look",
+                             and the panel neither renames nor resequences
+                             what the library already settled. -->
+                        <option value="orphans">isolated nodes</option>
+                        <option value="cycles">cycles</option>
+                        <option value="degree">nodes of degree</option>
+                        <option value="twigs">short twigs</option>
+                        <option value="tips">suspicious tips</option>
+                        <option value="junctions">suspicious junctions</option>
+                    </select>
+                    <button id="dxRunBtn">List</button>
+                    <span id="dxStatus" class="dim"></span>
+                </div>
+                <div id="dxParams" class="row"></div>
+                <div class="row nav-row">
+                    <button id="findPrevBtn" title="Previous finding ([)">‹ prev</button>
+                    <span id="findPos" class="dim"></span>
+                    <button id="findNextBtn" title="Next finding (])">next ›</button>
+                </div>
+                <div id="findingsList" class="list"></div>
             </div>
-            <div id="loadedSkel"></div>
+
+            <div id="tab-notes" class="tab-body" style="display: none">
+                <div id="notesList" class="list"></div>
+                <div class="dim hint">Select faces, then Note → Save in the bar below.</div>
+            </div>
+
+            <div id="tab-layers" class="tab-body" style="display: none">
+                <div class="layer-head">Mesh</div>
+                <div id="loadedMesh" class="item" style="display: none">
+                    <input type="color" id="meshColorPicker" class="hl-color-input" value="#8c8c99" title="Mesh color" />
+                    <span class="name" id="meshName">-</span>
+                    <button id="toggleMesh" class="toggle-vis icon-btn" title="hide (A)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
+                    <button id="removeMesh" class="icon-btn" title="Remove the mesh">x</button>
+                </div>
+                <div class="row">
+                    <label><input type="checkbox" id="wireToggle" checked /> wire</label>
+                    <label style="margin-left: 10px">opacity <input type="range" id="opacitySlider" min="0" max="100" value="50" /></label>
+                </div>
+
+                <div class="layer-head">
+                    <span title="The components break_up_mesh made. A row's 'pick' says whether its faces can be selected — the scope of every lasso and click.">Components</span>
+                    <span id="scopeNote" class="dim"></span>
+                    <span style="float: right">
+                        <button id="scopeAllBtn" title="Every component pickable">All</button>
+                        <button id="scopeNoneBtn" title="No component pickable">None</button>
+                    </span>
+                </div>
+                <div id="componentList" class="list"></div>
+
+                <div class="layer-head">Skeletons</div>
+                <div id="loadedSkel"></div>
+                <div class="row">
+                    <label><input type="checkbox" id="tubeToggle" /> tubes</label>
+                    <label
+                        style="margin-left: 10px"
+                        title="What a plain click picks: a face of the mesh, or a node (its bin, when the skeleton was built from this mesh) of a skeleton"
+                        >clicks pick
+                        <select id="pickTarget"><option value="mesh">Mesh</option></select></label
+                    >
+                </div>
+
+                <div class="layer-head">Overlays</div>
+                <div class="row">
+                    <label title="Opacity of every face overlay — components, findings, notes"
+                        >opacity <input type="range" id="annOpacitySlider" min="0" max="100" value="90"
+                    /></label>
+                    <button id="showGridBtn" style="margin-left: 10px">Show Grid</button>
+                    <span id="gridStatus" class="dim"></span>
+                </div>
+            </div>
+
+            <div id="hlClearAllRow" class="row inspector-foot" style="display: none">
+                <button id="hlHideAll" class="toggle-vis" title="hide all"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><span>All</span></button>
+                <button id="hlClearAll" style="margin-left: 6px" title="Clear every finding, note and overlay">Clear All</button>
+            </div>
         </div>
 
         <script type="importmap">
@@ -1108,6 +1215,9 @@
             let hlEllipsoids = []; // the wireframe tied to highlight i, if any
             let markerMeshes = [];
             let edgeGroupMeshes = [];
+            // The faces the next action consumes, drawn in the server's
+            // SELECTION_COLOR — amber, which no data colour comes near.
+            const SELECTION_COLOR = [1.0, 0.8, 0.0];
             let manualHighlightFaces = new Set();
             let manualHighlightMesh = null;
 
@@ -1220,10 +1330,14 @@
                     startContactView(contactData);
                     document.getElementById("empty-hint").textContent =
                         "Drop mesh A, then mesh B (.obj, .ply, .stl, .ctm, .npz), and their contact sites (.npz) if you have them";
-                    for (const id of ['info', 'controls', 'detect-panel', 'loaded-panel']) {
+                    for (const id of SINGLE_CELL_PANELS) {
                         const el = document.getElementById(id);
                         if (el) el.style.display = 'none';
                     }
+                    // The sites are the findings; the contact panel holds
+                    // the meshes, so Notes and Layers have nothing to add.
+                    for (const id of ["tabNotes", "tabLayers"])
+                        document.getElementById(id).style.display = "none";
                 }
 
                 // Update loaded panel
@@ -1231,16 +1345,14 @@
 
                 setupControls();
                 setupDragDrop();
+                setupInspector();
+                setupTools();
 
                 renderer.domElement.addEventListener("click", onClickSelect);
                 renderer.domElement.addEventListener("dblclick", onDblClickAnnotation);
                 setupLassoSelection();
                 setupSomaPin();
-                document.getElementById("hlClear").addEventListener("click", () => {
-                    manualHighlightFaces.clear();
-                    rebuildManualHighlight();
-                    syncManualHighlight();
-                });
+                document.getElementById("hlClear").addEventListener("click", clearSelection);
                 document.getElementById("hlRescue").addEventListener("click", runRescueAsNeurite);
                 document.getElementById("hlSaveBtn").addEventListener("click", saveHighlightAsAnnotation);
                 document.getElementById("hlSaveName").addEventListener("keydown", (e) => {
@@ -1261,7 +1373,6 @@
                 document.getElementById("removeOrganellesBtn").addEventListener("click", runRemoveOrganelles);
                 document.getElementById("removeFusionsBtn").addEventListener("click", runRemoveFusions);
                 document.getElementById("removeGapsBtn").addEventListener("click", runRemoveGaps);
-                document.getElementById("undoBtn").addEventListener("click", runUndo);
                 document.getElementById("saveBtn").addEventListener("click", openSaveDialog);
                 document.getElementById("saveDialogClose").addEventListener("click", closeSaveDialog);
                 document.getElementById("save-dialog-backdrop").addEventListener("click", closeSaveDialog);
@@ -1295,18 +1406,14 @@
                     );
                 document.getElementById("reassignApplyBtn").addEventListener("click", applyReassign);
                 document.getElementById("reassignCancelBtn").addEventListener("click", cancelReassign);
-                document
-                    .getElementById("modeMeshBtn")
-                    .addEventListener("click", () => setMode("mesh"));
-                document
-                    .getElementById("modeCompBtn")
-                    .addEventListener("click", () => setMode("components"));
-                document
-                    .getElementById("modeSkelBtn")
-                    .addEventListener("click", () => setMode("skeleton"));
-                document.getElementById("binSkelSel").addEventListener("change", () => {
+                document.getElementById("pickTarget").addEventListener("change", () => {
+                    // Node ids mean different things in different skeletons,
+                    // so picking another starts a new bin selection.
                     clearBinSelection();
-                    fetchEdgeSupport();
+                    dropNodeSelections();
+                    clearEdgeSupport();
+                    refreshEditingSkel();
+                    refreshContextBar();
                 });
                 document.getElementById("binClearBtn").addEventListener("click", clearBinSelection);
                 document.getElementById("binShowBall").addEventListener("change", redrawBinBalls);
@@ -1911,18 +2018,16 @@
                 updateLoadedPanel();
 
                 // Every way the skeleton can change — an edit applied, a
-                // re-skeletonize, an undo restoring currency — arrives here,
-                // so this is the one place that has to notice.  Which pairs
+                // re-skeletonize — arrives here, so this is the one place
+                // that has to notice.  Which pairs
                 // the tree already has is a function of this layer's edges, so
-                // it is re-asked when *this* layer is the one being looked at.
-                if (panelMode === "skeleton") {
-                    refreshBinSkelSel();
-                    if (document.getElementById("binSkelSel").value === name)
-                        fetchEdgeSupport();
+                // it is re-asked when *this* layer is the one picked.
+                if (editingSkel() === name) {
+                    clearEdgeSupport();
+                    if (selectedBins.length) fetchEdgeSupport();
                 }
-                // For the same reason: `stale` rides in on this message, and
-                // an undo that restores the very mesh a skeleton was built
-                // from clears it again.
+                refreshEditingSkel();
+                // For the same reason: `stale` rides in on this message.
                 refreshSkeletonizeCue();
             }
 
@@ -2096,8 +2201,12 @@
                 raycaster.setFromCamera(mouse, camera);
 
                 const pickTarget = document.getElementById("pickTarget").value;
+                // A skeleton built from this mesh is picked as bins: a node
+                // is the surface it owns, so the node or that surface names
+                // it.  Shift stays the face selection's, whatever is picked.
+                const binSkel = binsAvailable() ? editingSkel() : null;
 
-                if (pickTarget.startsWith("skel:")) {
+                if (pickTarget.startsWith("skel:") && !event.shiftKey) {
                     const targetSkelName = pickTarget.slice(5);
                     const sg = skelGroups[targetSkelName];
                     if (!sg || !sg.nodePoints) return;
@@ -2105,8 +2214,17 @@
                     const camDist = camera.position.distanceTo(controls.target);
                     raycaster.params.Points.threshold = camDist * 0.02;
                     const hits = raycaster.intersectObject(sg.nodePoints);
-                    if (hits.length === 0) return;
+                    if (hits.length === 0 && !binSkel) return;
 
+                    if (hits.length && binSkel) {
+                        selectBin(hits[0].index);
+                        return;
+                    }
+                }
+                if (pickTarget.startsWith("skel:") && !event.shiftKey && !binSkel) {
+                    const targetSkelName = pickTarget.slice(5);
+                    const sg = skelGroups[targetSkelName];
+                    const hits = raycaster.intersectObject(sg.nodePoints);
                     const bestHit = hits[0];
                     const bestSkelName = targetSkelName;
                     const skelNodeRadii = sg.radii;
@@ -2116,22 +2234,6 @@
                     const point = bestHit.point;
                     const radius = skelNodeRadii ? skelNodeRadii[nodeIndex] : null;
                     const key = `${bestSkelName}:${nodeIndex}`;
-
-                    // In the Skeleton panel a node is shown as the surface it
-                    // owns, not as a ball: the bin is what a node actually is.
-                    if (panelMode === "skeleton") {
-                        const sel = document.getElementById("binSkelSel");
-                        // Node ids mean different things in different layers,
-                        // so a click that switches layer starts a new
-                        // selection rather than adding to the old one.
-                        if (sel.value !== bestSkelName) {
-                            sel.value = bestSkelName;
-                            clearBinSelection();
-                            fetchEdgeSupport();
-                        }
-                        selectBin(nodeIndex);
-                        return;
-                    }
 
                     // Click same node again → deselect
                     if (selectedNodes[key]) {
@@ -2186,9 +2288,8 @@
                 // Only a *plain* click, though.  Shift is the surface
                 // modifier throughout — it is what draws the lasso — so a
                 // shift-click adjusts the face selection here as it does
-                // everywhere else.  Letting it pick a bin as well gave one
-                // modifier two meanings in the mode where both are live.
-                if (panelMode === "skeleton" && !event.shiftKey) {
+                // everywhere else.
+                if (binSkel && !event.shiftKey) {
                     selectBin(faceIndex, true);
                     return;
                 }
@@ -2214,8 +2315,9 @@
                     point: [point.x.toFixed(2), point.y.toFixed(2), point.z.toFixed(2)],
                     origPoint,
                 };
-                document.getElementById("selDetail").innerHTML =
-                    `<div>Face: <b>${faceIndex}</b></div><div>Pos: ${origPoint.join(", ")}</div>`;
+                const owner = componentOf(faceIndex);
+                document.getElementById("pickedInfo").textContent =
+                    `face ${faceIndex}${owner ? ` (${owner})` : ""} at ${origPoint.join(", ")}`;
 
                 if (ws && ws.readyState === WebSocket.OPEN)
                     ws.send(JSON.stringify({ type: "selection", payload: selInfo }));
@@ -2267,6 +2369,7 @@
 
             // ── Node selection display & sync ─────────────────────────────────────
             function updateNodeSelectionDisplay() {
+                refreshContextBar();
                 const keys = Object.keys(selectedNodes);
                 if (keys.length === 0) {
                     document.getElementById("selDetail").innerHTML = "";
@@ -2335,7 +2438,6 @@
 
                 const faces = Array.from(manualHighlightFaces);
                 document.getElementById("hlCount").textContent = faces.length;
-                document.getElementById("hlSaveRow").style.display = faces.length > 0 ? "block" : "none";
                 if (faces.length === 0 || !meshGeometry) return;
 
                 const posAttr = meshGeometry.getAttribute("position");
@@ -2351,7 +2453,7 @@
                 manualHighlightMesh = new THREE.Mesh(
                     geo,
                     new THREE.MeshPhongMaterial({
-                        color: new THREE.Color(1, 0.8, 0),
+                        color: new THREE.Color(...SELECTION_COLOR),
                         side: THREE.DoubleSide,
                         clippingPlanes: [clipPlane],
                         transparent: true,
@@ -2435,7 +2537,11 @@
                     const resp = await fetchFn();
                     const data = await resp.json();
                     setBtnState(btn, resp.ok ? "done" : "error");
-                    if (resp.ok) noteSkeletonInputs(resp.url);
+                    if (resp.ok) {
+                        noteSkeletonInputs(resp.url);
+                        // What a detection found is to be looked at next.
+                        if (/\/detect_/.test(resp.url || "")) showTab("findings");
+                    }
                     return data;
                 } catch (e) {
                     setBtnState(btn, "error");
@@ -2510,13 +2616,6 @@
                 );
             }
 
-            async function runUndo() {
-                await _runAction(
-                    document.getElementById("undoBtn"),
-                    () => fetch("/undo", { method: "POST" }),
-                );
-            }
-
             // The whole pipeline in one call.  Server-side it is literally
             // pre.preprocess(), so this cannot drift from the library; the
             // per-step buttons below stay for when a run needs watching or a
@@ -2587,102 +2686,271 @@
                 );
             }
 
-            // ── Mode selector ────────────────────────────────────────────
-            // Three modes, one per object in the derivation chain: the mesh,
-            // the components broken out of it, then the skeleton built from
-            // those.  They are also different activities — run the automatic
-            // steps in order, versus select/assign/commit — and separating
-            // them is what keeps a lasso from meaning two things.
-            // `componentMode` stays a boolean because the scope block below
-            // reads exactly one of the three.
-            let panelMode = "mesh"; // mesh | components | skeleton
-            let componentMode = false;
+            // ── The skeleton picked ──────────────────────────────────────
+            // There are no modes: what a plain click picks is a Layers
+            // setting ("clicks pick"), and every verb is offered whenever the
+            // selection makes it legal.  A skeleton picked there is the one
+            // the bin and edge verbs edit.
 
-            const MODE_ROWS = {
-                mesh: "mesh-rows",
-                components: "components-rows",
-                skeleton: "skeleton-rows",
-            };
-            const MODE_BTNS = {
-                mesh: "modeMeshBtn",
-                components: "modeCompBtn",
-                skeleton: "modeSkelBtn",
-            };
+            /** The skeleton clicks pick and the bin verbs edit, or null. */
+            function editingSkel() {
+                const v = document.getElementById("pickTarget").value;
+                return v.startsWith("skel:") && skelGroups[v.slice(5)] ? v.slice(5) : null;
+            }
 
-            function setMode(mode) {
-                // Mesh and Mesh Comp. both read a selection as faces to
-                // operate on; Skeleton reads it as surface to move between
-                // bins.  Carrying one across that line would hand the new
-                // mode a selection made under the other's scope.
-                if ((panelMode === "skeleton") !== (mode === "skeleton")) {
+            /** Whether a skeleton's bins can be picked: it was built from
+             *  the mesh on screen, so its nodes own surface here. */
+            function binsAvailable(name = editingSkel()) {
+                return !!(name && meshObj && skelGroups[name] && !skelGroups[name].stale);
+            }
+
+            /** Pick a skeleton (or the mesh, null) — what a finding that
+             *  names a node needs before its bin can be selected. */
+            function setPickTarget(name) {
+                const sel = document.getElementById("pickTarget");
+                const want = name ? `skel:${name}` : "mesh";
+                if (sel.value === want) return;
+                sel.value = want;
+                clearBinSelection();
+                dropNodeSelections();
+                clearEdgeSupport();
+                refreshEditingSkel();
+                refreshContextBar();
+            }
+
+            // ── The context bar ───────────────────────────────────────────
+            // What is selected, in words, and every verb legal for it.  Each
+            // row of verbs shows when its selection exists — faces, two
+            // faces or nodes or bins, a picked skeleton's bins — and a
+            // pending preview's Apply / Cancel until it is settled; nothing
+            // else decides whether a verb is offered.
+
+            /** Where the selected faces are: the components holding them,
+             *  most first. */
+            function facesWhere() {
+                if (!faceOwner || !manualHighlightFaces.size) return "";
+                const counts = new Map();
+                for (const f of manualHighlightFaces) {
+                    const o = f < faceOwner.length ? faceOwner[f] : -1;
+                    counts.set(o, (counts.get(o) || 0) + 1);
+                }
+                const named = [...counts.entries()]
+                    .sort((a, b) => b[1] - a[1])
+                    .map(
+                        ([o, n]) =>
+                            `${o < 0 ? "no component" : componentName((currentAnnotations.highlights || [])[o], o)}: ${n.toLocaleString()}`,
+                    );
+                return ` — ${named.slice(0, 3).join(", ")}${named.length > 3 ? `, +${named.length - 3} more` : ""}`;
+            }
+
+            function refreshContextBar() {
+                const bar = document.getElementById("context-bar");
+                if (!bar || contactMode) return;
+                const nFaces = manualHighlightFaces.size;
+                const nNodes = Object.keys(selectedNodes).length;
+                const nBins = selectedBins.length;
+                const skel = editingSkel();
+                const nComponents = componentHighlights().length;
+                const show = (id, on) => {
+                    document.getElementById(id).style.display = on ? "block" : "none";
+                };
+                show("ctxFaces", nFaces > 0);
+                show("ctxPath", nFaces === 2 || nNodes === 2 || nBins === 2);
+                show("ctxComponents", nFaces > 0 && nComponents > 0);
+                show("ctxBins", nBins > 0 || binsAvailable(skel));
+                // A preview waiting for Apply, or what one said (an error
+                // too), until it is settled.
+                show(
+                    "ctxPending",
+                    ["reassignPending", "reassignSummary", "skelEditSummary"].some(
+                        (id) => document.getElementById(id).style.display !== "none",
+                    ) || !!pendingSkelEdit,
+                );
+
+                const parts = [];
+                if (nFaces)
+                    parts.push(`${nFaces.toLocaleString()} face${nFaces === 1 ? "" : "s"}${facesWhere()}`);
+                if (nBins) parts.push(`${nBins} bin${nBins === 1 ? "" : "s"} of ${skel}`);
+                if (nNodes) parts.push(`${nNodes} node${nNodes === 1 ? "" : "s"}`);
+                let text = parts.length
+                    ? parts.join(" · ")
+                    : "Nothing selected — Shift+click or Shift+drag the mesh" +
+                      (binsAvailable(skel) ? `; click ${skel}'s nodes or surface for bins` : "");
+                if (scopeOn !== null) text += ` · pickable: ${scopeOn.size} of ${nComponents} components`;
+                document.getElementById("ctxWhat").textContent = text;
+                document.getElementById("hlCount").textContent = String(nFaces);
+                document.getElementById("hlClear").style.display = nFaces || nBins || nNodes ? "" : "none";
+            }
+
+            /** Select nothing: faces, bins and nodes alike. */
+            function clearSelection() {
+                if (manualHighlightFaces.size) {
                     manualHighlightFaces.clear();
                     rebuildManualHighlight();
                     syncManualHighlight();
                 }
-                panelMode = mode;
-                componentMode = mode === "components";
-                for (const [m, id] of Object.entries(MODE_ROWS))
-                    document.getElementById(id).style.display =
-                        m === mode ? "block" : "none";
-                for (const [m, id] of Object.entries(MODE_BTNS))
-                    document.getElementById(id).dataset.active = m === mode ? "1" : "0";
+                if (selectedBins.length) clearBinSelection();
+                if (Object.keys(selectedNodes).length) dropNodeSelections();
+                document.getElementById("selDetail").innerHTML = "";
+                refreshContextBar();
+            }
 
-                // Scoping is a Mesh Comp. notion; leaving a mask applied on the
-                // way out would silently narrow selection in a panel with no
-                // scope UI to explain it.  rebuildScopeMask reads componentMode.
-                rebuildScopeMask();
-                if (componentMode) renderScopeChips();
-                else cancelReassign();
-
-                if (mode === "skeleton") {
-                    refreshBinSkelSel();
-                    // The edge verb cannot be named without knowing which
-                    // pairs the surface supports, so this is not optional.
-                    fetchEdgeSupport();
-                } else {
-                    clearBinSelection();
-                    clearEdgeSupport();
+            /** Frame what is selected: faces, else bins, else nodes; with
+             *  nothing selected, the whole cell. */
+            function focusSelection() {
+                const box = new THREE.Box3();
+                const v = new THREE.Vector3();
+                const addFaces = (faces) => {
+                    if (!meshGeometry) return;
+                    const pos = meshGeometry.getAttribute("position").array;
+                    for (const f of faces)
+                        for (let k = 0; k < 3; k++) {
+                            const b = f * 9 + k * 3;
+                            box.expandByPoint(v.set(pos[b], pos[b + 1], pos[b + 2]));
+                        }
+                };
+                if (manualHighlightFaces.size) addFaces(manualHighlightFaces);
+                else if (selectedBins.length) for (const b of selectedBins) addFaces(b.faces);
+                else if (Object.keys(selectedNodes).length)
+                    for (const s of Object.values(selectedNodes)) box.expandByPoint(v.fromArray(s.point));
+                else {
+                    fitCamera();
+                    return;
                 }
+                if (box.isEmpty()) return;
+                const center = box.getCenter(new THREE.Vector3());
+                const radius = Math.max(box.getSize(new THREE.Vector3()).length() / 2, 200);
+                const offset = camera.position.clone().sub(controls.target).normalize();
+                controls.target.copy(center);
+                camera.position.copy(center).addScaledVector(offset, radius * 3);
+                controls.update();
+                scheduleStateUpdate();
+            }
+
+            /** Grab or rotate the selected faces, from a button. */
+            function startTransformFromUI(mode) {
+                if (!manualHighlightFaces.size) {
+                    showLogStatus("Select faces first — Shift+click or Shift+drag");
+                    fadeLogStatus();
+                    return;
+                }
+                if (transformMode) cancelTransform();
+                startTransform(mode);
+            }
+
+            function toggleHelp() {
+                const p = document.getElementById("help-panel");
+                p.style.display = p.style.display === "none" ? "block" : "none";
+            }
+
+            // ── The inspector's tabs and the tools ───────────────────────
+            function showTab(name) {
+                for (const btn of document.querySelectorAll("#inspector .tab"))
+                    btn.dataset.active = btn.dataset.tab === name ? "1" : "0";
+                for (const t of ["findings", "notes", "layers"])
+                    document.getElementById(`tab-${t}`).style.display = t === name ? "block" : "none";
+                try {
+                    localStorage.setItem("skeliner_tab", name);
+                } catch (e) {}
+            }
+
+            function setupInspector() {
+                for (const btn of document.querySelectorAll("#inspector .tab"))
+                    btn.addEventListener("click", () => showTab(btn.dataset.tab));
+                document.getElementById("findPrevBtn").addEventListener("click", () => stepFinding(-1));
+                document.getElementById("findNextBtn").addEventListener("click", () => stepFinding(1));
+                let saved = null;
+                try {
+                    saved = localStorage.getItem("skeliner_tab");
+                } catch (e) {}
+                if (contactMode) showTab("findings");
+                else if (["findings", "notes", "layers"].includes(saved)) showTab(saved);
+            }
+
+            function setupTools() {
+                const on = (id, fn) => document.getElementById(id).addEventListener("click", fn);
+                on("toolFocus", focusSelection);
+                on("toolGrab", () => startTransformFromUI("translate"));
+                on("toolRotate", () => startTransformFromUI("rotate"));
+                on("ctxGrab", () => startTransformFromUI("translate"));
+                on("ctxRotate", () => startTransformFromUI("rotate"));
+                on("toolViewX", () => setAxisView("x", 1));
+                on("toolViewY", () => setAxisView("y", 1));
+                on("toolViewZ", () => setAxisView("z", 1));
+                on("toolLock", () => {
+                    toggleCameraLock();
+                    document.getElementById("toolLock").dataset.on = cameraLocked ? "1" : "0";
+                });
+                on("toolHelp", toggleHelp);
+                on("helpBtn", toggleHelp);
+                on("helpClose", toggleHelp);
+                refreshContextBar();
             }
 
             // ── Selection scope ──────────────────────────────────────────
             // Near the soma several components sit within a few pixels of
             // each other, so an unscoped lasso grabs soma faces and
             // neighbouring dendrites along with the band that was wanted.
-            // Scoping lets the user draw roughly instead of carefully.
+            // Scoping lets the user draw roughly instead of carefully: a
+            // component's "pick" switch in Layers, or Alt with the lasso,
+            // which keeps it to the component it starts on.
             //
             // scopeOn is an allow-list of indices into
-            // currentAnnotations.highlights.  `null` means "not chosen yet",
-            // which shows every chip lit and behaves like Mesh does; an
-            // *empty* set is a deliberate choice that nothing is pickable.
-            // Keeping those two apart is what lets "All" and "None" be
-            // different buttons rather than two ways to say the same thing.
+            // currentAnnotations.highlights, components only.  `null` means
+            // "not chosen yet", which shows every switch on and leaves
+            // everything pickable; an *empty* set is a deliberate choice that
+            // nothing is pickable.  Keeping those two apart is what lets
+            // "All" and "None" be different buttons rather than two ways to
+            // say the same thing.
             //
             // The mask is a face-length Uint8Array rather than a Set because
             // the lookup is the lasso's inner loop, over every face.
             let scopeMask = null; // null → unscoped, everything pickable
             let scopeOn = null;
-            // Skeleton's scope, filled in by rebuildBinScopeMask.  Here
-            // rather than with the bin code because inScope is the one pick
-            // path both modes go through, and a scope it cannot see is a scope
-            // that silently does not apply.  Note `null` means the opposite of
-            // it does above: nothing pickable, since with no destination bin
-            // chosen there is nowhere for a lassoed vertex to go.
-            let binScopeMask = null;
+            // Face → index into currentAnnotations.highlights of the
+            // component holding it (-1: none), for the selection's summary
+            // and for Alt+lasso.
+            let faceOwner = null;
 
+            /** The component highlight groups, with their indices. */
             function componentHighlights() {
                 if (!currentAnnotations || !currentAnnotations.highlights) return [];
                 return currentAnnotations.highlights
                     .map((g, i) => ({ g, i }))
-                    .filter(({ g }) => (g.faces || []).length > 0);
+                    .filter(({ g }) => (g.faces || []).length > 0 && annotationKind(g, "highlights") === "component");
             }
 
             function scopeHas(i) {
                 return scopeOn === null || scopeOn.has(i);
             }
 
+            function rebuildFaceOwner() {
+                faceOwner = null;
+                if (!meshGeometry) return;
+                const comps = componentHighlights();
+                if (!comps.length) return;
+                const nFaces = meshGeometry.getAttribute("position").count / 3;
+                faceOwner = new Int32Array(nFaces).fill(-1);
+                for (const { g, i } of comps)
+                    for (const f of g.faces) if (f < nFaces) faceOwner[f] = i;
+            }
+
+            /** The name of the component holding a face, or "". */
+            function componentOf(faceIndex) {
+                if (!faceOwner || faceIndex >= faceOwner.length) return "";
+                const i = faceOwner[faceIndex];
+                if (i < 0) return "";
+                return componentName((currentAnnotations.highlights || [])[i], i);
+            }
+
+            /** A component's name as its rows show it: the label up to its
+             *  face count. */
+            function componentName(g, i) {
+                return ((g && g.label) || `group ${i}`).split(" (")[0];
+            }
+
             function rebuildScopeMask() {
-                if (!componentMode || scopeOn === null || !meshGeometry) {
+                if (scopeOn === null || !meshGeometry) {
                     scopeMask = null;
                     return;
                 }
@@ -2694,154 +2962,157 @@
                 }
             }
 
-            // Two modes, two scopes, one pick path.  Mesh Comp. bounds the
-            // lasso by component; Skeleton bounds it by the destination
-            // bin's graph neighbours, which is a correctness constraint and
-            // not only a convenience — see binScopeMask.
+            // One pick path for clicks, double-clicks and the lasso: the
+            // components switched on in Layers.  An Alt+lasso narrows it to
+            // the component under its start (lassoOwner).
+            let lassoOwner = -1;
             function inScope(faceIndex) {
-                if (panelMode === "skeleton") {
-                    return binScopeMask !== null && binScopeMask[faceIndex] === 1;
-                }
+                if (lassoOwner >= 0 && (!faceOwner || faceOwner[faceIndex] !== lassoOwner))
+                    return false;
                 return scopeMask === null || scopeMask[faceIndex] === 1;
             }
 
             // Discarded components are fragments the neurites already lost — all
             // but the wrongly-discarded ones are disconnected, and reassigning
             // a disconnected fragment cannot connect it to anything.  There
-            // can be dozens, so they collapse into one chip that acts on the
-            // whole set, and expand only when asked.
+            // can be dozens, so they fold into one row that acts on the whole
+            // set, and unfold only when asked.
             let discardedExpanded = false;
 
             function isDiscarded(g) {
                 return (g.label || "").startsWith("discarded ");
             }
 
-            function makeScopeChip(label, color, indices, { sub = false } = {}) {
+            /** A row's pick switch for the components at `indices`: on when
+             *  all are pickable, mixed when some are. */
+            function pickToggle(indices) {
                 const on = indices.filter((i) => scopeHas(i)).length;
-                const btn = document.createElement("button");
-                btn.dataset.on =
-                    on === indices.length ? "1" : on === 0 ? "0" : "mixed";
-                btn.title =
+                const label = document.createElement("label");
+                label.className = "pick-toggle";
+                label.title =
                     indices.length > 1
-                        ? "click to toggle all, double-click for this group alone"
-                        : "click to toggle, double-click for this one alone";
-                if (sub) btn.classList.add("scope-sub");
-                const sw = document.createElement("span");
-                sw.className = "chip-swatch";
-                sw.style.background = `rgb(${Math.round(color[0] * 255)},${Math.round(
-                    color[1] * 255,
-                )},${Math.round(color[2] * 255)})`;
-                btn.appendChild(sw);
-                btn.appendChild(document.createTextNode(label));
-
+                        ? "whether their faces can be selected; double-click for these alone"
+                        : "whether its faces can be selected; double-click for this one alone";
+                const box = document.createElement("input");
+                box.type = "checkbox";
+                box.checked = on === indices.length;
+                box.indeterminate = on > 0 && on < indices.length;
                 const all = componentHighlights().map((x) => x.i);
-                btn.addEventListener("click", () => {
-                    // First click materialises the implicit "everything", so
-                    // toggling one chip off leaves the rest lit.
+                box.addEventListener("change", () => {
+                    // The first change materialises the implicit
+                    // "everything", so switching one off leaves the rest on.
                     if (scopeOn === null) scopeOn = new Set(all);
-                    if (on === indices.length) for (const i of indices) scopeOn.delete(i);
-                    else for (const i of indices) scopeOn.add(i);
+                    if (box.checked) for (const i of indices) scopeOn.add(i);
+                    else for (const i of indices) scopeOn.delete(i);
                     rebuildScopeMask();
-                    renderScopeChips();
+                    renderComponentRows();
+                    refreshContextBar();
                 });
-                btn.addEventListener("dblclick", () => {
+                label.addEventListener("dblclick", (e) => {
+                    e.preventDefault();
                     scopeOn = new Set(indices);
                     rebuildScopeMask();
-                    renderScopeChips();
+                    renderComponentRows();
+                    refreshContextBar();
                 });
-                return btn;
+                label.appendChild(box);
+                label.appendChild(document.createTextNode(" pick"));
+                return label;
             }
 
-            function renderScopeChips() {
-                const host = document.getElementById("scopeChips");
+            /** Layers' component rows: one per component, the discarded
+             *  folded into one, each with its pick switch. */
+            function renderComponentRows() {
+                const host = document.getElementById("componentList");
+                if (!host) return;
                 host.innerHTML = "";
                 const groups = componentHighlights();
+                const note = document.getElementById("scopeNote");
                 if (!groups.length) {
                     host.innerHTML =
-                        "<span style='color:#a86'>run Break first — no components yet</span>";
+                        "<div class='dim'>none yet — Run, or Steps → Break</div>";
+                    if (note) note.textContent = "";
                     return;
                 }
-
                 const discarded = groups.filter(({ g }) => isDiscarded(g));
                 const named = groups.filter(({ g }) => !isDiscarded(g));
+                for (const { g, i } of named) host.appendChild(highlightRow(g, i, { pick: true }));
 
-                for (const { g, i } of named) {
-                    host.appendChild(
-                        makeScopeChip(
-                            (g.label || `group ${i}`).split(" (")[0],
-                            g.color || [1, 1, 1],
-                            [i],
-                        ),
-                    );
-                }
-
-                // One of them is just a component; only a pile needs collapsing.
                 if (discarded.length === 1) {
                     const { g, i } = discarded[0];
-                    host.appendChild(
-                        makeScopeChip(
-                            (g.label || "discarded").split(" (")[0],
-                            g.color || [0.5, 0.5, 0.5],
-                            [i],
-                        ),
-                    );
+                    host.appendChild(highlightRow(g, i, { pick: true }));
                 } else if (discarded.length > 1) {
                     const idx = discarded.map((x) => x.i);
-                    host.appendChild(
-                        makeScopeChip(
-                            `discarded ×${discarded.length}`,
-                            discarded[0].g.color || [0.5, 0.5, 0.5],
-                            idx,
-                        ),
-                    );
+                    const nf = discarded.reduce((s, { g }) => s + g.faces.length, 0);
+                    const row = document.createElement("div");
+                    row.className = "hl-item";
+                    const left = document.createElement("span");
+                    left.style.cssText = "display:flex;align-items:center;";
                     const expander = document.createElement("button");
-                    expander.className = "scope-expander";
+                    expander.className = "icon-btn";
                     expander.textContent = discardedExpanded ? "▾" : "▸";
-                    expander.title = discardedExpanded
-                        ? "collapse the discarded fragments"
-                        : "list the discarded fragments";
+                    expander.title = discardedExpanded ? "fold the discarded fragments" : "list the discarded fragments";
+                    expander.style.marginLeft = "0";
+                    expander.style.marginRight = "6px";
                     expander.addEventListener("click", () => {
                         discardedExpanded = !discardedExpanded;
-                        renderScopeChips();
+                        renderComponentRows();
                     });
-                    host.appendChild(expander);
-
-                    if (discardedExpanded) {
-                        for (const { g, i } of discarded) {
-                            host.appendChild(
-                                makeScopeChip(
-                                    (g.label || `discarded ${i}`).split(" (")[0],
-                                    g.color || [0.5, 0.5, 0.5],
-                                    [i],
-                                    { sub: true },
-                                ),
-                            );
-                        }
-                    }
+                    left.appendChild(expander);
+                    const name = document.createElement("span");
+                    name.textContent = `discarded ×${discarded.length}`;
+                    left.appendChild(name);
+                    const count = document.createElement("span");
+                    count.className = "dim";
+                    count.textContent = ` (${nf.toLocaleString()})`;
+                    left.appendChild(count);
+                    row.appendChild(left);
+                    const eye = document.createElement("button");
+                    eye.className = "toggle-vis icon-btn";
+                    const shown = () => idx.some((i) => {
+                        const m = annotationMeshes[i];
+                        return !m || m.visible;
+                    });
+                    setToggleVisIcon(eye, shown());
+                    eye.title = "show or hide every discarded fragment";
+                    eye.addEventListener("click", () => {
+                        const vis = !shown();
+                        for (const i of idx) if (annotationMeshes[i]) annotationMeshes[i].visible = vis;
+                        setToggleVisIcon(eye, vis);
+                        _saveAnnVisibility();
+                    });
+                    row.appendChild(eye);
+                    row.appendChild(pickToggle(idx));
+                    host.appendChild(row);
+                    if (discardedExpanded)
+                        for (const { g, i } of discarded)
+                            host.appendChild(highlightRow(g, i, { pick: true, sub: true }));
                 }
 
-                const lit = scopeOn === null ? groups.length : scopeOn.size;
-                const note = document.createElement("span");
-                note.style.cssText = `color:${lit ? "#888" : "#a86"};margin-left:10px`;
-                note.textContent = lit
-                    ? `${lit} of ${groups.length} pickable`
-                    : "nothing pickable — light a component";
-                host.appendChild(note);
+                if (note) {
+                    const lit = scopeOn === null ? groups.length : scopeOn.size;
+                    note.textContent =
+                        scopeOn === null
+                            ? ""
+                            : lit
+                              ? `${lit} of ${groups.length} pickable`
+                              : "nothing pickable";
+                }
             }
 
             function setScopeAll(on) {
                 scopeOn = on ? null : new Set();
                 rebuildScopeMask();
-                renderScopeChips();
+                renderComponentRows();
+                refreshContextBar();
             }
 
             function resetScope() {
                 // Component ids are positions in a list re-sorted by size on
                 // every re-derive, so a scope kept across one would name
-                // different components than the user lit.
+                // different components than the user switched on.
                 scopeOn = null;
                 rebuildScopeMask();
-                if (componentMode) renderScopeChips();
             }
 
             // ── Rescue discarded fragments ───────────────────────────────
@@ -2883,11 +3154,11 @@
                     isDiscarded(g),
                 );
                 if (!discarded.length) {
-                    hint.textContent = "none — run Break first";
+                    hint.textContent = "none — Run, or Steps → Break";
                 } else if (!discarded.some(({ i }) => scopeHas(i))) {
                     // Scope is a pick filter, so an unlit fragment cannot be
                     // selected at all and the double-click just does nothing.
-                    hint.textContent = "out of scope — light their chip first";
+                    hint.textContent = "not pickable — switch them on in Layers";
                 } else {
                     hint.textContent = "double-click one in the 3D view";
                 }
@@ -2950,6 +3221,7 @@
                 document.getElementById("reassignPending").style.display = on
                     ? "inline"
                     : "none";
+                refreshContextBar();
             }
 
             async function runReassign(target, btn) {
@@ -2980,7 +3252,7 @@
                 // them so the majority-rule fringe is visible as the part of
                 // the change nobody drew.
                 drawReassignOverlay(data.leaving, [0.9, 0.3, 0.9]);
-                drawReassignOverlay(data.entering, [0.2, 1.0, 0.6]);
+                drawReassignOverlay(data.entering, [0.098, 0.62, 0.439]);
 
                 const effects = data.effects.length
                     ? data.effects
@@ -3032,7 +3304,7 @@
                 [1.0, 0.35, 0.1],
                 [0.2, 0.9, 1.0],
                 [0.9, 0.3, 1.0],
-                [0.4, 1.0, 0.35],
+                [0.224, 0.529, 0.898],
             ];
             let binOverlays = [];   // face patches, one per selected bin
             let binBalls = [];      // the radius each bin produces
@@ -3044,39 +3316,18 @@
                 return selectedBins.length ? selectedBins[0] : null;
             }
 
-            function rebuildBinScopeMask() {
-                const dest = binDestination();
-                if (!dest || !dest.editable || !meshGeometry) {
-                    binScopeMask = null;
-                    return;
-                }
-                const nFaces = meshGeometry.getAttribute("position").count / 3;
-                binScopeMask = new Uint8Array(nFaces);
-                for (const f of dest.scopeFaces || []) {
-                    if (f < nFaces) binScopeMask[f] = 1;
-                }
-            }
-
-            function refreshBinSkelSel() {
-                const sel = document.getElementById("binSkelSel");
-                const had = sel.value;
-                sel.innerHTML = "";
-                for (const [name, g] of Object.entries(skelGroups)) {
-                    const o = document.createElement("option");
-                    o.value = name;
-                    o.textContent = g.stale ? `${name} (stale)` : name;
-                    sel.appendChild(o);
-                }
-                if (had && skelGroups[had]) sel.value = had;
-                if (!sel.options.length) {
-                    setBinReadout("No skeleton loaded — run Skeletonize first.");
-                } else if (skelGroups[sel.value] && skelGroups[sel.value].stale) {
+            /** Say whether the picked skeleton's bins can be edited: one
+             *  built from another mesh names vertices that have moved. */
+            function refreshEditingSkel() {
+                const name = editingSkel();
+                if (name && skelGroups[name].stale) {
                     setBinReadout(
                         '<span style="color:#e77">This skeleton was built from a ' +
                             "different mesh — its bins name vertices that have " +
                             "moved. Re-skeletonize before editing.</span>",
                     );
                 }
+                refreshContextBar();
             }
 
             function setBinReadout(html) {
@@ -3100,9 +3351,9 @@
                 setBinReadout("Click a node, or the surface it owns, to select a bin.");
                 // The pending edit names the bins that just went away.
                 runSkelCancel();
-                rebuildBinScopeMask();
                 refreshBinMoveRow();
                 refreshEdgeRow();
+                refreshContextBar();
             }
 
             function redrawBinBalls() {
@@ -3113,7 +3364,7 @@
                 }
                 binBalls = [];
                 if (!document.getElementById("binShowBall").checked) return;
-                const sname = document.getElementById("binSkelSel").value;
+                const sname = editingSkel();
                 const sg = skelGroups[sname];
                 if (!sg || !sg.nodes) return;
                 selectedBins.forEach((b, i) => {
@@ -3172,7 +3423,7 @@
 
             /** Select the bin for a node id, or for a face if `byFace`. */
             async function selectBin(value, byFace = false) {
-                const sname = document.getElementById("binSkelSel").value;
+                const sname = editingSkel();
                 if (!sname) {
                     setBinReadout("No skeleton loaded — run Skeletonize first.");
                     return;
@@ -3212,9 +3463,12 @@
                 );
                 redrawBinBalls();
                 renderBinReadout();
-                rebuildBinScopeMask();
                 refreshBinMoveRow();
                 refreshEdgeRow();
+                // The edge verb cannot be named without knowing which pairs
+                // the surface supports; asked once per skeleton picked.
+                if (!surfaceEdges) fetchEdgeSupport();
+                refreshContextBar();
             }
 
             // ── Edge editing ─────────────────────────────────────────────
@@ -3243,7 +3497,7 @@
             }
 
             function treeHasEdge(u, v) {
-                const sg = skelGroups[document.getElementById("binSkelSel").value];
+                const sg = skelGroups[editingSkel()];
                 const e = sg && sg.data && sg.data.edges;
                 if (!e) return false;
                 for (let i = 0; i < e.length; i += 2) {
@@ -3293,7 +3547,7 @@
 
             /** Line segments between node pairs of the selected skeleton. */
             function makeSkelLines(pairs, color, opacity = 1.0) {
-                const sg = skelGroups[document.getElementById("binSkelSel").value];
+                const sg = skelGroups[editingSkel()];
                 if (!sg || !sg.nodes || !pairs.length) return null;
                 const pos = new Float32Array(pairs.length * 6);
                 let n = 0;
@@ -3407,7 +3661,9 @@
 
             async function runDiagnostic() {
                 const kind = document.getElementById("dxKindSel").value;
-                const sname = document.getElementById("binSkelSel").value;
+                // The skeleton picked, else the first loaded: a check reads
+                // a skeleton, not the bins clicks pick.
+                const sname = editingSkel() || Object.keys(skelGroups)[0];
                 const status = document.getElementById("dxStatus");
                 const btn = document.getElementById("dxRunBtn");
                 if (!sname) {
@@ -3429,7 +3685,7 @@
                     });
                     const data = await r.json();
                     status.textContent = data.ok
-                        ? `${data.n} found — open Annotations to step through`
+                        ? `${data.n} found — step through them with next ›`
                         : data.error || "error";
                 } catch (e) {
                     status.textContent = "error: " + e.message;
@@ -3445,8 +3701,8 @@
              * ~15 ms on a 583-node cell, ~110 ms on an 11k-node one.
              */
             async function fetchEdgeSupport() {
-                const sname = document.getElementById("binSkelSel").value;
-                if (panelMode !== "skeleton" || !sname) {
+                const sname = editingSkel();
+                if (!sname || !binsAvailable(sname)) {
                     clearEdgeSupport();
                     return;
                 }
@@ -3463,7 +3719,7 @@
                     return;
                 }
                 // A reply for a layer no longer selected describes other nodes.
-                if (panelMode !== "skeleton" || document.getElementById("binSkelSel").value !== sname)
+                if (editingSkel() !== sname)
                     return;
                 if (!data.ok) {
                     clearEdgeSupport();
@@ -3503,6 +3759,7 @@
                     clearBinMoveOverlay();
                     edgePreviewOverlay = disposeLine(edgePreviewOverlay);
                 }
+                refreshContextBar();
             }
 
             /**
@@ -3658,9 +3915,9 @@
                 if (!dest) return;
                 // A split names no destination — its node does not exist yet.
                 const base = route
-                    ? { name: document.getElementById("binSkelSel").value }
+                    ? { name: editingSkel() }
                     : {
-                          name: document.getElementById("binSkelSel").value,
+                          name: editingSkel(),
                           to: dest.node,
                       };
                 const data = await _runAction(document.getElementById(btnId), () =>
@@ -3675,7 +3932,7 @@
                     return;
                 }
                 clearBinMoveOverlay();
-                binMoveOverlay = makeFaceOverlay(data.movedFaces, [0.3, 1.0, 0.3], 0.9);
+                binMoveOverlay = makeFaceOverlay(data.movedFaces, [0.098, 0.62, 0.439], 0.9);
                 renderBinEditSummary(data);
                 setSkelPending("bin");
             }
@@ -3767,7 +4024,7 @@
                             method: "POST",
                             headers: { "Content-Type": "application/json" },
                             body: JSON.stringify({
-                                name: document.getElementById("binSkelSel").value,
+                                name: editingSkel(),
                                 u: pair[0],
                                 v: pair[1],
                             }),
@@ -3781,7 +4038,7 @@
                 if (data.verb === "clip") {
                     // What a cut costs is the subtree it strands, so draw
                     // that rather than the edge being removed.
-                    const sg = skelGroups[document.getElementById("binSkelSel").value];
+                    const sg = skelGroups[editingSkel()];
                     const orphan = new Set(data.orphans);
                     const e = sg && sg.data ? sg.data.edges : [];
                     const pairs = [];
@@ -3792,7 +4049,7 @@
                 } else {
                     edgePreviewOverlay = makeSkelLines(
                         [[data.u, data.v]],
-                        data.verb === "restore" ? [0.3, 1.0, 0.3] : [1.0, 0.7, 0.1],
+                        data.verb === "restore" ? [0.098, 0.62, 0.439] : [0.224, 0.529, 0.898],
                     );
                 }
                 renderEdgeEditSummary(data);
@@ -3813,7 +4070,7 @@
                                 method: "POST",
                                 headers: { "Content-Type": "application/json" },
                                 body: JSON.stringify({
-                                    name: document.getElementById("binSkelSel").value,
+                                    name: editingSkel(),
                                 }),
                             },
                         ),
@@ -3832,7 +4089,7 @@
             async function runSkelCancel() {
                 // Nothing this page previewed is waiting on the server.
                 if (!pendingSkelEdit) return;
-                const name = document.getElementById("binSkelSel").value;
+                const name = editingSkel();
                 const body = JSON.stringify({ name });
                 const opts = {
                     method: "POST",
@@ -4308,6 +4565,14 @@
                             node1: s1.nodeIndex,
                             node2: s2.nodeIndex,
                         };
+                    } else if (selectedBins.length === 2) {
+                        // Two bins are two nodes of the picked skeleton.
+                        body = {
+                            type: "skeleton",
+                            skelName: editingSkel(),
+                            node1: selectedBins[0].node,
+                            node2: selectedBins[1].node,
+                        };
                     } else if (nFaces === 2) {
                         const faces = Array.from(manualHighlightFaces);
                         body = { type: "mesh", face1: faces[0], face2: faces[1], mode };
@@ -4332,8 +4597,10 @@
                             if (!currentAnnotations.highlights) currentAnnotations.highlights = [];
                             currentAnnotations.highlights.push({
                                 faces: data.path,
-                                color: [0.2, 1.0, 0.8],
+                                color: [0.247, 0.773, 0.831],
                                 label: `path (${data.nFaces}f, ${data.length.toFixed(0)}nm)`,
+                                role: "finding",
+                                source: "paths",
                             });
                             manualHighlightFaces.clear();
                             rebuildManualHighlight();
@@ -4342,12 +4609,15 @@
                             if (!currentAnnotations.edge_groups) currentAnnotations.edge_groups = [];
                             currentAnnotations.edge_groups.push({
                                 segments: data.segments,
-                                color: [1.0, 1.0, 0.2],
+                                color: [0.247, 0.773, 0.831],
                                 label: `path (${data.nNodes}n, ${data.length.toFixed(0)}nm)`,
+                                role: "finding",
+                                source: "paths",
                             });
                         }
                         applyAnnotations(currentAnnotations);
                         syncAnnotationsToServer();
+                        showTab("findings");
                         btn.textContent =
                             data.type === "mesh"
                                 ? `${data.nFaces}f ${data.length.toFixed(0)}nm`
@@ -4375,10 +4645,11 @@
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify(payload),
                     }).catch(() => {});
-                // Every selection change funnels through here, so neither row
-                // can fall out of step with what is selected.
+                // Every selection change funnels through here, so no row of
+                // the context bar can fall out of step with what is selected.
                 refreshRescueRow();
                 refreshBinMoveRow();
+                refreshContextBar();
             }
 
             // ── Transform (edit mesh) ─────────────────────────────────────
@@ -4677,13 +4948,14 @@
                 if (el) el.style.display = "none";
             }
 
+            // The server's SERIES_COLORS: each apart from the next, none
+            // near the selection's amber.
             const SAVE_COLORS = [
-                [0.2, 0.6, 1.0],
-                [0.1, 0.9, 0.4],
-                [0.9, 0.2, 0.8],
-                [1.0, 0.9, 0.1],
-                [1.0, 0.4, 0.1],
-                [0.4, 0.9, 0.9],
+                [0.902, 0.404, 0.404],
+                [0.224, 0.529, 0.898],
+                [0.851, 0.349, 0.149],
+                [0.098, 0.62, 0.439],
+                [0.565, 0.522, 0.914],
             ];
             let saveColorIdx = 0;
 
@@ -4695,7 +4967,7 @@
                 const color = SAVE_COLORS[saveColorIdx % SAVE_COLORS.length];
                 saveColorIdx++;
 
-                const payload = { faces, color, label };
+                const payload = { faces, color, label, role: "note" };
                 if (ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({ type: "save_highlight", payload }));
                 } else {
@@ -4749,7 +5021,8 @@
                     currentAnnotations.edge_groups.push({
                         segments: data.segments,
                         label: "chunk grid",
-                        color: [1.0, 0.6, 0.0],
+                        role: "grid",
+                        color: [0.45, 0.55, 1.0],
                     });
                     applyAnnotations(currentAnnotations);
                     syncAnnotationsToServer();
@@ -4887,34 +5160,38 @@
              * the nearest face the ray meets on the kept side of the clip
              * plane, the side the lasso takes faces from.
              */
-            function onHighlight(x, y) {
-                if (!meshObj || manualHighlightFaces.size === 0) return false;
+            /** The face under a screen point, on the kept side of the clip
+             *  plane, or -1. */
+            function faceAt(x, y) {
+                if (!meshObj) return -1;
                 mouse.x = (x / window.innerWidth) * 2 - 1;
                 mouse.y = -(y / window.innerHeight) * 2 + 1;
                 raycaster.setFromCamera(mouse, camera);
                 for (const hit of raycaster.intersectObject(meshObj)) {
                     if (clipPlane.distanceToPoint(hit.point) < 0) continue;
-                    return manualHighlightFaces.has(hit.faceIndex);
+                    return hit.faceIndex;
                 }
-                return false;
+                return -1;
             }
 
             /**
-             * Shift+drag a rectangle over the surface.  Where the drag starts
-             * decides what it does, as shift-click does for one face: started
-             * on a highlighted face it takes the highlighted faces under the
-             * rectangle out of the highlight — so its edge can be trimmed by
-             * a rectangle that spills past it — and started anywhere else it
-             * adds the faces under the rectangle.  The rectangle turns red
-             * once the drag is one that takes faces out.
+             * Drag a rectangle over the surface.  The keys held at the
+             * press say what it does, nothing else: Shift adds the faces
+             * under it; Shift with Cmd (Ctrl off a Mac) takes every selected
+             * face under it out of the selection, however much of the
+             * rectangle lies over unselected surface, and adds none.  The
+             * rectangle is red while it takes faces out.  With Alt as well
+             * an add keeps to the component the drag starts on.
              */
             function setupLassoSelection() {
                 const rect = document.getElementById("lasso-rect");
                 let dragging = false;
                 let startX = 0,
                     startY = 0;
-                // whether the drag takes faces out; null until it is a drag
-                let removing = null;
+                // whether the drag takes faces out: Cmd / Ctrl at the press
+                let removing = false;
+                // Alt held at the start: keep to the component under it
+                let ownComponent = false;
 
                 renderer.domElement.addEventListener("pointerdown", (e) => {
                     if (!e.shiftKey || e.button !== 0) return;
@@ -4922,8 +5199,9 @@
                     // Prevent orbit controls from handling shift+drag
                     controls.enabled = false;
                     dragging = true;
-                    removing = null;
-                    rect.classList.remove("removing");
+                    removing = e.metaKey || e.ctrlKey;
+                    ownComponent = e.altKey && !removing;
+                    rect.classList.toggle("removing", removing);
                     startX = e.clientX;
                     startY = e.clientY;
                     rect.style.left = startX + "px";
@@ -4937,14 +5215,6 @@
 
                 window.addEventListener("pointermove", (e) => {
                     if (!dragging) return;
-                    // Past the click threshold this is a drag, and the face it
-                    // started on decides what it does — looked up only now,
-                    // so a shift-click does not pay for a second raycast.
-                    const far = Math.abs(e.clientX - startX) >= 5 || Math.abs(e.clientY - startY) >= 5;
-                    if (removing === null && far) {
-                        removing = onHighlight(startX, startY);
-                        rect.classList.toggle("removing", removing);
-                    }
                     const x = Math.min(startX, e.clientX);
                     const y = Math.min(startY, e.clientY);
                     const w = Math.abs(e.clientX - startX);
@@ -4976,7 +5246,6 @@
                     suppressClickAfterDrag();
 
                     if (!meshGeometry) return;
-                    if (removing === null) removing = onHighlight(startX, startY);
                     const posAttr = meshGeometry.getAttribute("position");
                     const nFaces = posAttr.count / 3;
 
@@ -5004,9 +5273,21 @@
                             if (inRect(i)) manualHighlightFaces.delete(i);
                         }
                     } else {
+                        // Alt: the component under the start bounds the add,
+                        // on top of the scope; off any component, nothing.
+                        if (ownComponent) {
+                            const f = faceAt(startX, startY);
+                            lassoOwner = f >= 0 && faceOwner ? faceOwner[f] : -1;
+                            if (lassoOwner < 0) {
+                                showLogStatus("Alt+lasso: start on a component");
+                                fadeLogStatus();
+                                return;
+                            }
+                        }
                         for (let i = 0; i < nFaces; i++) {
                             if (inRect(i) && inScope(i)) manualHighlightFaces.add(i);
                         }
+                        lassoOwner = -1;
                     }
 
                     rebuildManualHighlight();
@@ -5017,6 +5298,8 @@
             // ── Right-click / Ctrl+click to recenter ─────────────────────────
             let pointerDownPos = null;
             function onRecenter(event) {
+                // Shift is the selection's: Shift+Cmd is a lasso that unselects
+                if (event.shiftKey) return;
                 const isRight = event.button === 2;
                 const isCtrlLeft = event.button === 0 && (event.ctrlKey || event.metaKey);
                 if (!isRight && !isCtrlLeft) return;
@@ -5173,10 +5456,12 @@
                 annotationsHidden = false;
                 setToggleVisIcon(document.getElementById("hlHideAll"), true, "All");
                 currentAnnotations = annotations;
+                rebuildFaceOwner();
                 resetScope();
                 refreshRescueRow();
                 if (!annotations) {
                     updateHighlightsPanel();
+                    refreshContextBar();
                     return;
                 }
                 let hiddenLabels = [];
@@ -5353,6 +5638,7 @@
                 if (contactMode) applyContactVisibility();
                 // listed once drawn, so each row's eye shows what its mesh does
                 updateHighlightsPanel();
+                refreshContextBar();
             }
 
             // Announcements can come in quick succession (a reset, then the
@@ -5535,322 +5821,520 @@
                 controls.update();
                 scheduleStateUpdate();
 
-                if (mk.node == null || panelMode !== "skeleton") return;
-                const sel = document.getElementById("binSkelSel");
-                if (mk.skelName && sel.value !== mk.skelName && skelGroups[mk.skelName]) {
-                    sel.value = mk.skelName;
-                    clearBinSelection();
-                    fetchEdgeSupport();
-                } else {
-                    clearBinSelection();
-                }
+                // A node it names is picked as its bin, so the bin verbs are
+                // armed the moment the camera gets there: the skeleton it
+                // names becomes the one clicks pick, if it has bins here.
+                const sname = mk.skelName && skelGroups[mk.skelName] ? mk.skelName : editingSkel();
+                if (mk.node == null || !binsAvailable(sname)) return;
+                setPickTarget(sname);
+                clearBinSelection();
                 selectBin(mk.node);
             }
 
-            function removeEdgeGroup(idx) {
+            function removeEdgeGroup(idx, refresh = true) {
                 if (!currentAnnotations || !currentAnnotations.edge_groups) return;
                 currentAnnotations.edge_groups.splice(idx, 1);
                 disposeObj(edgeGroupMeshes[idx]);
                 edgeGroupMeshes.splice(idx, 1);
+                if (!refresh) return;
                 updateHighlightsPanel();
                 syncAnnotationsToServer();
             }
 
-            function updateHighlightsPanel() {
-                const list = document.getElementById("hlList");
-                list.innerHTML = "";
-                const clearRow = document.getElementById("hlClearAllRow");
-                const hasHighlights =
-                    currentAnnotations &&
-                    currentAnnotations.highlights &&
-                    currentAnnotations.highlights.length > 0;
-                const hasMarkers =
-                    currentAnnotations && currentAnnotations.markers && currentAnnotations.markers.length > 0;
-                const hasEdgeGroups =
-                    currentAnnotations &&
-                    currentAnnotations.edge_groups &&
-                    currentAnnotations.edge_groups.length > 0;
-                if (!hasHighlights && !hasMarkers && !hasEdgeGroups) {
-                    clearRow.style.display = "none";
-                    return;
+            // ── The inspector's lists ─────────────────────────────────────
+            // Every entry of the annotations lands in one place by what it
+            // is: a component (Layers, with its pick switch), a finding —
+            // something to look at, from a detection, a check, a QC report,
+            // a path — (Findings, grouped by where it came from, stepped
+            // through with next / previous), or a note the user kept
+            // (Notes).  The chunk grid is a Layers switch, not a row.
+
+            /** What an annotation entry is: "component", "finding", "note"
+             *  or "grid" — as its writer said, or, for a file written before
+             *  entries said, as its label does. */
+            function annotationKind(g, channel) {
+                if (g.role) return g.role;
+                const label = (g.label || "").toLowerCase();
+                if (channel === "highlights") {
+                    if (
+                        Number.isInteger(g.neurite) ||
+                        label === "soma" ||
+                        label.startsWith("organelles (") ||
+                        label.startsWith("discarded ")
+                    )
+                        return "component";
+                    return /^(qc:|organelle:|fusion |gap |patch:|fragments|disconnected |hole |path |site )/.test(
+                        label,
+                    )
+                        ? "finding"
+                        : "note";
                 }
-                clearRow.style.display = "block";
-                if (hasHighlights) {
-                    currentAnnotations.highlights.forEach((group, idx) => {
-                        const n = (group.faces || []).length;
-                        if (n === 0 || contactHides(group)) return;
-                        const color = group.color || [1, 0, 0];
-                        const label = group.label || `Group ${idx}`;
-                        const div = document.createElement("div");
-                        div.className = "hl-item";
-                        const rgb = `rgb(${Math.round(color[0] * 255)},${Math.round(color[1] * 255)},${Math.round(color[2] * 255)})`;
-
-                        const picker = document.createElement("input");
-                        picker.type = "color";
-                        picker.className = "hl-color-input";
-                        picker.value = rgbToHex(color);
-                        picker.title = "Click to change color";
-                        picker.addEventListener("input", () => {
-                            const nc = hexToRgb01(picker.value);
-                            group.color = nc;
-                            for (const m of [annotationMeshes[idx], hlEllipsoids[idx]]) {
-                                if (!m) continue;
-                                m.material.color.setRGB(nc[0], nc[1], nc[2]);
-                                m.material.needsUpdate = true;
-                            }
-                            if (hlEllipsoids[idx]) hlEllipsoids[idx].userData.ell.color = nc;
-                        });
-                        picker.addEventListener("change", () => syncAnnotationsToServer());
-
-                        const left = document.createElement("span");
-                        left.style.cssText = "display:flex;align-items:center;";
-                        left.appendChild(picker);
-
-                        const nameSpan = document.createElement("span");
-                        nameSpan.textContent = label;
-                        nameSpan.title = "Click to rename, double-click to center";
-                        nameSpan.style.cssText = "cursor:pointer;border-bottom:1px dashed #555;";
-                        nameSpan.addEventListener("click", () => {
-                            const input = document.createElement("input");
-                            input.type = "text";
-                            input.value = group.label || "";
-                            input.style.cssText =
-                                "font-size:11px;width:100px;font-family:monospace;background:#222;color:#ccc;border:1px solid #555;padding:1px 3px;";
-                            const commit = () => {
-                                const newName = input.value.trim();
-                                // Renaming a *neurite* is not an annotation
-                                // edit — it names the component, which is
-                                // what skeletonize reads to set the SWC
-                                // type.  The new label comes back from the
-                                // server's republish, so it cannot drift
-                                // from what the component actually holds.
-                                if (newName && Number.isInteger(group.neurite)) {
-                                    nameNeurite(group.neurite, newName);
-                                    return;
-                                }
-                                if (newName) {
-                                    group.label = newName;
-                                    if (hlEllipsoids[idx]) hlEllipsoids[idx].userData.ell.label = newName;
-                                }
-                                syncAnnotationsToServer();
-                                updateHighlightsPanel();
-                            };
-                            input.addEventListener("blur", commit);
-                            input.addEventListener("keydown", (e) => {
-                                if (e.key === "Enter") input.blur();
-                            });
-                            nameSpan.replaceWith(input);
-                            input.focus();
-                            input.select();
-                        });
-                        nameSpan.addEventListener("dblclick", () => focusOnAnnotation(idx));
-                        left.appendChild(nameSpan);
-
-                        const countSpan = document.createElement("span");
-                        countSpan.textContent = ` (${n.toLocaleString()})`;
-                        countSpan.style.color = "#888";
-                        left.appendChild(countSpan);
-
-                        div.appendChild(left);
-
-                        const focusBtn = document.createElement("button");
-                        focusBtn.className = "icon-btn";
-                        focusBtn.textContent = "⌖";
-                        focusBtn.title = "Center camera on this annotation";
-                        focusBtn.addEventListener("click", () => focusOnAnnotation(idx));
-                        div.appendChild(focusBtn);
-
-                        const toggleBtn = document.createElement("button");
-                        toggleBtn.className = "toggle-vis icon-btn";
-                        const shown = () => {
-                            const m = annotationMeshes[idx] || hlEllipsoids[idx];
-                            return !m || m.visible;
-                        };
-                        setToggleVisIcon(toggleBtn, shown());
-                        toggleBtn.addEventListener("click", () => {
-                            const vis = !shown();
-                            for (const m of [annotationMeshes[idx], hlEllipsoids[idx]])
-                                if (m) m.visible = vis;
-                            setToggleVisIcon(toggleBtn, vis);
-                            _saveAnnVisibility();
-                        });
-                        div.appendChild(toggleBtn);
-
-                        const saveBtn = document.createElement("button");
-                        saveBtn.className = "icon-btn";
-                        saveBtn.textContent = "\u2913";
-                        saveBtn.title = "Save this annotation as .obj submesh";
-                        saveBtn.addEventListener("click", () => saveAnnotationSubmesh(idx));
-                        div.appendChild(saveBtn);
-
-                        const btn = document.createElement("button");
-                        btn.className = "icon-btn";
-                        btn.textContent = "x";
-                        btn.addEventListener("click", () => removeAnnotationGroup(idx));
-                        div.appendChild(btn);
-                        list.appendChild(div);
-                    });
-                }
-                if (hasMarkers) {
-                    currentAnnotations.markers.forEach((mk, idx) => {
-                        const color = mk.color || [1, 1, 1];
-                        const label = mk.label || `Marker ${idx}`;
-                        const div = document.createElement("div");
-                        div.className = "hl-item";
-                        const rgb = `rgb(${Math.round(color[0] * 255)},${Math.round(color[1] * 255)},${Math.round(color[2] * 255)})`;
-                        const left = document.createElement("span");
-                        const swatch = document.createElement("span");
-                        swatch.className = "hl-swatch";
-                        swatch.style.cssText = `background:${rgb}; border-radius:50%`;
-                        left.appendChild(swatch);
-                        // A marker naming a node says so, since the id is what
-                        // a diagnostic reports and what the reader has to
-                        // match against a list elsewhere.
-                        const nameSpan = document.createElement("span");
-                        nameSpan.textContent =
-                            label + (mk.node != null ? ` · node ${mk.node}` : "");
-                        nameSpan.title =
-                            mk.node != null
-                                ? "Double-click to centre on this node and select its bin"
-                                : "Double-click to centre on this marker";
-                        nameSpan.style.cssText =
-                            "cursor:pointer;border-bottom:1px dashed #555;";
-                        nameSpan.addEventListener("dblclick", () => focusOnMarker(idx));
-                        left.appendChild(nameSpan);
-                        div.appendChild(left);
-
-                        const focusBtn = document.createElement("button");
-                        focusBtn.className = "icon-btn";
-                        focusBtn.textContent = "⌖";
-                        focusBtn.title = "Center camera on this marker";
-                        focusBtn.addEventListener("click", () => focusOnMarker(idx));
-                        div.appendChild(focusBtn);
-
-                        const toggleBtn = document.createElement("button");
-                        toggleBtn.className = "toggle-vis icon-btn";
-                        setToggleVisIcon(
-                            toggleBtn,
-                            !(markerMeshes[idx] && !markerMeshes[idx].visible),
-                        );
-                        toggleBtn.addEventListener("click", () => {
-                            if (!markerMeshes[idx]) return;
-                            markerMeshes[idx].visible = !markerMeshes[idx].visible;
-                            setToggleVisIcon(toggleBtn, markerMeshes[idx].visible);
-                        });
-                        div.appendChild(toggleBtn);
-
-                        const btn = document.createElement("button");
-                        btn.className = "icon-btn";
-                        btn.textContent = "x";
-                        btn.addEventListener("click", () => removeMarker(idx));
-                        div.appendChild(btn);
-                        list.appendChild(div);
-                    });
-                }
-                if (hasEdgeGroups) {
-                    currentAnnotations.edge_groups.forEach((group, idx) => {
-                        const segs = group.segments || [];
-                        if (segs.length === 0 || contactHides(group)) return;
-                        const color = group.color || [1, 1, 1];
-                        const label = group.label || `Edges ${idx}`;
-                        const div = document.createElement("div");
-                        div.className = "hl-item";
-
-                        const picker = document.createElement("input");
-                        picker.type = "color";
-                        picker.className = "hl-color-input";
-                        picker.value = rgbToHex(color);
-                        picker.title = "Click to change color";
-                        picker.addEventListener("input", () => {
-                            const nc = hexToRgb01(picker.value);
-                            group.color = nc;
-                            if (edgeGroupMeshes[idx]) {
-                                edgeGroupMeshes[idx].material.color.setRGB(nc[0], nc[1], nc[2]);
-                                edgeGroupMeshes[idx].material.needsUpdate = true;
-                            }
-                        });
-                        picker.addEventListener("change", () => syncAnnotationsToServer());
-
-                        const left = document.createElement("span");
-                        left.style.cssText = "display:flex;align-items:center;";
-                        left.appendChild(picker);
-
-                        const nameSpan = document.createElement("span");
-                        nameSpan.textContent = label;
-                        nameSpan.title = "Click to rename, double-click to center";
-                        nameSpan.style.cssText = "cursor:pointer;border-bottom:1px dashed #555;";
-                        nameSpan.addEventListener("click", () => {
-                            const input = document.createElement("input");
-                            input.type = "text";
-                            input.value = group.label || "";
-                            input.style.cssText =
-                                "font-size:11px;width:100px;font-family:monospace;background:#222;color:#ccc;border:1px solid #555;padding:1px 3px;";
-                            const commit = () => {
-                                const newName = input.value.trim();
-                                if (newName) group.label = newName;
-                                syncAnnotationsToServer();
-                                updateHighlightsPanel();
-                            };
-                            input.addEventListener("blur", commit);
-                            input.addEventListener("keydown", (e) => {
-                                if (e.key === "Enter") input.blur();
-                            });
-                            nameSpan.replaceWith(input);
-                            input.focus();
-                            input.select();
-                        });
-                        nameSpan.addEventListener("dblclick", () => focusOnEdgeGroup(idx));
-                        left.appendChild(nameSpan);
-
-                        const countSpan = document.createElement("span");
-                        countSpan.textContent = ` (${segs.length.toLocaleString()})`;
-                        countSpan.style.color = "#888";
-                        left.appendChild(countSpan);
-
-                        div.appendChild(left);
-
-                        const focusBtn = document.createElement("button");
-                        focusBtn.className = "icon-btn";
-                        focusBtn.textContent = "⌖";
-                        focusBtn.title = "Center camera on this edge group";
-                        focusBtn.addEventListener("click", () => focusOnEdgeGroup(idx));
-                        div.appendChild(focusBtn);
-
-                        const toggleBtn = document.createElement("button");
-                        toggleBtn.className = "toggle-vis icon-btn";
-                        setToggleVisIcon(
-                            toggleBtn,
-                            !(edgeGroupMeshes[idx] && !edgeGroupMeshes[idx].visible),
-                        );
-                        toggleBtn.addEventListener("click", () => {
-                            if (!edgeGroupMeshes[idx]) return;
-                            edgeGroupMeshes[idx].visible = !edgeGroupMeshes[idx].visible;
-                            setToggleVisIcon(toggleBtn, edgeGroupMeshes[idx].visible);
-                        });
-                        div.appendChild(toggleBtn);
-
-                        const btn = document.createElement("button");
-                        btn.className = "icon-btn";
-                        btn.textContent = "x";
-                        btn.addEventListener("click", () => removeEdgeGroup(idx));
-                        div.appendChild(btn);
-                        list.appendChild(div);
-                    });
-                }
+                if (channel === "markers")
+                    return label.startsWith("qc:") || g.node != null || g.dx ? "finding" : "note";
+                if (label === "chunk grid") return "grid";
+                return /^(path |hole |site )/.test(label) || g.dx || g.aabb ? "finding" : "note";
             }
 
-            function removeMarker(idx) {
+            /** Where a finding came from, the name its group goes by. */
+            function findingSource(g) {
+                if (g.source) return g.source;
+                const m = (g.label || "").toLowerCase().match(/^([a-z ]+?)(:| \d| \(|$)/);
+                return m ? m[1].trim() || "other" : "other";
+            }
+
+            // The findings in the order listed, for next / previous, and the
+            // one the camera was last sent to.
+            let findingOrder = []; // [{channel, idx, entry}]
+            let findCursor = -1;
+
+            function updateHighlightsPanel() {
+                const ann = currentAnnotations || {};
+                const findings = new Map(); // source → [{channel, idx, entry}]
+                const notes = [];
+                const add = (channel, list) =>
+                    (list || []).forEach((entry, idx) => {
+                        if (contactHides(entry)) return;
+                        const n =
+                            channel === "highlights"
+                                ? (entry.faces || []).length
+                                : channel === "edge_groups"
+                                  ? (entry.segments || []).length
+                                  : 1;
+                        if (!n) return;
+                        const kind = annotationKind(entry, channel);
+                        if (kind === "finding") {
+                            const src = findingSource(entry);
+                            if (!findings.has(src)) findings.set(src, []);
+                            findings.get(src).push({ channel, idx, entry });
+                        } else if (kind === "note") notes.push({ channel, idx, entry });
+                    });
+                add("highlights", ann.highlights);
+                add("markers", ann.markers);
+                add("edge_groups", ann.edge_groups);
+
+                const anyRow = (ann.highlights || []).length + (ann.markers || []).length + (ann.edge_groups || []).length;
+                document.getElementById("hlClearAllRow").style.display = anyRow ? "block" : "none";
+
+                // Findings, a group per source.
+                const flist = document.getElementById("findingsList");
+                flist.innerHTML = "";
+                const prev = findingOrder[findCursor];
+                findingOrder = [];
+                for (const [src, items] of findings) {
+                    flist.appendChild(findingGroupHead(src, items));
+                    for (const it of items) {
+                        const row = entryRow(it.channel, it.entry, it.idx);
+                        row.dataset.finding = String(findingOrder.length);
+                        findingOrder.push(it);
+                        flist.appendChild(row);
+                    }
+                }
+                if (!findingOrder.length)
+                    flist.innerHTML =
+                        "<div class='dim hint'>Nothing to look at yet: Steps → Detect, a check above, " +
+                        "a dropped QC report, or Path in the bar below.</div>";
+                // The cursor stays on the finding it was on, if it is still listed.
+                findCursor = prev ? findingOrder.findIndex((it) => it.entry === prev.entry) : -1;
+                markCurrentFinding();
+                document.getElementById("findingsCount").textContent = findingOrder.length
+                    ? String(findingOrder.length)
+                    : "";
+
+                // Notes.
+                const nlist = document.getElementById("notesList");
+                nlist.innerHTML = "";
+                for (const it of notes) nlist.appendChild(entryRow(it.channel, it.entry, it.idx));
+                document.getElementById("notesCount").textContent = notes.length ? String(notes.length) : "";
+
+                renderComponentRows();
+            }
+
+            /** A finding group's head: where they came from, how many, and
+             *  show / hide or clear them all. */
+            function findingGroupHead(src, items) {
+                const head = document.createElement("div");
+                head.className = "hl-item group-head";
+                const name = document.createElement("span");
+                name.textContent = `${src} `;
+                const count = document.createElement("span");
+                count.className = "dim";
+                count.textContent = `(${items.length})`;
+                name.appendChild(count);
+                head.appendChild(name);
+                const objs = () => items.map((it) => entryObject(it.channel, it.idx)).filter(Boolean);
+                const eye = document.createElement("button");
+                eye.className = "toggle-vis icon-btn";
+                const shown = () => objs().some((m) => m.visible);
+                setToggleVisIcon(eye, shown());
+                eye.title = `show or hide every ${src} finding`;
+                eye.addEventListener("click", () => {
+                    const vis = !shown();
+                    for (const m of objs()) m.visible = vis;
+                    setToggleVisIcon(eye, vis);
+                    _saveAnnVisibility();
+                    updateHighlightsPanel();
+                });
+                head.appendChild(eye);
+                const clear = document.createElement("button");
+                clear.className = "icon-btn";
+                clear.textContent = "x";
+                clear.title = `clear every ${src} finding`;
+                clear.addEventListener("click", () => removeEntries(items));
+                head.appendChild(clear);
+                return head;
+            }
+
+            /** The scene object drawing an entry. */
+            function entryObject(channel, idx) {
+                if (channel === "highlights") return annotationMeshes[idx] || hlEllipsoids[idx];
+                if (channel === "markers") return markerMeshes[idx];
+                return edgeGroupMeshes[idx];
+            }
+
+            /** Remove several entries at once, last index first so the
+             *  others keep theirs until their turn. */
+            function removeEntries(items) {
+                const byChannel = { highlights: [], markers: [], edge_groups: [] };
+                for (const it of items) byChannel[it.channel].push(it.idx);
+                for (const [channel, idxs] of Object.entries(byChannel)) {
+                    idxs.sort((a, b) => b - a);
+                    for (const i of idxs) {
+                        if (channel === "highlights") removeAnnotationGroup(i, false);
+                        else if (channel === "markers") removeMarker(i, false);
+                        else removeEdgeGroup(i, false);
+                    }
+                }
+                updateHighlightsPanel();
+                syncAnnotationsToServer();
+            }
+
+            function entryRow(channel, entry, idx) {
+                if (channel === "highlights") return highlightRow(entry, idx);
+                if (channel === "markers") return markerRow(entry, idx);
+                return edgeGroupRow(entry, idx);
+            }
+
+            /** A click on a name renames it in place. */
+            function renamable(nameSpan, current, commitName) {
+                nameSpan.addEventListener("click", () => {
+                    const input = document.createElement("input");
+                    input.type = "text";
+                    input.value = current || "";
+                    input.style.cssText =
+                        "font-size:11px;width:100px;font-family:monospace;background:#222;color:#ccc;border:1px solid #555;padding:1px 3px;";
+                    const commit = () => commitName(input.value.trim());
+                    input.addEventListener("blur", commit);
+                    input.addEventListener("keydown", (e) => {
+                        if (e.key === "Enter") input.blur();
+                    });
+                    nameSpan.replaceWith(input);
+                    input.focus();
+                    input.select();
+                });
+            }
+
+            /** A face group's row: colour, name (click renames), count,
+             *  select its faces, focus, show / hide, save as OBJ, remove —
+             *  or, for a component, its pick switch instead of remove. */
+            function highlightRow(group, idx, { pick = false, sub = false } = {}) {
+                const n = (group.faces || []).length;
+                const color = group.color || [1, 0, 0];
+                const label = group.label || `Group ${idx}`;
+                const div = document.createElement("div");
+                div.className = "hl-item ann-row" + (sub ? " sub" : "");
+
+                const picker = document.createElement("input");
+                picker.type = "color";
+                picker.className = "hl-color-input";
+                picker.value = rgbToHex(color);
+                picker.title = "Click to change color";
+                picker.addEventListener("input", () => {
+                    const nc = hexToRgb01(picker.value);
+                    group.color = nc;
+                    for (const m of [annotationMeshes[idx], hlEllipsoids[idx]]) {
+                        if (!m) continue;
+                        m.material.color.setRGB(nc[0], nc[1], nc[2]);
+                        m.material.needsUpdate = true;
+                    }
+                    if (hlEllipsoids[idx]) hlEllipsoids[idx].userData.ell.color = nc;
+                });
+                picker.addEventListener("change", () => syncAnnotationsToServer());
+
+                const left = document.createElement("span");
+                left.style.cssText = "display:flex;align-items:center;min-width:0;";
+                left.appendChild(picker);
+
+                const nameSpan = document.createElement("span");
+                nameSpan.textContent = pick ? componentName(group, idx) : label;
+                nameSpan.title = "Click to rename, double-click to center";
+                nameSpan.style.cssText =
+                    "cursor:pointer;border-bottom:1px dashed #555;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+                // Renaming a *neurite* is not an annotation edit — it names
+                // the component, which is what skeletonize reads to set the
+                // SWC type.  The new label comes back from the server's
+                // republish, so it cannot drift from what the component holds.
+                renamable(nameSpan, group.label, (newName) => {
+                    if (newName && Number.isInteger(group.neurite)) {
+                        nameNeurite(group.neurite, newName);
+                        return;
+                    }
+                    if (newName) {
+                        group.label = newName;
+                        if (hlEllipsoids[idx]) hlEllipsoids[idx].userData.ell.label = newName;
+                    }
+                    syncAnnotationsToServer();
+                    updateHighlightsPanel();
+                });
+                nameSpan.addEventListener("dblclick", () => focusOnAnnotation(idx));
+                left.appendChild(nameSpan);
+
+                const countSpan = document.createElement("span");
+                countSpan.textContent = ` (${n.toLocaleString()})`;
+                countSpan.style.color = "#888";
+                left.appendChild(countSpan);
+                div.appendChild(left);
+
+                const selBtn = document.createElement("button");
+                selBtn.className = "icon-btn";
+                selBtn.textContent = "◌";
+                selBtn.title = "Select its faces (those pickable)";
+                selBtn.addEventListener("click", () => selectGroupFaces(idx));
+                div.appendChild(selBtn);
+
+                const focusBtn = document.createElement("button");
+                focusBtn.className = "icon-btn";
+                focusBtn.textContent = "⌖";
+                focusBtn.title = "Center camera on this annotation";
+                focusBtn.addEventListener("click", () => focusOnAnnotation(idx));
+                div.appendChild(focusBtn);
+
+                const toggleBtn = document.createElement("button");
+                toggleBtn.className = "toggle-vis icon-btn";
+                const shown = () => {
+                    const m = annotationMeshes[idx] || hlEllipsoids[idx];
+                    return !m || m.visible;
+                };
+                setToggleVisIcon(toggleBtn, shown());
+                toggleBtn.addEventListener("click", () => {
+                    const vis = !shown();
+                    for (const m of [annotationMeshes[idx], hlEllipsoids[idx]]) if (m) m.visible = vis;
+                    setToggleVisIcon(toggleBtn, vis);
+                    _saveAnnVisibility();
+                });
+                div.appendChild(toggleBtn);
+
+                const saveBtn = document.createElement("button");
+                saveBtn.className = "icon-btn";
+                saveBtn.textContent = "⤓";
+                saveBtn.title = "Save this annotation as .obj submesh";
+                saveBtn.addEventListener("click", () => saveAnnotationSubmesh(idx));
+                div.appendChild(saveBtn);
+
+                if (pick) {
+                    div.appendChild(pickToggle([idx]));
+                } else {
+                    const btn = document.createElement("button");
+                    btn.className = "icon-btn";
+                    btn.textContent = "x";
+                    btn.addEventListener("click", () => removeAnnotationGroup(idx));
+                    div.appendChild(btn);
+                }
+                return div;
+            }
+
+            /** A marker's row; one naming a node says so, since the id is
+             *  what a check reports. */
+            function markerRow(mk, idx) {
+                const color = mk.color || [1, 1, 1];
+                const label = mk.label || `Marker ${idx}`;
+                const div = document.createElement("div");
+                div.className = "hl-item ann-row";
+                const rgb = `rgb(${Math.round(color[0] * 255)},${Math.round(color[1] * 255)},${Math.round(color[2] * 255)})`;
+                const left = document.createElement("span");
+                left.style.cssText = "display:flex;align-items:center;min-width:0;";
+                const swatch = document.createElement("span");
+                swatch.className = "hl-swatch";
+                swatch.style.cssText = `background:${rgb}; border-radius:50%; flex-shrink:0`;
+                left.appendChild(swatch);
+                const nameSpan = document.createElement("span");
+                nameSpan.textContent = label + (mk.node != null ? ` · node ${mk.node}` : "");
+                nameSpan.title =
+                    mk.node != null
+                        ? "Double-click to centre on this node and select its bin"
+                        : "Double-click to centre on this marker";
+                nameSpan.style.cssText =
+                    "cursor:pointer;border-bottom:1px dashed #555;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+                nameSpan.addEventListener("dblclick", () => focusOnMarker(idx));
+                left.appendChild(nameSpan);
+                div.appendChild(left);
+
+                const focusBtn = document.createElement("button");
+                focusBtn.className = "icon-btn";
+                focusBtn.textContent = "⌖";
+                focusBtn.title = "Center camera on this marker";
+                focusBtn.addEventListener("click", () => focusOnMarker(idx));
+                div.appendChild(focusBtn);
+
+                const toggleBtn = document.createElement("button");
+                toggleBtn.className = "toggle-vis icon-btn";
+                setToggleVisIcon(toggleBtn, !(markerMeshes[idx] && !markerMeshes[idx].visible));
+                toggleBtn.addEventListener("click", () => {
+                    if (!markerMeshes[idx]) return;
+                    markerMeshes[idx].visible = !markerMeshes[idx].visible;
+                    setToggleVisIcon(toggleBtn, markerMeshes[idx].visible);
+                });
+                div.appendChild(toggleBtn);
+
+                const btn = document.createElement("button");
+                btn.className = "icon-btn";
+                btn.textContent = "x";
+                btn.addEventListener("click", () => removeMarker(idx));
+                div.appendChild(btn);
+                return div;
+            }
+
+            /** An edge group's row: colour, name, segment count, focus,
+             *  show / hide, remove. */
+            function edgeGroupRow(group, idx) {
+                const segs = group.segments || [];
+                const color = group.color || [1, 1, 1];
+                const label = group.label || `Edges ${idx}`;
+                const div = document.createElement("div");
+                div.className = "hl-item ann-row";
+
+                const picker = document.createElement("input");
+                picker.type = "color";
+                picker.className = "hl-color-input";
+                picker.value = rgbToHex(color);
+                picker.title = "Click to change color";
+                picker.addEventListener("input", () => {
+                    const nc = hexToRgb01(picker.value);
+                    group.color = nc;
+                    if (edgeGroupMeshes[idx]) {
+                        edgeGroupMeshes[idx].material.color.setRGB(nc[0], nc[1], nc[2]);
+                        edgeGroupMeshes[idx].material.needsUpdate = true;
+                    }
+                });
+                picker.addEventListener("change", () => syncAnnotationsToServer());
+
+                const left = document.createElement("span");
+                left.style.cssText = "display:flex;align-items:center;min-width:0;";
+                left.appendChild(picker);
+
+                const nameSpan = document.createElement("span");
+                nameSpan.textContent = label;
+                nameSpan.title = "Click to rename, double-click to center";
+                nameSpan.style.cssText =
+                    "cursor:pointer;border-bottom:1px dashed #555;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+                renamable(nameSpan, group.label, (newName) => {
+                    if (newName) group.label = newName;
+                    syncAnnotationsToServer();
+                    updateHighlightsPanel();
+                });
+                nameSpan.addEventListener("dblclick", () => focusOnEdgeGroup(idx));
+                left.appendChild(nameSpan);
+
+                const countSpan = document.createElement("span");
+                countSpan.textContent = ` (${segs.length.toLocaleString()})`;
+                countSpan.style.color = "#888";
+                left.appendChild(countSpan);
+                div.appendChild(left);
+
+                const focusBtn = document.createElement("button");
+                focusBtn.className = "icon-btn";
+                focusBtn.textContent = "⌖";
+                focusBtn.title = "Center camera on this edge group";
+                focusBtn.addEventListener("click", () => focusOnEdgeGroup(idx));
+                div.appendChild(focusBtn);
+
+                const toggleBtn = document.createElement("button");
+                toggleBtn.className = "toggle-vis icon-btn";
+                setToggleVisIcon(toggleBtn, !(edgeGroupMeshes[idx] && !edgeGroupMeshes[idx].visible));
+                toggleBtn.addEventListener("click", () => {
+                    if (!edgeGroupMeshes[idx]) return;
+                    edgeGroupMeshes[idx].visible = !edgeGroupMeshes[idx].visible;
+                    setToggleVisIcon(toggleBtn, edgeGroupMeshes[idx].visible);
+                });
+                div.appendChild(toggleBtn);
+
+                const btn = document.createElement("button");
+                btn.className = "icon-btn";
+                btn.textContent = "x";
+                btn.addEventListener("click", () => removeEdgeGroup(idx));
+                div.appendChild(btn);
+                return div;
+            }
+
+            /** Add a face group's pickable faces to the selection. */
+            function selectGroupFaces(idx) {
+                const g = (currentAnnotations.highlights || [])[idx];
+                if (!g) return;
+                let added = 0;
+                for (const f of g.faces || [])
+                    if (inScope(f) && !manualHighlightFaces.has(f)) {
+                        manualHighlightFaces.add(f);
+                        added++;
+                    }
+                rebuildManualHighlight();
+                syncManualHighlight();
+                if (!added && (g.faces || []).length)
+                    showLogStatus("none of its faces is pickable — switch its component on in Layers");
+            }
+
+            // ── Stepping through the findings ─────────────────────────────
+            function markCurrentFinding() {
+                for (const row of document.querySelectorAll("#findingsList .hl-item.current"))
+                    row.classList.remove("current");
+                const pos = document.getElementById("findPos");
+                if (findCursor < 0 || findCursor >= findingOrder.length) {
+                    pos.textContent = findingOrder.length ? `${findingOrder.length} to look at` : "";
+                    return;
+                }
+                const row = document.querySelector(`#findingsList [data-finding="${findCursor}"]`);
+                if (row) {
+                    row.classList.add("current");
+                    if (row.scrollIntoView) row.scrollIntoView({ block: "nearest" });
+                }
+                const it = findingOrder[findCursor];
+                pos.textContent = `${findCursor + 1} / ${findingOrder.length} · ${findingSource(it.entry)}`;
+            }
+
+            /** Send the camera to the next finding (step = 1) or the
+             *  previous one (-1), round the list. */
+            function stepFinding(step) {
+                if (!findingOrder.length) return;
+                findCursor =
+                    findCursor < 0
+                        ? step > 0
+                            ? 0
+                            : findingOrder.length - 1
+                        : (findCursor + step + findingOrder.length) % findingOrder.length;
+                const it = findingOrder[findCursor];
+                if (it.channel === "highlights") focusOnAnnotation(it.idx);
+                else if (it.channel === "markers") focusOnMarker(it.idx);
+                else focusOnEdgeGroup(it.idx);
+                markCurrentFinding();
+            }
+
+            function removeMarker(idx, refresh = true) {
                 if (!currentAnnotations || !currentAnnotations.markers) return;
                 currentAnnotations.markers.splice(idx, 1);
                 disposeObj(markerMeshes[idx]);
                 markerMeshes.splice(idx, 1);
+                if (!refresh) return;
                 updateHighlightsPanel();
                 syncAnnotationsToServer();
             }
 
-            function removeAnnotationGroup(idx) {
+            function removeAnnotationGroup(idx, refresh = true) {
                 if (!currentAnnotations || !currentAnnotations.highlights) return;
                 currentAnnotations.highlights.splice(idx, 1);
+                // Components are named by their place in this list: the
+                // face owners and the scope move with it.
+                if (scopeOn !== null)
+                    scopeOn = new Set([...scopeOn].filter((i) => i !== idx).map((i) => (i > idx ? i - 1 : i)));
+                rebuildFaceOwner();
+                rebuildScopeMask();
                 // Its own wireframe, and no other that happens to share a colour.
                 const linked = hlEllipsoids[idx];
                 if (linked) {
@@ -5865,6 +6349,7 @@
                 hlEllipsoids.splice(idx, 1);
                 disposeObj(annotationMeshes[idx]);
                 annotationMeshes.splice(idx, 1);
+                if (!refresh) return;
                 updateHighlightsPanel();
                 syncAnnotationsToServer();
             }
@@ -5880,7 +6365,7 @@
                 // what the contact panel hides stays hidden
                 if (contactMode) applyContactVisibility();
                 // Sync individual toggle buttons
-                document.querySelectorAll("#hlList button.toggle-vis").forEach((btn) => {
+                document.querySelectorAll("#inspector .ann-row button.toggle-vis, #inspector .group-head button.toggle-vis").forEach((btn) => {
                     setToggleVisIcon(btn, vis);
                 });
                 setToggleVisIcon(document.getElementById("hlHideAll"), vis, "All");
@@ -5961,14 +6446,18 @@
                     } else if (msg.type === "skeleton_removed") {
                         const sname = msg.payload && msg.payload.name;
                         if (sname && skelGroups[sname]) {
+                            const wasEditing = editingSkel() === sname;
                             disposeGroup(skelGroups[sname].group);
                             delete skelGroups[sname];
                             const opt = document.querySelector(`#pickTarget option[value="skel:${sname}"]`);
                             if (opt) opt.remove();
+                            if (wasEditing) document.getElementById("pickTarget").value = "mesh";
                             dropNodeSelections(sname);
-                            if (document.getElementById("binSkelSel").value === sname)
+                            if (wasEditing) {
                                 clearBinSelection();
-                            refreshBinSkelSel();
+                                clearEdgeSupport();
+                            }
+                            refreshEditingSkel();
                         }
                         updateLoadedPanel();
                         refreshSkeletonizeCue();
@@ -5979,10 +6468,12 @@
                         for (const k of Object.keys(skelGroups)) delete skelGroups[k];
                         dropNodeSelections();
                         clearBinSelection();
-                        refreshBinSkelSel();
+                        clearEdgeSupport();
                         document
                             .querySelectorAll('#pickTarget option[value^="skel:"]')
                             .forEach((o) => o.remove());
+                        document.getElementById("pickTarget").value = "mesh";
+                        refreshEditingSkel();
                         updateLoadedPanel();
                         refreshSkeletonizeCue();
                         if (!meshObj) document.getElementById("empty-hint").style.display = "block";
@@ -6025,8 +6516,11 @@
                 };
             }
 
-            const UI_PANELS = ['info', 'controls', 'detect-panel', 'selection-info', 'loaded-panel'];
-            const CONTACT_PANELS = ['contact-panel', 'selection-info'];
+            // The single-cell viewer's panels; contact mode keeps only the
+            // inspector, whose findings are the sites.
+            const SINGLE_CELL_PANELS = ['pipeline-panel', 'tools', 'context-bar', 'status-bar', 'gizmo-host'];
+            const UI_PANELS = [...SINGLE_CELL_PANELS, 'inspector'];
+            const CONTACT_PANELS = ['contact-panel', 'inspector'];
             let panelsVisible = true;
             function togglePanels() {
               panelsVisible = !panelsVisible;
@@ -6350,6 +6844,12 @@
                   showLogStatus(somaPoint ? "Soma point kept" : "No soma point");
                   return;
               }
+              if (e.key === 'Escape') {
+                  const help = document.getElementById('help-panel');
+                  if (help.style.display !== 'none') help.style.display = 'none';
+                  else if (!contactMode) clearSelection();
+                  return;
+              }
 
               // Axis constraints during active transform
               if (transformMode && (e.key === 'x' || e.key === 'X')) {
@@ -6365,18 +6865,23 @@
                   showTransformStatus(); return;
               }
 
-              if (e.key === 'g' || e.key === 'G') {
-                  if (transformMode) cancelTransform();
-                  startTransform('translate');
+              if ((e.key === 'g' || e.key === 'G') && !e.ctrlKey && !e.metaKey) {
+                  startTransformFromUI('translate');
                   return;
               }
               if ((e.key === 't' || e.key === 'T') && !e.ctrlKey && !e.metaKey) {
-                  if (transformMode) cancelTransform();
-                  startTransform('rotate');
+                  startTransformFromUI('rotate');
                   return;
               }
 
               if (transformMode) return; // block other keys during transform
+
+              if (e.key === '?') { toggleHelp(); return; }
+              if (!contactMode && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                  if (e.key === 'f' || e.key === 'F') { focusSelection(); return; }
+                  if (e.key === ']') { stepFinding(1); return; }
+                  if (e.key === '[') { stepFinding(-1); return; }
+              }
 
               // [a]/[b] toggle mesh A (primary) / B (first extra mesh)
               if (contactMode && contactView.meshes[e.key.toUpperCase()]) {
@@ -6401,9 +6906,12 @@
                   return;
               }
 
-              if (e.key === 's' || e.key === 'S') { const d = document.getElementById('shortcutsPanel'); d.open = !d.open; }
+              if ((e.key === 's' || e.key === 'S') && !e.ctrlKey && !e.metaKey) toggleHelp();
               if (e.key === 'h' || e.key === 'H') togglePanels();
-              if (e.key === 'l' || e.key === 'L') toggleCameraLock();
+              if (e.key === 'l' || e.key === 'L') {
+                  toggleCameraLock();
+                  document.getElementById("toolLock").dataset.on = cameraLocked ? "1" : "0";
+              }
               if (e.ctrlKey || e.metaKey || e.altKey) return;
               if (e.key === 'x' || e.key === 'X') setAxisView('x', 1);
               if (e.key === 'y' || e.key === 'Y') setAxisView('y', 1);
@@ -6428,9 +6936,9 @@
             gizmoRenderer.setPixelRatio(window.devicePixelRatio);
             gizmoRenderer.domElement.style.position = "absolute";
             gizmoRenderer.domElement.style.left = "0px";
-            gizmoRenderer.domElement.style.bottom = "100%";
+            gizmoRenderer.domElement.style.bottom = "0";
             gizmoRenderer.domElement.style.pointerEvents = "none";
-            document.getElementById("detect-panel").appendChild(gizmoRenderer.domElement);
+            document.getElementById("gizmo-host").appendChild(gizmoRenderer.domElement);
 
             function makeAxis(dir, color, label) {
                 const group = new THREE.Group();
