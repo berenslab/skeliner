@@ -62,7 +62,7 @@ A lightweight skeletonizer that converts neuron meshes into biophysical‑modell
     </td>
     <td width="30%" align="center">
       <img width="100%"  alt="detecing gaps" src=".github/media/skel/bins.png" /> <br />
-      <sub>Geodesic Binning with perpenticular correction</sub>
+      <sub>Geodesic Binnings</sub>
     </td>
     <td width="30%" align="center">
       <img width="100%"  alt="bridging gaps" src=".github/media/skel/skel.png" />
@@ -86,11 +86,11 @@ A lightweight skeletonizer that converts neuron meshes into biophysical‑modell
     </td>
     <td width="30%" align="center">
       <img width="100%"  alt="zoomed in to the contact sites (opaque)" src=".github/media/contacts/zoom-in-opaque.png" /> <br />
-      <sub>Contact sites (zoomed in)</sub>
+      <sub>Contact sites with mesh</sub>
     </td>
     <td width="30%" align="center">
       <img width="100%"  alt="zommed in to the contact sites (transparent)" src=".github/media/contacts/zoom-in-transparent.png" />
-      <sub>Contact sites (zommed in with transparent meshes)</sub>
+      <sub>Contact sites only</sub>
     </td>
   </tr>
 </table>
