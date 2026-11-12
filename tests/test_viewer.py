@@ -514,6 +514,42 @@ def bin_client(tmp_path, monkeypatch):
         yield client, name, mesh, skel
 
 
+def test_the_rings_are_every_bin_and_which_ones_touch(bin_client):
+    """All bins at once: each face's owner (the page colours by it) and
+    the pairs of bins sharing surface (so touching rings differ) — the
+    pairs the mesh joins, each once, smaller node first."""
+    from skeliner import dx
+
+    client, name, mesh, skel = bin_client
+    r = client.post("/bin_rings", json={"name": name})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["nNodes"] == len(skel.nodes)
+    owner = np.frombuffer(base64.b64decode(body["owner"]), dtype="<i4")
+    pairs = np.frombuffer(base64.b64decode(body["pairs"]), dtype="<i4").reshape(-1, 2)
+    np.testing.assert_array_equal(
+        owner, dx.face_owner(skel, _mesh_state_of(client.app)["mesh"])
+    )
+
+    # the pairs are the bins whose vertices share a mesh edge
+    lut = np.full(len(mesh.vertices), -1)
+    for node, vs in enumerate(skel.node2verts):
+        lut[np.asarray(vs, dtype=np.int64)] = node
+    e = lut[np.asarray(mesh.edges_unique)]
+    e = e[(e >= 0).all(axis=1) & (e[:, 0] != e[:, 1])]
+    want = np.unique(np.sort(e, axis=1), axis=0)
+    np.testing.assert_array_equal(pairs, want)
+    assert len(pairs) >= len(skel.nodes) - 1, "fixture: a tube's bins touch in a chain"
+
+
+def test_no_rings_for_a_skeleton_of_another_mesh(bin_client):
+    client, name, mesh, _ = bin_client
+    _mesh_state_of(client.app)["mesh"] = mesh.copy()
+    r = client.post("/bin_rings", json={"name": name})
+    assert r.status_code == 409
+    assert "different mesh" in r.json()["error"]
+
+
 def test_a_bin_is_the_surface_its_node_owns(bin_client):
     client, name, mesh, skel = bin_client
     r = client.post("/bin", json={"name": name, "node": 3})
@@ -2532,6 +2568,17 @@ def test_the_dialog_agrees_with_skeletonize_about_the_defaults():
 # so a renamed id leaves a tab over nothing or a row that never shows.
 
 
+def test_the_mesh_and_skeleton_rows_are_laid_out_as_a_components():
+    """In Layers, a row's name takes the room and its buttons sit together
+    at the end, the mesh's and the skeletons' as a component's — they had
+    been spread across the row."""
+    html = _page_html()
+    item = html.split("#inspector .item {")[1].split("}")[0]
+    name = html.split("#inspector .item .name {")[1].split("}")[0]
+    assert "space-between" not in item
+    assert "flex: 1" in name and "min-width: 0" in name
+
+
 def test_every_tab_has_a_button_and_a_body():
     import re
 
@@ -4080,6 +4127,22 @@ def test_the_components_are_told_apart():
             check(a, cycle[(i + 1) % len(cycle)], f"{name} {i} against the next")
     for c in parts:
         check(v.SKELETON_COLORS[0], c, f"the first skeleton over {c}")
+
+
+def test_any_two_bins_are_told_apart():
+    """Any two bins can touch — clicked, or in the rings, which take the
+    clicks' colours — so every pair of the page's bin colours is apart,
+    and each from the grey mesh they lie on (a bin that looked grey would
+    read as surface no node owns)."""
+    from skeliner.viewer import viewer as v
+
+    _, block, _ = _page_colour_lists()
+    rings = block("BIN_COLORS")
+    assert len(rings) == 4, "four colours colour a surface's bins apart"
+    for i, a in enumerate(rings):
+        for b in [*rings[i + 1 :], v.MESH_COLOR]:
+            cvd, normal = _apart(a, b)
+            assert cvd >= 8 and normal >= 15, f"{a} / {b}: ΔE {cvd:.1f} / {normal:.1f}"
 
 
 def _through(c, under, alpha):

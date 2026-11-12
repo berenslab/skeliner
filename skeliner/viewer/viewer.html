@@ -236,7 +236,8 @@
             #tools .tool-sep {
                 height: 4px;
             }
-            #tools button[data-on="1"] {
+            #tools button[data-on="1"],
+            #loadedSkel button[data-on="1"] {
                 background: #3a2a4a;
                 border-color: #d98cd9;
                 color: #fff;
@@ -358,17 +359,23 @@
                 border: none;
                 border-radius: 1px;
             }
+            /* The mesh's and the skeletons' rows, laid out as a component's:
+               the name takes the room, the buttons sit together at the end. */
             #inspector .item {
                 display: flex;
-                justify-content: space-between;
                 align-items: center;
             }
             #inspector .item .name {
+                flex: 1;
+                min-width: 0;
                 color: #adf;
-                max-width: 230px;
                 overflow: hidden;
                 text-overflow: ellipsis;
                 white-space: nowrap;
+            }
+            #inspector .item button {
+                margin-left: 4px;
+                flex-shrink: 0;
             }
             #drop-overlay {
                 display: none;
@@ -1615,6 +1622,31 @@
                             nameSpan.textContent = `${sname} (${sinfo.nNodes.toLocaleString()}n)`;
                             div.appendChild(nameSpan);
 
+                            // every node's ring of surface at once
+                            const ringBtn = document.createElement("button");
+                            ringBtn.className = "icon-btn";
+                            ringBtn.textContent = "◎";
+                            const ringsOn = !!rings && rings.name === sname;
+                            ringBtn.dataset.on = ringsOn ? "1" : "0";
+                            ringBtn.disabled = !ringsOn && !binsAvailable(sname);
+                            ringBtn.title = ringsOn
+                                ? `Rings: ${rings.nRings.toLocaleString()} bins, ` +
+                                  `${rings.used.map((n) => n.toLocaleString()).join(" / ")} in the four colours` +
+                                  (rings.clashes
+                                      ? `; ${rings.clashes} touching pair${rings.clashes === 1 ? " shares" : "s share"} one`
+                                      : "") +
+                                  " — click to hide"
+                                : binsAvailable(sname)
+                                  ? "Rings: colour the mesh by this skeleton's bins, each node's ring of surface, touching rings apart"
+                                  : "Rings: only for a skeleton built from the mesh as it is now";
+                            ringBtn.addEventListener("click", () => {
+                                if (rings && rings.name === sname) {
+                                    clearRings();
+                                    updateLoadedPanel();
+                                } else showRings(sname);
+                            });
+                            div.appendChild(ringBtn);
+
                             const toggleBtn = document.createElement("button");
                             toggleBtn.className = "toggle-vis icon-btn";
                             setToggleVisIcon(toggleBtn, true);
@@ -1727,7 +1759,8 @@
                 document.getElementById("showGridBtn").textContent = "Show Grid";
                 document.getElementById("gridStatus").textContent = "";
 
-                // Remove old mesh
+                // Remove old mesh, and the rings drawn with its arrays
+                clearRings();
                 if (meshObj) {
                     scene.remove(meshObj);
                     meshObj.geometry.dispose();
@@ -2033,6 +2066,11 @@
                 refreshEditingSkel();
                 // For the same reason: `stale` rides in on this message.
                 refreshSkeletonizeCue();
+                // and the rings, which are this layer's bins
+                if (rings && rings.name === name) {
+                    if (binsAvailable(name)) showRings(name);
+                    else clearRings();
+                }
             }
 
             function buildTubes(name) {
@@ -2181,6 +2219,7 @@
                 });
                 document.getElementById("annOpacitySlider").addEventListener("input", (e) => {
                     const val = parseInt(e.target.value) / 100;
+                    if (rings) rings.mesh.material.opacity = val;
                     for (const m of annotationMeshes) {
                         if (!m) continue;
                         m.material.transparent = true;
@@ -3245,6 +3284,196 @@
                 return m;
             }
 
+            // ── Every bin at once ───────────────────────────────────────
+            // A switch on a skeleton's Layers row: the mesh coloured by its
+            // bins — each node's ring of surface, what a click shows one at
+            // a time — in the clicks' four colours, touching rings apart.
+            let rings = null; // { name, mesh, nRings, used, clashes }
+            let ringsSeq = 0;
+
+            /** A colour (0..k-1) per node, each about as often as the others
+             *  and neighbours (`pairs`, flat u, v) apart where k colours
+             *  allow: nodes taken in smallest-last order (each meets few
+             *  coloured neighbours), given the colour fewest of them have,
+             *  the least used of those; then a node sharing a colour with a
+             *  neighbour is given another, pass by pass, while that helps.
+             *  Four cannot always do it: bins can touch so that a handful
+             *  of them need five.  The caller counts the pairs left. */
+            function colourRings(n, pairs, k) {
+                const deg = new Int32Array(n);
+                for (let i = 0; i < pairs.length; i += 2) {
+                    deg[pairs[i]]++;
+                    deg[pairs[i + 1]]++;
+                }
+                const start = new Int32Array(n + 1);
+                for (let i = 0; i < n; i++) start[i + 1] = start[i] + deg[i];
+                const at = start.slice(0, n);
+                const adj = new Int32Array(start[n]);
+                for (let i = 0; i < pairs.length; i += 2) {
+                    const u = pairs[i], v = pairs[i + 1];
+                    adj[at[u]++] = v;
+                    adj[at[v]++] = u;
+                }
+                // take the least-connected node off, again and again; colour
+                // in the reverse order
+                let maxDeg = 0;
+                for (let i = 0; i < n; i++) maxDeg = Math.max(maxDeg, deg[i]);
+                const head = new Int32Array(maxDeg + 1).fill(-1);
+                const next = new Int32Array(n).fill(-1);
+                const prev = new Int32Array(n).fill(-1);
+                const unlink = (u) => {
+                    if (prev[u] >= 0) next[prev[u]] = next[u];
+                    else head[deg[u]] = next[u];
+                    if (next[u] >= 0) prev[next[u]] = prev[u];
+                };
+                const link = (u) => {
+                    prev[u] = -1;
+                    next[u] = head[deg[u]];
+                    if (head[deg[u]] >= 0) prev[head[deg[u]]] = u;
+                    head[deg[u]] = u;
+                };
+                for (let i = 0; i < n; i++) link(i);
+                const gone = new Uint8Array(n);
+                const order = new Int32Array(n);
+                let d = 0;
+                for (let i = n - 1; i >= 0; i--) {
+                    while (head[d] < 0) d++;
+                    const u = head[d];
+                    unlink(u);
+                    gone[u] = 1;
+                    order[i] = u;
+                    for (let j = start[u]; j < start[u + 1]; j++) {
+                        const w = adj[j];
+                        if (gone[w]) continue;
+                        unlink(w);
+                        deg[w]--;
+                        link(w);
+                    }
+                    d = Math.max(0, d - 1);
+                }
+                const colour = new Int32Array(n).fill(-1);
+                const used = new Int32Array(k);
+                const near = new Int32Array(k);
+                const pick = (u) => {
+                    near.fill(0);
+                    for (let j = start[u]; j < start[u + 1]; j++)
+                        if (colour[adj[j]] >= 0) near[colour[adj[j]]]++;
+                    let best = 0;
+                    for (let c = 1; c < k; c++)
+                        if (near[c] < near[best] || (near[c] === near[best] && used[c] < used[best])) best = c;
+                    return best;
+                };
+                for (const u of order) {
+                    colour[u] = pick(u);
+                    used[colour[u]]++;
+                }
+                const clashing = (u) => {
+                    for (let j = start[u]; j < start[u + 1]; j++) if (colour[adj[j]] === colour[u]) return true;
+                    return false;
+                };
+                for (let pass = 0; pass < 16; pass++) {
+                    let changed = 0;
+                    for (let u = 0; u < n; u++) {
+                        if (!clashing(u)) continue;
+                        const was = colour[u];
+                        used[was]--;
+                        colour[u] = -1;
+                        colour[u] = pick(u);
+                        used[colour[u]]++;
+                        if (colour[u] !== was) changed++;
+                    }
+                    if (!changed) break;
+                }
+                return colour;
+            }
+
+            /** Colour the mesh by skeleton `name`'s bins.  The overlay draws
+             *  the mesh's own positions and normals (an index of the faces a
+             *  node owns), so a grab or a rotate moves it along. */
+            async function showRings(name) {
+                const seq = ++ringsSeq;
+                clearRings();
+                let data;
+                try {
+                    const resp = await fetch("/bin_rings", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ name }),
+                    });
+                    data = await resp.json();
+                    if (!resp.ok || !data.ok) throw new Error((data && data.error) || resp.statusText);
+                } catch (e) {
+                    showLogStatus(`Rings: ${e.message}`);
+                    fadeLogStatus();
+                    updateLoadedPanel();
+                    return;
+                }
+                if (seq !== ringsSeq || !meshGeometry) return;
+                const ob = base64Bytes(data.owner);
+                const pb = base64Bytes(data.pairs);
+                const owner = new Int32Array(ob.buffer, ob.byteOffset, ob.byteLength / 4);
+                const pairs = new Int32Array(pb.buffer, pb.byteOffset, pb.byteLength / 4);
+                const K = BIN_COLORS.length;
+                const colour = colourRings(data.nNodes, pairs, K);
+                const used = new Int32Array(K);
+                for (const c of colour) used[c]++;
+                let clashes = 0;
+                for (let k = 0; k < pairs.length; k += 2)
+                    if (colour[pairs[k]] === colour[pairs[k + 1]]) clashes++;
+
+                const posAttr = meshGeometry.getAttribute("position");
+                const nFaces = Math.min(owner.length, posAttr.count / 3);
+                let owned = 0;
+                for (let f = 0; f < nFaces; f++) if (owner[f] >= 0) owned++;
+                const index = new Uint32Array(owned * 3);
+                const rgb = new Uint8Array(posAttr.count * 3);
+                const bytes = BIN_COLORS.map((c) => c.map((x) => Math.round(x * 255)));
+                for (let f = 0, j = 0; f < nFaces; f++) {
+                    const o = owner[f];
+                    if (o < 0) continue;
+                    const c = bytes[colour[o]];
+                    for (let k = 0; k < 3; k++) {
+                        const v = f * 3 + k;
+                        index[j++] = v;
+                        rgb[v * 3] = c[0];
+                        rgb[v * 3 + 1] = c[1];
+                        rgb[v * 3 + 2] = c[2];
+                    }
+                }
+                const geo = new THREE.BufferGeometry();
+                geo.setAttribute("position", posAttr);
+                geo.setAttribute("normal", meshGeometry.getAttribute("normal"));
+                geo.setAttribute("color", new THREE.BufferAttribute(rgb, 3, true));
+                geo.setIndex(new THREE.BufferAttribute(index, 1));
+                const mesh = new THREE.Mesh(
+                    geo,
+                    new THREE.MeshPhongMaterial({
+                        vertexColors: true,
+                        side: THREE.DoubleSide,
+                        clippingPlanes: [clipPlane],
+                        transparent: true,
+                        opacity: parseInt(document.getElementById("annOpacitySlider").value) / 100,
+                        polygonOffset: true,
+                        polygonOffsetFactor: -2,
+                    }),
+                );
+                scene.add(mesh);
+                rings = { name, mesh, nRings: data.nNodes, used: Array.from(used), clashes };
+                updateLoadedPanel();
+            }
+
+            function clearRings() {
+                if (!rings) return;
+                scene.remove(rings.mesh);
+                const geo = rings.mesh.geometry;
+                // the mesh's own positions and normals stay with the mesh
+                geo.deleteAttribute("position");
+                geo.deleteAttribute("normal");
+                geo.dispose();
+                rings.mesh.material.dispose();
+                rings = null;
+            }
+
             function drawReassignOverlay(faces, color) {
                 const m = makeFaceOverlay(faces, color);
                 if (m) reassignOverlays.push(m);
@@ -3331,13 +3560,17 @@
             // in this mode a selected node renders as the surface it owns
             // rather than as a ball.
             //
-            // The whole partition is never shipped — a bin is ~0.3-0.9 KB of
-            // face ids on real cells, so it is fetched per click.
+            // A bin is ~0.3-0.9 KB of face ids on real cells, so it is
+            // fetched per click; the whole partition only for the rings.
+            //
+            // The bins' colours, clicked and in the rings alike.  Any two can
+            // touch, so every pair is apart (colour-blind too), and none
+            // passes for the selection, the organelles or the grey mesh.
             const BIN_COLORS = [
                 [1.0, 0.35, 0.1],
                 [0.2, 0.9, 1.0],
                 [0.9, 0.3, 1.0],
-                [0.224, 0.529, 0.898],
+                [0.102, 0.102, 0.722],
             ];
             let binOverlays = [];   // face patches, one per selected bin
             let binBalls = [];      // the radius each bin produces
@@ -6546,6 +6779,7 @@
                         buildSkeleton(msg.payload);
                     } else if (msg.type === "skeleton_removed") {
                         const sname = msg.payload && msg.payload.name;
+                        if (rings && rings.name === sname) clearRings();
                         if (sname && skelGroups[sname]) {
                             const wasEditing = editingSkel() === sname;
                             disposeGroup(skelGroups[sname].group);
@@ -6565,6 +6799,7 @@
                         if (Object.keys(skelGroups).length === 0 && !meshObj)
                             document.getElementById("empty-hint").style.display = "block";
                     } else if (msg.type === "all_skeletons_removed") {
+                        clearRings();
                         for (const sg of Object.values(skelGroups)) disposeGroup(sg.group);
                         for (const k of Object.keys(skelGroups)) delete skelGroups[k];
                         dropNodeSelections();
@@ -6583,6 +6818,7 @@
                     } else if (msg.type === "log_end") {
                         fadeLogStatus();
                     } else if (msg.type === "mesh_removed") {
+                        clearRings();
                         if (meshObj) {
                             scene.remove(meshObj);
                             meshObj.geometry.dispose();

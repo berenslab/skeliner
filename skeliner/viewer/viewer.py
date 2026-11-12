@@ -4396,13 +4396,54 @@ def _create_app(
             sstate["pending_bin_edit"] = None
         return JSONResponse({"ok": True})
 
+    async def bin_rings(request):
+        """Every bin's surface at once, for the page to colour: the node
+        owning each face (``-1`` where none holds two of its vertices,
+        :func:`skeliner.dx.face_owner`) and the pairs of nodes whose bins
+        share surface (the node-adjacency graph the mesh implies, as
+        :func:`skeliner.dx.edge_support` rebuilds it), so the page can give
+        touching rings different colours.
+
+        Sent only when asked for: four bytes a face, where ``/bin`` sends
+        one bin per click.
+        """
+        from skeliner.skeletonize import _edges_from_mesh
+
+        name, _sstate, skel, err = _skel_edit_target(await _body_of(request))
+        if err is not None:
+            return err
+        mesh = mesh_state["mesh"]
+        owner = _face_owner_for(name)
+        pairs = np.asarray(
+            _edges_from_mesh(
+                np.asarray(mesh.edges_unique), skel.vert2node, len(mesh.vertices)
+            ),
+            dtype=np.int64,
+        ).reshape(-1, 2)
+        pairs = np.unique(np.sort(pairs[pairs[:, 0] != pairs[:, 1]], axis=1), axis=0)
+
+        def _b64(a):
+            return base64.b64encode(np.asarray(a, dtype="<i4").tobytes()).decode(
+                "ascii"
+            )
+
+        return JSONResponse(
+            {
+                "ok": True,
+                "name": name,
+                "nNodes": len(skel.nodes),
+                "owner": _b64(owner),
+                "pairs": _b64(pairs.reshape(-1)),
+            }
+        )
+
     async def get_bin(request):
         """The surface one skeleton node owns.
 
         A node's position and every radius are computed from the mesh vertices
         it owns, so this is what the node actually *is*.  Small enough to fetch
-        per click — a bin is ~0.3–0.9 KB of face ids on real cells — which is
-        why the partition is never shipped in bulk.
+        per click — a bin is ~0.3–0.9 KB of face ids on real cells — so one
+        click fetches one; the whole partition goes only to ``/bin_rings``.
 
         Accepts either ``node`` (which bin?) or ``face`` (which bin owns this
         piece of surface?), the same lookup in both directions.
@@ -5419,6 +5460,7 @@ def _create_app(
             ),
             Route("/skeletonize", run_skeletonize, methods=["POST"]),
             Route("/bin", get_bin, methods=["POST"]),
+            Route("/bin_rings", bin_rings, methods=["POST"]),
             Route("/bin_reassign_preview", bin_reassign_preview, methods=["POST"]),
             Route("/bin_reassign_apply", bin_reassign_apply, methods=["POST"]),
             Route("/bin_split_preview", bin_split_preview, methods=["POST"]),
