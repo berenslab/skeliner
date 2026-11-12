@@ -1107,7 +1107,9 @@
                      is exposed rather than baked in: change it, re-run, and
                      watch which nodes come and go.  Results land as findings,
                      and focusing one selects its bin, which arms the bin
-                     verbs. -->
+                     verbs.  Shown while a skeleton is loaded (never in
+                     contact mode, which has none). -->
+                <div id="checkRows" style="display: none">
                 <div class="row">
                     <span
                         class="row-label"
@@ -1133,6 +1135,7 @@
                     <span id="dxStatus" class="dim"></span>
                 </div>
                 <div id="dxParams" class="row"></div>
+                </div>
                 <div class="row nav-row">
                     <button id="findPrevBtn" title="Previous finding ([)">‹ prev</button>
                     <span id="findPos" class="dim"></span>
@@ -2071,6 +2074,7 @@
                     if (binsAvailable(name)) showRings(name);
                     else clearRings();
                 }
+                refreshCheckRows();
             }
 
             function buildTubes(name) {
@@ -2902,6 +2906,14 @@
                 // Layers on every load, the page in use most; contact mode
                 // has only Findings
                 showTab(contactMode ? "findings" : "layers");
+                refreshCheckRows();
+            }
+
+            /** The checks run on a skeleton: shown while one is loaded,
+             *  never in contact mode, which has none. */
+            function refreshCheckRows() {
+                const rows = document.getElementById("checkRows");
+                if (rows) rows.style.display = !contactMode && Object.keys(skelGroups).length ? "" : "none";
             }
 
             function setupTools() {
@@ -6796,6 +6808,7 @@
                         }
                         updateLoadedPanel();
                         refreshSkeletonizeCue();
+                        refreshCheckRows();
                         if (Object.keys(skelGroups).length === 0 && !meshObj)
                             document.getElementById("empty-hint").style.display = "block";
                     } else if (msg.type === "all_skeletons_removed") {
@@ -6812,6 +6825,7 @@
                         refreshEditingSkel();
                         updateLoadedPanel();
                         refreshSkeletonizeCue();
+                        refreshCheckRows();
                         if (!meshObj) document.getElementById("empty-hint").style.display = "block";
                     } else if (msg.type === "log") {
                         showLogStatus(msg.text);

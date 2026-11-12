@@ -78,7 +78,22 @@ A lightweight skeletonizer that converts neuron meshes into biophysical‑modell
       areas on A/B and their mean, plus compact AABBs for downstream use.
     - Optional skeleton‑only approximation of contact sites/areas when meshes are unavailable.
 
-
+<table>
+  <tr>
+    <td width="30%" align="center">
+      <img width="100%" alt="contact sites between two cells" src=".github/media/contacts/contacts.png" />  <br />   
+      <sub>All contacts sites of two cells</sub>
+    </td>
+    <td width="30%" align="center">
+      <img width="100%"  alt="zoomed in to the contact sites (opaque)" src=".github/media/contacts/zoom-in-opaque.png" /> <br />
+      <sub>Contact sites (zoomed in)</sub>
+    </td>
+    <td width="30%" align="center">
+      <img width="100%"  alt="zommed in to the contact sites (transparent)" src=".github/media/contacts/zoom-in-transparent.png" />
+      <sub>Contact sites (zommed in with transparent meshes)</sub>
+    </td>
+  </tr>
+</table>
 
 - I/O, visualization, diagnostics and post-processing
     - Read/write SWC and compact NPZ;
