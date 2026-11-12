@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use mesh::geometry::{arange, numpy_sum};
-use mesh::raster::{dilate3, enclosed, fill_holes, label, sq_distance_to};
+use mesh::raster::{enclosed, fill_holes, label, sq_distance_to};
 use rayon::prelude::*;
 
 /// Distance between Z-levels.
@@ -65,11 +65,6 @@ struct Slab {
     /// grid, so a window gives the whole slab's coordinates to the bit.
     off: [usize; 2],
     occ: Vec<bool>,
-    /// Grid cell of each of the level's vertices.
-    cell: Vec<usize>,
-    /// Components of the dilated occupancy.
-    labeled: Vec<u32>,
-    n_labels: u32,
 }
 
 /// A level's grid: its origin and size, and the cell each point falls in.
@@ -125,50 +120,6 @@ struct Void {
 /// A 2D convex hull's facet equations `(n0, n1, offset)`, inside where
 /// `n . p + offset <= 0`, as scipy's `ConvexHull.equations` gives them.
 pub type Hull = Vec<[f64; 3]>;
-
-/// `_z_slice_cluster`: rasterise the points (at least ten) and label the
-/// dilated occupancy.  Returns the slab and the mask of the largest
-/// cluster, the lowest label among equals.
-fn rasterise(pts: &[[f64; 2]], grid_res: f64) -> Option<(Slab, Vec<bool>)> {
-    let Grid {
-        nx,
-        ny,
-        xy_min,
-        cell,
-    } = grid(pts, grid_res)?;
-    let mut occ = vec![false; nx * ny];
-    for &c in &cell {
-        occ[c] = true;
-    }
-    let (labeled, n_labels) = label(&dilate3(&occ, nx, ny), nx, ny);
-    if n_labels == 0 {
-        return None;
-    }
-    let mut sizes = vec![0usize; n_labels as usize + 1];
-    for &l in &labeled {
-        sizes[l as usize] += 1;
-    }
-    let mut lid = 1;
-    for l in 2..=n_labels as usize {
-        if sizes[l] > sizes[lid] {
-            lid = l;
-        }
-    }
-    let region = labeled.iter().map(|&l| l as usize == lid).collect();
-    Some((
-        Slab {
-            nx,
-            ny,
-            xy_min,
-            off: [0, 0],
-            occ,
-            cell,
-            labeled,
-            n_labels,
-        },
-        region,
-    ))
-}
 
 /// The void's peak and its deep part, given the occupancy `occ_s` the
 /// distances are taken to and the candidate `void` cells (at least one).
@@ -240,6 +191,48 @@ fn section_radius(filled: &[bool], nx: usize, ny: usize, pk: usize, grid_res: f6
     (sq_distance_to(&outside, nx, ny)[pk] as f64).sqrt() * grid_res
 }
 
+/// Squared distance from cell `p` of a grid `n` cells a side to the
+/// nearest cell `out` holds — what [`sq_distance_to`] gives at `p`,
+/// `i64::MAX` when there is none — searched ring by ring outwards (the
+/// cells `r` away along one axis and at most `r` along the other) until no
+/// ring can hold a nearer one.
+fn sq_distance_out(p: [usize; 2], n: [usize; 2], out: impl Fn(usize, usize) -> bool) -> i64 {
+    let [pi, pj] = p;
+    let d2 = |i: usize, j: usize| (i.abs_diff(pi).pow(2) + j.abs_diff(pj).pow(2)) as i64;
+    let reach = pi.max(n[0] - 1 - pi).max(pj).max(n[1] - 1 - pj);
+    let mut best = i64::MAX;
+    for r in 0..=reach {
+        if (r * r) as i64 >= best {
+            break;
+        }
+        // the rows r away, whole; between them, the two columns r away
+        let (j0, j1) = (pj.saturating_sub(r), (pj + r).min(n[1] - 1));
+        let rows = [
+            pi.checked_sub(r),
+            Some(pi + r).filter(|&i| i < n[0] && r > 0),
+        ];
+        for i in rows.into_iter().flatten() {
+            for j in j0..=j1 {
+                if out(i, j) {
+                    best = best.min(d2(i, j));
+                }
+            }
+        }
+        if r == 0 {
+            continue;
+        }
+        let cols = [pj.checked_sub(r), Some(pj + r).filter(|&j| j < n[1])];
+        for i in (pi + 1).saturating_sub(r)..=(pi + r - 1).min(n[0] - 1) {
+            for j in cols.into_iter().flatten() {
+                if out(i, j) {
+                    best = best.min(d2(i, j));
+                }
+            }
+        }
+    }
+    best
+}
+
 /// `_z_slice_void`: the void enclosed by the soma cluster `region`, and the
 /// section's radius at it.
 fn slice_void(s: &Slab, region: &[bool], grid_res: f64) -> Option<(Void, f64)> {
@@ -262,20 +255,14 @@ fn slice_void(s: &Slab, region: &[bool], grid_res: f64) -> Option<(Void, f64)> {
 /// with the section's radius at it.
 type Cluster = (Vec<bool>, Option<(Void, f64)>);
 
-/// [`rasterise`]'s largest cluster and [`slice_void`]'s void in it, without
-/// rasterising the slab's box, which on a cell a millimetre wide is mostly
-/// empty: the occupied cells are labelled as [`dilate3`] and the
-/// 4-connected [`label`] label them — two join when their 3x3 blocks overlap
-/// or share a side, within three cells along one axis and two along the
-/// other — and the largest (by dilated cells; among equals the first
-/// `label` meets, the one whose first cell comes first in row-major order)
-/// is rasterised alone, in a window one cell past its dilated cells.  The
-/// window holds every cell the void, the filled section and both distance
-/// transforms read, so they come out as on the whole slab.  Returns which
-/// points fall in the cluster, and its void with the section's radius.
-fn largest_section(pts: &[[f64; 2]], grid_res: f64) -> Option<Cluster> {
-    let g = grid(pts, grid_res)?;
-    let (nx, ny) = (g.nx as i64, g.ny as i64);
+/// A level's occupied cells, ascending, in the components [`label`] finds
+/// in their [dilated](mesh::raster::dilate3) occupancy, without rasterising
+/// it: two cells join when their 3x3 blocks overlap or share a side —
+/// within three cells along one axis and two along the other.  Returns the
+/// cells and, for each, its component's first cell in row-major order (an
+/// index into them).
+fn components(g: &Grid) -> (Vec<usize>, Vec<usize>) {
+    let ny = g.ny as i64;
     let mut occ: Vec<usize> = g.cell.clone();
     occ.sort_unstable();
     occ.dedup();
@@ -304,8 +291,15 @@ fn largest_section(pts: &[[f64; 2]], grid_res: f64) -> Option<Cluster> {
             }
         }
     }
-    let roots: Vec<usize> = (0..occ.len()).map(|k| root(&mut parent, k)).collect();
-    // each component's dilated cells, counted once
+    let roots = (0..occ.len()).map(|k| root(&mut parent, k)).collect();
+    (occ, roots)
+}
+
+/// The dilated cells of [`components`]' components — the 3x3 block round
+/// each of their cells, on the grid — as `(root, cell)`, ascending, each
+/// once.
+fn dilated_cells(g: &Grid, occ: &[usize], roots: &[usize]) -> Vec<(usize, usize)> {
+    let (nx, ny) = (g.nx as i64, g.ny as i64);
     let mut dilated: Vec<(usize, usize)> = Vec::with_capacity(9 * occ.len());
     for (k, &c) in occ.iter().enumerate() {
         let (i, j) = (c as i64 / ny, c as i64 % ny);
@@ -317,6 +311,23 @@ fn largest_section(pts: &[[f64; 2]], grid_res: f64) -> Option<Cluster> {
     }
     dilated.sort_unstable();
     dilated.dedup();
+    dilated
+}
+
+/// The whole slab's largest cluster and [`slice_void`]'s void in it,
+/// without rasterising the slab's box, which on a cell a millimetre wide
+/// is mostly empty: of the occupied cells' [`components`], the largest (by
+/// dilated cells; among equals the first `label` meets, the one whose
+/// first cell comes first in row-major order) is rasterised alone, in a
+/// window one cell past its dilated cells.  The window holds every cell the
+/// void, the filled section and both distance transforms read, so they come
+/// out as on the whole slab.  Returns which points fall in the cluster, and
+/// its void with the section's radius.
+fn largest_section(pts: &[[f64; 2]], grid_res: f64) -> Option<Cluster> {
+    let g = grid(pts, grid_res)?;
+    let (nx, ny) = (g.nx as i64, g.ny as i64);
+    let (occ, roots) = components(&g);
+    let dilated = dilated_cells(&g, &occ, &roots);
     let mut best = (0usize, usize::MAX);
     let mut run = 0usize;
     for (n, &(r, _)) in dilated.iter().enumerate() {
@@ -360,9 +371,6 @@ fn largest_section(pts: &[[f64; 2]], grid_res: f64) -> Option<Cluster> {
         xy_min: g.xy_min,
         off: [i0 as usize, j0 as usize],
         occ: w_occ,
-        cell: Vec::new(),
-        labeled: Vec::new(),
-        n_labels: 1,
     };
     let mask = g
         .cell
@@ -704,8 +712,7 @@ impl ZScan {
                 .filter_map(|&i| {
                     let hull = if i < lo { hull_lo } else { hull_hi }?;
                     let pts: Vec<[f64; 2]> = levels[i].vi.iter().map(|&v| xy[v as usize]).collect();
-                    let (slab, _) = rasterise(&pts, p.grid_res)?;
-                    hull_guided_void(&slab, hull, p.grid_res).map(|(v, m)| (i, v, m))
+                    hull_guided_void(&pts, hull, p.grid_res).map(|(v, m)| (i, v, m))
                 })
                 .collect()
         });
@@ -734,68 +741,98 @@ impl ZScan {
     }
 }
 
-/// The retry on one slab: clusters whose centroid lies inside the hull
-/// (within one cell) form the soma, and the void is sought inside the hull.
-/// Returns the void with the section's radius at it (the hull's), and the
-/// new soma mask over the level's vertices.
-fn hull_guided_void(s: &Slab, hull: &Hull, grid_res: f64) -> Option<((Void, f64), Vec<bool>)> {
-    let (nx, ny) = (s.nx, s.ny);
+/// The retry on one level's points (at least ten): the [`components`] of
+/// their occupied cells whose centroid — of their dilated cells — lies
+/// inside the hull (within one cell) form the soma, and the void is sought
+/// among the occupied cells inside the hull.  Those alone are rasterised,
+/// in their own window: the 4-ray enclosure, the void and the distances to
+/// them read no cell outside it, and the section's radius at the void —
+/// the distance to the nearest cell outside the hull — is searched from the
+/// void's centre outwards ([`sq_distance_out`]), so all comes out as on the
+/// whole slab.  Returns the void with the section's radius at it, and the
+/// new soma mask over the points.
+fn hull_guided_void(
+    pts: &[[f64; 2]],
+    hull: &Hull,
+    grid_res: f64,
+) -> Option<((Void, f64), Vec<bool>)> {
+    let g = grid(pts, grid_res)?;
+    let ny = g.ny;
     let centre = |i: f64, j: f64| {
         [
-            s.xy_min[0] + i * grid_res + grid_res / 2.0,
-            s.xy_min[1] + j * grid_res + grid_res / 2.0,
+            g.xy_min[0] + i * grid_res + grid_res / 2.0,
+            g.xy_min[1] + j * grid_res + grid_res / 2.0,
         ]
     };
     let inside =
         |p: [f64; 2], tol: f64| hull.iter().all(|e| p[0] * e[0] + p[1] * e[1] + e[2] <= tol);
-    let hull_mask: Vec<bool> = (0..nx * ny)
-        .map(|c| inside(centre((c / ny) as f64, (c % ny) as f64), 0.0))
-        .collect();
+    let in_hull = |i: usize, j: usize| inside(centre(i as f64, j as f64), 0.0);
 
-    // centroid of each label's cells: exact integer sums, then one division
-    let n = s.n_labels as usize;
-    let mut sum = vec![[0u64; 2]; n + 1];
-    let mut count = vec![0u64; n + 1];
-    for (c, &l) in s.labeled.iter().enumerate() {
-        sum[l as usize][0] += (c / ny) as u64;
-        sum[l as usize][1] += (c % ny) as u64;
-        count[l as usize] += 1;
+    // each component's centroid: exact integer sums, then one division
+    let (occ, roots) = components(&g);
+    let mut keep = vec![false; occ.len()];
+    for run in dilated_cells(&g, &occ, &roots).chunk_by(|a, b| a.0 == b.0) {
+        let (mut si, mut sj) = (0u64, 0u64);
+        for &(_, c) in run {
+            si += (c / ny) as u64;
+            sj += (c % ny) as u64;
+        }
+        let k = run.len() as f64;
+        keep[run[0].0] = inside(centre(si as f64 / k, sj as f64 / k), grid_res);
     }
-    let keep: Vec<bool> = (0..=n)
-        .map(|l| {
-            l > 0 && count[l] > 0 && {
-                let k = count[l] as f64;
-                inside(centre(sum[l][0] as f64 / k, sum[l][1] as f64 / k), grid_res)
-            }
-        })
-        .collect();
-    let merged: Vec<bool> = s.labeled.iter().map(|&l| keep[l as usize]).collect();
-    if !merged.iter().any(|&m| m) {
+    if !keep.iter().any(|&k| k) {
         return None;
     }
-    let mask = s.cell.iter().map(|&c| merged[c]).collect();
-
-    let occ_h: Vec<bool> = s
-        .occ
+    let mask = g
+        .cell
         .iter()
-        .zip(&hull_mask)
-        .map(|(&o, &h)| o && h)
+        .map(|c| keep[roots[occ.binary_search(c).expect("an occupied cell")]])
         .collect();
-    let enc = enclosed(&occ_h, nx, ny);
-    let void: Vec<bool> = (0..nx * ny)
-        .map(|c| enc[c] && hull_mask[c] && !occ_h[c])
+
+    // the occupied cells inside the hull, in their window
+    let held: Vec<(usize, usize)> = occ
+        .iter()
+        .map(|&c| (c / ny, c % ny))
+        .filter(|&(i, j)| in_hull(i, j))
+        .collect();
+    if held.is_empty() {
+        return None;
+    }
+    let (mut lo, mut hi) = ([usize::MAX; 2], [0usize; 2]);
+    for &(i, j) in &held {
+        lo = [lo[0].min(i), lo[1].min(j)];
+        hi = [hi[0].max(i), hi[1].max(j)];
+    }
+    let (wnx, wny) = (hi[0] - lo[0] + 1, hi[1] - lo[1] + 1);
+    let mut w_occ = vec![false; wnx * wny];
+    for &(i, j) in &held {
+        w_occ[(i - lo[0]) * wny + j - lo[1]] = true;
+    }
+    let enc = enclosed(&w_occ, wnx, wny);
+    let void: Vec<bool> = (0..wnx * wny)
+        .map(|w| enc[w] && !w_occ[w] && in_hull(w / wny + lo[0], w % wny + lo[1]))
         .collect();
     if !void.iter().any(|&v| v) {
         return None;
     }
-    let v = locate_void(s, &occ_h, &void, grid_res);
-    let sec = section_radius(&hull_mask, nx, ny, v.pk, grid_res);
-    Some(((v, sec), mask))
+    let window = Slab {
+        nx: wnx,
+        ny: wny,
+        xy_min: g.xy_min,
+        off: lo,
+        occ: w_occ,
+    };
+    let v = locate_void(&window, &window.occ, &void, grid_res);
+    let at = [v.pk / wny + lo[0], v.pk % wny + lo[1]];
+    let out = sq_distance_out(at, [g.nx, g.ny], |i, j| !in_hull(i, j));
+    Some(((v, (out as f64).sqrt() * grid_res), mask))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mesh::geometry::hull_equations;
+    use mesh::raster::dilate3;
 
     /// xorshift64*, in [0, 1).
     fn uniform(state: &mut u64) -> f64 {
@@ -803,6 +840,124 @@ mod tests {
         *state ^= *state << 25;
         *state ^= *state >> 27;
         (state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// A slab rasterised whole: each point's cell, and the components of
+    /// the dilated occupancy.
+    struct Whole {
+        slab: Slab,
+        cell: Vec<usize>,
+        labeled: Vec<u32>,
+        n_labels: u32,
+    }
+
+    /// `_z_slice_cluster` on the whole slab: rasterise the points (at least
+    /// ten) and label the dilated occupancy.  Returns the slab and the mask
+    /// of the largest cluster, the lowest label among equals.
+    fn rasterise(pts: &[[f64; 2]], grid_res: f64) -> Option<(Whole, Vec<bool>)> {
+        let Grid {
+            nx,
+            ny,
+            xy_min,
+            cell,
+        } = grid(pts, grid_res)?;
+        let mut occ = vec![false; nx * ny];
+        for &c in &cell {
+            occ[c] = true;
+        }
+        let (labeled, n_labels) = label(&dilate3(&occ, nx, ny), nx, ny);
+        if n_labels == 0 {
+            return None;
+        }
+        let mut sizes = vec![0usize; n_labels as usize + 1];
+        for &l in &labeled {
+            sizes[l as usize] += 1;
+        }
+        let mut lid = 1;
+        for l in 2..=n_labels as usize {
+            if sizes[l] > sizes[lid] {
+                lid = l;
+            }
+        }
+        let region = labeled.iter().map(|&l| l as usize == lid).collect();
+        let slab = Slab {
+            nx,
+            ny,
+            xy_min,
+            off: [0, 0],
+            occ,
+        };
+        Some((
+            Whole {
+                slab,
+                cell,
+                labeled,
+                n_labels,
+            },
+            region,
+        ))
+    }
+
+    /// The retry on the whole slab: the labels whose centroid lies inside
+    /// the hull (within one cell) form the soma, and the void is sought
+    /// inside the hull.
+    fn retried_on_the_whole_slab(
+        w: &Whole,
+        hull: &Hull,
+        grid_res: f64,
+    ) -> Option<((Void, f64), Vec<bool>)> {
+        let s = &w.slab;
+        let (nx, ny) = (s.nx, s.ny);
+        let centre = |i: f64, j: f64| {
+            [
+                s.xy_min[0] + i * grid_res + grid_res / 2.0,
+                s.xy_min[1] + j * grid_res + grid_res / 2.0,
+            ]
+        };
+        let inside =
+            |p: [f64; 2], tol: f64| hull.iter().all(|e| p[0] * e[0] + p[1] * e[1] + e[2] <= tol);
+        let hull_mask: Vec<bool> = (0..nx * ny)
+            .map(|c| inside(centre((c / ny) as f64, (c % ny) as f64), 0.0))
+            .collect();
+
+        let n = w.n_labels as usize;
+        let mut sum = vec![[0u64; 2]; n + 1];
+        let mut count = vec![0u64; n + 1];
+        for (c, &l) in w.labeled.iter().enumerate() {
+            sum[l as usize][0] += (c / ny) as u64;
+            sum[l as usize][1] += (c % ny) as u64;
+            count[l as usize] += 1;
+        }
+        let keep: Vec<bool> = (0..=n)
+            .map(|l| {
+                l > 0 && count[l] > 0 && {
+                    let k = count[l] as f64;
+                    inside(centre(sum[l][0] as f64 / k, sum[l][1] as f64 / k), grid_res)
+                }
+            })
+            .collect();
+        let merged: Vec<bool> = w.labeled.iter().map(|&l| keep[l as usize]).collect();
+        if !merged.iter().any(|&m| m) {
+            return None;
+        }
+        let mask = w.cell.iter().map(|&c| merged[c]).collect();
+
+        let occ_h: Vec<bool> = s
+            .occ
+            .iter()
+            .zip(&hull_mask)
+            .map(|(&o, &h)| o && h)
+            .collect();
+        let enc = enclosed(&occ_h, nx, ny);
+        let void: Vec<bool> = (0..nx * ny)
+            .map(|c| enc[c] && hull_mask[c] && !occ_h[c])
+            .collect();
+        if !void.iter().any(|&v| v) {
+            return None;
+        }
+        let v = locate_void(s, &occ_h, &void, grid_res);
+        let sec = section_radius(&hull_mask, nx, ny, v.pk, grid_res);
+        Some(((v, sec), mask))
     }
 
     /// What the whole slab gives for the largest cluster: which points fall
@@ -813,9 +968,9 @@ mod tests {
     );
 
     fn on_the_whole_slab(pts: &[[f64; 2]], grid_res: f64) -> Option<Section> {
-        let (slab, region) = rasterise(pts, grid_res)?;
-        let mask = slab.cell.iter().map(|&c| region[c]).collect();
-        let void = slice_void(&slab, &region, grid_res);
+        let (w, region) = rasterise(pts, grid_res)?;
+        let mask = w.cell.iter().map(|&c| region[c]).collect();
+        let void = slice_void(&w.slab, &region, grid_res);
         Some((
             mask,
             void.map(|(v, s)| (v.cx, v.cy, v.void_r, v.void_xy, s)),
@@ -830,51 +985,62 @@ mod tests {
         ))
     }
 
+    /// Slab `case` of the fixtures: hollow rings among specks spread far,
+    /// specks on a lattice of 2–4 cells (blocks that touch, by a side or a
+    /// corner, and that do not), rings of one size (a tie), a slab of a few
+    /// points.  Returns the points, the first ring's first.
+    fn slab_points(case: usize, s: &mut u64, grid_res: f64) -> (Vec<[f64; 2]>, usize) {
+        let mut pts: Vec<[f64; 2]> = Vec::new();
+        let mut first = 0;
+        let rings = 1 + case % 3;
+        let r = 400.0 + 3600.0 * uniform(s);
+        for k in 0..rings {
+            let (cx, cy) = if case.is_multiple_of(7) {
+                // the same ring twice: a tie
+                (k as f64 * 20_000.0, 0.0)
+            } else {
+                (40_000.0 * uniform(s), 40_000.0 * uniform(s))
+            };
+            let rr = if case.is_multiple_of(7) {
+                r
+            } else {
+                400.0 + 3600.0 * uniform(s)
+            };
+            let n = (rr / 20.0) as usize;
+            for q in 0..n {
+                let a = q as f64 * std::f64::consts::TAU / n as f64;
+                pts.push([cx + rr * a.cos(), cy + rr * a.sin()]);
+            }
+            if k == 0 {
+                first = n;
+            }
+        }
+        let spread = [1_000.0, 30_000.0, 200_000.0][case % 3];
+        for _ in 0..(case * 7) % 300 {
+            pts.push([spread * uniform(s), spread * uniform(s)]);
+        }
+        let step = grid_res * (2.0 + (case % 3) as f64);
+        for a in 0..(case % 5) {
+            for b in 0..(case % 4) {
+                pts.push([-20_000.0 + a as f64 * step, b as f64 * step]);
+            }
+        }
+        if case.is_multiple_of(11) {
+            pts.truncate(10 + case % 5);
+        }
+        let first = first.min(pts.len());
+        (pts, first)
+    }
+
     /// The largest cluster found from its occupied cells and rasterised in
-    /// a window is the whole slab's, to the bit: hollow rings among specks
-    /// spread far, specks on a lattice of 2–4 cells (blocks that touch, by
-    /// a side or a corner, and that do not), rings of one size (a tie), a
-    /// slab of a few points.
+    /// a window is the whole slab's, to the bit, on every fixture.
     #[test]
     fn the_largest_section_is_the_whole_slabs() {
         let mut s = 0x9e37_79b9_7f4a_7c15u64;
         let grid_res = 200.0;
         let (mut voids, mut mixed) = (0, 0);
         for case in 0..300 {
-            let mut pts: Vec<[f64; 2]> = Vec::new();
-            let rings = 1 + case % 3;
-            let r = 400.0 + 3600.0 * uniform(&mut s);
-            for k in 0..rings {
-                let (cx, cy) = if case % 7 == 0 {
-                    // the same ring twice: a tie
-                    (k as f64 * 20_000.0, 0.0)
-                } else {
-                    (40_000.0 * uniform(&mut s), 40_000.0 * uniform(&mut s))
-                };
-                let rr = if case % 7 == 0 {
-                    r
-                } else {
-                    400.0 + 3600.0 * uniform(&mut s)
-                };
-                let n = (rr / 20.0) as usize;
-                for q in 0..n {
-                    let a = q as f64 * std::f64::consts::TAU / n as f64;
-                    pts.push([cx + rr * a.cos(), cy + rr * a.sin()]);
-                }
-            }
-            let spread = [1_000.0, 30_000.0, 200_000.0][case % 3];
-            for _ in 0..(case * 7) % 300 {
-                pts.push([spread * uniform(&mut s), spread * uniform(&mut s)]);
-            }
-            let step = grid_res * (2.0 + (case % 3) as f64);
-            for a in 0..(case % 5) {
-                for b in 0..(case % 4) {
-                    pts.push([-20_000.0 + a as f64 * step, b as f64 * step]);
-                }
-            }
-            if case % 11 == 0 {
-                pts.truncate(10 + case % 5);
-            }
+            let (pts, _) = slab_points(case, &mut s, grid_res);
             let got = in_its_window(&pts, grid_res);
             assert_eq!(got, on_the_whole_slab(&pts, grid_res), "case {case}");
             let (mask, void) = got.expect("ten points or more");
@@ -885,6 +1051,83 @@ mod tests {
         assert!(voids > 200 && mixed > 200, "{voids} voids, {mixed} mixed");
         let few = [[0.0, 0.0]; 9];
         assert!(in_its_window(&few, grid_res).is_none());
+    }
+
+    /// What a retry gives: the void's centre, radius and deep part, the
+    /// section's radius, and which points fall in the soma.
+    type Retried = (f64, f64, f64, Option<Vec<[f64; 2]>>, f64, Vec<bool>);
+
+    fn retried(((v, sec), mask): ((Void, f64), Vec<bool>)) -> Retried {
+        (v.cx, v.cy, v.void_r, v.void_xy, sec, mask)
+    }
+
+    /// The square of half-side `h` round `c` as hull equations.
+    fn square(c: [f64; 2], h: f64) -> Hull {
+        vec![
+            [1.0, 0.0, -(c[0] + h)],
+            [0.0, 1.0, -(c[1] + h)],
+            [-1.0, 0.0, c[0] - h],
+            [0.0, -1.0, c[1] - h],
+        ]
+    }
+
+    /// The retry, rasterised in the window of the occupied cells inside the
+    /// hull, is the whole slab's, to the bit: the fixtures, every other one
+    /// with a gap in its first ring, under the hulls of that ring, of half
+    /// of it, of a cloud of points, of a square past the whole slab and of
+    /// one apart from it.
+    #[test]
+    fn the_retry_in_its_window_is_the_whole_slabs() {
+        let mut s = 0x2545_f491_4f6c_dd1du64;
+        let grid_res = 200.0;
+        let (mut voids, mut none) = (0, 0);
+        for case in 0..300 {
+            let (mut pts, n) = slab_points(case, &mut s, grid_res);
+            let ring = pts[..n].to_vec();
+            if case % 2 == 0 {
+                // an eighth of the ring gone
+                pts.drain(..n / 8);
+            }
+            let cloud: Vec<[f64; 2]> = (0..5 + case % 40)
+                .map(|_| [40_000.0 * uniform(&mut s), 40_000.0 * uniform(&mut s)])
+                .collect();
+            let hulls = [
+                hull_equations(&ring),
+                hull_equations(&ring[..n / 2]),
+                hull_equations(&cloud),
+                Some(square([0.0, 0.0], 1e7)),
+                Some(square([-1e6, -1e6], 1000.0)),
+            ];
+            for hull in hulls.iter().flatten() {
+                let got = hull_guided_void(&pts, hull, grid_res).map(retried);
+                let want = rasterise(&pts, grid_res)
+                    .and_then(|(w, _)| retried_on_the_whole_slab(&w, hull, grid_res))
+                    .map(retried);
+                assert_eq!(got, want, "case {case}");
+                voids += usize::from(got.is_some());
+                none += usize::from(got.is_none());
+            }
+        }
+        // the fixtures: both outcomes, many times
+        assert!(voids > 300 && none > 300, "{voids} voids, {none} none");
+    }
+
+    /// The distance searched from one cell outwards is the distance
+    /// transform's at it: on grids of one row or column and wider, with no
+    /// cell to reach, a few, many and all of them.
+    #[test]
+    fn the_distance_out_is_the_transforms() {
+        let mut s = 11u64;
+        for case in 0..60 {
+            let (nx, ny) = (1 + case % 9 * 3, 1 + case % 7 * 4);
+            let share = [0.0, 0.002, 0.05, 0.5, 1.0][case % 5];
+            let out: Vec<bool> = (0..nx * ny).map(|_| uniform(&mut s) < share).collect();
+            let want = sq_distance_to(&out, nx, ny);
+            for (c, &d) in want.iter().enumerate() {
+                let got = sq_distance_out([c / ny, c % ny], [nx, ny], |i, j| out[i * ny + j]);
+                assert_eq!(got, d, "case {case}, cell {c}");
+            }
+        }
     }
 
     /// A level's vertices taken from the Z-sorted run are the ones the plain
