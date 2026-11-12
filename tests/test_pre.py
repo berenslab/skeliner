@@ -1813,7 +1813,7 @@ def _kernel_kinds(mesh, soma, org):
     usable = pre._usable_face_mask(mesh)
     soma_face = pre.soma_face_mask(faces, None if soma is None else soma.verts)
     claimed = np.zeros(len(faces), dtype=bool)
-    _, kinds = pre._break_up_pieces(
+    _, kinds, _ = pre._break_up_pieces(
         faces,
         mesh.vertices,
         usable,

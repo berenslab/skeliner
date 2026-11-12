@@ -1461,7 +1461,7 @@ def break_up_mesh(
             normals=mesh.face_normals,
         )
 
-    components, kinds = pieces()
+    components, kinds, body = pieces()
     # Arbor a ring of folds severed — cut off from its mesh component's
     # body, yet bigger than the organelles walling it and looking out of
     # the cell — is joined back across its walls that touch the body; an
@@ -1475,6 +1475,7 @@ def break_up_mesh(
         np.asarray(organelles.manual, dtype=bool),
         components,
         np.asarray(kinds, dtype=np.uint8),
+        np.asarray(body, dtype=bool),
     )
     if len(walls):
         organelles = Organelles(
@@ -1483,7 +1484,7 @@ def break_up_mesh(
             expanded=_cleared(organelles.expanded, walls),
             manual=organelles.manual,
         )
-        components, kinds = pieces()
+        components, kinds, _ = pieces()
     if soma is not None:
         kinds = _neurites_left_out(
             components, kinds, faces, verts, soma, usable & soma_face
@@ -1710,7 +1711,7 @@ def _break_up_pieces(
     *,
     centers,
     normals,
-) -> tuple[list[np.ndarray], np.ndarray]:
+) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
     """The pieces :func:`break_up_mesh` classifies: components of the usable
     faces that are neither soma nor organelle, largest first, and the kind
     of each — :data:`_PIECE_TRAPPED` when only organelle faces connect it to
@@ -1720,6 +1721,8 @@ def _break_up_pieces(
     :data:`_PIECE_SOMA` when more than half its outer edges meet soma faces
     and it has no more faces than the soma (only with a soma); else
     :data:`_PIECE_CANDIDATE`.  Claimed pieces are never trapped or soma.
+    Third, per face, whether it lies on its mesh component's body — what a
+    piece is cut off from, for the walls given back.
     """
     vertices = np.asarray(vertices, dtype=np.float64)
     return kernels.pre.break_up_classify(

@@ -50,7 +50,10 @@ pub struct BreakUpMesh<'a> {
 /// is a patch of the soma's surface, while a neurite leaving the soma
 /// reads as soma by its boundary at any length (its far end is capped), so
 /// an organelle-free arbor all one piece would be taken whole.
-pub fn classify(m: &BreakUpMesh<'_>, has_soma: bool) -> (Vec<Vec<u32>>, Vec<Piece>) {
+///
+/// Also, per face, whether it lies on its mesh component's body — what a
+/// piece is cut off from, which [`severed_walls`] reads on the same faces.
+pub fn classify(m: &BreakUpMesh<'_>, has_soma: bool) -> (Vec<Vec<u32>>, Vec<Piece>, Vec<bool>) {
     let nf = m.faces.len();
     let pick = |keep: &dyn Fn(usize) -> bool| -> Vec<u32> {
         (0..nf).filter(|&f| keep(f)).map(|f| f as u32).collect()
@@ -60,7 +63,7 @@ pub fn classify(m: &BreakUpMesh<'_>, has_soma: bool) -> (Vec<Vec<u32>>, Vec<Piec
     let remain = pick(&|f| m.usable[f] && !m.soma_face[f] && !m.organelle[f]);
     let components = listed_face_components(m.faces, &remain);
     if components.is_empty() {
-        return (components, Vec::new());
+        return (components, Vec::new(), reachable);
     }
     let topo = Topology::new(m.faces, m.n_vertices);
     let soma_size = (0..nf).filter(|&f| m.usable[f] && m.soma_face[f]).count();
@@ -160,7 +163,7 @@ pub fn classify(m: &BreakUpMesh<'_>, has_soma: bool) -> (Vec<Vec<u32>>, Vec<Piec
             }
         })
         .collect();
-    (components, kinds)
+    (components, kinds, reachable)
 }
 
 /// Per face, whether it lies on its mesh component's body: the component's
@@ -219,9 +222,9 @@ fn bodies(faces: &[[u32; 3]], usable: &[bool], organelle: &[bool]) -> Vec<bool> 
 /// organelle piece next to both, the trapped pieces in it counted as its
 /// own: an organelle's inside) by the wall's [`corridor`] between them.
 /// A wall holding a face `fixed` (an organelle drawn by hand) stays, and a
-/// `claimed` piece is the user's to place.  `pieces` and `kinds` are
-/// [`classify`]'s on the same faces.  Returns the organelle faces of the
-/// corridors, ascending.
+/// `claimed` piece is the user's to place.  `pieces`, `kinds` and `body`
+/// are [`classify`]'s on the same faces and organelles.  Returns the
+/// organelle faces of the corridors, ascending.
 #[allow(clippy::too_many_arguments)]
 pub fn severed_walls(
     faces: &[[u32; 3]],
@@ -232,9 +235,23 @@ pub fn severed_walls(
     fixed: &[bool],
     pieces: &[Vec<u32>],
     kinds: &[Piece],
+    body: &[bool],
 ) -> Vec<u32> {
     let nf = faces.len();
-    let reachable = bodies(faces, usable, organelle);
+    // the pieces cut off from their body and not trapped; with none there
+    // is no wall to look at
+    let cut: Vec<&Vec<u32>> = pieces
+        .iter()
+        .zip(kinds)
+        .filter(|(p, kind)| {
+            **kind == Piece::Candidate
+                && !p.iter().any(|&f| body[f as usize] || claimed[f as usize])
+        })
+        .map(|(p, _)| p)
+        .collect();
+    if cut.is_empty() {
+        return Vec::new();
+    }
     let topo = Topology::new(faces, n_vertices);
     // a wall is organelle faces and the trapped pieces among them — an
     // organelle's inside is the organelle's: a piece can be severed from
@@ -263,14 +280,7 @@ pub fn severed_walls(
     // body)
     let mut may: Vec<Option<bool>> = vec![None; walls.len()];
     let mut give = vec![false; nf];
-    for (p, kind) in pieces.iter().zip(kinds) {
-        let cut_off = *kind == Piece::Candidate
-            && !p
-                .iter()
-                .any(|&f| reachable[f as usize] || claimed[f as usize]);
-        if !cut_off {
-            continue;
-        }
+    for p in cut {
         let mut around: Vec<u32> = p
             .iter()
             .flat_map(|&f| topo.face_neighbors(f as usize))
@@ -288,11 +298,11 @@ pub fn severed_walls(
                     && w.iter().any(|&f| {
                         topo.face_neighbors(f as usize)
                             .into_iter()
-                            .any(|g| reachable[g as usize])
+                            .any(|g| body[g as usize])
                     })
             });
             if ok {
-                corridor(&topo, &walls[k], &in_piece, &reachable, &mut give);
+                corridor(&topo, &walls[k], &in_piece, body, &mut give);
             }
         }
     }
@@ -447,7 +457,8 @@ mod tests {
             centers: &centers,
             normals: &normals,
         };
-        classify(&m, has_soma)
+        let (pieces, kinds, _) = classify(&m, has_soma);
+        (pieces, kinds)
     }
 
     fn kinds(
@@ -523,7 +534,7 @@ mod tests {
             centers: &centers,
             normals: &normals,
         };
-        let (pieces, kinds) = classify(&m, true);
+        let (pieces, kinds, body) = classify(&m, true);
         severed_walls(
             &faces,
             verts.len(),
@@ -533,6 +544,7 @@ mod tests {
             &flags(&fixed),
             &pieces,
             &kinds,
+            &body,
         )
     }
 
@@ -599,7 +611,7 @@ mod tests {
             centers: &centers,
             normals: &normals,
         };
-        let (pieces, kinds) = classify(&m, false);
+        let (pieces, kinds, body) = classify(&m, false);
         let walls = severed_walls(
             &faces,
             verts.len(),
@@ -609,6 +621,7 @@ mod tests {
             &none,
             &pieces,
             &kinds,
+            &body,
         );
         let want: Vec<u32> = (0..nf as u32)
             .filter(|&f| {
@@ -622,18 +635,19 @@ mod tests {
     }
 
     /// Two walls with an organelle's inside between: the body (columns
-    /// 0-3), a wall (4), a piece no bigger than its walls, trapped (5),
-    /// a wall (6) and a piece of arbor (7-12).  Neither wall touches both
-    /// the arbor and the body; with the trapped piece they are one wall
-    /// that does, and its corridor joins the arbor back.
+    /// 0-7), a wall (8), a piece no bigger than its walls, trapped (9),
+    /// a wall (10) and a piece of arbor, smaller than the body (11-16).
+    /// Neither wall touches both the arbor and the body; with the trapped
+    /// piece they are one wall that does, and its corridor joins the arbor
+    /// back.
     #[test]
     fn a_wall_holds_the_organelle_inside_it() {
-        let (cols, rows) = (13, 3);
+        let (cols, rows) = (17, 3);
         let (verts, faces) = grid(cols, rows);
         let (centers, normals) = centres_and_normals(&verts, &faces);
         let nf = faces.len();
         let column = |f: usize| (f / 2) as u32 / rows;
-        let organelle: Vec<bool> = (0..nf).map(|f| [4, 6].contains(&column(f))).collect();
+        let organelle: Vec<bool> = (0..nf).map(|f| [8, 10].contains(&column(f))).collect();
         let none = vec![false; nf];
         let usable = vec![true; nf];
         let m = BreakUpMesh {
@@ -647,7 +661,7 @@ mod tests {
             centers: &centers,
             normals: &normals,
         };
-        let (pieces, kinds) = classify(&m, false);
+        let (pieces, kinds, body) = classify(&m, false);
         let kind_of = |col: u32| {
             let i = pieces
                 .iter()
@@ -655,8 +669,11 @@ mod tests {
                 .expect("a piece");
             kinds[i]
         };
-        assert_eq!(kind_of(5), Piece::Trapped);
-        assert_eq!(kind_of(7), Piece::Candidate);
+        assert_eq!(kind_of(9), Piece::Trapped);
+        assert_eq!(kind_of(11), Piece::Candidate);
+        // the body is the columns before the first wall: neither the
+        // inside nor the arbor, nor the walls
+        assert!((0..nf).all(|f| body[f] == (column(f) < 8)));
         let walls = severed_walls(
             &faces,
             verts.len(),
@@ -666,11 +683,12 @@ mod tests {
             &none,
             &pieces,
             &kinds,
+            &body,
         );
         // organelle faces of both walls, none of the trapped piece's
         assert!(walls.iter().all(|&f| organelle[f as usize]));
         let cols: BTreeSet<u32> = walls.iter().map(|&f| column(f as usize)).collect();
-        assert_eq!(cols, BTreeSet::from([4, 6]));
+        assert_eq!(cols, BTreeSet::from([8, 10]));
         // released, the arbor and the inside are the body's again
         let mut left = organelle.clone();
         for &f in &walls {
@@ -680,11 +698,20 @@ mod tests {
             organelle: &left,
             ..m
         };
-        let (pieces2, _) = classify(&m2, false);
+        let (pieces2, _, _) = classify(&m2, false);
         let arbor = pieces2
             .iter()
-            .find(|p| p.iter().any(|&f| column(f as usize) == 12))
+            .find(|p| p.iter().any(|&f| column(f as usize) == 16))
             .expect("the arbor");
         assert!(arbor.iter().any(|&f| column(f as usize) == 0));
+    }
+
+    /// With no piece cut off there is no wall to give back: an organelle
+    /// quad at the strip's far end (6) cuts nothing off, and with no
+    /// organelle at all every piece lies on the body.
+    #[test]
+    fn nothing_cut_off_gives_nothing_back() {
+        assert!(walls_on(false, 12..14, None, 0..0).is_empty());
+        assert!(walls_on(false, 0..0, None, 0..0).is_empty());
     }
 }

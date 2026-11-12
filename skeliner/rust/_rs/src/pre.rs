@@ -1209,14 +1209,21 @@ fn remove_fusions<'py>(
     ))
 }
 
-/// Pieces from [`break_up_classify`] and their kinds.
-type PiecesOut<'py> = (Vec<Bound<'py, PyArray1<i64>>>, Bound<'py, PyArray1<u8>>);
+/// Pieces from [`break_up_classify`], their kinds, and per face whether it
+/// lies on its mesh component's body.
+type PiecesOut<'py> = (
+    Vec<Bound<'py, PyArray1<i64>>>,
+    Bound<'py, PyArray1<u8>>,
+    Bound<'py, PyArray1<bool>>,
+);
 
 /// `skeliner.pre.break_up_mesh`'s pieces: the usable faces that are
 /// neither soma nor organelle, by component, largest first, each with its
-/// kind (0 candidate, 1 trapped behind organelles, 2 soma).  `vertices`,
-/// `centers` and `normals` cast the rays that tell a piece walled in by
-/// organelles inside the cell from a neurite cut off by them.
+/// kind (0 candidate, 1 trapped behind organelles, 2 soma); and per face
+/// whether it lies on its mesh component's body, which
+/// [`break_up_severed_walls`] reads.  `vertices`, `centers` and `normals`
+/// cast the rays that tell a piece walled in by organelles inside the cell
+/// from a neurite cut off by them.
 #[pyfunction]
 #[pyo3(signature = (
     faces, n_vertices, usable, organelle, soma_face, claimed, has_soma,
@@ -1262,7 +1269,7 @@ fn break_up_classify<'py>(
     let organelle = flags("organelle", &organelle)?;
     let soma_face = flags("soma_face", &soma_face)?;
     let claimed = flags("claimed", &claimed)?;
-    let (comps, kinds) = py.detach(|| {
+    let (comps, kinds, body) = py.detach(|| {
         let m = ::pre::breakup::BreakUpMesh {
             faces: &tris,
             n_vertices: n,
@@ -1281,15 +1288,15 @@ fn break_up_classify<'py>(
         .map(|c| Array1::from_iter(c.into_iter().map(i64::from)).into_pyarray(py))
         .collect();
     let kinds = Array1::from_iter(kinds.into_iter().map(|k| k as u8)).into_pyarray(py);
-    Ok((comps, kinds))
+    Ok((comps, kinds, Array1::from_vec(body).into_pyarray(py)))
 }
 
 /// `skeliner.pre.break_up_mesh`'s walls to give back
 /// (`::pre::breakup::severed_walls`): the organelle faces between a piece
 /// [`break_up_classify`] found cut off from its component's body, not
-/// trapped (`pieces`, `kinds`), and that body.  A wall with a face `fixed`
-/// (drawn by hand) stays, and so does a `claimed` piece's.  Face ids,
-/// ascending.
+/// trapped (`pieces`, `kinds`, `body`: its three outputs on the same faces
+/// and organelles), and that body.  A wall with a face `fixed` (drawn by
+/// hand) stays, and so does a `claimed` piece's.  Face ids, ascending.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn break_up_severed_walls<'py>(
@@ -1302,6 +1309,7 @@ fn break_up_severed_walls<'py>(
     fixed: numpy::PyReadonlyArray1<'py, bool>,
     pieces: Vec<numpy::PyReadonlyArray1<'py, i64>>,
     kinds: numpy::PyReadonlyArray1<'py, u8>,
+    body: numpy::PyReadonlyArray1<'py, bool>,
 ) -> PyResult<Bound<'py, PyArray1<i64>>> {
     use ::pre::breakup::Piece;
     let (tris, n) = checked_faces(&faces, Some(n_vertices))?;
@@ -1316,6 +1324,7 @@ fn break_up_severed_walls<'py>(
     };
     let (usable, organelle) = (flags("usable", &usable)?, flags("organelle", &organelle)?);
     let (claimed, fixed) = (flags("claimed", &claimed)?, flags("fixed", &fixed)?);
+    let body = flags("body", &body)?;
     let pieces: Vec<Vec<u32>> = pieces
         .iter()
         .map(|p| face_ids(p, tris.len()))
@@ -1335,7 +1344,7 @@ fn break_up_severed_walls<'py>(
     }
     let walls = py.detach(|| {
         ::pre::breakup::severed_walls(
-            &tris, n, &usable, &organelle, &claimed, &fixed, &pieces, &kinds,
+            &tris, n, &usable, &organelle, &claimed, &fixed, &pieces, &kinds, &body,
         )
     });
     Ok(Array1::from_iter(walls.into_iter().map(i64::from)).into_pyarray(py))

@@ -4234,7 +4234,7 @@ def break_up_classify(
     vertices,
     centers,
     normals,
-) -> tuple[list[np.ndarray], np.ndarray]:
+) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
     """The pieces ``skeliner.pre.break_up_mesh`` classifies: components of
     the usable faces that are neither soma nor organelle, largest first, and
     the kind of each — :data:`PIECE_TRAPPED` when only organelle faces
@@ -4243,8 +4243,9 @@ def break_up_classify(
     faces looking into the cell; :data:`PIECE_SOMA` when more than half its
     outer edges meet soma faces and it has no more faces than the soma
     (only with a soma), else :data:`PIECE_CANDIDATE`.  Claimed pieces are
-    never trapped or soma.  *vertices*, *centers* and *normals* cast the
-    rays."""
+    never trapped or soma.  Third, per face, whether it lies on its mesh
+    component's body, which ``break_up_severed_walls`` reads.  *vertices*,
+    *centers* and *normals* cast the rays."""
     faces, _ = checked_faces(faces, n_vertices)
     vertices = rows3("V", vertices)
     if len(vertices) != n_vertices:
@@ -4308,7 +4309,7 @@ def break_up_classify(
     remain_fi = np.where(remain)[0]
 
     if len(remain_fi) == 0:
-        return [], np.zeros(0, dtype=np.uint8)
+        return [], np.zeros(0, dtype=np.uint8), reachable
 
     components = face_components(faces, remain_fi)
     # Still needed below, to count how much of each component's boundary
@@ -4365,7 +4366,7 @@ def break_up_classify(
             soma_frac = n_soma / n_total if n_total > 0 else 0.0
             if soma_frac > 0.5:
                 kinds[k] = PIECE_SOMA
-    return components, kinds
+    return components, kinds, reachable
 
 
 def otsu_threshold(values: np.ndarray) -> tuple[float, float]:
