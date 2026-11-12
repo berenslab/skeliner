@@ -17,7 +17,10 @@ permissions:
 
 jobs:
   # The extension is built for the stable ABI (abi3, Python >= 3.11), so each
-  # platform needs one wheel rather than one per Python version.
+  # platform needs one wheel rather than one per Python version.  Both macOS
+  # wheels come from the arm64 runner, x86_64 cross-compiled (pure Rust, so
+  # no C toolchain for the target is needed); `macos-latest` rather than a
+  # numbered image, which GitHub retires.
   wheels:
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -26,8 +29,8 @@ jobs:
         include:
           - { runner: ubuntu-latest, target: x86_64, manylinux: auto }
           - { runner: ubuntu-latest, target: aarch64, manylinux: auto }
-          - { runner: macos-14, target: x86_64 }
-          - { runner: macos-14, target: aarch64 }
+          - { runner: macos-latest, target: x86_64 }
+          - { runner: macos-latest, target: aarch64 }
           - { runner: windows-latest, target: x64 }
 
     steps:
