@@ -10,10 +10,13 @@ from collections import Counter, defaultdict, deque
 import numpy as np
 
 from .mesh import (
-    border_loops,
+    EDGE_COLS,
+    border_edges,
     checked_faces,
+    cycles_of_edges,
     edge_to_faces,
     face_adjacency,
+    hole_neighbours,
     nearest,
     non_degenerate,
     right_singular,
@@ -27,62 +30,122 @@ from .post import _RAY_CHUNK
 _EPS = float(np.finfo(np.float64).eps)
 
 
-def sever_cost(sel: set[int], face_adj: dict[int, set[int]], budget: int) -> int:
-    """How many faces removing *sel* would strand, capped at ``budget``.
+def sever_cost(
+    sel: set[int], face_adj: dict[int, set[int]], budget: int, rejoined=()
+) -> int:
+    """How many faces removing *sel* would strand, capped at ``budget + 1``.
 
-    Everything but the largest surviving piece is stranded.  Each piece is
-    grown separately and abandoned once it passes ``budget``: at most one
-    piece can exceed the budget and still be the largest, and if two do the
-    cost already exceeds it.  Returns ``budget + 1`` in that case.
+    The pieces left are walked whole from the faces bordering *sel*,
+    lowest first.  Everything is stranded but the largest piece, which
+    stays, and the piece holding a face of *rejoined* — the bridge's other
+    tip, which the bridge joins back: two parts glued only by fusion faces
+    lie in one face-edge component, and peeling a tip off one can cut the
+    other off across the glue.
     """
     seeds: set[int] = set()
     for fi in sel:
         seeds.update(f for f in face_adj[fi] if f not in sel)
     if not seeds:
         return 0
+    rejoined = {int(f) for f in rejoined}
 
-    seen: set[int] = set()
-    closed: list[int] = []
-    n_over = 0
+    seen: set[int] = set(sel)
+    # each piece's size, and whether it holds the other tip
+    pieces: list[tuple[int, bool]] = []
     for seed in sorted(seeds):
         if seed in seen:
             continue
-        stack = [seed]
         seen.add(seed)
-        size = 0
-        over = False
+        stack = [seed]
+        size, holds = 0, False
         while stack:
             u = stack.pop()
             size += 1
-            if size > budget:
-                over = True
-                # u is popped but not yet walked; the drain below walks it
-                stack.append(u)
-                break
+            holds = holds or u in rejoined
             for v in face_adj[u]:
-                if v not in sel and v not in seen:
+                if v not in seen:
                     seen.add(v)
                     stack.append(v)
-        if over:
-            n_over += 1
-            if n_over >= 2:
-                return budget + 1
-            # drain the rest of this piece so its faces are not revisited
-            while stack:
-                u = stack.pop()
-                for v in face_adj[u]:
-                    if v not in sel and v not in seen:
-                        seen.add(v)
-                        stack.append(v)
-        else:
-            closed.append(size)
+        pieces.append((size, holds))
 
-    if n_over:
-        # the oversized piece is the largest; everything closed is lost
-        return sum(closed)
-    if not closed:
-        return 0
-    return sum(closed) - max(closed)
+    total = sum(size for size, _ in pieces)
+    stay = max(range(len(pieces)), key=lambda i: (pieces[i][0], -i))
+    other = next(
+        (size for i, (size, holds) in enumerate(pieces) if holds and i != stay), 0
+    )
+    return min(total - pieces[stay][0] - other, budget + 1)
+
+
+def rim_loops(
+    sel: set[int],
+    edge_to_faces: dict[tuple[int, int], list[int]],
+    faces: np.ndarray | None = None,
+    hole_nbrs: dict[int, list[int]] | None = None,
+) -> list[list[int]]:
+    """The rim of *sel*: the closed loops along the border of what
+    removing it leaves.
+
+    That border is the edges between *sel* and the faces outside it and,
+    where *sel* takes faces off a hole in the mesh (an edge of one face),
+    the rest of that hole's edges.  A tip on an open end — a neurite the
+    segmentation cut, gaping at the piece across the gap — has its rim
+    round the end: by the edges to outside faces alone its border runs open
+    from hole to hole and closes no loop.  A selection that takes no face
+    off a hole has the border loops of its own faces; one touching a hole
+    only at a vertex leaves the hole whole.
+
+    The loops are the border's simple cycles (:func:`cycles_of_edges`):
+    where the border pinches — touches itself at a vertex, as when a patch
+    meets a hole at a vertex besides the edges it takes off it — each lobe
+    is a loop, so a patch that cuts a flap off at the pinch has two, as one
+    that wraps a tube does.  *faces* as in :func:`border_edges`;
+    *hole_nbrs* is :func:`hole_neighbours` of *edge_to_faces*, built here
+    when not given.
+    """
+    edges = set(border_edges(sel, edge_to_faces, faces))
+    if hole_nbrs is None:
+        hole_nbrs = hole_neighbours(edge_to_faces)
+    # the selection's own edges on a hole, and the hole edges joined to
+    # them through shared vertices
+    if faces is None:
+        keys = [e for e, fis in edge_to_faces.items() if len(fis) == 1]
+    else:
+        keys = []
+        for fi in sel:
+            f = faces[fi]
+            for a, b in EDGE_COLS:
+                u, v = int(f[a]), int(f[b])
+                keys.append((u, v) if u < v else (v, u))
+    hole: set[tuple[int, int]] = set()
+    for e in keys:
+        fis = edge_to_faces.get(e)
+        if fis is not None and len(fis) == 1 and fis[0] in sel:
+            hole.add(e)
+    walk = [v for e in hole for v in e]
+    seen: set[int] = set()
+    while walk:
+        v = walk.pop()
+        if v in seen:
+            continue
+        seen.add(v)
+        for w in hole_nbrs.get(v, ()):
+            e = (v, w) if v < w else (w, v)
+            if e not in hole:
+                hole.add(e)
+                walk.append(w)
+    edges.update(e for e in hole if edge_to_faces[e][0] not in sel)
+    return cycles_of_edges(sorted(edges))
+
+
+def _pinched(loops: list[list[int]]) -> bool:
+    """Whether two of *loops* share a vertex: the rim pinches there."""
+    seen: set[int] = set()
+    for lp in loops:
+        for v in lp:
+            if v in seen:
+                return True
+            seen.add(v)
+    return False
 
 
 def expand_tip_to_good_rim(
@@ -94,24 +157,37 @@ def expand_tip_to_good_rim(
     max_iters: int = 20,
     max_eat_factor: int = 30,
     faces: np.ndarray | None = None,
+    hole_nbrs: dict[int, list[int]] | None = None,
 ) -> tuple[set[int], list[int] | None]:
-    """Peel BFS rings from *tip* until its border has at least
-    *target_verts* vertices: ``(expanded tip, largest border loop found or
-    None)``.  Growth is capped at ``len(tip) * max_eat_factor`` faces."""
+    """Peel BFS rings from *tip* until its rim (:func:`rim_loops`) has at
+    least *target_verts* vertices and is clean — no two of its loops share
+    a vertex.  A pinched rim, two lobes touching at a vertex, would leave
+    the lobe the tube does not take hanging by that vertex: a sliver
+    stranded, which the next ring takes in.  Growth is capped at
+    ``len(tip) * max_eat_factor`` faces.  *faces* and *hole_nbrs* as in
+    :func:`rim_loops`.
+
+    Returns a selection and the longest loop of its rim: the first whose
+    rim is good, else the last whose rim had a loop — the loop is always
+    the rim of the selection that comes with it — else the last selection
+    and None.  (Grown past its last loop — a speck swallowed whole — the
+    selection would take away the faces the loop's tube was to meet.)
+    """
     sel: set[int] = set(int(fi) for fi in tip)
     if not sel:
         return sel, None
     max_size = max(len(sel) * max_eat_factor, target_verts * 4)
+    if hole_nbrs is None:
+        hole_nbrs = hole_neighbours(edge_to_faces)
 
-    best_loop: list[int] | None = None
+    best: tuple[set[int], list[int]] | None = None
     for _ in range(max_iters):
-        loops = border_loops(sel, edge_to_faces, faces)
-        loops = [lp for lp in loops if len(lp) >= 3]
+        loops = rim_loops(sel, edge_to_faces, faces, hole_nbrs)
         if loops:
             biggest = max(loops, key=len)
-            best_loop = biggest
-            if len(biggest) >= target_verts:
+            if len(biggest) >= target_verts and not _pinched(loops):
                 return sel, biggest
+            best = (set(sel), biggest)
         # Expand by one BFS ring
         next_sel = set(sel)
         for fi in sel:
@@ -121,7 +197,7 @@ def expand_tip_to_good_rim(
             break
         sel = next_sel
 
-    return sel, best_loop
+    return best if best is not None else (sel, None)
 
 
 def expand_selection_per_group(
@@ -133,13 +209,17 @@ def expand_selection_per_group(
     max_iters: int = 20,
     max_eat_factor: int = 30,
     faces: np.ndarray | None = None,
+    hole_nbrs: dict[int, list[int]] | None = None,
 ) -> tuple[set[int], list[list[int]]]:
     """Split *sel* into edge-connected groups, expand each on its own with
-    :func:`expand_tip_to_good_rim`, then trace the border loops of the
-    merged selection: ``(selection, loops)``."""
+    :func:`expand_tip_to_good_rim`, then trace the rim of the merged
+    selection: ``(selection, loops)``.  *faces* and *hole_nbrs* as in
+    :func:`rim_loops`."""
     sel_set: set[int] = set(int(fi) for fi in sel)
     if not sel_set:
         return sel_set, []
+    if hole_nbrs is None:
+        hole_nbrs = hole_neighbours(edge_to_faces)
 
     # Split sel into edge-connected sub-groups via BFS over face_adj,
     # restricted to faces inside sel_set.
@@ -172,13 +252,11 @@ def expand_selection_per_group(
             max_iters=max_iters,
             max_eat_factor=max_eat_factor,
             faces=faces,
+            hole_nbrs=hole_nbrs,
         )
         expanded |= sub_sel
 
-    # Re-trace loops on the final merged selection
-    loops = border_loops(expanded, edge_to_faces, faces)
-    loops = [lp for lp in loops if len(lp) >= 3]
-    return expanded, loops
+    return expanded, rim_loops(expanded, edge_to_faces, faces, hole_nbrs)
 
 
 def face_edge_components(
@@ -2796,22 +2874,132 @@ def stitch_and_rebuild(
     return added, new_faces
 
 
-def removal_would_sever(sel: set[int], edge_to_faces, faces=None) -> bool:
+def paired(tips, peeled, edge_to_faces, face_adj, *, faces=None, hole_nbrs=None):
+    """Both sides' rims within five times of each other, as
+    :func:`validate_loop_pair` takes them, where growing the shorter side's
+    tip further gets them there.
+
+    *peeled* is each side's ``(patch, longest rim loop)``.  A rim round a
+    hole is as long as the hole, while the other side stops at its first
+    rim of six vertices: the shorter side is grown again from its tip in
+    *tips* until its rim reaches a fifth of the longer — and kept so only if
+    it does, the loop then the rim of the patch that comes with it.  The
+    rest as in :func:`expand_tip_to_good_rim`.
+    """
+    (_, loop_a), (_, loop_b) = peeled
+    na, nb = len(loop_a), len(loop_b)
+    if max(na, nb) <= 5 * min(na, nb):
+        return list(peeled)
+    need = -(-max(na, nb) // 5)
+    short = int(nb < na)
+    out = list(peeled)
+    sel, lp = expand_tip_to_good_rim(
+        tips[short],
+        edge_to_faces,
+        face_adj,
+        target_verts=need,
+        faces=faces,
+        hole_nbrs=hole_nbrs,
+    )
+    if lp is not None and len(lp) >= need:
+        out[short] = (sel, lp)
+    return out
+
+
+def compatible(faces, planned, rescue, edge_to_faces) -> list[bool]:
+    """Which of the *planned* bridges (``(kind, loops, removed faces,
+    tips)``, kind ``"tube"`` with a loop pair or ``"fan"`` with a hole) can
+    all be stitched.
+
+    Decided gap by gap, a bridge can be left with nothing to meet: every
+    face along one of its loops taken by other bridges' patches, so its
+    tube or fan would end on nothing — two bridges landing side by side on
+    one surface.  Only bridges whose footprints — the vertices of the faces
+    each takes away and of its loops — meet can do that to each other;
+    those are kept one by one, the one winning back more faces
+    (``rescue(i)``) first, ties to the earlier gap, each unless it or one
+    kept would be left so.  A bridge meeting none is kept.
+    *edge_to_faces* is :func:`skeliner.python.mesh.edge_to_faces`' map.
+    """
+    prints: list[set[int]] = []
+    # each bridge's loops, as their edges
+    seams: list[list[list[tuple[int, int]]]] = []
+    for kind, loops, removed, _ in planned:
+        verts = {int(v) for f in removed for v in faces[f]}
+        rings = [loops[0], loops[1]] if kind == "tube" else [loops]
+        for lp in rings:
+            verts.update(lp)
+        prints.append(verts)
+        seams.append(
+            [
+                [
+                    (
+                        min(lp[i], lp[(i + 1) % len(lp)]),
+                        max(lp[i], lp[(i + 1) % len(lp)]),
+                    )
+                    for i in range(len(lp))
+                ]
+                for lp in rings
+            ]
+        )
+    owner: dict[int, int] = {}
+    meets = [False] * len(planned)
+    for i, verts in enumerate(prints):
+        for v in verts:
+            j = owner.setdefault(v, i)
+            if j != i:
+                meets[i] = meets[j] = True
+    keep = [True] * len(planned)
+    order = sorted(
+        ((rescue(i), i) for i in range(len(planned)) if meets[i]),
+        key=lambda wi: (-wi[0], wi[1]),
+    )
+    # the faces the kept bridges take, and their loops
+    gone: set[int] = set()
+    kept_loops: list[list[tuple[int, int]]] = []
+    for _, i in order:
+        taking = planned[i][2]
+
+        def bare(lp):
+            """No face left along the loop *lp*."""
+            for e in lp:
+                fis = edge_to_faces.get(e)
+                if fis is not None and any(
+                    f not in gone and f not in taking for f in fis
+                ):
+                    return False
+            return True
+
+        mine = seams[i]
+        if any(bare(lp) for lp in mine) or any(bare(lp) for lp in kept_loops):
+            keep[i] = False
+        else:
+            gone |= taking
+            kept_loops.extend(mine)
+    return keep
+
+
+def removal_would_sever(
+    sel: set[int], edge_to_faces, faces=None, hole_nbrs=None
+) -> bool:
     """Would removing the connected patch *sel* cut its surface in two?
 
     `expand_tip_to_good_rim` grows a patch by BFS, so *sel* is always
-    connected and its border is a single closed curve when it sits at a
-    tube END (a cap).  Two or more border loops mean the patch is an
-    annulus that wraps the surface — removing it leaves the far side
-    disconnected, severing whatever lies beyond.  *edge_to_faces* is the
-    dict :func:`skeliner.python.mesh.edge_to_faces` builds or a
-    ``Topology`` of either path.
+    connected and its rim (:func:`rim_loops`) is a single closed curve when
+    it sits at a tube END (a cap).  Two or more rim loops mean the patch
+    wraps the surface — an annulus round a tube, or a band cutting a flap
+    off an open end — and removing it leaves the far side disconnected,
+    severing whatever lies beyond.  *edge_to_faces* is the dict
+    :func:`skeliner.python.mesh.edge_to_faces` builds or a ``Topology`` of
+    either path; *faces* and *hole_nbrs* as in :func:`rim_loops`, for the
+    dict.
     """
-    if hasattr(edge_to_faces, "border_loops"):
-        loops = edge_to_faces.border_loops(sel)
+    if hasattr(edge_to_faces, "rim_loops"):
+        loops = edge_to_faces.rim_loops(sel)
     else:
-        loops = border_loops(set(int(f) for f in sel), edge_to_faces, faces)
-    return sum(1 for lp in loops if len(lp) >= 3) >= 2
+        sel = set(int(f) for f in sel)
+        loops = rim_loops(sel, edge_to_faces, faces, hole_nbrs)
+    return len(loops) >= 2
 
 
 def remove_gaps(
@@ -2827,15 +3015,22 @@ def remove_gaps(
     faces or None when nothing was stitched, n_bridged, n_removed,
     n_skipped)``.
 
-    Each side's tip is peeled to a clean rim; a pair that cannot be
-    stitched, or whose removal would strand more than the stitch wins back
-    (sizes from the raw face-edge components *labels*, computed on first
-    need when None), is skipped.  Rims that share two or more vertices
-    belong to tips lying side by side, glued along those vertices (a fusion
-    join): a tube from rim to rim would weld both of its ends onto the glue
-    and fold over it, so both tips go and the one hole they leave is closed
-    with a fan — or the gap is skipped when their union does not leave
-    exactly one hole.  *fit* is :func:`zipper_stitch`'s.
+    Each side's tip is peeled to a clean rim (:func:`rim_loops`, so a tip
+    on an open end has the end in its rim; a side whose rim is more than
+    five times shorter than the other's grown on to pair with it,
+    :func:`paired`); a pair that cannot be stitched, or whose removal
+    would strand more than the stitch wins back (sizes from the components
+    *labels* — face-edge components, or split along fusion walls by the
+    caller — the face-edge ones computed on first need when None), is
+    skipped.  Rims that share two or more vertices belong to tips lying
+    side by side, glued along those vertices (a fusion join): a tube from
+    rim to rim would weld both of its ends onto the glue and fold over it,
+    so both tips go and the one hole they leave is closed with a fan — or
+    the gap is skipped when their union does not leave exactly one hole.
+    Each gap is decided on its own; a bridge whose loop other bridges'
+    patches strip bare would meet nothing, and of such bridges the one
+    winning back more is kept (:func:`compatible`).  *fit* is
+    :func:`zipper_stitch`'s.
     """
     vertices = rows3("V", vertices)
     faces, _ = checked_faces(faces, len(vertices))
@@ -2856,9 +3051,10 @@ def remove_gaps(
             sides.append(_face_ids(side, nf).tolist())
         tips.append(sides)
 
-    # Build edge / face adjacency once.
+    # Build edge / face adjacency and the holes once.
     edge_to_face = edge_to_faces(faces)
     face_adj = face_adjacency(edge_to_face)
+    hole_nbrs = hole_neighbours(edge_to_face)
 
     # Component labels for `rescue_size`.  Only a gap that actually trips
     # the sever check needs them, and labelling a multi-million-face mesh
@@ -2879,32 +3075,37 @@ def remove_gaps(
     # "rim" (e.g. 3 verts when the tip is a tongue attached at a single
     # triangle); peeling more rings exposes a clean cross-section that
     # the stitcher can bridge manifoldly.
-    faces_to_remove: set[int] = set()
-    loop_pairs: list[tuple[list[int], list[int]]] = []
-    fills: list[list[int]] = []
+    # each bridge as decided on its own: ("tube", (loop_a, loop_b)) or
+    # ("fan", hole), the faces it takes away, and its gap's tips' first faces
+    planned: list[tuple[str, object, set[int], tuple[int, int]]] = []
     n_skipped = 0
     for faces_a, faces_b in tips:
         sel_a, loop_a = expand_tip_to_good_rim(
-            faces_a, edge_to_face, face_adj, faces=faces
+            faces_a, edge_to_face, face_adj, faces=faces, hole_nbrs=hole_nbrs
         )
         sel_b, loop_b = expand_tip_to_good_rim(
-            faces_b, edge_to_face, face_adj, faces=faces
+            faces_b, edge_to_face, face_adj, faces=faces, hole_nbrs=hole_nbrs
         )
         if loop_a is None or loop_b is None:
             n_skipped += 1
             continue
+        (sel_a, loop_a), (sel_b, loop_b) = paired(
+            [faces_a, faces_b],
+            [(sel_a, loop_a), (sel_b, loop_b)],
+            edge_to_face,
+            face_adj,
+            faces=faces,
+            hole_nbrs=hole_nbrs,
+        )
 
         # Tips side by side, glued along the vertices their rims share:
         # remove both and close the one hole they leave.
         set_a, set_b = set(loop_a), set(loop_b)
         if len(set_a & set_b) >= 2 and set_a != set_b:
             union = sel_a | sel_b
-            holes = [
-                lp for lp in border_loops(union, edge_to_face, faces) if len(lp) >= 3
-            ]
+            holes = rim_loops(union, edge_to_face, faces, hole_nbrs)
             if len(holes) == 1:
-                fills.append(holes[0])
-                faces_to_remove |= union
+                planned.append(("fan", holes[0], union, (faces_a[0], faces_b[0])))
             else:
                 n_skipped += 1
             continue
@@ -2924,18 +3125,37 @@ def remove_gaps(
         # the same annular shape strands 4 f and rescues 4,160 f.  Skip
         # only when the stitch costs more than it saves — two face
         # counts, no distance scope and no threshold.
-        sev_a = removal_would_sever(sel_a, edge_to_face, faces)
-        sev_b = removal_would_sever(sel_b, edge_to_face, faces)
+        sev_a = removal_would_sever(sel_a, edge_to_face, faces, hole_nbrs)
+        sev_b = removal_would_sever(sel_b, edge_to_face, faces, hole_nbrs)
         if sev_a or sev_b:
             rescue = _lazy_rescue(faces_a[0], faces_b[0])
-            if (sev_a and sever_cost(sel_a, face_adj, rescue) > rescue) or (
-                sev_b and sever_cost(sel_b, face_adj, rescue) > rescue
+            if (sev_a and sever_cost(sel_a, face_adj, rescue, faces_b) > rescue) or (
+                sev_b and sever_cost(sel_b, face_adj, rescue, faces_a) > rescue
             ):
                 n_skipped += 1
                 continue
 
-        loop_pairs.append((loop_a, loop_b))
-        faces_to_remove |= sel_a | sel_b
+        planned.append(
+            ("tube", (loop_a, loop_b), sel_a | sel_b, (faces_a[0], faces_b[0]))
+        )
+
+    # a bridge another's patches leave with nothing to meet yields to the
+    # one winning back more
+    keep = compatible(
+        faces, planned, lambda i: _lazy_rescue(*planned[i][3]), edge_to_face
+    )
+    faces_to_remove: set[int] = set()
+    loop_pairs: list[tuple[list[int], list[int]]] = []
+    fills: list[list[int]] = []
+    for (kind, bridge, removed, _), kept in zip(planned, keep):
+        if not kept:
+            n_skipped += 1
+            continue
+        faces_to_remove |= removed
+        if kind == "tube":
+            loop_pairs.append(bridge)
+        else:
+            fills.append(bridge)
 
     if not loop_pairs and not fills:
         return np.empty((0, 3)), None, 0, 0, n_skipped
@@ -4014,7 +4234,7 @@ def break_up_classify(
     vertices,
     centers,
     normals,
-) -> tuple[list[np.ndarray], np.ndarray]:
+) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
     """The pieces ``skeliner.pre.break_up_mesh`` classifies: components of
     the usable faces that are neither soma nor organelle, largest first, and
     the kind of each — :data:`PIECE_TRAPPED` when only organelle faces
@@ -4023,8 +4243,9 @@ def break_up_classify(
     faces looking into the cell; :data:`PIECE_SOMA` when more than half its
     outer edges meet soma faces and it has no more faces than the soma
     (only with a soma), else :data:`PIECE_CANDIDATE`.  Claimed pieces are
-    never trapped or soma.  *vertices*, *centers* and *normals* cast the
-    rays."""
+    never trapped or soma.  Third, per face, whether it lies on its mesh
+    component's body, which ``break_up_severed_walls`` reads.  *vertices*,
+    *centers* and *normals* cast the rays."""
     faces, _ = checked_faces(faces, n_vertices)
     vertices = rows3("V", vertices)
     if len(vertices) != n_vertices:
@@ -4088,7 +4309,7 @@ def break_up_classify(
     remain_fi = np.where(remain)[0]
 
     if len(remain_fi) == 0:
-        return [], np.zeros(0, dtype=np.uint8)
+        return [], np.zeros(0, dtype=np.uint8), reachable
 
     components = face_components(faces, remain_fi)
     # Still needed below, to count how much of each component's boundary
@@ -4145,7 +4366,7 @@ def break_up_classify(
             soma_frac = n_soma / n_total if n_total > 0 else 0.0
             if soma_frac > 0.5:
                 kinds[k] = PIECE_SOMA
-    return components, kinds
+    return components, kinds, reachable
 
 
 def otsu_threshold(values: np.ndarray) -> tuple[float, float]:
@@ -4940,6 +5161,32 @@ def z_slice_void(
     return cx, cy, void_r, void_xy
 
 
+def _from_above(parts: list[np.ndarray], grid_res: float) -> dict:
+    """The cells of the void deep parts *parts* (``(M, 2)`` cell centres,
+    each level's on its own grid) seen from above, filed by the cell of a
+    common grid they fall in."""
+    cells: dict[tuple[int, int], list[tuple[float, float]]] = {}
+    for part in parts:
+        for x, y in part.tolist():
+            key = (math.floor(x / grid_res), math.floor(y / grid_res))
+            cells.setdefault(key, []).append((x, y))
+    return cells
+
+
+def _meets_from_above(cells: dict, part: np.ndarray, grid_res: float) -> bool:
+    """Whether a cell of the deep part *part* overlaps one of *cells*
+    (:func:`_from_above`): their centres less than a cell apart on both
+    axes."""
+    for x, y in part.tolist():
+        i, j = math.floor(x / grid_res), math.floor(y / grid_res)
+        for a in (i - 1, i, i + 1):
+            for b in (j - 1, j, j + 1):
+                for qx, qy in cells.get((a, b), ()):
+                    if abs(x - qx) < grid_res and abs(y - qy) < grid_res:
+                        return True
+    return False
+
+
 class ZScan:
     """The Z-level scan of a mesh's vertices that finds the nucleus: per
     level, the largest cluster of the vertices near it and the void inside
@@ -4949,7 +5196,9 @@ class ZScan:
     Construction runs the first pass, each level on its own, and finds the
     chain; :meth:`retry` runs the second, on the levels next to the chain
     whose soma ring has a gap that breaks the void test, inside the convex
-    hull of the chain end's soma cluster.
+    hull of the chain end's soma cluster.  Given *near*, a point on or in
+    the soma, the chain is the one past the void minimum nearest it
+    (:meth:`_chain`).
     """
 
     def __init__(
@@ -4959,6 +5208,7 @@ class ZScan:
         z_tol: float,
         min_void_r: float | None,
         max_shift: float,
+        near=None,
     ):
         from scipy.ndimage import (
             binary_dilation,
@@ -4971,6 +5221,7 @@ class ZScan:
         self._verts = verts
         self._grid_res = grid_res
         self._max_shift = max_shift
+        self._near = None if near is None else tuple(float(x) for x in near)
 
         z_unique = np.unique(verts[:, 2])
         z_step = 210.0
@@ -5057,10 +5308,27 @@ class ZScan:
         return [r for r in runs if len(r) >= 2]
 
     def _chain(self, min_void_r: float) -> list[int] | None:
-        """The longest run past *min_void_r*, the first among equals; None
-        when there is none."""
+        """The nucleus run past *min_void_r*: the longest, the first among
+        equals — or, given a point on or in the soma (*near*), the run with
+        a level's void centre nearest it, the first among equals.  The point
+        picks among the runs the void minimum lets through; it lets none
+        through itself.  None when there is no run."""
         runs = self._chains(min_void_r)
-        return max(runs, key=len) if runs else None
+        if not runs:
+            return None
+        if self._near is None:
+            return max(runs, key=len)
+        px, py, pz = self._near
+
+        def reach(run: list[int]) -> float:
+            out = np.inf
+            for i in run:
+                z, cx, cy = self._raw[i][0], self._raw[i][1], self._raw[i][2]
+                dx, dy, dz = cx - px, cy - py, z - pz
+                out = min(out, dx * dx + dy * dy + dz * dz)
+            return out
+
+        return min(runs, key=reach)
 
     def _void_floor(self) -> float | None:
         """The biggest void anywhere else in the cell than its body, when the
@@ -5068,15 +5336,18 @@ class ZScan:
         holding the cell's biggest void, its peak the first level with that
         void; its reach is its widest section's radius past the farthest of
         its centres from the peak's, in XY.  The body is every level within
-        that reach of the peak's void centre, and above or below it, within
-        its XY reach, every level whose section is still at least half the
-        widest — a ring doubled from its exit's is the body, as the soma's
-        stub erosion has it — so a tall soma stays whole and a neurite
-        leaving it straight up or down counts as elsewhere.  A nucleus is
-        the cell's one void a neurite cannot hold: the peak must beat the
-        biggest void elsewhere by more than the grid resolves (a cell: each
-        radius is uncertain by half of one); None when it does not — no
-        nucleus."""
+        that reach of the peak's void centre, and every other level whose
+        section is still at least half the widest — a ring doubled from its
+        exit's is the body, as the soma's stub erosion has it — and whose
+        void lies within the reach in XY, or over or under the candidate's
+        void: its deep part overlapping, seen from above, a candidate
+        level's (:func:`_meets_from_above`).  So a tall soma stays whole,
+        and so does a long or lobed nucleus, whose deepest point wanders
+        from one end to the other between levels; a neurite leaving the soma
+        straight up or down counts as elsewhere.  A nucleus is the cell's
+        one void a neurite cannot hold: the peak must beat the biggest void
+        elsewhere by more than the grid resolves (a cell: each radius is
+        uncertain by half of one); None when it does not — no nucleus."""
         raw, sec = self._raw, self._sec
         cand, peak = None, 0.0
         for run in self._chains(sys.float_info.min):
@@ -5094,11 +5365,18 @@ class ZScan:
 
         widest = max(sec[i] for i in cand)
         foot = widest + max(off(i) for i in cand)
+        void = _from_above(
+            [raw[i][4] for i in cand if raw[i][4] is not None], self._grid_res
+        )
 
         def body(i):
             dx, dy, dz = raw[i][1] - px, raw[i][2] - py, raw[i][0] - pz
             near = math.sqrt(dx * dx + dy * dy + dz * dz) <= foot
-            return near or (off(i) <= foot and 2.0 * sec[i] >= widest)
+            over = off(i) <= foot or (
+                raw[i][4] is not None
+                and _meets_from_above(void, raw[i][4], self._grid_res)
+            )
+            return near or (over and 2.0 * sec[i] >= widest)
 
         other = max(
             (

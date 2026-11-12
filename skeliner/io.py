@@ -24,6 +24,8 @@ from .dataclass import (
 __all__ = [
     "load_mesh",
     "save_mesh",
+    "load_mesh_npz",
+    "save_mesh_npz",
     "load_skeleton",
     "save_skeleton",
     "load_skeleton_swc",
@@ -83,9 +85,12 @@ def load_mesh(filepath: str | Path) -> Mesh:
     dropped as the readers drop any vertex no face names, and a face the
     merge made a copy of another collapses to ``[0, 0, 0]``. Vertices that
     only touch — a seam is a chain of edges both sides of it repeat — stay
-    apart: :func:`skeliner.pre.remove_fusions` leaves a cut so, and a mesh it
-    cleaned reads back as written. Faces keep their places, so face ids into
-    the file stay valid.
+    apart: :func:`skeliner.pre.remove_fusions` leaves a cut so. Faces keep
+    their places, so face ids into the file stay valid. A mesh
+    ``preprocess`` cleaned does not come back exactly from an OBJ: the file
+    keeps eight decimals, and copies of a vertex a patch joins by a sliver
+    are one position there, which the merge joins (a vertex or two, on a
+    few cells); :func:`save_mesh_npz` keeps it exactly.
 
     OBJ files of plain vertices and triangles, the form EyeWire 2, MICrONS
     and FlyWire meshes come in and skeliner's own pipeline writes, are read
@@ -102,8 +107,14 @@ def load_mesh(filepath: str | Path) -> Mesh:
     triangles only, no normals, UV maps or attribute maps. Those files store
     each vertex as (z, x, y), the retina's depth first; it is read as
     (x, y, z), the depth in z as in the other data.
+
+    ``.npz`` is skeliner's array file (:func:`save_mesh_npz`), read by
+    :func:`load_mesh_npz` exactly as it was written: every vertex in its
+    place, no seam merged.
     """
     filepath = Path(filepath)
+    if filepath.suffix.lower() == ".npz":
+        return load_mesh_npz(filepath)
 
     # OBJ and EyeWire 1's CTM on the active path; the readers decline (None)
     # whatever else such a file holds, and trimesh reads it
@@ -142,9 +153,10 @@ def save_mesh(mesh, path: str | Path) -> None:
 
     A :class:`skeliner.Mesh` (or anything with ``vertices`` and ``faces``) goes
     to OBJ through skeliner's own writer on the active path, as trimesh
-    writes a plain mesh, and to every other format (ply, stl, glb, ...)
-    through trimesh, which must then be installed. A mesh with an
-    ``export`` of its own — a ``trimesh.Trimesh`` — writes itself.
+    writes a plain mesh, to ``.npz`` as its arrays (:func:`save_mesh_npz`),
+    and to every other format (ply, stl, glb, ...) through trimesh, which
+    must then be installed. A mesh with an ``export`` of its own — a
+    ``trimesh.Trimesh`` — writes itself, but to ``.npz``.
 
     An OBJ keeps every vertex, but :func:`load_mesh` reads back only the
     vertices a face names, as trimesh reads OBJ, and numbers the rest on: a
@@ -152,9 +164,14 @@ def save_mesh(mesh, path: str | Path) -> None:
     without ``compact=True``) reads back with other vertex ids, and vertex
     ids saved beside it — a soma's ``verts`` — would name other vertices.
     Writing such a mesh to OBJ warns; :func:`skeliner.pre.compact_mesh` it
-    first, with its components, when vertex ids are saved beside it.
+    first, with its components, when vertex ids are saved beside it. An OBJ
+    also keeps eight decimals of each coordinate. An ``.npz`` keeps the
+    mesh exactly: every vertex, every digit.
     """
     path = Path(path)
+    if path.suffix.lower() == ".npz":
+        save_mesh_npz(mesh, path)
+        return
     if not isinstance(mesh, Mesh) and hasattr(mesh, "export"):
         mesh.export(str(path))
         return
@@ -167,12 +184,47 @@ def save_mesh(mesh, path: str | Path) -> None:
                 f"{path}: {int((~named).sum()):,} vertices no face names are"
                 " written but not read back, so the vertex ids from"
                 f" {int(np.argmin(named)):,} on change when the file is read;"
-                " compact the mesh first when vertex ids are saved beside it",
+                " compact the mesh first when vertex ids are saved beside it,"
+                " or save it as .npz",
                 stacklevel=2,
             )
         kernels.io.write_obj(str(path), mesh.vertices, mesh.faces)
     else:
         mesh.to_trimesh().export(str(path))
+
+
+def save_mesh_npz(mesh, path: str | Path, *, compress: bool = True) -> None:
+    """Write a mesh to a ``.npz`` archive: its ``vertices`` (float64) and
+    ``faces`` (int64), compressed unless *compress* is False.
+
+    :func:`load_mesh_npz` reads it back exactly as it was — every vertex in
+    its place, whether a face names it or not, every digit of it, and no
+    seam merged — so the vertex and face ids saved beside it (a soma's
+    ``verts``, the components) stay valid, as they need not through an OBJ
+    (:func:`save_mesh`). A :class:`skeliner.Mesh` is written as it is;
+    anything else with ``vertices`` and ``faces`` as :meth:`Mesh.of` makes
+    it.
+    """
+    path = Path(path)
+    if not path.suffix:
+        path = path.with_suffix(".npz")
+    mesh = Mesh.of(mesh)
+    save_fn = np.savez_compressed if compress else np.savez
+    save_fn(path, vertices=mesh.vertices, faces=mesh.faces)
+
+
+def load_mesh_npz(path: str | Path) -> Mesh:
+    """Read a mesh written by :func:`save_mesh_npz` — or any ``.npz``
+    holding ``vertices`` ``(N, 3)`` and ``faces`` ``(F, 3)`` — exactly as
+    it was written: every vertex and face in its place, no seam merged."""
+    path = Path(path)
+    with np.load(path, allow_pickle=False) as z:
+        if not {"vertices", "faces"} <= set(z.files):
+            raise ValueError(
+                f"{path}: a mesh .npz holds 'vertices' and 'faces', "
+                f"this one {sorted(z.files)}"
+            )
+        return Mesh(z["vertices"], z["faces"])
 
 
 # -----------
@@ -830,7 +882,9 @@ def save_components_npz(
 ) -> None:
     """Write a :class:`MeshComponents` to a single ``.npz`` archive.
 
-    Packs soma, organelles, neurites, and discarded into one file.
+    Packs soma, organelles, neurites, and discarded into one file, and the
+    record of the :func:`~skeliner.pre.preprocess` run that made them, if
+    any (as JSON).
     """
     path = Path(path)
     if not path.suffix:
@@ -876,6 +930,9 @@ def save_components_npz(
     payload["n_discarded"] = np.array(len(components.discarded.components))
     for i, comp in enumerate(components.discarded.components):
         payload[f"discarded_{i}"] = np.asarray(comp, dtype=np.int64)
+
+    if components.record is not None:
+        payload["record"] = _json_encode_meta(components.record)
 
     save_fn = np.savez_compressed if compress else np.savez
     save_fn(path, **payload)
@@ -935,8 +992,14 @@ def load_components_npz(path: str | Path) -> MeshComponents:
             [z[f"discarded_{i}"].astype(np.int64) for i in range(n_d)]
         )
 
+        record = _json_decode_meta(z["record"]) if "record" in z else None
+
     return MeshComponents(
-        soma=soma, organelles=organelles, neurites=neurites, discarded=discarded
+        soma=soma,
+        organelles=organelles,
+        neurites=neurites,
+        discarded=discarded,
+        record=record,
     )
 
 
@@ -944,7 +1007,7 @@ def load_components_npz(path: str | Path) -> MeshComponents:
 # --- Mesh Contact Sites ---
 # --------------------------
 
-# --- shared helpers (feel free to move to serde.py if you prefer) -----
+# --- shared helpers -----
 
 
 def _json_encode_meta(meta: dict) -> np.ndarray:

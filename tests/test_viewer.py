@@ -173,6 +173,100 @@ def test_a_soma_is_assigned_on_a_freshly_loaded_cell(reassign_client):
     assert np.allclose(state["soma"].center, soma.center)
 
 
+def test_preprocess_looks_for_no_soma_when_switched_off(reassign_client, monkeypatch):
+    # the Run button's soma switch, for a cell with none in the mesh: off,
+    # preprocess is told so and a soma by hand goes with the run; on (the
+    # default) it is the hand soma or find_soma's again
+    from skeliner import pre
+
+    client, state, _ = reassign_client
+    state["soma"] = None
+    state["organelles"] = None
+    state["neurites"] = None
+    state["discarded"] = None
+    faces = np.asarray(state["mesh"].faces)
+    z = state["mesh"].vertices[faces].mean(axis=1)[:, 2]
+    sel = np.flatnonzero(np.abs(z) <= 100.0).tolist()
+    r = client.post("/reassign_preview", json={"faces": sel, "to": "soma"})
+    assert r.status_code == 200, r.json()
+    assert client.post("/reassign_apply").json()["ok"]
+    assert state["soma_by_hand"], "fixture: a soma by hand to drop"
+
+    seen = {}
+    run = pre.preprocess
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(pre, "preprocess", spy)
+    r = client.post("/preprocess", json={"organelles": False, "soma": False})
+    assert r.json()["ok"]
+    assert seen["soma"] is False
+    assert state["soma"] is None and not state["soma_by_hand"]
+    assert client.post("/preprocess", json={"organelles": False}).json()["ok"]
+    assert seen["soma"] is None
+
+
+def test_preprocess_looks_for_the_soma_at_the_soma_point(reassign_client, monkeypatch):
+    # the page's soma point (a click on the soma, the mesh's frame) is
+    # preprocess(soma=point); the switch off still means no soma, and a soma
+    # by hand is taken as it is; a point that is no point is refused
+    from skeliner import pre
+
+    client, state, _ = reassign_client
+    hand = state["soma"]  # the tube's band, for the soma by hand below
+    seen = {}
+    run = pre.preprocess
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(pre, "preprocess", spy)
+    point = [0.0, 50.0, 0.0]
+    state["soma_by_hand"] = False
+    body = {"organelles": False, "somaPoint": point}
+    assert client.post("/preprocess", json=body).json()["ok"]
+    assert isinstance(seen["soma"], np.ndarray)
+    np.testing.assert_array_equal(seen["soma"], point)
+
+    assert client.post("/preprocess", json={**body, "soma": False}).json()["ok"]
+    assert seen["soma"] is False
+
+    state["soma"] = hand
+    state["soma_by_hand"] = True
+    assert client.post("/preprocess", json=body).json()["ok"]
+    assert seen["soma"] is hand
+
+    # a NaN on the page is sent as null (JSON.stringify)
+    for bad in ([1.0, 2.0], [1.0, "x", 3.0], [1.0, None, 3.0]):
+        r = client.post("/preprocess", json={**body, "somaPoint": bad})
+        assert r.status_code == 400 and "somaPoint" in r.json()["error"]
+
+
+def test_the_soma_button_looks_at_the_soma_point(reassign_client, monkeypatch):
+    # Soma (ring cutoff) with the page's soma point is find_soma(near=); a
+    # soma that does not lie there is none, said so
+    from skeliner import pre
+
+    client, _, _ = reassign_client
+    seen = {}
+
+    def find(*_a, **kwargs):
+        seen.update(kwargs)
+        return None
+
+    monkeypatch.setattr(pre, "find_soma", find)
+    body = {"method": "ring_cutoff", "somaPoint": [1.0, 2.0, 3.0]}
+    r = client.post("/detect_soma", json=body).json()
+    np.testing.assert_array_equal(seen["near"], [1.0, 2.0, 3.0])
+    assert not r["ok"] and r["error"] == "No soma found at the point"
+
+    r = client.post("/detect_soma", json={"method": "ring_cutoff"}).json()
+    assert seen["near"] is None and r["error"] == "No soma found"
+
+
 @pytest.mark.parametrize(
     "body, expected",
     [
@@ -787,6 +881,114 @@ def test_preprocess_drops_the_caches_keyed_to_the_replaced_mesh(rescue_client):
     assert state["mesh_stats"] is None
     assert state["gap_clusters"] is None
     assert state["fusion_clusters"] is None
+
+
+def test_the_components_saved_carry_the_record_of_the_run(rescue_client, tmp_path):
+    """What the run decided is the session's until a new run or a new cell;
+    Break re-derives the split, not the mesh the run made, so it keeps it,
+    and the components the page saves (and compacts) carry it."""
+    from skeliner.io import load_components_npz
+
+    client, state, speck = rescue_client
+    assert client.post("/preprocess").status_code == 200
+    record = state["record"]
+    assert record is not None and record["soma"]["asked"] in ("find", "given")
+
+    assert client.post("/break_up_mesh").status_code == 200
+    assert state["record"] is record
+    saved = tmp_path / "c.npz"
+    saved.write_bytes(client.get("/export_components").content)
+    assert load_components_npz(saved).record == record
+
+    assert client.post("/compact_mesh").status_code == 200
+    assert state["record"] == record
+
+
+def test_a_qc_report_dropped_lists_its_sites_as_markers(rescue_client, tmp_path):
+    """sk.qc.report's sites become markers about the session's centroid, each
+    as large as what it marks (a median edge at least) and said in words; the
+    soma is left to the components; a second report replaces the first's
+    markers and leaves the others."""
+    client, state, speck = rescue_client
+    centroid = np.asarray(state["centroid"], dtype=float)
+    rep = {
+        "qc": 1,
+        "skeliner": "test",
+        "meta": {"cell": "x"},
+        "summary": {"median_edge": 10.0},
+        "flags": ["no_soma"],
+        "sites": [
+            {
+                "kind": "bridge",
+                "position": [100.0, 0.0, 0.0],
+                "extent": 30.0,
+                "length": 60.0,
+                "edges": 6.0,
+                "relative": 0.5,
+                "a": [70.0, 0.0, 0.0],
+                "b": [130.0, 0.0, 0.0],
+                "pieces": [None, 10],
+            },
+            {
+                "kind": "discarded",
+                "position": [0.0, 0.0, 400.0],
+                "extent": 2.0,
+                "index": 0,
+                "faces": 12,
+                "at_soma": False,
+                "at_organelle": True,
+                "arbor_distance": None,
+                "reach": None,
+            },
+            {"kind": "soma", "position": [0.0, 0.0, 0.0], "extent": 500.0},
+        ],
+    }
+    other = {"position": [1.0, 2.0, 3.0], "radius": 5.0, "label": "mine"}
+    state_ann = client.get("/annotations").json()
+    state_ann["markers"] = [other]
+    (tmp_path / "ann.json").write_text(json.dumps(state_ann))
+    client.post(
+        "/upload", files={"file": ("ann.json", (tmp_path / "ann.json").read_bytes())}
+    )
+
+    upload = {"file": ("qc.json", json.dumps(rep).encode())}
+    assert client.post("/upload", files=upload).json() == {
+        "ok": True,
+        "type": "qc",
+        "name": "qc.json",
+        "sites": 2,
+        "flags": ["no_soma"],
+    }
+    markers = client.get("/annotations").json()["markers"]
+    assert markers[0] == other
+    bridge, piece = markers[1:]
+    assert (bridge["qc"], piece["qc"]) == ("bridge", "discarded")
+    np.testing.assert_allclose(bridge["position"], np.array([100.0, 0, 0]) - centroid)
+    assert (bridge["radius"], piece["radius"]) == (30.0, 10.0)
+    assert bridge["label"] == (
+        "qc: bridge, 60 long (6 median edges, 0.5× the piece it joins)"
+    )
+    assert piece["label"] == "qc: discarded piece 0, 12 faces, at an organelle"
+
+    rep["sites"] = rep["sites"][:1]
+    again = {"file": ("qc.json", json.dumps(rep).encode())}
+    assert client.post("/upload", files=again).json()["sites"] == 1
+    markers = client.get("/annotations").json()["markers"]
+    assert [m.get("qc") for m in markers] == [None, "bridge"]
+
+
+def test_a_qc_report_needs_its_mesh_first(tmp_path, monkeypatch):
+    from starlette.testclient import TestClient
+
+    from skeliner.viewer import viewer as viewer_mod
+
+    monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
+    rep = {"qc": 1, "summary": {}, "flags": [], "sites": []}
+    with TestClient(_create_app(port=8915)) as client:
+        r = client.post(
+            "/upload", files={"file": ("qc.json", json.dumps(rep).encode())}
+        )
+    assert r.status_code == 400 and "mesh" in r.json()["error"]
 
 
 def test_preprocess_leaves_the_mesh_uncompacted(rescue_client):
@@ -2103,6 +2305,29 @@ def test_an_eyewire_ctm_drop_is_a_mesh_its_components_follow(
     results = r.json()["results"]
     assert [(x["name"], x["ok"]) for x in results] == [
         ("mesh.ctm", True),
+        ("components.npz", True),
+    ]
+    assert drop_client.get("/loaded").json()["mesh"]["nFaces"] == len(mesh.faces)
+    assert _neurite_labels(drop_client)
+
+
+def test_a_mesh_npz_drop_is_a_mesh_its_components_follow(
+    drop_client, drop_files, tmp_path
+):
+    """A mesh saved as ``.npz`` is told from the other ``.npz`` files by its
+    arrays and applied first, as an OBJ is, though ``components.npz`` sorts
+    ahead of ``mesh.npz``."""
+    import skeliner as sk
+
+    mesh_path, comp_path, _ = drop_files
+    mesh = sk.io.load_mesh(mesh_path)
+    npz_path = tmp_path / "mesh.npz"
+    sk.io.save_mesh(mesh, npz_path)
+
+    r = drop_client.post("/upload_batch", files=_as_batch(comp_path, npz_path))
+    assert r.status_code == 200, r.text
+    assert [(x["name"], x["ok"]) for x in r.json()["results"]] == [
+        ("mesh.npz", True),
         ("components.npz", True),
     ]
     assert drop_client.get("/loaded").json()["mesh"]["nFaces"] == len(mesh.faces)

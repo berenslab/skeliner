@@ -7,7 +7,8 @@ Usage:
     skeliner view-contacts A.obj B.obj   # two meshes and where they touch
 
 Launches a local web server with a Three.js viewer. Supports:
-  - Mesh files: .obj, .ply, .stl and EyeWire 1's .ctm (always in nm)
+  - Mesh files: .obj, .ply, .stl, EyeWire 1's .ctm and skeliner's mesh .npz
+                (always in nm)
   - Skeleton files: .swc (always in µm → converted to nm),
                     .npz (unit from metadata)
 
@@ -216,14 +217,119 @@ _TIER_SKELETON = 2
 _TIER_ANNOTATION = 3
 
 #: The files a drop reads as a mesh, with :func:`skeliner.io.load_mesh`;
-#: ``.ctm`` is EyeWire 1's format.
+#: ``.ctm`` is EyeWire 1's format.  A mesh ``.npz`` is told from the other
+#: ``.npz`` by its arrays (:func:`_is_mesh_file`).
 _MESH_SUFFIXES = (".obj", ".ply", ".stl", ".ctm")
+
+
+def _is_mesh_data(path: Path) -> bool:
+    """Check if an npz file holds a mesh (``save_mesh_npz``)."""
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            return "vertices" in data and "faces" in data
+    except Exception:
+        return False
+
+
+def _is_mesh_file(path: Path) -> bool:
+    """Whether a drop reads *path* as a mesh."""
+    suffix = path.suffix.lower()
+    return suffix in _MESH_SUFFIXES or (suffix == ".npz" and _is_mesh_data(path))
+
+
+def _is_qc_report(data) -> bool:
+    """Whether a dropped JSON is a :func:`skeliner.qc.report`."""
+    return isinstance(data, dict) and {"qc", "summary", "sites"} <= data.keys()
+
+
+#: A qc site's marker colour, by kind.
+_QC_COLORS = {
+    "bridge": [1.0, 0.6, 0.1],
+    "fusion": [1.0, 0.25, 0.25],
+    "parallel_patch": [0.95, 0.85, 0.2],
+    "discarded": [0.4, 0.8, 1.0],
+    "soma_point": [0.9, 0.31, 0.9],
+    "stem": [0.4, 0.9, 0.4],
+    "tree": [1.0, 0.3, 0.6],
+    "loop": [1.0, 0.3, 0.6],
+    "bounds": [0.45, 0.55, 1.0],
+}
+
+
+def _qc_label(s: dict) -> str:
+    """A qc site in words, lengths in the mesh's units."""
+
+    def g(v) -> str:
+        return "?" if v is None else f"{v:.4g}"
+
+    kind = s["kind"]
+    if kind == "bridge":
+        return (
+            f"bridge, {g(s['length'])} long ({g(s['edges'])} median edges, "
+            f"{g(s['relative'])}× the piece it joins)"
+        )
+    if kind == "fusion":
+        return f"fusion cut, {s['faces']} faces"
+    if kind == "parallel_patch":
+        return f"parallel patch cut, {s['faces']} faces"
+    if kind == "discarded":
+        parts = [f"discarded piece {s['index']}, {s['faces']} faces"]
+        if s.get("neurite"):
+            parts.append("a neurite at the soma — rescue it?")
+        elif s.get("at_soma"):
+            parts.append("at the soma")
+        if s.get("at_organelle"):
+            parts.append("at an organelle")
+        if s.get("arbor_distance") is not None:
+            parts.append(
+                f"{g(s['arbor_distance'])} from the arbor (reach {g(s['reach'])})"
+            )
+        return ", ".join(parts)
+    if kind == "soma_point":
+        return "no soma at the point given"
+    if kind == "stem":
+        return f"stem to node {s['node']}, {g(s['gap'])} off the soma"
+    if kind == "tree":
+        return f"a tree of its own, {s['nodes']} nodes"
+    if kind == "loop":
+        return f"loop through node {s['node']}"
+    if kind == "bounds":
+        return (
+            f"meets the volume's {'xyz'[s['axis']]} {s['side']} face "
+            f"({s['vertices']} vertices)"
+        )
+    return kind
+
+
+def _qc_markers(report: dict, centroid) -> list[dict]:
+    """A qc report's sites as markers, centred as the page draws (about
+    *centroid*): each as large as what it marks, but at least a median edge,
+    translucent so the surface it marks shows through.  The soma is left
+    out — the components draw it."""
+    floor = (report.get("summary") or {}).get("median_edge") or 1.0
+    out = []
+    for s in report.get("sites", []):
+        if s.get("kind") == "soma" or s.get("position") is None:
+            continue
+        out.append(
+            {
+                "position": [
+                    float(p) - float(c) for p, c in zip(s["position"], centroid)
+                ],
+                "color": _QC_COLORS.get(s["kind"], [1.0, 1.0, 1.0]),
+                "radius": max(float(s.get("extent") or 0.0), float(floor)),
+                "opacity": 0.4,
+                "label": f"qc: {_qc_label(s)}",
+                "qc": s["kind"],
+            }
+        )
+    return out
 
 
 def _upload_tier(path: Path) -> int:
     """Which tier *path* belongs to; lower tiers are applied first."""
     suffix = path.suffix.lower()
-    if suffix in _MESH_SUFFIXES:
+    if _is_mesh_file(path):
         return _TIER_MESH
     if suffix == ".swc":
         return _TIER_SKELETON
@@ -395,6 +501,11 @@ def _create_app(
         # Input state too — /preprocess takes it instead of find_soma's, so
         # a soma assigned where none was found is not lost to the next run.
         "soma_by_hand": False,
+        # What the last /preprocess run decided (MeshComponents.record), or
+        # a loaded components file's.  Break and the reassignments re-derive
+        # the split but not the mesh the run made, so they keep it; the
+        # components the page saves carry it.
+        "record": None,
     }
 
     def _claim_floor(body) -> int:
@@ -413,6 +524,23 @@ def _create_app(
             return await request.json() or {}
         except Exception:
             return {}
+
+    def _soma_point(body) -> np.ndarray | None:
+        """Where the page says the soma is: ``somaPoint``, a click on it in
+        the mesh's own frame, as ``find_soma(near=)`` takes it — or None.
+
+        Raises ValueError for anything but three finite numbers.
+        """
+        raw = (body or {}).get("somaPoint")
+        if raw is None:
+            return None
+        try:
+            point = np.asarray(raw, dtype=np.float64).reshape(3)
+        except (TypeError, ValueError):
+            point = None
+        if point is None or not np.isfinite(point).all():
+            raise ValueError("somaPoint must be three finite numbers")
+        return point
 
     def _organelle_mask(org) -> np.ndarray | None:
         """Combined bool mask from Organelles object."""
@@ -519,7 +647,8 @@ def _create_app(
     state_path.write_text(json.dumps(initial, indent=2), encoding="utf-8")
 
     connected_clients: list[WebSocket] = []
-    # The mesh_state entries that describe one mesh's faces or vertices.
+    # The mesh_state entries that describe one mesh's faces or vertices
+    # (the record names none, but the run on that cell).
     _MESH_KEYED = (
         "mesh_stats",
         "organelles",
@@ -533,6 +662,7 @@ def _create_app(
         "parallel_patches",
         "fragment_mask",
         "pending_reassignment",
+        "record",
     )
     _undo_stack: list[tuple[Mesh, str]] = []  # (mesh, its annotations.json)
     _UNDO_LIMIT = 10
@@ -748,7 +878,7 @@ def _create_app(
                 paths.append(tmp_path)
         finally:
             await form.close()
-        meshes = sorted(p for p in paths if p.suffix.lower() in _MESH_SUFFIXES)
+        meshes = sorted(p for p in paths if _is_mesh_file(p))
         site_files = [
             p for p in paths if p.suffix.lower() == ".npz" and _is_contact_sites(p)
         ]
@@ -972,7 +1102,7 @@ def _create_app(
         suffix = tmp_path.suffix.lower()
 
         try:
-            if suffix in _MESH_SUFFIXES:
+            if _is_mesh_file(tmp_path):
                 mesh = load_mesh(tmp_path)
                 print(
                     f"Uploaded mesh: {len(mesh.vertices):,} verts, {len(mesh.faces):,} faces"
@@ -1158,7 +1288,10 @@ def _create_app(
                         organelles=comp.organelles,
                         neurites=comp.neurites,
                         discarded=comp.discarded,
+                        record=comp.record,
                     )
+                # the run that made these components, if the file has one
+                mesh_state["record"] = comp.record
 
                 org_mask = comp.organelles.mask
                 if mesh_state.get("mesh") is None:
@@ -1314,11 +1447,44 @@ def _create_app(
                 return JSONResponse({"ok": True, "type": "skeleton", "name": filename})
 
             elif suffix == ".json":
-                # Annotation JSON — merge with deduplication
                 incoming = json.loads(tmp_path.read_text(encoding="utf-8"))
                 current = {}
                 if annotations_path.exists():
                     current = json.loads(annotations_path.read_text(encoding="utf-8"))
+
+                if _is_qc_report(incoming):
+                    # sk.qc.report — its sites listed as markers, in place of
+                    # an earlier report's; the cell's mesh must be in first
+                    centroid = mesh_state.get("centroid")
+                    if mesh_state.get("mesh") is None or centroid is None:
+                        return JSONResponse(
+                            {
+                                "ok": False,
+                                "error": "Load the cell's mesh before its qc report",
+                            },
+                            status_code=400,
+                        )
+                    markers = _qc_markers(incoming, centroid)
+                    current["markers"] = [
+                        m for m in current.get("markers", []) if not m.get("qc")
+                    ] + markers
+                    await _save_annotations(current)
+                    flags = list(incoming.get("flags") or [])
+                    await _log(
+                        f"[skeliner.qc] {filename}: {len(markers)} sites"
+                        + (f"; flags: {', '.join(flags)}" if flags else "")
+                    )
+                    return JSONResponse(
+                        {
+                            "ok": True,
+                            "type": "qc",
+                            "name": filename,
+                            "sites": len(markers),
+                            "flags": flags,
+                        }
+                    )
+
+                # Annotation JSON — merge with deduplication
                 if "highlights" not in current:
                     current["highlights"] = []
 
@@ -1731,20 +1897,22 @@ def _create_app(
         """Run soma detection and write result to annotations.
 
         Accepts optional JSON body ``{"method": "z_contour"}`` or
-        ``{"method": "ring_cutoff"}``.  Defaults to z_contour.
+        ``{"method": "ring_cutoff"}``.  Defaults to z_contour.  With
+        ``somaPoint`` (a click on the soma, the mesh's own frame),
+        ``ring_cutoff`` is ``find_soma(near=)``: the soma found there, or
+        none.
         """
         if mesh_state["mesh"] is None:
             return JSONResponse(
                 {"ok": False, "error": "No mesh loaded"}, status_code=400
             )
 
-        # Parse method choice from request body (POST with JSON)
-        method = "z_contour"
+        body = await _body_of(request)
+        method = body.get("method", "z_contour")
         try:
-            body = await request.json()
-            method = body.get("method", "z_contour")
-        except Exception:
-            pass
+            point = _soma_point(body)
+        except ValueError as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
         if method == "ring_cutoff":
             from skeliner.pre import find_soma as _find
@@ -1770,9 +1938,11 @@ def _create_app(
                 organelles=mesh_state.get("organelles"),
                 mesh_stats=mesh_state.get("mesh_stats"),
                 verbose=True,
+                near=point,
             )
         if soma is None:
-            return JSONResponse({"ok": False, "error": "No soma found"})
+            where = "" if point is None or method == "z_contour" else " at the point"
+            return JSONResponse({"ok": False, "error": f"No soma found{where}"})
 
         mesh_state["soma"] = soma
         mesh_state["soma_by_hand"] = False
@@ -2983,8 +3153,11 @@ def _create_app(
         This *is* ``pre.preprocess`` rather than the panel's buttons pressed
         in order by the server, so the viewer and the library cannot drift
         into two pipelines wearing one name.  Its soma comes from
-        ``find_soma``, as the Soma button's does — unless the soma is the
-        user's, assigned or edited by hand, which it takes instead.
+        ``find_soma``, as the Soma button's does, looking near the soma
+        point when the page has one (``somaPoint``, a click on the soma) —
+        unless the soma is the user's, assigned or edited by hand, which it
+        takes instead, or the soma switch is off: the cell has none, and none
+        is looked for.
 
         Left uncompacted.  ``compact_mesh`` reindexes faces, and annotations,
         the rescue list and every loaded skeleton are all stated in face ids;
@@ -3002,6 +3175,11 @@ def _create_app(
         n_before = len(mesh.faces)
         body = await _body_of(request)
         floor = _claim_floor(body)
+        no_soma = not bool(body.get("soma", True))
+        try:
+            point = _soma_point(body)
+        except ValueError as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
         # An override the user has already made is input to this run, not a
         # casualty of it — break_up_mesh re-derives the neurite/discarded
@@ -3011,7 +3189,13 @@ def _create_app(
             mesh,
             organelles=bool(body.get("organelles", True)),
             fill=bool(body.get("fill", True)),
-            soma=mesh_state["soma"] if mesh_state["soma_by_hand"] else None,
+            soma=(
+                False
+                if no_soma
+                else mesh_state["soma"]
+                if mesh_state["soma_by_hand"]
+                else point  # None: find one anywhere
+            ),
             rescued=mesh_state["rescued"],
             released=mesh_state["released"],
             claim_min_faces=floor,
@@ -3028,6 +3212,10 @@ def _create_app(
         mesh_state["mesh_stats"] = None
         mesh_state["gap_clusters"] = None
         out = await _publish_components(components)
+        mesh_state["record"] = components.record
+        if no_soma:
+            # the run said the cell has none: a soma by hand went with it
+            mesh_state["soma_by_hand"] = False
         await _log(
             f"Preprocess: {n_before:,} → {len(new_mesh.faces):,} faces, "
             f"{out['nNeurites']} neurites, {out['nDiscarded']} discarded"
@@ -3053,6 +3241,7 @@ def _create_app(
             organelles=org,
             neurites=mesh_state.get("neurites") or Neurites([]),
             discarded=mesh_state.get("discarded") or Discarded([]),
+            record=mesh_state.get("record"),
         )
 
     def _released_after(target, sel) -> np.ndarray:
@@ -3212,6 +3401,7 @@ def _create_app(
             organelles=org,
             neurites=mesh_state.get("neurites") or Neurites([]),
             discarded=mesh_state.get("discarded") or Discarded([]),
+            record=mesh_state.get("record"),
         )
 
         def _run():
@@ -3405,6 +3595,7 @@ def _create_app(
             organelles=org,
             neurites=mesh_state.get("neurites", Neurites([])),
             discarded=mesh_state.get("discarded", Discarded([])),
+            record=mesh_state.get("record"),
         )
 
         prefix = request.query_params.get("prefix", "")

@@ -10,11 +10,10 @@ use std::collections::{BTreeSet, HashMap};
 
 use mesh::Topology;
 use mesh::components::face_edge_components;
-use mesh::geometry::{HAS_FMA, numpy_order};
-use mesh::loops::border_loops;
+use mesh::geometry::{HAS_FMA, cos_sin, numpy_order};
 use rayon::prelude::*;
 
-use crate::gaps::{expand_tip_to_good_rim, rescue_size, sever_cost};
+use crate::gaps::{expand_tip_to_good_rim, rescue_size, rim_loops, sever_cost};
 
 type V3 = [f64; 3];
 
@@ -320,7 +319,7 @@ fn zipper_stitch<E>(
         let mut ids = Vec::with_capacity(n_ring_pts);
         for j in 0..n_ring_pts {
             let r = profile_a[j] * (1.0 - t) + profile_b[j] * t;
-            let (cos, sin) = (target[j].cos(), target[j].sin());
+            let (cos, sin) = cos_sin(target[j]);
             let pt = [0, 1, 2].map(|k| c[k] + r * (cos * u_vec[k] + sin * right[k]));
             ids.push((n_existing + new_verts.len()) as u32);
             new_verts.push(pt);
@@ -582,9 +581,173 @@ fn loop_pair_ok(a: &[u32], b: &[u32]) -> bool {
     vertex_set(a) != vertex_set(b)
 }
 
+/// A tip's patch and the longest loop of its rim.
+type Peeled = (BTreeSet<u32>, Vec<u32>);
+
+/// Both sides' rims within five times of each other, as `loop_pair_ok`
+/// takes them, where growing the shorter side's tip further gets them
+/// there.  A rim round a hole is as long as the hole, while the other side
+/// stops at its first rim of six vertices: the shorter side is grown again
+/// from its tip until its rim reaches a fifth of the longer — and kept so
+/// only if it does, the loop then the rim of the patch that comes with it.
+fn paired(topo: &Topology, tips: [&[u32]; 2], peeled: [Peeled; 2]) -> [Peeled; 2] {
+    let [na, nb] = [peeled[0].1.len(), peeled[1].1.len()];
+    if na.max(nb) <= 5 * na.min(nb) {
+        return peeled;
+    }
+    let need = na.max(nb).div_ceil(5);
+    let short = usize::from(nb < na);
+    let mut out = peeled;
+    if let (sel, Some(lp)) = expand_tip_to_good_rim(topo, tips[short], need, 20, 30)
+        && lp.len() >= need
+    {
+        out[short] = (sel, lp);
+    }
+    out
+}
+
+/// One gap's bridge as decided on its own: a tube between two rims, or a
+/// fan over the one hole two side-by-side tips leave.
+enum Bridge {
+    Tube(Vec<u32>, Vec<u32>),
+    Fan(Vec<u32>),
+}
+
+/// A bridge, the faces it takes away, and its gap's tips' first faces.
+struct Planned {
+    bridge: Bridge,
+    removed: BTreeSet<u32>,
+    tips: (u32, u32),
+}
+
+/// Rescue sizes (`rescue_size`) from the raw face-edge components, given
+/// or labelled on first need.
+struct Rescues<'a> {
+    given: Option<&'a [i64]>,
+    own: Option<Vec<i64>>,
+    counts: Option<HashMap<i64, usize>>,
+}
+
+impl Rescues<'_> {
+    fn of(&mut self, topo: &Topology, fa: u32, fb: u32) -> usize {
+        let labels: &[i64] = match self.given {
+            Some(l) => l,
+            None => self.own.get_or_insert_with(|| face_edge_components(topo).0),
+        };
+        let counts = self.counts.get_or_insert_with(|| {
+            let mut c = HashMap::new();
+            for &l in labels {
+                *c.entry(l).or_insert(0usize) += 1;
+            }
+            c
+        });
+        let sizes = |l: i64| counts.get(&l).copied().unwrap_or(0);
+        rescue_size(labels, &sizes, fa as usize, fb as usize)
+    }
+}
+
+/// Each loop of a bridge — its tube's two ends, or its fan's hole — as its
+/// edges, `[low, high]` pairs.
+fn seams(p: &Planned) -> Vec<Vec<[u32; 2]>> {
+    let loops: Vec<&Vec<u32>> = match &p.bridge {
+        Bridge::Tube(a, b) => vec![a, b],
+        Bridge::Fan(hole) => vec![hole],
+    };
+    loops
+        .into_iter()
+        .map(|lp| {
+            (0..lp.len())
+                .map(|i| {
+                    let (u, v) = (lp[i], lp[(i + 1) % lp.len()]);
+                    [u.min(v), u.max(v)]
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Which of the `planned` bridges can all be stitched.  Decided gap by
+/// gap, a bridge can be left with nothing to meet: every face along one
+/// of its loops taken by other bridges' patches, so its tube or fan would
+/// end on nothing — two bridges landing side by side on one surface.  Only
+/// bridges whose footprints — the vertices of the faces each takes away
+/// and of its loops — meet can do that to each other; those are kept one
+/// by one, the one winning back more faces (`rescue`, by index) first,
+/// ties to the earlier gap, each unless it or one kept would be left so.
+/// A bridge meeting none is kept.
+fn compatible(
+    topo: &Topology,
+    faces: &[[u32; 3]],
+    planned: &[Planned],
+    rescue: &mut impl FnMut(usize) -> usize,
+) -> Vec<bool> {
+    let prints: Vec<BTreeSet<u32>> = planned
+        .iter()
+        .map(|p| {
+            let mut v: BTreeSet<u32> = p.removed.iter().flat_map(|&f| faces[f as usize]).collect();
+            match &p.bridge {
+                Bridge::Tube(a, b) => v.extend(a.iter().chain(b)),
+                Bridge::Fan(hole) => v.extend(hole),
+            }
+            v
+        })
+        .collect();
+    let mut owner: HashMap<u32, usize> = HashMap::new();
+    let mut meets = vec![false; planned.len()];
+    for (i, print) in prints.iter().enumerate() {
+        for &v in print {
+            match owner.get(&v) {
+                Some(&j) if j != i => {
+                    meets[i] = true;
+                    meets[j] = true;
+                }
+                Some(_) => {}
+                None => {
+                    owner.insert(v, i);
+                }
+            }
+        }
+    }
+    let mut keep = vec![true; planned.len()];
+    let mut order: Vec<(usize, usize)> = (0..planned.len())
+        .filter(|&i| meets[i])
+        .map(|i| (rescue(i), i))
+        .collect();
+    order.sort_by_key(|&(won, i)| (std::cmp::Reverse(won), i));
+    // the faces the kept bridges take, and their loops
+    let mut gone: BTreeSet<u32> = BTreeSet::new();
+    let mut kept_loops: Vec<Vec<[u32; 2]>> = Vec::new();
+    for (_, i) in order {
+        let mine = seams(&planned[i]);
+        let taking = &planned[i].removed;
+        // a loop no face is left along
+        let bare = |lp: &Vec<[u32; 2]>| {
+            lp.iter().all(|e| {
+                topo.edge_id(e[0], e[1]).is_none_or(|id| {
+                    topo.edge_faces(id)
+                        .iter()
+                        .all(|f| gone.contains(f) || taking.contains(f))
+                })
+            })
+        };
+        if mine.iter().any(bare) || kept_loops.iter().any(bare) {
+            keep[i] = false;
+        } else {
+            gone.extend(taking);
+            kept_loops.extend(mine);
+        }
+    }
+    keep
+}
+
 /// `skeliner.pre.remove_gaps` once the gaps are known: per gap, peel both
 /// tips to clean rims, skip pairs that fail validation or whose removal
 /// would strand more than the stitch wins back, then stitch and rebuild.
+/// Rims, the hole a fusion join leaves and whether a tip wraps the surface
+/// or cuts a flap off (two rim loops or more) are all read from
+/// [`rim_loops`], so a tip on an open end has the end in its rim; a side
+/// whose rim is more than five times shorter than the other's is grown on
+/// to pair with it.
 ///
 /// Rims that share two or more vertices belong to tips lying side by side,
 /// glued along those vertices (a fusion join); a tube from rim to rim would
@@ -592,8 +755,13 @@ fn loop_pair_ok(a: &[u32], b: &[u32]) -> bool {
 /// bridged by removing both tips and closing the one hole they leave with a
 /// fan — or skipped when their union does not leave exactly one hole.
 ///
-/// `labels` are the raw face-edge components the rescue sizes are read
-/// from, computed here on first need when not given.
+/// Each gap is decided on its own; a bridge whose loop other bridges'
+/// patches strip bare would meet nothing, and of such bridges the one
+/// winning back more is kept ([`compatible`]).
+///
+/// `labels` are the components the rescue sizes are read from — face-edge
+/// components, or split along fusion walls by the caller — computed here
+/// (face-edge) on first need when not given.
 pub fn remove_gaps<E>(
     topo: &Topology,
     m: &StitchMesh<'_>,
@@ -601,33 +769,40 @@ pub fn remove_gaps<E>(
     gaps: &[GapTips],
     fit: &mut impl FnMut(&[u32]) -> Result<LoopFit, E>,
 ) -> Result<GapsRemoved, E> {
-    let mut own_labels: Option<Vec<i64>> = None;
-    let mut counts: Option<HashMap<i64, usize>> = None;
-    let mut remove: BTreeSet<u32> = BTreeSet::new();
-    let mut pairs: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
-    let mut fills: Vec<Vec<u32>> = Vec::new();
+    let mut rescues = Rescues {
+        given: labels,
+        own: None,
+        counts: None,
+    };
+    let mut planned: Vec<Planned> = Vec::new();
     let mut n_skipped = 0;
     for g in gaps {
+        let tips = (g.faces_a[0], g.faces_b[0]);
         let (sel_a, loop_a) = expand_tip_to_good_rim(topo, &g.faces_a, 6, 20, 30);
         let (sel_b, loop_b) = expand_tip_to_good_rim(topo, &g.faces_b, 6, 20, 30);
         let (Some(loop_a), Some(loop_b)) = (loop_a, loop_b) else {
             n_skipped += 1;
             continue;
         };
+        let [(sel_a, loop_a), (sel_b, loop_b)] = paired(
+            topo,
+            [&g.faces_a, &g.faces_b],
+            [(sel_a, loop_a), (sel_b, loop_b)],
+        );
         let (set_a, set_b) = (vertex_set(&loop_a), vertex_set(&loop_b));
         let shared = set_a
             .iter()
             .filter(|v| set_b.binary_search(v).is_ok())
             .count();
         if shared >= 2 && set_a != set_b {
-            let union: Vec<u32> = sel_a.union(&sel_b).copied().collect();
-            let holes: Vec<Vec<u32>> = border_loops(topo, &union)
-                .into_iter()
-                .filter(|lp| lp.len() >= 3)
-                .collect();
+            let union: BTreeSet<u32> = sel_a.union(&sel_b).copied().collect();
+            let holes = rim_loops(topo, &union);
             if let [hole] = holes.as_slice() {
-                fills.push(hole.clone());
-                remove.extend(union);
+                planned.push(Planned {
+                    bridge: Bridge::Fan(hole.clone()),
+                    removed: union,
+                    tips,
+                });
             } else {
                 n_skipped += 1;
             }
@@ -637,39 +812,39 @@ pub fn remove_gaps<E>(
             n_skipped += 1;
             continue;
         }
-        let severs = |sel: &BTreeSet<u32>| {
-            let faces: Vec<u32> = sel.iter().copied().collect();
-            border_loops(topo, &faces)
-                .iter()
-                .filter(|lp| lp.len() >= 3)
-                .count()
-                >= 2
-        };
+        let severs = |sel: &BTreeSet<u32>| rim_loops(topo, sel).len() >= 2;
         let (sev_a, sev_b) = (severs(&sel_a), severs(&sel_b));
         if sev_a || sev_b {
-            let labels: &[i64] = match labels {
-                Some(l) => l,
-                None => own_labels.get_or_insert_with(|| face_edge_components(topo).0),
-            };
-            let counts = counts.get_or_insert_with(|| {
-                let mut c = HashMap::new();
-                for &l in labels {
-                    *c.entry(l).or_insert(0usize) += 1;
-                }
-                c
-            });
-            let sizes = |l: i64| counts.get(&l).copied().unwrap_or(0);
-            let rescue = rescue_size(labels, &sizes, g.faces_a[0] as usize, g.faces_b[0] as usize);
-            if (sev_a && sever_cost(topo, &sel_a, rescue) > rescue)
-                || (sev_b && sever_cost(topo, &sel_b, rescue) > rescue)
+            let rescue = rescues.of(topo, tips.0, tips.1);
+            if (sev_a && sever_cost(topo, &sel_a, rescue, &g.faces_b) > rescue)
+                || (sev_b && sever_cost(topo, &sel_b, rescue, &g.faces_a) > rescue)
             {
                 n_skipped += 1;
                 continue;
             }
         }
-        pairs.push((loop_a, loop_b));
-        remove.extend(sel_a);
-        remove.extend(sel_b);
+        planned.push(Planned {
+            bridge: Bridge::Tube(loop_a, loop_b),
+            removed: sel_a.union(&sel_b).copied().collect(),
+            tips,
+        });
+    }
+    let keep = compatible(topo, m.faces, &planned, &mut |i| {
+        rescues.of(topo, planned[i].tips.0, planned[i].tips.1)
+    });
+    let mut remove: BTreeSet<u32> = BTreeSet::new();
+    let mut pairs: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
+    let mut fills: Vec<Vec<u32>> = Vec::new();
+    for (p, kept) in planned.into_iter().zip(keep) {
+        if !kept {
+            n_skipped += 1;
+            continue;
+        }
+        remove.extend(p.removed);
+        match p.bridge {
+            Bridge::Tube(a, b) => pairs.push((a, b)),
+            Bridge::Fan(hole) => fills.push(hole),
+        }
     }
     if pairs.is_empty() && fills.is_empty() {
         return Ok(GapsRemoved {
@@ -861,6 +1036,51 @@ mod tests {
         assert_eq!(c[0], [0.0; 3]);
         assert_eq!(c[4], [1.0, 0.0, 0.0]);
         assert_eq!(c[2], [0.5, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_bridge_left_with_nothing_to_meet_yields_to_one_winning_back_more() {
+        // A 6 x 6 grid of squares, vertex r * 7 + c; each bridge a fan
+        // taking one inner square away, its rim the square's border.
+        let mut faces = Vec::new();
+        for r in 0..6u32 {
+            for c in 0..6u32 {
+                let v = r * 7 + c;
+                faces.push([v, v + 1, v + 8]);
+                faces.push([v, v + 8, v + 7]);
+            }
+        }
+        let t = Topology::new(&faces, 49);
+        let fan = |r: u32, c: u32| {
+            let (v, f) = (r * 7 + c, 2 * (r * 6 + c));
+            Planned {
+                bridge: Bridge::Fan(vec![v, v + 1, v + 8, v + 7]),
+                removed: BTreeSet::from([f, f + 1]),
+                tips: (0, 0),
+            }
+        };
+        // squares (2,2) and (2,3) share a seam edge, whose faces both take;
+        // (3,4) touches (2,3) at a corner alone; (4,1) meets none: every
+        // loop keeps faces along it, so every bridge is kept
+        let planned = [fan(2, 2), fan(2, 3), fan(4, 1), fan(3, 4)];
+        let won = [5, 9, 3, 1];
+        let keep = compatible(&t, &faces, &planned, &mut |i| won[i]);
+        assert_eq!(keep, [true; 4]);
+        // the block of squares (1..=3, 1..=3) takes every face along the
+        // loop round (2,2): of the two, the one winning back more stays
+        let block = Planned {
+            bridge: Bridge::Fan(vec![8, 9, 10, 11, 18, 25, 32, 31, 30, 29, 22, 15]),
+            removed: (1..4u32)
+                .flat_map(|r| (1..4u32).flat_map(move |c| [2 * (r * 6 + c), 2 * (r * 6 + c) + 1]))
+                .collect(),
+            tips: (0, 0),
+        };
+        let keep = compatible(&t, &faces, &[block, fan(2, 2)], &mut |i| [5, 9][i]);
+        assert_eq!(keep, [false, true]);
+        // nothing meets: every bridge kept, no rescue asked for
+        let apart = [fan(1, 1), fan(4, 4)];
+        let keep = compatible(&t, &faces, &apart, &mut |_| unreachable!());
+        assert_eq!(keep, [true, true]);
     }
 
     #[test]

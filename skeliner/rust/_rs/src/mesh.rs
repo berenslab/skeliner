@@ -191,6 +191,14 @@ impl PyTopology {
         Ok(py.detach(|| ::mesh::loops::border_loops(&self.inner, &sel)))
     }
 
+    /// The rim of the faces in `sel`: the closed loops along the border of
+    /// what removing them leaves, the rest of any hole they take faces off
+    /// included (`skeliner.python.pre.rim_loops`).
+    fn rim_loops(&self, py: Python<'_>, sel: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<u32>>> {
+        let sel: BTreeSet<u32> = selection(sel)?.into_iter().collect();
+        Ok(py.detach(|| ::pre::gaps::rim_loops(&self.inner, &sel)))
+    }
+
     /// `skeliner.pre._expand_tip_to_good_rim` on this mesh: `(selection,
     /// longest loop or None)`.
     #[pyo3(signature = (tip, target_verts=6, max_iters=20, max_eat_factor=30))]
@@ -237,10 +245,19 @@ impl PyTopology {
         }))
     }
 
-    /// `skeliner.pre._sever_cost` on this mesh.
-    fn sever_cost(&self, py: Python<'_>, sel: &Bound<'_, PyAny>, budget: usize) -> PyResult<usize> {
+    /// `skeliner.pre._sever_cost` on this mesh; the piece holding a face of
+    /// `rejoined` (the bridge's other tip) is joined back, not stranded.
+    #[pyo3(signature = (sel, budget, rejoined=None))]
+    fn sever_cost(
+        &self,
+        py: Python<'_>,
+        sel: &Bound<'_, PyAny>,
+        budget: usize,
+        rejoined: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<usize> {
         let sel: BTreeSet<u32> = selection(sel)?.into_iter().collect();
-        Ok(py.detach(|| ::pre::gaps::sever_cost(&self.inner, &sel, budget)))
+        let rejoined = rejoined.map(selection).transpose()?.unwrap_or_default();
+        Ok(py.detach(|| ::pre::gaps::sever_cost(&self.inner, &sel, budget, &rejoined)))
     }
 
     /// Edge → faces as CSR arrays `(offsets, faces)`, edges in ascending

@@ -324,6 +324,25 @@ def test_organelles_npz_backward_compat(tmp_path):
     assert np.array_equal(loaded.expanded, np.zeros(nF, dtype=bool))
 
 
+def test_components_npz_keep_the_record_of_the_run(tmp_path):
+    """What preprocess decided goes with the components into the file and
+    back; components no run made have none, before and after."""
+    import trimesh
+
+    from skeliner.io import load_components_npz, save_components_npz
+
+    ball = trimesh.creation.icosphere(subdivisions=3, radius=3000.0)
+    _, comps = sk.pre.preprocess(ball, organelles=False)
+    assert comps.record is not None
+    save_components_npz(comps, tmp_path / "c.npz")
+    assert load_components_npz(tmp_path / "c.npz").record == comps.record
+
+    bare = sk.pre.break_up_mesh(ball, comps.soma, None)
+    assert bare.record is None
+    save_components_npz(bare, tmp_path / "bare.npz")
+    assert load_components_npz(tmp_path / "bare.npz").record is None
+
+
 # ------------------------------------------------------------------------
 #  MeshStats NPZ round-trip
 # ------------------------------------------------------------------------
@@ -575,6 +594,46 @@ def test_saving_a_vertex_no_face_names_warns(tmp_path):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         save_mesh(sk.Mesh(SEAM_V[:3], SEAM_F[:1]), tmp_path / "tight.obj")
+
+
+def test_a_mesh_reads_back_from_npz_exactly(reference_mesh, tmp_path):
+    # what an OBJ cannot keep, kept: a vertex no face names, the copies
+    # along a seam (reading an OBJ merges them), every digit
+    v = np.vstack([np.asarray(SEAM_V, dtype=np.float64) / 3.0, [[7.0, 7.0, 7.0]]])
+    odd = sk.Mesh(v, SEAM_F)
+    with pytest.warns(UserWarning, match="or save it as .npz"):
+        save_mesh(odd, tmp_path / "odd.obj")
+    via_obj = load_mesh(tmp_path / "odd.obj")
+    assert len(via_obj.vertices) < len(v), "fixture: the OBJ must lose something"
+
+    for name, mesh in {"odd": odd, "reference": reference_mesh}.items():
+        writes = {
+            "save_mesh": lambda p: save_mesh(mesh, p),
+            "save_mesh_npz": lambda p: sk.io.save_mesh_npz(mesh, p),
+            "uncompressed": lambda p: sk.io.save_mesh_npz(mesh, p, compress=False),
+            "trimesh": lambda p: save_mesh(mesh.to_trimesh(), p),
+        }
+        for how, write in writes.items():
+            path = tmp_path / f"{name}_{how}.npz"
+            write(path)
+            for back in (load_mesh(path), sk.io.load_mesh_npz(path)):
+                assert back.vertices.dtype == np.float64, (name, how)
+                assert back.faces.dtype == np.int64, (name, how)
+                if how == "trimesh" and name == "odd":
+                    # Mesh.of merges the seam a trimesh mesh hands it
+                    assert np.array_equal(
+                        back.faces, sk.Mesh.of(odd.to_trimesh()).faces
+                    )
+                    continue
+                assert np.array_equal(back.vertices, mesh.vertices), (name, how)
+                assert np.array_equal(back.faces, mesh.faces), (name, how)
+
+
+def test_an_npz_without_a_mesh_is_refused(tmp_path):
+    path = tmp_path / "soma.npz"
+    np.savez(path, center=np.zeros(3))
+    with pytest.raises(ValueError, match="holds 'vertices' and 'faces'"):
+        load_mesh(path)
 
 
 def test_mesh_of_merges_a_seam_keeping_the_vertices():
