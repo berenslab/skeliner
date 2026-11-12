@@ -2,7 +2,7 @@
 
 [![PyPI version](https://badge.fury.io/py/skeliner.svg)](https://badge.fury.io/py/skeliner)
 
-A lightweight skeletonizer that converts neuron meshes into biophysical‑modelling‑ready morphologies. 
+A lightweight skeletonizer that converts neuron meshes into biophysical‑modelling‑ready morphologies. Built for [Eyewire II](https://eyewire.ai), in Rust, with Python binding.
 
 ## Features
 
