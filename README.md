@@ -10,11 +10,11 @@ A lightweight skeletonizer that converts neuron meshes into biophysical‑modell
 
 - Mesh Preprocessing
     - remove mesh anomolies such as parallel faces due to chunk merging failures, gaps (broken neurites), fusions (wrong connections)
-    - find and classify soma, organelles, neurites and fragments that should be descarded 
+    - find and classify soma, organelles, and neurites (and also fragments that should be descarded)
 
 - Mesh → SWC skeletons
     - Center‑line, acyclic skeleton.
-    - Per‑node radii with multiple estimators (median/mean/trim) and an automatic recommendation.
+    - Per‑node radii with multiple estimators (centerline/median/mean/trim) and an automatic recommendation.
     - Ellipsoidal soma detection near the soma centroid.
     - Bridges disconnected mesh components back to the soma (gap‑closing) and prunes tiny peri‑soma artefacts.
     - SWC and NPZ export with metadata;
@@ -27,7 +27,7 @@ A lightweight skeletonizer that converts neuron meshes into biophysical‑modell
     - Optional skeleton‑only approximation of contact sites/areas when meshes are unavailable.
 
 - I/O, visualization, diagnostics and post-processing
-    - Read/write SWC and compact NPZ; load meshes via `trimesh`.
+    - Read/write SWC and compact NPZ;
     - 2D projections and 3D viewers for meshes, skeletons, and contact patches.
     - Various diagnostics and post-processing tools.
 
@@ -54,7 +54,7 @@ pip install -e "skeliner[dev]"
 
 ### Mesh preprocessing and skeletonization
 
-Since v0.4.0, the recommended pipeline is the preprocess route. The mesh preprocessing will clean up most artifacts that would potentially degrade the quality of the skeletons, which includes identifying internal organelles surfaces, locating the soma, and also bridging disconnected paths. All these are done in one call automatically. The skeleton then can be estimated from the cleaned mesh and the identified components (organelles, soma, and neurites):
+Since v0.4.0, the preprocessing pipeline is the recommended route, while the original raw mesh direct skeletonization route is kept as a faster but less accurate alternative. The mesh preprocessing will clean up most artifacts that would potentially degrade the quality of the skeletons, which includes identifying internal organelles surfaces, locating the soma, and also bridging disconnected paths. All these are done in one call automatically. The skeleton then can be estimated from the cleaned mesh and the identified components (organelles, soma, and neurites):
 
 ```python
 import skeliner as sk
@@ -82,7 +82,7 @@ print("contact patches:", len(sites.faces_A))
 print("mean areas (mesh units^2):", sites.area_mean)
 
 # Optional: visualize patches
-# sk.plot.view_contacts(meshA, meshB, sites, sides="A")
+# sk.view.view_contacts(meshA, meshB, sites, sides="A")
 ```
 
 <p align="center">
