@@ -173,6 +173,37 @@ def test_a_soma_is_assigned_on_a_freshly_loaded_cell(reassign_client):
     assert np.allclose(state["soma"].center, soma.center)
 
 
+def test_the_soma_wireframe_follows_a_reassignment(reassign_client):
+    # faces handed to the soma: the soma is the ellipsoid its vertices now
+    # give, and the wireframe the page draws is that one, about the
+    # session's centroid
+    client, state, neurites = reassign_client
+    mesh = state["mesh"]
+    before = state["soma"].axes.copy()
+    z = mesh.vertices[mesh.faces].mean(axis=1)[:, 2]
+    # the ring of arbor faces next to the band, on its upper side
+    up = np.concatenate(list(neurites))
+    up = up[z[up] > 0]
+    sel = up[z[up] <= z[up].min() + 1e-6]
+    assert len(sel) >= 16, "fixture: a ring of faces above the band"
+
+    r = client.post("/reassign_preview", json={"faces": sel.tolist(), "to": "soma"})
+    assert r.status_code == 200, r.json()
+    assert client.post("/reassign_apply").json()["ok"]
+
+    soma = state["soma"]
+    fitted = Soma.fit(np.asarray(mesh.vertices)[soma.verts])
+    np.testing.assert_allclose(soma.center, fitted.center)
+    np.testing.assert_allclose(soma.axes, fitted.axes)
+    assert not np.allclose(soma.axes, before)
+    (ell,) = client.get("/annotations").json()["ellipsoids"]
+    centroid = np.asarray(state["centroid"], dtype=np.float64)
+    np.testing.assert_allclose(
+        np.asarray(ell["center"]) + centroid, soma.center, atol=1e-6
+    )
+    np.testing.assert_allclose(ell["axes"], soma.axes)
+
+
 def test_preprocess_looks_for_no_soma_when_switched_off(reassign_client, monkeypatch):
     # the Run button's soma switch, for a cell with none in the mesh: off,
     # preprocess is told so and a soma by hand goes with the run; on (the

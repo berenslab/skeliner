@@ -1725,6 +1725,67 @@ class TestPreviewReassignment:
         assert before <= after
         assert set(np.unique(np.asarray(mesh.faces)[sel]).tolist()) <= after
 
+    @staticmethod
+    def _cell():
+        """The ball with a process standing out of it, broken up: a soma,
+        and the process a neurite."""
+        mesh, soma, org = _ball_with_stub(height=160.0)
+        comp = pre.break_up_mesh(mesh, soma, org)
+        assert comp.soma is not None and len(comp.neurites) == 1
+        return mesh, comp
+
+    @staticmethod
+    def _fitted(mesh, soma):
+        """Whether *soma*'s ellipsoid is the one its vertices give."""
+        ref = Soma.fit(mesh.vertices[soma.verts])
+        return np.allclose(soma.center, ref.center) and np.allclose(soma.axes, ref.axes)
+
+    def test_faces_given_to_the_soma_refit_its_ellipsoid(self):
+        mesh, comp = self._cell()
+        f = np.asarray(mesh.faces)
+        cz = mesh.vertices[f].mean(axis=1)[:, 2]
+        (process,) = comp.neurites
+        base = process[(cz[process] > 105.0) & (cz[process] < 150.0)]
+        r = pre.preview_reassignment(mesh, comp, base, to="soma")
+        soma = r.components.soma
+        assert np.isin(np.unique(f[base]), soma.verts).all()
+        assert self._fitted(mesh, soma)
+        # it reaches up the process it took a piece of
+        assert soma.center[2] > comp.soma.center[2]
+        assert soma.nucleus is comp.soma.nucleus
+
+    def test_faces_released_from_the_soma_refit_its_ellipsoid(self):
+        mesh, comp = self._cell()
+        f = np.asarray(mesh.faces)
+        cz = mesh.vertices[f].mean(axis=1)[:, 2]
+        sv = comp.soma.verts
+        on_soma = np.flatnonzero(pre.soma_face_mask(f, sv))
+        bottom = on_soma[cz[on_soma] < -60.0]
+        r = pre.preview_reassignment(
+            mesh, comp, bottom, to="remainder", released=bottom
+        )
+        soma = r.components.soma
+        assert not np.isin(np.unique(f[bottom]), soma.verts).any()
+        assert self._fitted(mesh, soma)
+        # what is left sits higher
+        assert soma.center[2] > comp.soma.center[2]
+
+    def test_a_soma_released_whole_is_none(self):
+        mesh, comp = self._cell()
+        f = np.asarray(mesh.faces)
+        every = np.flatnonzero(np.isin(f, comp.soma.verts).any(axis=1))
+        r = pre.preview_reassignment(mesh, comp, every, to="remainder", released=every)
+        assert r.components.soma is None
+
+    def test_an_organelle_assignment_keeps_the_ellipsoid(self):
+        # the soma's vertices are what they were: its ellipsoid is too
+        mesh, comp = self._cell()
+        on_soma = np.flatnonzero(pre.soma_face_mask(mesh.faces, comp.soma.verts))
+        r = pre.preview_reassignment(mesh, comp, on_soma[:40], to="organelle")
+        soma = r.components.soma
+        np.testing.assert_array_equal(soma.center, comp.soma.center)
+        np.testing.assert_array_equal(soma.axes, comp.soma.axes)
+
     def test_leaving_includes_the_majority_rule_fringe(self):
         mesh, comp, _ = _tube_with_soma()
         sel = comp.neurites[0][:64]

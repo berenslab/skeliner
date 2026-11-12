@@ -3036,7 +3036,10 @@
                 }
                 const discarded = groups.filter(({ g }) => isDiscarded(g));
                 const named = groups.filter(({ g }) => !isDiscarded(g));
-                for (const { g, i } of named) host.appendChild(highlightRow(g, i, { pick: true }));
+                for (const { g, i } of named) {
+                    host.appendChild(highlightRow(g, i, { pick: true }));
+                    if (hlEllipsoids[i]) host.appendChild(ellipsoidRow(g, i));
+                }
 
                 if (discarded.length === 1) {
                     const { g, i } = discarded[0];
@@ -5434,6 +5437,27 @@
             // ── Annotations ──────────────────────────────────────────────────────
             let currentAnnotations = null; // cached for panel rebuild
 
+            // The wireframes hidden on their own row (Layers), by the label of
+            // the highlight each belongs with.  Apart from the faces' state:
+            // the faces can be hidden to see the ellipsoid, or the ellipsoid
+            // to see the faces.
+            function hiddenEllipsoids() {
+                try {
+                    return JSON.parse(localStorage.getItem("skeliner_ellHidden")) || [];
+                } catch (e) {
+                    return [];
+                }
+            }
+
+            function setEllipsoidHidden(label, hidden) {
+                const set = new Set(hiddenEllipsoids());
+                if (hidden) set.add(label || "");
+                else set.delete(label || "");
+                try {
+                    localStorage.setItem("skeliner_ellHidden", JSON.stringify([...set]));
+                } catch (e) {}
+            }
+
             function _saveAnnVisibility() {
                 if (!currentAnnotations || !currentAnnotations.highlights) return;
                 const hidden = [];
@@ -5468,6 +5492,7 @@
                 try {
                     hiddenLabels = JSON.parse(localStorage.getItem('skeliner_annHidden')) || [];
                 } catch (e) {}
+                const hiddenEll = hiddenEllipsoids();
                 // Face highlights
                 if (annotations.highlights) {
                     for (const group of annotations.highlights) {
@@ -5620,9 +5645,10 @@
                         m.applyMatrix4(mtx);
                         m.userData.ell = ell;
                         scene.add(m);
-                        // So hiding, recolouring or deleting the highlight takes
-                        // the wireframe along.  The server labels an ellipsoid
-                        // with its highlight's label; older files match by colour.
+                        // So recolouring or deleting the highlight takes the
+                        // wireframe along; it is shown or hidden on a row of
+                        // its own.  The server labels an ellipsoid with its
+                        // highlight's label; older files match by colour.
                         const hls = annotations.highlights || [];
                         const hlIdx =
                             ell.label != null
@@ -5630,7 +5656,11 @@
                                 : hls.findIndex((h) => sameColor(h.color, color));
                         if (hlIdx >= 0 && !hlEllipsoids[hlIdx]) {
                             hlEllipsoids[hlIdx] = m;
-                            if (hiddenLabels.includes(hls[hlIdx].label || "")) m.visible = false;
+                            const label = hls[hlIdx].label || "";
+                            // a group with no faces drawn has only this to hide
+                            m.visible =
+                                !hiddenEll.includes(label) &&
+                                !(!annotationMeshes[hlIdx] && hiddenLabels.includes(label));
                         }
                         markerMeshes.push(m);
                     }
@@ -6108,16 +6138,16 @@
                 focusBtn.addEventListener("click", () => focusOnAnnotation(idx));
                 div.appendChild(focusBtn);
 
+                // The faces; a wireframe that belongs with them has a row of
+                // its own (ellipsoidRow), unless there are no faces to show.
                 const toggleBtn = document.createElement("button");
                 toggleBtn.className = "toggle-vis icon-btn";
-                const shown = () => {
-                    const m = annotationMeshes[idx] || hlEllipsoids[idx];
-                    return !m || m.visible;
-                };
+                const drawn = () => annotationMeshes[idx] || hlEllipsoids[idx];
+                const shown = () => !drawn() || drawn().visible;
                 setToggleVisIcon(toggleBtn, shown());
                 toggleBtn.addEventListener("click", () => {
                     const vis = !shown();
-                    for (const m of [annotationMeshes[idx], hlEllipsoids[idx]]) if (m) m.visible = vis;
+                    if (drawn()) drawn().visible = vis;
                     setToggleVisIcon(toggleBtn, vis);
                     _saveAnnVisibility();
                 });
@@ -6139,6 +6169,40 @@
                     btn.addEventListener("click", () => removeAnnotationGroup(idx));
                     div.appendChild(btn);
                 }
+                return div;
+            }
+
+            /** The wireframe of the ellipsoid that belongs with highlight
+             *  idx (the soma's fit), on a row under it: its semi-axes, and
+             *  an eye of its own, remembered by the highlight's label. */
+            function ellipsoidRow(group, idx) {
+                const m = hlEllipsoids[idx];
+                const div = document.createElement("div");
+                div.className = "hl-item ann-row sub";
+                const left = document.createElement("span");
+                left.style.cssText = "display:flex;align-items:center;min-width:0;";
+                const name = document.createElement("span");
+                name.textContent = "ellipsoid";
+                name.title = "The ellipsoid fitted to its vertices";
+                left.appendChild(name);
+                const axes = (m.userData.ell.axes || []).map((a) => Math.round(a).toLocaleString());
+                if (axes.length === 3) {
+                    const dims = document.createElement("span");
+                    dims.className = "dim";
+                    dims.textContent = ` (${axes.join(" × ")})`;
+                    dims.title = "Its semi-axes, in the mesh's units";
+                    left.appendChild(dims);
+                }
+                div.appendChild(left);
+                const eye = document.createElement("button");
+                eye.className = "toggle-vis icon-btn";
+                setToggleVisIcon(eye, m.visible);
+                eye.addEventListener("click", () => {
+                    m.visible = !m.visible;
+                    setToggleVisIcon(eye, m.visible);
+                    setEllipsoidHidden(group.label, !m.visible);
+                });
+                div.appendChild(eye);
                 return div;
             }
 
@@ -6360,8 +6424,12 @@
                 const vis = !annotationsHidden;
                 for (const m of [...annotationMeshes, ...markerMeshes, ...edgeGroupMeshes])
                     if (m) m.visible = vis;
-                // every row now hidden or shown alike, and remembered so
+                // every row now hidden or shown alike, and remembered so —
+                // the wireframes' own rows too
                 _saveAnnVisibility();
+                ((currentAnnotations && currentAnnotations.highlights) || []).forEach((g, i) => {
+                    if (hlEllipsoids[i]) setEllipsoidHidden(g.label, !vis);
+                });
                 // what the contact panel hides stays hidden
                 if (contactMode) applyContactVisibility();
                 // Sync individual toggle buttons
@@ -6598,10 +6666,16 @@
                 try {
                     hiddenLabels = JSON.parse(localStorage.getItem("skeliner_annHidden")) || [];
                 } catch (e) {}
+                const hiddenEll = hiddenEllipsoids();
                 (currentAnnotations.highlights || []).forEach((g, i) => {
-                    const vis =
-                        !annotationsHidden && !contactHides(g) && !hiddenLabels.includes(g.label || "");
-                    for (const m of [annotationMeshes[i], hlEllipsoids[i]]) if (m) m.visible = vis;
+                    const label = g.label || "";
+                    const vis = !annotationsHidden && !contactHides(g);
+                    const own = hiddenLabels.includes(label);
+                    if (annotationMeshes[i]) annotationMeshes[i].visible = vis && !own;
+                    // a wireframe on its own row; with no faces, the group's
+                    if (hlEllipsoids[i])
+                        hlEllipsoids[i].visible =
+                            vis && !hiddenEll.includes(label) && !(!annotationMeshes[i] && own);
                 });
                 (currentAnnotations.edge_groups || []).forEach((g, i) => {
                     if (edgeGroupMeshes[i]) edgeGroupMeshes[i].visible = !annotationsHidden && !contactHides(g);

@@ -1885,7 +1885,10 @@ def preview_reassignment(
         with none (find_soma found none), makes their largest connected
         piece the soma, its ellipsoid fitted to it; ``'organelle'`` sets them in
         :attr:`~skeliner.dataclass.Organelles.manual`; ``'remainder'``
-        releases them from both, back to the arbor.
+        releases them from both, back to the arbor.  A soma whose vertices
+        change has its ellipsoid refitted to them (:meth:`Soma.fit`, as
+        :func:`break_up_mesh` refits it to those it absorbs); released down
+        to vertices that span no ellipsoid, there is no soma.
     rescued : array-like of int, optional
         The component-level arbor claims in force, passed straight to
         :func:`break_up_mesh`.  Without them the re-derive this preview
@@ -1965,6 +1968,18 @@ def preview_reassignment(
     if soma is not None:
         new_soma = copy.copy(soma)
         new_soma.verts = new_soma_verts
+        if old_soma_verts is not None and not np.array_equal(
+            new_soma_verts, np.unique(old_soma_verts)
+        ):
+            # The ellipsoid follows the soma's vertices, as break_up_mesh
+            # refits it to those it absorbs; the re-derive below judges
+            # the pieces round the soma by it.  Released down to vertices
+            # that span none, the soma is gone.
+            new_soma = _soma_fitted_to(mesh, new_soma_verts)
+            if new_soma is None:
+                new_soma_verts = None
+            else:
+                new_soma.nucleus = soma.nucleus
 
     # --- what actually changes hands, fringe included ---
     usable = _usable_face_mask(mesh)
@@ -2014,20 +2029,30 @@ def _soma_from_selection(mesh: Mesh, sel: np.ndarray) -> Soma:
     _, piece = connected_components(
         coo_matrix((np.ones(len(a)), (a, b)), shape=(n, n)), directed=False
     )
-    verts = verts[piece == np.bincount(piece).argmax()]
-    if len(verts) >= 4:
-        pts = np.asarray(mesh.vertices, dtype=np.float64)[verts]
-        try:
-            # a flat patch's least variance is zero or a rounding below it
-            with np.errstate(invalid="ignore", divide="ignore"):
-                soma = Soma.fit(pts, verts=verts)
-        except ValueError:
-            soma = None
-        if soma is not None and np.isfinite(soma.axes).all() and soma.axes[-1] > 0:
-            return soma
-    raise ValueError(
-        "these faces span no soma: select faces round it, not a flat patch"
-    )
+    soma = _soma_fitted_to(mesh, verts[piece == np.bincount(piece).argmax()])
+    if soma is None:
+        raise ValueError(
+            "these faces span no soma: select faces round it, not a flat patch"
+        )
+    return soma
+
+
+def _soma_fitted_to(mesh: Mesh, verts: np.ndarray) -> Soma | None:
+    """The soma on the mesh vertices *verts*, its ellipsoid fitted to them
+    (:meth:`Soma.fit`), or None when they span no ellipsoid: fewer than
+    four, or flat."""
+    if len(verts) < 4:
+        return None
+    pts = np.asarray(mesh.vertices, dtype=np.float64)[verts]
+    try:
+        # a flat patch's least variance is zero or a rounding below it
+        with np.errstate(invalid="ignore", divide="ignore"):
+            soma = Soma.fit(pts, verts=verts)
+    except ValueError:
+        return None
+    if np.isfinite(soma.axes).all() and soma.axes[-1] > 0:
+        return soma
+    return None
 
 
 def apply_reassignment(
@@ -2040,10 +2065,10 @@ def apply_reassignment(
     the result — soma, organelle masks and the re-derived components all
     come from that one run and cannot disagree with what was shown.
 
-    Note that ``break_up_mesh`` refits the soma ellipsoid when its
-    absorption pass pulls extra vertices in, so ``center``/``axes``/``R``
-    can move.  A reassignment that absorbs nothing leaves the model
-    untouched and changes only ``verts``.
+    The soma's ellipsoid is the preview's: refitted to the soma's vertices
+    when the reassignment changed them, and again by ``break_up_mesh`` to
+    any its absorption pass pulled in.  One that leaves the soma's vertices
+    alone leaves the ellipsoid as it was.
     """
     after = reassignment.components
     components.soma = after.soma
