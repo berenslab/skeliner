@@ -4,13 +4,48 @@
 
 A lightweight skeletonizer that converts neuron meshes into biophysical‑modelling‑ready morphologies. 
 
-![](.github/banner.png)
-
 ## Features
 
 - Mesh Preprocessing
     - remove mesh anomolies such as parallel faces due to chunk merging failures, gaps (broken neurites), fusions (wrong connections)
     - find and classify soma, organelles, and neurites (and also fragments that should be descarded)
+
+<table>
+  <tr>
+    <td width="30%" align="center">
+      <img width="100%" alt="disconnected components" src=".github/media/pre/disconnected.png" />  <br />   
+      <sub>Disconnected Mesh</sub>
+    </td>
+    <td width="30%" align="center">
+      <img width="100%"  alt="detecing gaps" src=".github/media/pre/gaps.png" /> <br />
+      <sub>Gaps Detection</sub>
+    </td>
+    <td width="30%" align="center">
+      <img width="100%"  alt="bridging gaps" src=".github/media/pre/bridges.png" />
+      <sub>Gaps Bridging</sub>
+    </td>
+  </tr>
+</table>
+
+
+<table>
+  <tr>
+    <td width="30%" align="center">
+      <img width="100%" alt="original mesh" src=".github/media/pre/mesh.png" />  <br />   
+      <sub>Original Mesh</sub>
+    </td>
+    <td width="30%" align="center">
+      <img width="100%"  alt="detecting organelles" src=".github/media/pre/organelles.png" /> <br />
+      <sub>Organelles Detection</sub>
+    </td>
+    <td width="30%" align="center">
+      <img width="100%"  alt="classifying components" src=".github/media/pre/components.png" />
+      <sub>Mesh breakdown into components</sub>
+    </td>
+  </tr>
+</table>
+
+
 
 - Mesh → SWC skeletons
     - Center‑line, acyclic skeleton.
@@ -19,12 +54,46 @@ A lightweight skeletonizer that converts neuron meshes into biophysical‑modell
     - Bridges disconnected mesh components back to the soma (gap‑closing) and prunes tiny peri‑soma artefacts.
     - SWC and NPZ export with metadata;
 
+<table>
+  <tr>
+    <td width="30%" align="center">
+      <img width="100%" alt="Origin components" src=".github/media/skel/mesh.png" />  <br />   
+      <sub>Origin Mesh</sub>
+    </td>
+    <td width="30%" align="center">
+      <img width="100%"  alt="detecing gaps" src=".github/media/skel/bins.png" /> <br />
+      <sub>Geodesic Binning with perpenticular correction</sub>
+    </td>
+    <td width="30%" align="center">
+      <img width="100%"  alt="bridging gaps" src=".github/media/skel/skel.png" />
+      <sub>Skeleton</sub>
+    </td>
+  </tr>
+</table>
+
 - Pairwise contact sites (two cells)
     - Skeleton‑based seeding: fast KD‑tree search finds node↔node proximity pairs with tolerance; returns contact
       midpoints and per‑node loci.
     - Mesh‑based patches: around seeds, projects to both meshes and extracts touching triangle patches; returns per‑site
       areas on A/B and their mean, plus compact AABBs for downstream use.
     - Optional skeleton‑only approximation of contact sites/areas when meshes are unavailable.
+
+<table>
+  <tr>
+    <td width="30%" align="center">
+      <img width="100%" alt="contact sites between two cells" src=".github/media/contacts/contacts.png" />  <br />   
+      <sub>All contacts sites of two cells</sub>
+    </td>
+    <td width="30%" align="center">
+      <img width="100%"  alt="zoomed in to the contact sites (opaque)" src=".github/media/contacts/zoom-in-opaque.png" /> <br />
+      <sub>Contact sites (zoomed in)</sub>
+    </td>
+    <td width="30%" align="center">
+      <img width="100%"  alt="zommed in to the contact sites (transparent)" src=".github/media/contacts/zoom-in-transparent.png" />
+      <sub>Contact sites (zommed in with transparent meshes)</sub>
+    </td>
+  </tr>
+</table>
 
 - I/O, visualization, diagnostics and post-processing
     - Read/write SWC and compact NPZ;
@@ -84,12 +153,6 @@ print("mean areas (mesh units^2):", sites.area_mean)
 # Optional: visualize patches
 # sk.view.view_contacts(meshA, meshB, sites, sides="A")
 ```
-
-<p align="center">
-  <img src=".github/media/contacts-meshes-with-patches.png" width="30%">
-  <img src=".github/media/contacts-one-mesh-with-patches.png" width="30%">
-  <img src=".github/media/contacts-no-meshes-patches-only.png" width="30%">
-</p>
 
 ### Threads
 

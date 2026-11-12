@@ -36,6 +36,60 @@ from ..io import load_mesh
 
 _STATE_DIR = Path(os.environ.get("SKELINER_VIEW_STATE_DIR", "/tmp/skeliner_view"))
 
+# ── Colours ───────────────────────────────────────────────────────────
+# Every colour the viewer gives data comes from here.  Amber is the live
+# selection's — the faces the next action consumes — and nothing else's: no
+# data colour comes near it (tests hold each at OKLab ΔE ≥ 8 from it under
+# simulated protanopia and deuteranopia, and ≥ 15 in normal vision).
+
+#: The live selection (drawn by the page).
+SELECTION_COLOR = [1.0, 0.8, 0.0]
+#: The components `break_up_mesh` makes.  Soma and organelles apart from
+#: every neurite colour and from each other in normal and colour-blind
+#: vision.  The organelles are a bright green, the brightest data colour:
+#: they lie inside the soma and under the neurites, seen through the grey
+#: mesh, and must stand out there; the blue in it keeps it off the
+#: selection's amber for colour-blind eyes.
+SOMA_COLOR = [0.835, 0.318, 0.506]
+ORGANELLE_COLOR = [0.2, 1.0, 0.533]
+DISCARDED_COLOR = [0.5, 0.5, 0.5]
+#: The neurites, in turn: blues and violet, so the warm soma, the green
+#: organelles and the selection stand apart from every one; each apart
+#: from the next.
+NEURITE_COLORS = [
+    [0.224, 0.529, 0.898],
+    [0.247, 0.773, 0.831],
+    [0.565, 0.522, 0.914],
+    [0.133, 0.133, 0.765],
+]
+#: Everything else drawn in turn — detections, saved selections, sites —
+#: each apart from the next.
+SERIES_COLORS = [
+    [0.902, 0.404, 0.404],
+    [0.224, 0.529, 0.898],
+    [0.851, 0.349, 0.149],
+    [0.098, 0.62, 0.439],
+    [0.565, 0.522, 0.914],
+]
+#: Loaded skeletons, in turn; the first apart from every component.
+SKELETON_COLORS = [
+    [1.0, 0.4, 0.1],
+    [0.224, 0.529, 0.898],
+    [0.098, 0.62, 0.439],
+    [0.565, 0.522, 0.914],
+]
+#: The mesh's own colour, which every overlay is seen on.
+MESH_COLOR = [0.55, 0.55, 0.6]
+#: The three ways `find_organelles` flags a face.
+ORGANELLE_PART_COLORS = {
+    "pocket": [1.0, 0.15, 0.15],
+    "isolated": [0.098, 0.62, 0.439],
+    "expanded": [0.851, 0.349, 0.149],
+}
+#: A proposed skeleton cut, and the cable that stays.
+CUT_COLOR = [1.0, 0.25, 0.25]
+KEEP_COLOR = [0.098, 0.62, 0.439]
+
 
 def _ensure_state_dir():
     _STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -244,12 +298,12 @@ def _is_qc_report(data) -> bool:
 
 #: A qc site's marker colour, by kind.
 _QC_COLORS = {
-    "bridge": [1.0, 0.6, 0.1],
+    "bridge": [0.851, 0.349, 0.149],
     "fusion": [1.0, 0.25, 0.25],
-    "parallel_patch": [0.95, 0.85, 0.2],
+    "parallel_patch": [0.102, 0.702, 0.651],
     "discarded": [0.4, 0.8, 1.0],
     "soma_point": [0.9, 0.31, 0.9],
-    "stem": [0.4, 0.9, 0.4],
+    "stem": [0.098, 0.62, 0.439],
     "tree": [1.0, 0.3, 0.6],
     "loop": [1.0, 0.3, 0.6],
     "bounds": [0.45, 0.55, 1.0],
@@ -320,6 +374,8 @@ def _qc_markers(report: dict, centroid) -> list[dict]:
                 "radius": max(float(s.get("extent") or 0.0), float(floor)),
                 "opacity": 0.4,
                 "label": f"qc: {_qc_label(s)}",
+                "role": "finding",
+                "source": "qc",
                 "qc": s["kind"],
             }
         )
@@ -474,6 +530,12 @@ def _create_app(
         "mesh": None,  # a skeliner.Mesh
         "buffers": None,  # JSON-serialisable mesh data
         "path": None,  # source file path
+        # The mesh as it was loaded.  The chunk grid is the volume's, read
+        # off the vertices the segmentation's chunks share; the pipeline
+        # removes or moves those (parallel patches cut, holes filled), so
+        # the grid is found on this mesh, and kept once found.
+        "loaded_mesh": None,
+        "chunk_boundaries": None,
         "centroid": np.zeros(3, dtype=np.float32),
         "mesh_stats": None,  # cached from compute_mesh_stats
         "organelles": None,  # dict(pocket, isolated, expanded) bool masks, or None
@@ -550,14 +612,6 @@ def _create_app(
 
     # Multiple skeletons, keyed by filename
     skeleton_states: dict[str, dict[str, Any]] = {}
-    SKEL_COLORS = [
-        [1.0, 0.4, 0.1],  # orange
-        [0.2, 0.6, 1.0],  # blue
-        [0.1, 0.9, 0.4],  # green
-        [0.9, 0.2, 0.8],  # magenta
-        [1.0, 0.9, 0.1],  # yellow
-    ]
-
     # Extra meshes (keyed by name), each: {mesh, buffers, color, opacity}
     extra_mesh_states: dict[str, dict[str, Any]] = {}
     if extra_meshes is not None:
@@ -581,6 +635,7 @@ def _create_app(
         )
         buffers = _mesh_to_buffers(mesh, centroid=preload_centroid)
         mesh_state["mesh"] = mesh
+        mesh_state["loaded_mesh"] = mesh
         mesh_state["buffers"] = buffers
         mesh_state["path"] = "(preloaded)"
         mesh_state["centroid"] = np.asarray(buffers["centroid"], dtype=np.float32)
@@ -594,6 +649,7 @@ def _create_app(
         buffers = _mesh_to_buffers(mesh)
 
         mesh_state["mesh"] = mesh
+        mesh_state["loaded_mesh"] = mesh
         mesh_state["buffers"] = buffers
         mesh_state["path"] = str(mesh_path.resolve())
         mesh_state["centroid"] = np.asarray(buffers["centroid"], dtype=np.float32)
@@ -602,7 +658,7 @@ def _create_app(
     if preload_skeletons:
         centroid = mesh_state["centroid"]
         for name, skel in preload_skeletons:
-            color = SKEL_COLORS[len(skeleton_states) % len(SKEL_COLORS)]
+            color = SKELETON_COLORS[len(skeleton_states) % len(SKELETON_COLORS)]
             buffers = _skeleton_to_buffers(skel, centroid)
             buffers["color"] = color
             skeleton_states[name] = {
@@ -664,8 +720,6 @@ def _create_app(
         "pending_reassignment",
         "record",
     )
-    _undo_stack: list[tuple[Mesh, str]] = []  # (mesh, its annotations.json)
-    _UNDO_LIMIT = 10
 
     # ── Broadcast helper ──────────────────────────────────────────────
     def _current_track() -> str:
@@ -832,7 +886,13 @@ def _create_app(
         color = contact["colors"][side]
         if side == "A":
             _forget_mesh_state()
-            mesh_state.update(mesh=mesh, buffers=buffers, path=name)
+            mesh_state.update(
+                mesh=mesh,
+                buffers=buffers,
+                path=name,
+                loaded_mesh=mesh,
+                chunk_boundaries=None,
+            )
             await broadcast(
                 {"type": "mesh_loaded", "payload": {**buffers, "color": color}}
             )
@@ -937,7 +997,13 @@ def _create_app(
         contact["gen"] += 1
         contact["sites"] = None
         if side == "A":
-            mesh_state.update(mesh=None, buffers=None, path=None)
+            mesh_state.update(
+                mesh=None,
+                buffers=None,
+                path=None,
+                loaded_mesh=None,
+                chunk_boundaries=None,
+            )
             _forget_mesh_state()
             await broadcast({"type": "mesh_removed"})
         else:
@@ -989,7 +1055,7 @@ def _create_app(
         for name, state in extra_mesh_states.items():
             result[name] = {
                 **state["buffers"],
-                "color": state.get("color", [0.55, 0.55, 0.6]),
+                "color": state.get("color", MESH_COLOR),
                 "opacity": state.get("opacity", 1.0),
             }
         return JSONResponse(result)
@@ -1080,15 +1146,13 @@ def _create_app(
 
         Each would otherwise be applied to whatever mesh comes next: a cached
         detection is removed at its own face ids, and components left behind
-        send /skeletonize down the preprocessing track.  The undo stack goes
-        too — it would restore a mesh from another cell.
+        send /skeletonize down the preprocessing track.
         """
         for key in _MESH_KEYED:
             mesh_state[key] = None
         mesh_state["rescued"] = np.empty(0, dtype=np.int64)
         mesh_state["released"] = np.empty(0, dtype=np.int64)
         mesh_state["soma_by_hand"] = False
-        _undo_stack.clear()
 
     async def _apply_upload(tmp_path: Path, *, reset: bool = True):
         """Apply one upload that has already been written to ``port_dir``.
@@ -1114,6 +1178,8 @@ def _create_app(
                 buffers = _mesh_to_buffers(mesh)
 
                 mesh_state["mesh"] = mesh
+                mesh_state["loaded_mesh"] = mesh
+                mesh_state["chunk_boundaries"] = None
                 mesh_state["buffers"] = buffers
                 mesh_state["path"] = str(tmp_path.resolve())
                 mesh_state["centroid"] = np.asarray(
@@ -1159,24 +1225,30 @@ def _create_app(
                     ann["highlights"].append(
                         {
                             "faces": np.where(org.pocket)[0].tolist(),
-                            "color": [1, 0.15, 0.15],
+                            "color": ORGANELLE_PART_COLORS["pocket"],
                             "label": "organelle:pocket",
+                            "role": "finding",
+                            "source": "organelles",
                         }
                     )
                 if org.isolated.any():
                     ann["highlights"].append(
                         {
                             "faces": np.where(org.isolated)[0].tolist(),
-                            "color": [0.15, 0.8, 0.15],
+                            "color": ORGANELLE_PART_COLORS["isolated"],
                             "label": "organelle:isolated",
+                            "role": "finding",
+                            "source": "organelles",
                         }
                     )
                 if org.expanded.any():
                     ann["highlights"].append(
                         {
                             "faces": np.where(org.expanded)[0].tolist(),
-                            "color": [1, 0.6, 0.15],
+                            "color": ORGANELLE_PART_COLORS["expanded"],
                             "label": "organelle:expanded",
+                            "role": "finding",
+                            "source": "organelles",
                         }
                     )
 
@@ -1243,8 +1315,9 @@ def _create_app(
                     ann["highlights"].append(
                         {
                             "faces": soma_faces,
-                            "color": [0.9, 0.5, 0.9],
+                            "color": SOMA_COLOR,
                             "label": "soma",
+                            "role": "component",
                         }
                     )
                     centroid = mesh_state["centroid"]
@@ -1255,7 +1328,7 @@ def _create_app(
                             "center": (soma.center - centroid).tolist(),
                             "axes": soma.axes.tolist(),
                             "R": soma.R.tolist(),
-                            "color": [0.9, 0.5, 0.9],
+                            "color": SOMA_COLOR,
                         }
                     )
                     await _save_annotations(ann)
@@ -1335,13 +1408,7 @@ def _create_app(
                 if "highlights" not in ann:
                     ann["highlights"] = []
 
-                neurite_colors = [
-                    [0.2, 0.6, 1.0],
-                    [0.3, 1.0, 0.3],
-                    [1.0, 0.4, 0.1],
-                    [0.0, 0.9, 0.9],
-                    [1.0, 0.2, 0.6],
-                ]
+                neurite_colors = NEURITE_COLORS
                 # A bare neurites file is not a full set of components, so
                 # this cannot go through _publish_components — but it does
                 # carry names, and drawing them as "neurite {i}" would throw
@@ -1355,6 +1422,7 @@ def _create_app(
                             "faces": nf.tolist(),
                             "color": c,
                             "label": f"{name} ({len(nf):,}f)",
+                            "role": "component",
                             "neurite": i,
                         }
                     )
@@ -1369,7 +1437,7 @@ def _create_app(
                     f"Uploaded L2 graph: {buffers['nNodes']:,} nodes, {buffers['nEdges']:,} edges"
                 )
 
-                color = SKEL_COLORS[len(skeleton_states) % len(SKEL_COLORS)]
+                color = SKELETON_COLORS[len(skeleton_states) % len(SKELETON_COLORS)]
                 buffers["color"] = color
 
                 skeleton_states[filename] = {
@@ -1403,7 +1471,7 @@ def _create_app(
                         "not edited. Save as .npz to keep the vertex maps."
                     )
 
-                color = SKEL_COLORS[len(skeleton_states) % len(SKEL_COLORS)]
+                color = SKELETON_COLORS[len(skeleton_states) % len(SKELETON_COLORS)]
                 buffers = _skeleton_to_buffers(skel, mesh_state["centroid"])
                 buffers["color"] = color
 
@@ -1627,6 +1695,8 @@ def _create_app(
 
         if item_type == "mesh":
             mesh_state["mesh"] = None
+            mesh_state["loaded_mesh"] = None
+            mesh_state["chunk_boundaries"] = None
             mesh_state["buffers"] = None
             mesh_state["path"] = None
             mesh_state["centroid"] = np.zeros(3, dtype=np.float32)
@@ -1657,6 +1727,24 @@ def _create_app(
         body = await request.json()
         # The sending page already shows this; the others fetch it.
         await _save_annotations(body, origin=request.headers.get("x-skeliner-page"))
+        return JSONResponse({"ok": True})
+
+    async def _append_note(p: dict):
+        """Add the faces a page selected to the annotations, as a note."""
+        ann = _read_annotations()
+        ann.setdefault("highlights", []).append(
+            {
+                "faces": p.get("faces", []),
+                "color": p.get("color", SERIES_COLORS[0]),
+                "label": p.get("label", "selection"),
+                "role": p.get("role", "note"),
+            }
+        )
+        await _save_annotations(ann)
+
+    async def save_highlight(request):
+        """A note, posted by a page whose WebSocket is not open."""
+        await _append_note(await _body_of(request))
         return JSONResponse({"ok": True})
 
     async def post_state(request):
@@ -1721,8 +1809,10 @@ def _create_app(
                 highlights.append(
                     {
                         "faces": faces,
-                        "color": [1, 0.15, 0.15],
+                        "color": ORGANELLE_PART_COLORS["pocket"],
                         "label": "organelle:pocket",
+                        "role": "finding",
+                        "source": "organelles",
                     }
                 )
         elif det_type == "isolated":
@@ -1740,8 +1830,10 @@ def _create_app(
                 highlights.append(
                     {
                         "faces": faces,
-                        "color": [0.15, 0.8, 0.15],
+                        "color": ORGANELLE_PART_COLORS["isolated"],
                         "label": f"organelle:isolated ({len(faces):,})",
+                        "role": "finding",
+                        "source": "organelles",
                     }
                 )
         else:
@@ -1760,16 +1852,20 @@ def _create_app(
                 highlights.append(
                     {
                         "faces": sf,
-                        "color": [1, 0.15, 0.15],
+                        "color": ORGANELLE_PART_COLORS["pocket"],
                         "label": "organelle:pocket",
+                        "role": "finding",
+                        "source": "organelles",
                     }
                 )
             if iso:
                 highlights.append(
                     {
                         "faces": iso,
-                        "color": [0.15, 0.8, 0.15],
+                        "color": ORGANELLE_PART_COLORS["isolated"],
                         "label": "organelle:isolated",
+                        "role": "finding",
+                        "source": "organelles",
                     }
                 )
 
@@ -1818,6 +1914,8 @@ def _create_app(
                     "faces": faces,
                     "color": [0.2, 0.8, 0.8],
                     "label": "fragments",
+                    "role": "finding",
+                    "source": "fragments",
                 }
             )
             await _save_annotations(ann)
@@ -1873,20 +1971,15 @@ def _create_app(
         if "highlights" not in ann:
             ann["highlights"] = []
 
-        colors = [
-            [1.0, 0.3, 0.3],
-            [0.3, 1.0, 0.3],
-            [0.3, 0.3, 1.0],
-            [1.0, 1.0, 0.3],
-            [1.0, 0.3, 1.0],
-            [0.3, 1.0, 1.0],
-        ]
+        colors = SERIES_COLORS
         for i, faces in enumerate(components):
             ann["highlights"].append(
                 {
                     "faces": faces,
                     "color": colors[i % len(colors)],
                     "label": f"disconnected {i}",
+                    "role": "finding",
+                    "source": "disconnected",
                 }
             )
 
@@ -1922,7 +2015,7 @@ def _create_app(
             from skeliner.pre import find_soma_via_z_contour as _find
 
             label_prefix = "soma (z_contour)"
-        color = [0.9, 0.5, 0.9]
+        color = SOMA_COLOR
 
         mesh = mesh_state["mesh"]
         if method == "z_contour":
@@ -1968,6 +2061,7 @@ def _create_app(
                 "faces": soma_faces,
                 "color": color,
                 "label": label_prefix,
+                "role": "component",
             }
         )
         # Wireframe ellipsoid (coordinates shifted by mesh centroid); `label`
@@ -1980,6 +2074,7 @@ def _create_app(
                 "R": soma.R.tolist(),
                 "color": color,
                 "label": label_prefix,
+                "role": "component",
             }
         )
 
@@ -2043,14 +2138,7 @@ def _create_app(
         if "highlights" not in ann:
             ann["highlights"] = []
 
-        colors = [
-            [1.0, 0.3, 0.3],
-            [0.3, 1.0, 0.3],
-            [0.3, 0.3, 1.0],
-            [1.0, 1.0, 0.3],
-            [1.0, 0.3, 1.0],
-            [0.3, 1.0, 1.0],
-        ]
+        colors = SERIES_COLORS
         for i, (faces_a, faces_b, dist, da, db) in enumerate(gaps):
             label_a = "main" if da == -1 else f"disc {da}"
             label_b = "main" if db == -1 else f"disc {db}"
@@ -2060,6 +2148,8 @@ def _create_app(
                     "faces": faces_a + faces_b,
                     "color": color,
                     "label": f"gap {i}: {label_a} ↔ {label_b}, {dist:.0f}nm",
+                    "role": "finding",
+                    "source": "gaps",
                 }
             )
 
@@ -2141,20 +2231,38 @@ def _create_app(
             }
         )
 
+    def _chunk_boundaries():
+        """The volume's chunk boundary planes, read off the mesh as it was
+        loaded and kept.  The pipeline cuts the parallel patches at them and
+        fills holes, and the vertices the fill and the stitches add make
+        every lattice coordinate look like a plane, so the mesh on screen
+        after a run would give hundreds of planes that are not there."""
+        if mesh_state["chunk_boundaries"] is None:
+            from skeliner.pre import find_chunk_boundaries
+
+            src = mesh_state["loaded_mesh"]
+            if src is None:
+                src = mesh_state["mesh"]
+            if src is None:
+                return None
+            mesh_state["chunk_boundaries"] = find_chunk_boundaries(src)
+        return mesh_state["chunk_boundaries"]
+
     async def chunk_grid(_request):
-        """Compute chunk boundary grid and return as line segments."""
+        """The chunk boundary grid, as line segments, over the mesh as it
+        was loaded (:func:`_chunk_boundaries`)."""
         if mesh_state["mesh"] is None:
             return JSONResponse(
                 {"ok": False, "error": "No mesh loaded"}, status_code=400
             )
 
-        mesh = mesh_state["mesh"]
+        mesh = mesh_state["loaded_mesh"]
+        if mesh is None:
+            mesh = mesh_state["mesh"]
         centroid = mesh_state["centroid"]
 
         def _run():
-            from skeliner.pre import find_chunk_boundaries
-
-            boundaries = find_chunk_boundaries(mesh)
+            boundaries = _chunk_boundaries()
             verts = mesh.vertices
 
             bx = np.sort(boundaries.get(0, np.array([])))
@@ -2249,7 +2357,9 @@ def _create_app(
         await _log("[skeliner.pre] Detecting parallel patches...")
         from skeliner.pre import find_parallel_patches
 
-        results = await _run_with_log(find_parallel_patches, mesh, verbose=True)
+        results = await _run_with_log(
+            find_parallel_patches, mesh, boundaries=_chunk_boundaries(), verbose=True
+        )
 
         if not results:
             await _log("[skeliner.pre] No parallel patches found")
@@ -2268,7 +2378,7 @@ def _create_app(
 
         axis_colors = {
             0: {"up": [1.0, 0.3, 0.3], "down": [0.6, 0, 0]},
-            1: {"up": [0.3, 1.0, 0.3], "down": [0, 0.6, 0]},
+            1: {"up": [0.098, 0.62, 0.439], "down": [0.05, 0.35, 0.25]},
             2: {"up": [0.3, 0.3, 1.0], "down": [0, 0, 0.6]},
         }
         axis_names = ["X", "Y", "Z"]
@@ -2285,6 +2395,8 @@ def _create_app(
                         "faces": r["up_faces"],
                         "color": colors["up"],
                         "label": f"patch: {name}={bval} + ({len(r['up_faces'])}f)",
+                        "role": "finding",
+                        "source": "parallel patches",
                     }
                 )
             if r["down_faces"]:
@@ -2293,6 +2405,8 @@ def _create_app(
                         "faces": r["down_faces"],
                         "color": colors["down"],
                         "label": f"patch: {name}={bval} - ({len(r['down_faces'])}f)",
+                        "role": "finding",
+                        "source": "parallel patches",
                     }
                 )
             total_faces += len(r["faces"])
@@ -2382,20 +2496,15 @@ def _create_app(
         if "highlights" not in ann:
             ann["highlights"] = []
 
-        colors = [
-            [0.0, 1.0, 0.0],
-            [1.0, 0.0, 1.0],
-            [0.0, 1.0, 1.0],
-            [1.0, 1.0, 0.0],
-            [1.0, 0.5, 0.0],
-            [0.5, 0.0, 1.0],
-        ]
+        colors = SERIES_COLORS
         for i, cluster in enumerate(clusters):
             ann["highlights"].append(
                 {
                     "faces": cluster,
                     "color": colors[i % len(colors)],
                     "label": f"fusion {i}",
+                    "role": "finding",
+                    "source": "fusions",
                 }
             )
 
@@ -2432,9 +2541,7 @@ def _create_app(
 
         Derived by identity rather than set by a flag, for the same reason the
         face-owner cache is: there are four places that swap the mesh and a
-        fifth will be added.  Identity also gets undo right for free — undoing
-        back to the very mesh a skeleton was built from restores the *same
-        object*, so the skeleton is correctly current again.
+        fifth will be added.
 
         It errs conservative: ``compact_mesh`` builds a new mesh even when it
         removes nothing, so a no-op compaction still reads as stale.  That is
@@ -2535,16 +2642,6 @@ def _create_app(
             payload["facesRenumbered"] = True
         await broadcast({"type": "mesh_loaded", "payload": payload})
 
-    def _push_undo(mesh):
-        """Remember a mesh, and the annotations drawn on it, for ``/undo``."""
-        try:
-            ann = annotations_path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            ann = "{}"
-        _undo_stack.append((mesh, ann))
-        if len(_undo_stack) > _UNDO_LIMIT:
-            _undo_stack.pop(0)
-
     async def _apply_new_mesh(new_mesh, *, rederived: bool = False):
         """Replace the current mesh with a modified one and broadcast.
 
@@ -2552,11 +2649,6 @@ def _create_app(
         after — it only silences the note below, since the drop itself is
         unconditional and a republish overwrites it either way.
         """
-        # Save current mesh for undo
-        old = mesh_state["mesh"]
-        if old is not None:
-            _push_undo(old)
-
         mesh_state["mesh"] = new_mesh
         # Organelle mask/precompute and soma survive — _rebuild_mesh
         # preserves all face/vertex indices (degenerate faces only).
@@ -2877,11 +2969,6 @@ def _create_app(
         faces = np.asarray(mesh.faces, dtype=np.int32)
         centroid = mesh_state["centroid"]
 
-        # Push undo before modifying
-        old = mesh_state["mesh"]
-        if old is not None:
-            _push_undo(old)
-
         # Apply edits: each faceEdit has {face: int, verts: [[x,y,z]*3]}
         # The frontend positions are centroid-subtracted, so add centroid back
         for edit in face_edits:
@@ -2907,51 +2994,6 @@ def _create_app(
         await _log(f"Edit vertices: {n_faces_edited} faces modified")
 
         return JSONResponse({"ok": True, "facesEdited": n_faces_edited})
-
-    async def undo_mesh(_request):
-        """Revert to the previous mesh state."""
-        if not _undo_stack:
-            return JSONResponse(
-                {"ok": False, "error": "Nothing to undo"}, status_code=400
-            )
-        prev_mesh, prev_annotations = _undo_stack.pop()
-        # Apply without pushing to undo stack
-        mesh_state["mesh"] = prev_mesh
-        mesh_state["pending_reassignment"] = None
-        mesh_state["buffers"] = _mesh_to_buffers(
-            prev_mesh, centroid=mesh_state["centroid"]
-        )
-        # Faces the edit appended are gone again, so ids picked since may
-        # name nothing.
-        await _broadcast_edited_mesh(renumbered=True)
-        # The annotations as they were on that mesh: the edit cleared what it
-        # removed, and anything drawn since may name the faces it appended.
-        annotations_path.write_text(prev_annotations, encoding="utf-8")
-        await _announce_annotations()
-
-        await _rebroadcast_skeletons()
-
-        current = {}
-        if state_path.exists():
-            current = json.loads(state_path.read_text(encoding="utf-8"))
-        current["mesh"] = {
-            "path": mesh_state["path"],
-            "nVertices": len(prev_mesh.vertices),
-            "nFaces": len(prev_mesh.faces),
-        }
-        state_path.write_text(json.dumps(current, indent=2), encoding="utf-8")
-
-        await _log(
-            f"Undo: restored mesh with {len(prev_mesh.faces):,} faces "
-            f"({len(_undo_stack)} steps remaining)"
-        )
-        return JSONResponse(
-            {
-                "ok": True,
-                "nFaces": len(prev_mesh.faces),
-                "undoRemaining": len(_undo_stack),
-            }
-        )
 
     async def _publish_components(result):
         """Install a MeshComponents into mesh_state and redraw its annotations.
@@ -2985,8 +3027,9 @@ def _create_app(
             highlights.append(
                 {
                     "faces": np.where(soma_mask)[0].tolist(),
-                    "color": [0.9, 0.5, 0.9],
+                    "color": SOMA_COLOR,
                     "label": "soma",
+                    "role": "component",
                 }
             )
 
@@ -2994,18 +3037,13 @@ def _create_app(
         highlights.append(
             {
                 "faces": np.where(org_only)[0].tolist(),
-                "color": [1.0, 0.8, 0.0],
+                "color": ORGANELLE_COLOR,
                 "label": f"organelles ({int(org_only.sum()):,}f)",
+                "role": "component",
             }
         )
 
-        neurite_colors = [
-            [0.2, 0.6, 1.0],
-            [0.3, 1.0, 0.3],
-            [1.0, 0.4, 0.1],
-            [0.0, 0.9, 0.9],
-            [1.0, 0.2, 0.6],
-        ]
+        neurite_colors = NEURITE_COLORS
         labels = result.neurites.labels
         for i, nf in enumerate(result.neurites):
             c = neurite_colors[i % len(neurite_colors)]
@@ -3015,6 +3053,7 @@ def _create_app(
                     "faces": nf.tolist(),
                     "color": c,
                     "label": f"{name} ({len(nf):,}f)",
+                    "role": "component",
                     # Which neurite this is, for the page to name it back.
                     # Once renamed the label no longer carries the index,
                     # and position in `highlights` depends on whether there
@@ -3027,8 +3066,9 @@ def _create_app(
             highlights.append(
                 {
                     "faces": df.tolist(),
-                    "color": [0.5, 0.5, 0.5],
+                    "color": DISCARDED_COLOR,
                     "label": f"discarded {i} ({len(df):,}f)",
+                    "role": "component",
                 }
             )
 
@@ -3039,9 +3079,10 @@ def _create_app(
                     "center": (new_soma.center - centroid).tolist(),
                     "axes": new_soma.axes.tolist(),
                     "R": new_soma.R.tolist(),
-                    "color": [0.9, 0.5, 0.9],
+                    "color": SOMA_COLOR,
                     # the highlight it belongs with, for the page to link
                     "label": "soma",
+                    "role": "component",
                 }
             ]
         else:
@@ -3199,6 +3240,7 @@ def _create_app(
             rescued=mesh_state["rescued"],
             released=mesh_state["released"],
             claim_min_faces=floor,
+            chunk_boundaries=_chunk_boundaries(),
             verbose=True,
         )
 
@@ -3811,14 +3853,7 @@ def _create_app(
             loops = find_holes(mesh, verbose=True)
             mesh_state["hole_loops"] = loops
             verts = np.asarray(mesh.vertices, dtype=np.float32)
-            colors = [
-                [0.2, 0.6, 1.0],
-                [0.1, 0.9, 0.4],
-                [0.9, 0.2, 0.8],
-                [1.0, 0.9, 0.1],
-                [1.0, 0.4, 0.1],
-                [0.4, 0.9, 0.9],
-            ]
+            colors = SERIES_COLORS
             edge_groups = []
             for i, loop in enumerate(loops):
                 color = colors[i % len(colors)]
@@ -3832,6 +3867,8 @@ def _create_app(
                         "segments": segments,
                         "color": color,
                         "label": f"hole {i}",
+                        "role": "finding",
+                        "source": "holes",
                     }
                 )
             return edge_groups, len(loops)
@@ -3896,7 +3933,7 @@ def _create_app(
 
         # Add as a skeleton layer
         skel_name = "skeleton"
-        color = SKEL_COLORS[len(skeleton_states) % len(SKEL_COLORS)]
+        color = SKELETON_COLORS[len(skeleton_states) % len(SKELETON_COLORS)]
         buffers = _skeleton_to_buffers(skel, mesh_state["centroid"])
         buffers["color"] = color
 
@@ -4359,13 +4396,54 @@ def _create_app(
             sstate["pending_bin_edit"] = None
         return JSONResponse({"ok": True})
 
+    async def bin_rings(request):
+        """Every bin's surface at once, for the page to colour: the node
+        owning each face (``-1`` where none holds two of its vertices,
+        :func:`skeliner.dx.face_owner`) and the pairs of nodes whose bins
+        share surface (the node-adjacency graph the mesh implies, as
+        :func:`skeliner.dx.edge_support` rebuilds it), so the page can give
+        touching rings different colours.
+
+        Sent only when asked for: four bytes a face, where ``/bin`` sends
+        one bin per click.
+        """
+        from skeliner.skeletonize import _edges_from_mesh
+
+        name, _sstate, skel, err = _skel_edit_target(await _body_of(request))
+        if err is not None:
+            return err
+        mesh = mesh_state["mesh"]
+        owner = _face_owner_for(name)
+        pairs = np.asarray(
+            _edges_from_mesh(
+                np.asarray(mesh.edges_unique), skel.vert2node, len(mesh.vertices)
+            ),
+            dtype=np.int64,
+        ).reshape(-1, 2)
+        pairs = np.unique(np.sort(pairs[pairs[:, 0] != pairs[:, 1]], axis=1), axis=0)
+
+        def _b64(a):
+            return base64.b64encode(np.asarray(a, dtype="<i4").tobytes()).decode(
+                "ascii"
+            )
+
+        return JSONResponse(
+            {
+                "ok": True,
+                "name": name,
+                "nNodes": len(skel.nodes),
+                "owner": _b64(owner),
+                "pairs": _b64(pairs.reshape(-1)),
+            }
+        )
+
     async def get_bin(request):
         """The surface one skeleton node owns.
 
         A node's position and every radius are computed from the mesh vertices
         it owns, so this is what the node actually *is*.  Small enough to fetch
-        per click — a bin is ~0.3–0.9 KB of face ids on real cells — which is
-        why the partition is never shipped in bulk.
+        per click — a bin is ~0.3–0.9 KB of face ids on real cells — so one
+        click fetches one; the whole partition goes only to ``/bin_rings``.
 
         Accepts either ``node`` (which bin?) or ``face`` (which bin owns this
         piece of surface?), the same lookup in both directions.
@@ -4802,6 +4880,8 @@ def _create_app(
                     # nothing to buy by drawing them larger than they are.
                     "radius": min(max(r * 1.15, 50.0), 2000.0),
                     "label": f"{label}: {row['detail']}",
+                    "role": "finding",
+                    "source": "check",
                     "skelName": name,
                     "node": nid,
                     "dx": kind,
@@ -4821,8 +4901,10 @@ def _create_app(
             groups.append(
                 {
                     "segments": cut_segs,
-                    "color": [1.0, 0.25, 0.25],
+                    "color": CUT_COLOR,
                     "label": f"{label}: {cut_name} ({len(cut_segs)} edges)",
+                    "role": "finding",
+                    "source": "check",
                     "overlay": True,
                     "dx": kind,
                 }
@@ -4831,8 +4913,10 @@ def _create_app(
             groups.append(
                 {
                     "segments": keep_segs,
-                    "color": [0.3, 0.9, 0.4],
+                    "color": KEEP_COLOR,
                     "label": f"{label}: {keep_name} ({len(keep_segs)} edges)",
+                    "role": "finding",
+                    "source": "check",
                     "overlay": True,
                     "dx": kind,
                 }
@@ -5254,21 +5338,7 @@ def _create_app(
                         json.dumps(current, indent=2), encoding="utf-8"
                     )
                 elif msg.get("type") == "save_highlight":
-                    # Append user-selected faces as a named annotation
-                    ann = {}
-                    if annotations_path.exists():
-                        ann = json.loads(annotations_path.read_text(encoding="utf-8"))
-                    if "highlights" not in ann:
-                        ann["highlights"] = []
-                    p = msg["payload"]
-                    ann["highlights"].append(
-                        {
-                            "faces": p.get("faces", []),
-                            "color": p.get("color", [1, 0.8, 0]),
-                            "label": p.get("label", "selection"),
-                        }
-                    )
-                    await _save_annotations(ann)
+                    await _append_note(msg["payload"])
         except Exception:
             pass
         finally:
@@ -5341,6 +5411,7 @@ def _create_app(
             Route("/save_availability", get_save_availability, methods=["GET"]),
             Route("/annotations", get_annotations, methods=["GET"]),
             Route("/update_annotations", update_annotations, methods=["POST"]),
+            Route("/save_highlight", save_highlight, methods=["POST"]),
             Route("/upload", upload_file, methods=["POST"]),
             Route("/upload_batch", upload_batch, methods=["POST"]),
             Route("/remove", remove_item, methods=["POST"]),
@@ -5366,7 +5437,6 @@ def _create_app(
             Route("/remove_selected", do_remove_selected, methods=["POST"]),
             Route("/rescue_as_neurite", do_rescue_as_neurite, methods=["POST"]),
             Route("/edit_vertices", edit_vertices, methods=["POST"]),
-            Route("/undo", undo_mesh, methods=["POST"]),
             Route("/break_up_mesh", do_break_up_mesh, methods=["POST"]),
             Route("/preprocess", do_preprocess, methods=["POST"]),
             Route("/name_neurite", name_neurite, methods=["POST"]),
@@ -5390,6 +5460,7 @@ def _create_app(
             ),
             Route("/skeletonize", run_skeletonize, methods=["POST"]),
             Route("/bin", get_bin, methods=["POST"]),
+            Route("/bin_rings", bin_rings, methods=["POST"]),
             Route("/bin_reassign_preview", bin_reassign_preview, methods=["POST"]),
             Route("/bin_reassign_apply", bin_reassign_apply, methods=["POST"]),
             Route("/bin_split_preview", bin_split_preview, methods=["POST"]),
@@ -5568,14 +5639,14 @@ def _as_iter(x):
 def _resolve_mesh_colors(mesh_color, n: int) -> list[list[float]]:
     """Resolve mesh_color argument into a list of [r, g, b] per mesh."""
     DEFAULT = [
-        [0.55, 0.55, 0.6],
+        MESH_COLOR,
         [0.6, 0.5, 0.5],
         [0.5, 0.6, 0.5],
         [0.5, 0.5, 0.6],
         [0.6, 0.55, 0.5],
     ]
     if mesh_color == "same":
-        return [[0.55, 0.55, 0.6]] * n
+        return [MESH_COLOR] * n
     if mesh_color is None:
         return [DEFAULT[i % len(DEFAULT)] for i in range(n)]
     # Array-like of RGB tuples (e.g. cm.tab20.colors)
@@ -5668,16 +5739,15 @@ def view3d(
 # One colour per contact kind (`skeliner.pair.label_contacts`): blobs, the
 # likeliest synapses, in orange; kinds from older files fall back to violet.
 _KIND_COLORS = {
-    "blob": [1.00, 0.60, 0.10],  # orange
+    "blob": [0.851, 0.349, 0.149],  # orange
     "crossing": [0.20, 0.55, 1.00],  # blue
     "other": [0.55, 0.35, 0.85],  # violet
 }
 _SITE_COLORS = [
     [1.0, 0.4, 0.1],  # orange
     [0.2, 0.6, 1.0],  # blue
-    [0.1, 0.9, 0.4],  # green
+    [0.098, 0.62, 0.439],  # green
     [0.9, 0.2, 0.8],  # magenta
-    [1.0, 0.9, 0.1],  # yellow
     [0.0, 0.85, 0.7],  # teal
     [0.95, 0.5, 0.5],  # salmon
     [0.6, 0.4, 1.0],  # violet
@@ -5752,6 +5822,8 @@ def _contact_overlay(
                     "faces": f.tolist(),
                     "color": col,
                     "label": f"Site {i}{side}{tag}",
+                    "role": "finding",
+                    "source": "sites",
                     "meshKey": key,
                     "side": side,
                     **tags,
@@ -5773,6 +5845,8 @@ def _contact_overlay(
                     "segments": _bbox_segments(box),
                     "color": col,
                     "label": label,
+                    "role": "finding",
+                    "source": "sites",
                     "aabb": True,
                     **({"side": side} if side else {}),
                     **tags,

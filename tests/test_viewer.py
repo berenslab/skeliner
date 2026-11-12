@@ -173,6 +173,37 @@ def test_a_soma_is_assigned_on_a_freshly_loaded_cell(reassign_client):
     assert np.allclose(state["soma"].center, soma.center)
 
 
+def test_the_soma_wireframe_follows_a_reassignment(reassign_client):
+    # faces handed to the soma: the soma is the ellipsoid its vertices now
+    # give, and the wireframe the page draws is that one, about the
+    # session's centroid
+    client, state, neurites = reassign_client
+    mesh = state["mesh"]
+    before = state["soma"].axes.copy()
+    z = mesh.vertices[mesh.faces].mean(axis=1)[:, 2]
+    # the ring of arbor faces next to the band, on its upper side
+    up = np.concatenate(list(neurites))
+    up = up[z[up] > 0]
+    sel = up[z[up] <= z[up].min() + 1e-6]
+    assert len(sel) >= 16, "fixture: a ring of faces above the band"
+
+    r = client.post("/reassign_preview", json={"faces": sel.tolist(), "to": "soma"})
+    assert r.status_code == 200, r.json()
+    assert client.post("/reassign_apply").json()["ok"]
+
+    soma = state["soma"]
+    fitted = Soma.fit(np.asarray(mesh.vertices)[soma.verts])
+    np.testing.assert_allclose(soma.center, fitted.center)
+    np.testing.assert_allclose(soma.axes, fitted.axes)
+    assert not np.allclose(soma.axes, before)
+    (ell,) = client.get("/annotations").json()["ellipsoids"]
+    centroid = np.asarray(state["centroid"], dtype=np.float64)
+    np.testing.assert_allclose(
+        np.asarray(ell["center"]) + centroid, soma.center, atol=1e-6
+    )
+    np.testing.assert_allclose(ell["axes"], soma.axes)
+
+
 def test_preprocess_looks_for_no_soma_when_switched_off(reassign_client, monkeypatch):
     # the Run button's soma switch, for a cell with none in the mesh: off,
     # preprocess is told so and a soma by hand goes with the run; on (the
@@ -483,6 +514,42 @@ def bin_client(tmp_path, monkeypatch):
         yield client, name, mesh, skel
 
 
+def test_the_rings_are_every_bin_and_which_ones_touch(bin_client):
+    """All bins at once: each face's owner (the page colours by it) and
+    the pairs of bins sharing surface (so touching rings differ) — the
+    pairs the mesh joins, each once, smaller node first."""
+    from skeliner import dx
+
+    client, name, mesh, skel = bin_client
+    r = client.post("/bin_rings", json={"name": name})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["nNodes"] == len(skel.nodes)
+    owner = np.frombuffer(base64.b64decode(body["owner"]), dtype="<i4")
+    pairs = np.frombuffer(base64.b64decode(body["pairs"]), dtype="<i4").reshape(-1, 2)
+    np.testing.assert_array_equal(
+        owner, dx.face_owner(skel, _mesh_state_of(client.app)["mesh"])
+    )
+
+    # the pairs are the bins whose vertices share a mesh edge
+    lut = np.full(len(mesh.vertices), -1)
+    for node, vs in enumerate(skel.node2verts):
+        lut[np.asarray(vs, dtype=np.int64)] = node
+    e = lut[np.asarray(mesh.edges_unique)]
+    e = e[(e >= 0).all(axis=1) & (e[:, 0] != e[:, 1])]
+    want = np.unique(np.sort(e, axis=1), axis=0)
+    np.testing.assert_array_equal(pairs, want)
+    assert len(pairs) >= len(skel.nodes) - 1, "fixture: a tube's bins touch in a chain"
+
+
+def test_no_rings_for_a_skeleton_of_another_mesh(bin_client):
+    client, name, mesh, _ = bin_client
+    _mesh_state_of(client.app)["mesh"] = mesh.copy()
+    r = client.post("/bin_rings", json={"name": name})
+    assert r.status_code == 409
+    assert "different mesh" in r.json()["error"]
+
+
 def test_a_bin_is_the_surface_its_node_owns(bin_client):
     client, name, mesh, skel = bin_client
     r = client.post("/bin", json={"name": name, "node": 3})
@@ -637,30 +704,6 @@ def test_a_real_preprocessing_action_invalidates_the_skeleton(
 
     assert client.post("/bin", json={"name": name, "node": 3}).status_code == 409
     assert client.get(f"/export_skeleton?name={name}").status_code == 409
-
-
-def test_undo_after_a_real_edit_restores_currency(bin_client):
-    client, name, _, _ = bin_client
-    faces = client.post("/bin", json={"name": name, "node": 3}).json()["faces"]
-    client.post("/remove_selected", json={"faces": faces[:5]})
-    assert client.post("/bin", json={"name": name, "node": 3}).status_code == 409
-
-    assert client.post("/undo").status_code == 200
-    assert client.post("/bin", json={"name": name, "node": 3}).status_code == 200
-
-
-def test_returning_to_the_original_mesh_makes_it_current_again(bin_client):
-    """Comparing by identity gets undo right for free: restoring the very
-    mesh a skeleton was built from restores the same object."""
-    client, name, mesh, _ = bin_client
-    state = _mesh_state_of(client.app)
-    original = state["mesh"]
-
-    state["mesh"] = mesh.copy()
-    assert client.post("/bin", json={"name": name, "node": 3}).status_code == 409
-
-    state["mesh"] = original
-    assert client.post("/bin", json={"name": name, "node": 3}).status_code == 200
 
 
 def test_the_owner_cache_follows_the_skeleton(bin_client):
@@ -2516,73 +2559,63 @@ def test_the_dialog_agrees_with_skeletonize_about_the_defaults():
         )
 
 
-# ── the mode selector ─────────────────────────────────────────────────
+# ── the inspector's tabs and the context bar ──────────────────────────
 #
-# Three modes, named after the three objects in the derivation chain: the
-# mesh, the components broken out of it, the skeleton built from those.
-# Each is wired through three parallel tables — the buttons, the row
-# containers they reveal, and the click handlers — so renaming one means
-# editing all three.  A site missed leaves a button that lights up over an
-# empty panel, which reads as the mode simply having nothing in it.
+# There are no modes: what a verb acts on is the selection, so the verbs
+# are rows of the context bar, each shown when its selection exists; what
+# to look at, what was noted and what is drawn are the inspector's tabs.
+# Each is wired through the markup and a function that looks it up by id,
+# so a renamed id leaves a tab over nothing or a row that never shows.
 
 
-def _mode_wiring():
-    """Parse the mode keys, their element ids and the click wiring."""
-    import re
-    from pathlib import Path
-
-    from skeliner.viewer import viewer as viewer_mod
-
-    html = Path(viewer_mod.__file__).with_name("viewer.html").read_text()
-
-    def table(name):
-        block = html.split(f"const {name} = {{")[1].split("};")[0]
-        return dict(re.findall(r'(\w+):\s*"([^"]+)"', block))
-
-    wired = dict(
-        re.findall(
-            r'getElementById\("(\w+)"\)\s*\.addEventListener\('
-            r'"click",\s*\(\)\s*=>\s*setMode\("(\w+)"\)',
-            html,
-        )
-    )
-    default = re.search(r'let panelMode = "(\w+)"', html).group(1)
-    return html, table("MODE_ROWS"), table("MODE_BTNS"), wired, default
+def test_the_mesh_and_skeleton_rows_are_laid_out_as_a_components():
+    """In Layers, a row's name takes the room and its buttons sit together
+    at the end, the mesh's and the skeletons' as a component's — they had
+    been spread across the row."""
+    html = _page_html()
+    item = html.split("#inspector .item {")[1].split("}")[0]
+    name = html.split("#inspector .item .name {")[1].split("}")[0]
+    assert "space-between" not in item
+    assert "flex: 1" in name and "min-width: 0" in name
 
 
-def test_every_mode_has_a_button_a_panel_and_a_handler():
-    """`setMode` shows one row container and lights one button, both looked
-    up by id.  An id that names nothing throws inside the loop, leaving the
-    panel on whichever mode it was already displaying."""
-    html, rows, btns, wired, default = _mode_wiring()
-
-    assert set(rows) == set(btns), (
-        f"MODE_ROWS has {sorted(rows)}, MODE_BTNS has {sorted(btns)}"
-    )
-    assert len(rows) == 3, f"expected three modes, parsed {sorted(rows)}"
-    assert default in rows, f"panelMode starts at {default!r}, not a mode"
-
-    for mode, row_id in rows.items():
-        assert f'id="{row_id}"' in html, f"{mode}: no element id={row_id!r}"
-    for mode, btn_id in btns.items():
-        assert f'id="{btn_id}"' in html, f"{mode}: no element id={btn_id!r}"
-        assert wired.get(btn_id) == mode, (
-            f"{btn_id} calls setMode({wired.get(btn_id)!r}), expected {mode!r}"
-        )
-
-
-def test_the_mode_buttons_are_exactly_the_ones_styled_as_modes():
-    """The active-mode highlight is CSS on `button.mode-btn[data-active]`.
-    A mode button without the class switches the panel while still looking
-    inactive; anything else carrying it looks like a fourth mode."""
+def test_every_tab_has_a_button_and_a_body():
     import re
 
-    html, _, btns, _, _ = _mode_wiring()
+    html = _page_html()
+    tabs = re.findall(r'<button id="(\w+)" class="tab" data-tab="(\w+)"', html)
+    assert {t for _, t in tabs} == {"findings", "notes", "layers"}, tabs
+    for _, t in tabs:
+        assert f'id="tab-{t}"' in html, f"tab {t} has no body"
+    body = html.split("function showTab(name) {")[1].split("\n            }")[0]
+    listed = re.search(r"for \(const t of \[([^\]]+)\]\)", body).group(1)
+    assert {s.strip(' "') for s in listed.split(",")} == {t for _, t in tabs}
 
-    styled = set(re.findall(r'<button\s+id="(\w+)"\s+class="mode-btn"', html))
-    assert styled == set(btns.values()), (
-        f"styled as modes: {sorted(styled)}, declared: {sorted(btns.values())}"
+
+def test_every_context_bar_row_is_shown_by_its_selection():
+    """Each row of verbs is shown or hidden by refreshContextBar, and each
+    id it shows is a row of the bar."""
+    import re
+
+    html = _page_html()
+    bar = html.split('<div id="context-bar" class="panel">')[1].split(
+        '<div id="status-bar">'
+    )[0]
+    rows = set(re.findall(r'<div id="(ctx\w+)" class="ctx-row"', bar))
+    rows.discard("ctxSummary")  # always shown: it says what is selected
+    body = html.split("function refreshContextBar() {")[1].split("\n            }\n")[0]
+    shown = set(re.findall(r'show\(\s*"(ctx\w+)"', body))
+    assert shown == rows, (
+        f"rows {sorted(rows)}, shown by refreshContextBar {sorted(shown)}"
     )
+
+
+def test_no_mode_gates_a_verb():
+    """A mode would hide a verb where its selection makes it legal: the
+    page keeps none."""
+    html = _page_html()
+    for gone in ("panelMode", "setMode(", "componentMode", 'class="mode-btn"'):
+        assert gone not in html, f"{gone} is back"
 
 
 # ── a skeleton must belong to the mesh it is loaded beside ────────────
@@ -3035,7 +3068,6 @@ _EDITS = {
     "edit vertices": [
         ("/edit_vertices", {"faceEdits": [{"face": 0, "verts": _TRIANGLE}]})
     ],
-    "undo": [("/remove_selected", {"faces": [0, 1, 2]}), ("/undo", None)],
     "compact": [("/compact_mesh", None)],
 }
 
@@ -3142,7 +3174,6 @@ def test_a_new_cell_starts_without_the_last_ones_detections(mesh_client, tmp_pat
 
     for key in _SENTINEL_CACHES:
         assert state[key] is None, f"{key} survived a new mesh"
-    assert client.post("/undo").status_code == 400, "undo restored the old cell"
 
 
 def test_removing_the_mesh_takes_what_was_found_on_it(mesh_client, tmp_path):
@@ -3160,7 +3191,6 @@ def test_removing_the_mesh_takes_what_was_found_on_it(mesh_client, tmp_path):
     assert "annotations_updated" in [m["type"] for m in page.sent]
     for key in _SENTINEL_CACHES:
         assert state[key] is None, f"{key} outlived its mesh"
-    assert client.post("/undo").status_code == 400
     state_file = json.loads((tmp_path / "8918" / "state.json").read_text())
     assert "mesh" not in state_file
 
@@ -3191,19 +3221,6 @@ def test_compacting_keeps_every_centroid_relative_position(mesh_client):
     assert ann["markers"] == marks["markers"]
     assert ann["ellipsoids"] == marks["ellipsoids"]
     assert page.meshes()[-1].get("facesRenumbered") is True
-
-
-def test_undo_brings_back_the_annotations_of_the_mesh_it_restores(mesh_client):
-    client, _ = mesh_client
-    first = {"highlights": [{"faces": [0, 1, 2, 3], "color": [1, 0, 0], "label": "a"}]}
-    client.post("/update_annotations", json=first)
-    assert client.post("/remove_selected", json={"faces": [0, 1]}).json()["ok"]
-    later = {"highlights": [{"faces": [9], "color": [0, 1, 0], "label": "b"}]}
-    client.post("/update_annotations", json=later)
-
-    assert client.post("/undo").json()["ok"]
-
-    assert client.get("/annotations").json() == first
 
 
 def test_detecting_the_soma_again_replaces_it(mesh_client, monkeypatch):
@@ -3247,6 +3264,33 @@ def _page_html():
     return Path(viewer_mod.__file__).with_name("viewer.html").read_text()
 
 
+def test_every_route_the_page_asks_for_is_served(mesh_client):
+    """The page names its routes in strings, and nothing ties a string to a
+    route: a note posted to one that never existed was answered 404, and
+    the answer was not read."""
+    import re
+
+    client, _ = mesh_client
+    served = {getattr(r, "path", None) for r in client.app.routes}
+    asked = set(re.findall(r"""["'`](/[a-z_]+)(?=["'`?$])""", _page_html()))
+    assert len(asked) > 30, "the page's routes were not found"
+    assert {"/mesh", "/skeletonize", "/save_highlight"} <= asked
+    assert sorted(asked - served) == []
+
+
+def test_a_note_saved_without_the_websocket_is_kept(mesh_client):
+    """A page whose WebSocket is closed posts the note instead; the page
+    clears the selection either way, so a dropped note is gone."""
+    client, _ = mesh_client
+    note = {"faces": [3, 4, 5], "color": [1, 0, 0], "label": "look here"}
+    assert client.post("/save_highlight", json=note).json()["ok"]
+
+    ann = client.get("/annotations").json()
+    kept = [h for h in ann["highlights"] if h["label"] == "look here"]
+    assert len(kept) == 1
+    assert kept[0]["faces"] == [3, 4, 5] and kept[0]["role"] == "note"
+
+
 def test_an_empty_slot_never_stops_the_overlays_updating():
     """A group with nothing to draw holds a null slot so rows and meshes stay
     aligned.  Every walk over the slots must step over it: one that did not
@@ -3277,7 +3321,10 @@ def test_every_function_the_page_calls_is_defined():
 
     html = _page_html()
     script = html.split('<script type="module">')[1].split("</script>")[0]
-    script = re.sub(r"//[^\n]*|`[^`]*`|\"[^\"\n]*\"|'[^'\n]*'", "", script)
+    # comments (line and block), template literals and strings are no calls
+    script = re.sub(
+        r"/\*[\s\S]*?\*/|//[^\n]*|`[^`]*`|\"[^\"\n]*\"|'[^'\n]*'", "", script
+    )
     called = set(re.findall(r"(?<![\w.$])([A-Za-z_$][\w$]*)\s*\(", script))
     defined = set(re.findall(r"function\s+([A-Za-z_$][\w$]*)", script))
     defined |= set(re.findall(r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=", script))
@@ -3371,9 +3418,11 @@ def test_a_marker_can_name_the_node_it_marks():
     assert "selectBin(mk.node)" in body, "focusing a node marker does not select it"
     # Toggling would make focusing the same row twice deselect it.
     assert "clearBinSelection()" in body, "selection is toggled rather than set"
-    assert 'panelMode !== "skeleton"' in body, (
-        "bin selection is attempted outside the mode that has a bin panel"
-    )
+    # A bin exists only where its skeleton was built from the mesh on
+    # screen; there, the skeleton it names becomes the one clicks pick, so
+    # the bin verbs act on it.
+    assert "binsAvailable(" in body, "a bin is selected where there are no bins"
+    assert "setPickTarget(" in body, "the marker's skeleton is not the one picked"
 
 
 # ── contact sites ─────────────────────────────────────────────────────
@@ -3932,3 +3981,320 @@ def test_bare_view_contacts_starts_an_empty_viewer(monkeypatch):
     (a, b, sites), kw = called["view_contacts"]
     assert (a, b, sites) == (None, None, None)
     assert kw["names"] == ("A", "B")
+
+
+# ── colours ───────────────────────────────────────────────────────────
+#
+# The selection's amber marks the faces the next action consumes, so no
+# data colour may pass for it.  Organelles were drawn in that very amber
+# until 2026-11; bright greens read as amber to protanopes and
+# deuteranopes.  The distances are the dataviz palette validator's: OKLab
+# ΔE ×100, colour-blindness by Machado, Oliveira & Fernandes (2009) at
+# severity 1.
+
+_MACHADO = {
+    "protan": [
+        [0.152286, 1.052583, -0.204868],
+        [0.114503, 0.786281, 0.099216],
+        [-0.003882, -0.048116, 1.051998],
+    ],
+    "deutan": [
+        [0.367322, 0.860646, -0.227968],
+        [0.280085, 0.672501, 0.047413],
+        [-0.011820, 0.042940, 0.968881],
+    ],
+}
+
+
+def _oklab(rgb, cvd=None):
+    """OKLab of an sRGB triple in [0, 1], seen with *cvd* if given."""
+    lin = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in rgb]
+    if cvd is not None:
+        m = _MACHADO[cvd]
+        lin = [
+            min(1.0, max(0.0, sum(m[i][j] * lin[j] for j in range(3))))
+            for i in range(3)
+        ]
+    r, g, b = lin
+    lc = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b) ** (1 / 3)
+    mc = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b) ** (1 / 3)
+    sc = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b) ** (1 / 3)
+    return (
+        0.2104542553 * lc + 0.7936177850 * mc - 0.0040720468 * sc,
+        1.9779984951 * lc - 2.4285922050 * mc + 0.4505937099 * sc,
+        0.0259040371 * lc + 0.7827717662 * mc - 0.8086757660 * sc,
+    )
+
+
+def _apart(a, b):
+    """(colour-blind, normal) OKLab ΔE ×100 between two colours: the
+    colour-blind one the smaller of protanopia's and deuteranopia's."""
+    import math
+
+    cvd = min(100 * math.dist(_oklab(a, k), _oklab(b, k)) for k in ("protan", "deutan"))
+    return cvd, 100 * math.dist(_oklab(a), _oklab(b))
+
+
+def _page_colour_lists():
+    """The page's own colour lists and every colour literal it draws."""
+    import re
+    from pathlib import Path
+
+    from skeliner.viewer import viewer as viewer_mod
+
+    html = Path(viewer_mod.__file__).with_name("viewer.html").read_text()
+    triple = r"\[\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)\s*\]"
+
+    def block(name):
+        body = html.split(f"const {name} = [")[1].split("];")[0]
+        return [[float(x) for x in t] for t in re.findall(triple, "[" + body + "]")]
+
+    drawn = []
+    for line in html.splitlines():
+        if re.search(r"color:|Overlay\(|makeSkelLines\(|makeFaceOverlay\(", line):
+            drawn += [[float(x) for x in t] for t in re.findall(triple, line)]
+    return html, block, drawn
+
+
+def test_no_data_colour_passes_for_the_selection():
+    from skeliner.viewer import viewer as v
+
+    _, block, drawn = _page_colour_lists()
+    data = {
+        "soma": v.SOMA_COLOR,
+        "organelles": v.ORGANELLE_COLOR,
+        "discarded": v.DISCARDED_COLOR,
+        "cut": v.CUT_COLOR,
+        "keep": v.KEEP_COLOR,
+    }
+    for name, group in [
+        ("neurite", v.NEURITE_COLORS),
+        ("series", v.SERIES_COLORS),
+        ("skeleton", v.SKELETON_COLORS),
+        ("organelle part", list(v.ORGANELLE_PART_COLORS.values())),
+        ("qc", list(v._QC_COLORS.values())),
+        ("contact kind", list(v._KIND_COLORS.values())),
+        ("contact site", v._SITE_COLORS),
+        ("page bin", block("BIN_COLORS")),
+        ("page drawn", drawn),
+    ]:
+        for i, c in enumerate(group):
+            data[f"{name} {i}"] = c
+    for name, c in data.items():
+        cvd, normal = _apart(c, v.SELECTION_COLOR)
+        assert cvd >= 8 and normal >= 15, (
+            f"{name} {c} is ΔE {cvd:.1f} (colour-blind) / {normal:.1f} (normal) "
+            "from the selection's amber"
+        )
+
+
+def test_the_page_draws_the_selection_and_the_series_in_the_servers_colours():
+    import re
+
+    from skeliner.viewer import viewer as v
+
+    html, block, _ = _page_colour_lists()
+    sel = re.search(r"const SELECTION_COLOR = \[([^\]]+)\]", html).group(1)
+    assert [float(x) for x in sel.split(",")] == v.SELECTION_COLOR
+    assert "new THREE.Color(...SELECTION_COLOR)" in html, (
+        "the highlight is not drawn in it"
+    )
+    assert block("SAVE_COLORS") == v.SERIES_COLORS
+
+
+def test_the_components_are_told_apart():
+    """The pairs that meet on screen: soma, organelles and each neurite
+    colour against each other; each cycle's neighbours; the first skeleton
+    over every component."""
+    from skeliner.viewer import viewer as v
+
+    def check(a, b, what):
+        cvd, normal = _apart(a, b)
+        assert cvd >= 8 and normal >= 15, f"{what}: ΔE {cvd:.1f} / {normal:.1f}"
+
+    parts = [v.SOMA_COLOR, v.ORGANELLE_COLOR, *v.NEURITE_COLORS]
+    for i, a in enumerate(parts):
+        for b in parts[i + 1 :]:
+            if a in v.NEURITE_COLORS and b in v.NEURITE_COLORS:
+                continue
+            check(a, b, f"{a} against {b}")
+    for name, cycle in [
+        ("neurite", v.NEURITE_COLORS),
+        ("series", v.SERIES_COLORS),
+        ("skeleton", v.SKELETON_COLORS),
+    ]:
+        for i, a in enumerate(cycle):
+            check(a, cycle[(i + 1) % len(cycle)], f"{name} {i} against the next")
+    for c in parts:
+        check(v.SKELETON_COLORS[0], c, f"the first skeleton over {c}")
+
+
+def test_any_two_bins_are_told_apart():
+    """Any two bins can touch — clicked, or in the rings, which take the
+    clicks' colours — so every pair of the page's bin colours is apart,
+    and each from the grey mesh they lie on (a bin that looked grey would
+    read as surface no node owns)."""
+    from skeliner.viewer import viewer as v
+
+    _, block, _ = _page_colour_lists()
+    rings = block("BIN_COLORS")
+    assert len(rings) == 4, "four colours colour a surface's bins apart"
+    for i, a in enumerate(rings):
+        for b in [*rings[i + 1 :], v.MESH_COLOR]:
+            cvd, normal = _apart(a, b)
+            assert cvd >= 8 and normal >= 15, f"{a} / {b}: ΔE {cvd:.1f} / {normal:.1f}"
+
+
+def _through(c, under, alpha):
+    """Colour *c* drawn at *alpha* over *under*, mixed in linear light as the
+    renderer blends, back in sRGB."""
+
+    def lin(x):
+        return x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4
+
+    def gam(x):
+        return 12.92 * x if x <= 0.0031308 else 1.055 * x ** (1 / 2.4) - 0.055
+
+    return [gam(alpha * lin(a) + (1 - alpha) * lin(b)) for a, b in zip(c, under)]
+
+
+def test_the_organelles_show_on_the_mesh():
+    """Organelles mostly lie inside the soma, looked at through the grey mesh
+    turned down, so their colour must stand off the grey — and still at half
+    opacity, mixed into it (the dark indigo they had first did not: ΔE 12
+    there, against the selection amber's 17)."""
+    from skeliner.viewer import viewer as v
+
+    html, _, _ = _page_colour_lists()
+    assert 'id="meshColorPicker" class="hl-color-input" value="#8c8c99"' in html
+    assert [round(x, 2) for x in v.MESH_COLOR] == [0.55, 0.55, 0.6]
+    _, full = _apart(v.ORGANELLE_COLOR, v.MESH_COLOR)
+    _, half = _apart(_through(v.ORGANELLE_COLOR, v.MESH_COLOR, 0.5), v.MESH_COLOR)
+    _, amber_half = _apart(_through(v.SELECTION_COLOR, v.MESH_COLOR, 0.5), v.MESH_COLOR)
+    assert full >= 30 and half >= amber_half, (full, half, amber_half)
+
+
+def test_nothing_else_passes_for_the_organelles():
+    """The organelles' bright green is theirs: no other data colour comes
+    near it (the page's fallbacks for an entry with no colour of its own,
+    white, aside)."""
+    from skeliner.viewer import viewer as v
+
+    _, block, drawn = _page_colour_lists()
+    others = [
+        v.SOMA_COLOR,
+        v.DISCARDED_COLOR,
+        *v.NEURITE_COLORS,
+        *v.SERIES_COLORS,
+        *v.SKELETON_COLORS,
+        *v.ORGANELLE_PART_COLORS.values(),
+        *v._QC_COLORS.values(),
+        *block("BIN_COLORS"),
+        *block("SAVE_COLORS"),
+        *(c for c in drawn if c != [1.0, 1.0, 1.0] and c != [1, 1, 1]),
+    ]
+    for c in others:
+        cvd, normal = _apart(c, v.ORGANELLE_COLOR)
+        assert cvd >= 8 and normal >= 15, (
+            f"{c} is ΔE {cvd:.1f} / {normal:.1f} from the organelles' green"
+        )
+
+
+# ── the chunk grid ────────────────────────────────────────────────────
+
+
+def test_the_chunk_grid_is_the_loaded_meshs(tmp_path, monkeypatch):
+    """The chunk boundaries are the volume's, found from the vertices the
+    chunks share; the pipeline cuts the parallel patches there and compacts
+    the mesh, which takes those vertices away.  After that the grid shown
+    is still the one the loaded mesh gives (it came out wrong after a Run,
+    read off the processed mesh)."""
+    from starlette.testclient import TestClient
+
+    from skeliner.viewer import viewer as viewer_mod
+
+    monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
+    rng = np.random.default_rng(5)
+    # background vertices, and planes of shared x, y and z: the chunks'
+    # joins (the grid's lines run where two axes' planes cross)
+    v = rng.uniform(0, 600, size=(3000, 3))
+    planted = []
+    for axis, values in [
+        (0, (60, 120, 180, 240)),
+        (1, (150, 300, 450)),
+        (2, (200, 400)),
+    ]:
+        for x in values:
+            pts = rng.uniform(0, 600, size=(150, 3))
+            pts[:, axis] = x
+            planted.append(np.arange(len(v), len(v) + len(pts)))
+            v = np.vstack([v, pts])
+    on_plane = np.concatenate(planted)
+    f = rng.integers(0, len(v), size=(4000, 3))
+    f = f[(f[:, 0] != f[:, 1]) & (f[:, 1] != f[:, 2]) & (f[:, 0] != f[:, 2])]
+    mesh = trimesh.Trimesh(v, f, process=False)
+    with TestClient(_create_app(preload_mesh=mesh, port=8922)) as client:
+        before = client.post("/chunk_grid").json()
+        assert before["ok"] and before["segments"]
+        # every face on a plane vertex cut, then the mesh compacted: the
+        # planes' vertices are gone from the mesh on screen
+        cut = np.flatnonzero(np.isin(f, on_plane).any(axis=1)).tolist()
+        assert client.post("/remove_selected", json={"faces": cut}).json()["ok"]
+        assert client.post("/compact_mesh").json()["ok"]
+        assert client.get("/loaded").json()["mesh"]["nVertices"] < len(v)
+        after = client.post("/chunk_grid").json()
+        assert after["ok"] and after["segments"] == before["segments"]
+
+
+def test_parallel_patches_are_looked_for_at_the_loaded_meshs_planes(
+    tmp_path, monkeypatch
+):
+    """Detect Parallel after an edit asks at the planes of the mesh as
+    loaded — a processed mesh's own vertices give hundreds that are not
+    there — and preprocess hands the planes it is given to that step."""
+    from starlette.testclient import TestClient
+
+    import skeliner as sk
+    from skeliner.viewer import viewer as viewer_mod
+
+    monkeypatch.setattr(viewer_mod, "_STATE_DIR", tmp_path, raising=False)
+    rng = np.random.default_rng(6)
+    v = rng.uniform(0, 600, size=(3000, 3))
+    on_plane = []
+    for x in (60, 120, 180, 240):
+        pts = rng.uniform(0, 600, size=(150, 3))
+        pts[:, 0] = x
+        on_plane.append(np.arange(len(v), len(v) + len(pts)))
+        v = np.vstack([v, pts])
+    on_plane = np.concatenate(on_plane)
+    f = rng.integers(0, len(v), size=(4000, 3))
+    f = f[(f[:, 0] != f[:, 1]) & (f[:, 1] != f[:, 2]) & (f[:, 0] != f[:, 2])]
+    mesh = trimesh.Trimesh(v, f, process=False)
+    loaded = sk.pre.find_chunk_boundaries(sk.dataclass.Mesh(v, f))
+    asked = []
+
+    def record(_m, *, boundaries=None, **_kw):
+        asked.append(boundaries)
+        return []
+
+    monkeypatch.setattr(sk.pre, "find_parallel_patches", record)
+    with TestClient(_create_app(preload_mesh=mesh, port=8923)) as client:
+        cut = np.flatnonzero(np.isin(f, on_plane).any(axis=1)).tolist()
+        assert client.post("/remove_selected", json={"faces": cut}).json()["ok"]
+        assert client.post("/compact_mesh").json()["ok"]
+        client.post("/detect_parallel_patches")
+    assert asked and set(asked[-1]) == set(loaded)
+    for axis, values in loaded.items():
+        assert np.array_equal(asked[-1][axis], values)
+
+    class Stop(Exception):
+        pass
+
+    def stop(_m, *, boundaries=None, **_kw):
+        asked.append(boundaries)
+        raise Stop
+
+    monkeypatch.setattr(sk.pre, "find_parallel_patches", stop)
+    with pytest.raises(Stop):
+        sk.pre.preprocess(sk.dataclass.Mesh(v, f), chunk_boundaries=loaded)
+    assert asked[-1] is loaded
