@@ -1079,21 +1079,22 @@
             "
         ></div>
 
-        <!-- What to look at, what was noted, what is drawn.  Every list
+        <!-- What is drawn, what to look at, what was noted.  Every list
              entry of the annotations lands in one of the three by the kind
-             its writer gave it. -->
+             its writer gave it.  Layers first, and open on load: it is the
+             one in use most. -->
         <div id="inspector" class="panel">
             <div class="tabs">
-                <button id="tabFindings" class="tab" data-tab="findings" data-active="1">
+                <button id="tabLayers" class="tab" data-tab="layers" data-active="1">Layers</button>
+                <button id="tabFindings" class="tab" data-tab="findings">
                     Findings <span id="findingsCount" class="dim"></span>
                 </button>
                 <button id="tabNotes" class="tab" data-tab="notes">
                     Notes <span id="notesCount" class="dim"></span>
                 </button>
-                <button id="tabLayers" class="tab" data-tab="layers">Layers</button>
             </div>
 
-            <div id="tab-findings" class="tab-body">
+            <div id="tab-findings" class="tab-body" style="display: none">
                 <!-- Checks list candidates and never edit.  Every threshold
                      here is a heuristic with nothing validating it, so the cut
                      is exposed rather than baked in: change it, re-run, and
@@ -1138,7 +1139,7 @@
                 <div class="dim hint">Select faces, then Note → Save in the bar below.</div>
             </div>
 
-            <div id="tab-layers" class="tab-body" style="display: none">
+            <div id="tab-layers" class="tab-body">
                 <div class="layer-head">Mesh</div>
                 <div id="loadedMesh" class="item" style="display: none">
                     <input type="color" id="meshColorPicker" class="hl-color-input" value="#8c8c99" title="Mesh color" />
@@ -1153,8 +1154,10 @@
 
                 <div class="layer-head">
                     <span title="The components break_up_mesh made. A row's 'pick' says whether its faces can be selected — the scope of every lasso and click.">Components</span>
+                    <button id="componentsEye" class="toggle-vis icon-btn" style="display: none"></button>
                     <span id="scopeNote" class="dim"></span>
                     <span style="float: right">
+                        <span class="dim" title="Which components a lasso or a click can select; it shows and hides nothing">pick</span>
                         <button id="scopeAllBtn" title="Every component pickable">All</button>
                         <button id="scopeNoneBtn" title="No component pickable">None</button>
                     </span>
@@ -1429,6 +1432,7 @@
                 renderDxParams();
                 document.getElementById("skelApplyBtn").addEventListener("click", runSkelApply);
                 document.getElementById("skelCancelBtn").addEventListener("click", runSkelCancel);
+                document.getElementById("componentsEye").addEventListener("click", toggleComponents);
                 document.getElementById("scopeAllBtn").addEventListener("click", () => setScopeAll(true));
                 document.getElementById("scopeNoneBtn").addEventListener("click", () => setScopeAll(false));
                 const claimInput = document.getElementById("claimMinFaces");
@@ -2847,11 +2851,8 @@
             function showTab(name) {
                 for (const btn of document.querySelectorAll("#inspector .tab"))
                     btn.dataset.active = btn.dataset.tab === name ? "1" : "0";
-                for (const t of ["findings", "notes", "layers"])
+                for (const t of ["layers", "findings", "notes"])
                     document.getElementById(`tab-${t}`).style.display = t === name ? "block" : "none";
-                try {
-                    localStorage.setItem("skeliner_tab", name);
-                } catch (e) {}
             }
 
             function setupInspector() {
@@ -2859,12 +2860,9 @@
                     btn.addEventListener("click", () => showTab(btn.dataset.tab));
                 document.getElementById("findPrevBtn").addEventListener("click", () => stepFinding(-1));
                 document.getElementById("findNextBtn").addEventListener("click", () => stepFinding(1));
-                let saved = null;
-                try {
-                    saved = localStorage.getItem("skeliner_tab");
-                } catch (e) {}
-                if (contactMode) showTab("findings");
-                else if (["findings", "notes", "layers"].includes(saved)) showTab(saved);
+                // Layers on every load, the page in use most; contact mode
+                // has only Findings
+                showTab(contactMode ? "findings" : "layers");
             }
 
             function setupTools() {
@@ -3028,6 +3026,7 @@
                 host.innerHTML = "";
                 const groups = componentHighlights();
                 const note = document.getElementById("scopeNote");
+                refreshComponentsEye();
                 if (!groups.length) {
                     host.innerHTML =
                         "<div class='dim'>none yet — Run, or Steps → Break</div>";
@@ -3083,6 +3082,7 @@
                         for (const i of idx) if (annotationMeshes[i]) annotationMeshes[i].visible = vis;
                         setToggleVisIcon(eye, vis);
                         _saveAnnVisibility();
+                        refreshComponentsEye();
                     });
                     row.appendChild(eye);
                     row.appendChild(pickToggle(idx));
@@ -3101,6 +3101,36 @@
                               ? `${lit} of ${groups.length} pickable`
                               : "nothing pickable";
                 }
+            }
+
+            /** What the Components head's eye shows and hides: every
+             *  component's faces and the soma's ellipsoid. */
+            function componentObjects() {
+                const objs = [];
+                for (const { i } of componentHighlights())
+                    for (const m of [annotationMeshes[i], hlEllipsoids[i]]) if (m) objs.push(m);
+                return objs;
+            }
+
+            /** The head's eye: open while any component shows. */
+            function refreshComponentsEye() {
+                const eye = document.getElementById("componentsEye");
+                if (!eye) return;
+                const objs = componentObjects();
+                eye.style.display = objs.length ? "" : "none";
+                setToggleVisIcon(eye, objs.some((m) => m.visible));
+                eye.title = "show or hide every component";
+            }
+
+            /** Every component shown or hidden at once, and each row
+             *  remembers it, as its own eye would. */
+            function toggleComponents() {
+                const vis = !componentObjects().some((m) => m.visible);
+                for (const m of componentObjects()) m.visible = vis;
+                _saveAnnVisibility();
+                for (const { g, i } of componentHighlights())
+                    if (hlEllipsoids[i]) setEllipsoidHidden(g.label, !vis);
+                renderComponentRows();
             }
 
             function setScopeAll(on) {
@@ -6150,6 +6180,7 @@
                     if (drawn()) drawn().visible = vis;
                     setToggleVisIcon(toggleBtn, vis);
                     _saveAnnVisibility();
+                    if (pick) refreshComponentsEye();
                 });
                 div.appendChild(toggleBtn);
 
@@ -6201,6 +6232,7 @@
                     m.visible = !m.visible;
                     setToggleVisIcon(eye, m.visible);
                     setEllipsoidHidden(group.label, !m.visible);
+                    refreshComponentsEye();
                 });
                 div.appendChild(eye);
                 return div;
@@ -6436,6 +6468,7 @@
                 document.querySelectorAll("#inspector .ann-row button.toggle-vis, #inspector .group-head button.toggle-vis").forEach((btn) => {
                     setToggleVisIcon(btn, vis);
                 });
+                refreshComponentsEye();
                 setToggleVisIcon(document.getElementById("hlHideAll"), vis, "All");
             }
 
