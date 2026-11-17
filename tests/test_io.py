@@ -562,8 +562,8 @@ def test_a_mesh_remove_fusions_cut_reads_back_as_written(tmp_path):
 
     trimesh = pytest.importorskip("trimesh")
     # two balls sharing one vertex, a bow-tie that remove_fusions cuts into
-    # two vertices at one position: the second ball's antipode of vertex 0
-    # moved onto vertex 0
+    # two vertices a thousandth of an edge apart: the second ball's
+    # antipode of vertex 0 moved onto vertex 0
     ball = trimesh.creation.icosphere(subdivisions=1, radius=1000.0)
     b = np.round(ball.vertices)
     far = int(np.argmin(np.linalg.norm(b + b[0], axis=1)))
@@ -575,12 +575,15 @@ def test_a_mesh_remove_fusions_cut_reads_back_as_written(tmp_path):
     pinch = int(np.flatnonzero((f == 0).any(axis=1))[0])
     cut = sk.pre.remove_fusions(sk.Mesh(v, f), fusions=[[pinch]])
     assert len(cut.vertices) == len(v) + 1
-    assert np.array_equal(cut.vertices[-1], cut.vertices[0])
+    apart = np.linalg.norm(cut.vertices[-1] - cut.vertices[0])
+    assert 0 < apart < 1.0
     path = tmp_path / "cut.obj"
     save_mesh(cut, path)
     for mesh in both(load_mesh, path):
-        assert np.array_equal(mesh.vertices, cut.vertices)
+        # every vertex read back in its place, to the file's eight decimals
+        assert np.allclose(mesh.vertices, cut.vertices, rtol=0, atol=5e-9)
         assert np.array_equal(mesh.faces, cut.faces)
+        assert not np.array_equal(mesh.vertices[-1], mesh.vertices[0])
 
 
 def test_saving_a_vertex_no_face_names_warns(tmp_path):

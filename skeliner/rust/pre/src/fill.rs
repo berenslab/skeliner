@@ -590,15 +590,13 @@ fn vertex_normals(
     sum.into_iter().map(|(v, s)| (v, unit(s))).collect()
 }
 
-/// A hole's patch: Liepa's triangulation of its loop, refined.
-fn patch(
-    lp: &Loop,
-    verts: &[V3],
-    faces: &[[u32; 3]],
-    topo: &Topology,
-    surface: &[bool],
-    med: f64,
-) -> Option<Patch> {
+/// What a triangulation of the loop `lp` reads off it: its vertices'
+/// points; the unit normal of the `surface` face along each edge, as the
+/// loop runs; and the surface's own edges between vertices of the loop not
+/// next on it, by their places on the loop.
+type Frame = (Vec<V3>, Vec<V3>, HashSet<(usize, usize)>);
+
+fn frame(lp: &Loop, verts: &[V3], faces: &[[u32; 3]], topo: &Topology, surface: &[bool]) -> Frame {
     let n = lp.verts.len();
     let p: Vec<V3> = lp.verts.iter().map(|&v| verts[v as usize]).collect();
     // the surface's normal along each edge, as the loop runs
@@ -634,8 +632,42 @@ fn patch(
             }
         }
     }
+    (p, outer, banned)
+}
+
+/// A hole's patch: Liepa's triangulation of its loop, refined.
+fn patch(
+    lp: &Loop,
+    verts: &[V3],
+    faces: &[[u32; 3]],
+    topo: &Topology,
+    surface: &[bool],
+    med: f64,
+) -> Option<Patch> {
+    let (p, outer, banned) = frame(lp, verts, faces, topo, surface);
     let tris = triangulate(&p, &outer, &banned)?;
     Some(refine(p, tris, &banned, med))
+}
+
+/// Liepa's triangulation of the loop `lp` alone, no vertex added
+/// ([`triangulate`]): triangles over its vertices, wound against the
+/// `surface` faces along it, none spanning no area or laying an edge
+/// between two of its vertices that a surface face has; None where every
+/// way does.
+pub fn span(
+    lp: &Loop,
+    verts: &[V3],
+    faces: &[[u32; 3]],
+    topo: &Topology,
+    surface: &[bool],
+) -> Option<Vec<[u32; 3]>> {
+    let (p, outer, banned) = frame(lp, verts, faces, topo, surface);
+    let tris = triangulate(&p, &outer, &banned)?;
+    Some(
+        tris.into_iter()
+            .map(|t| t.map(|i| lp.verts[i as usize]))
+            .collect(),
+    )
 }
 
 /// Liepa's triangulation of the loop through `p`, `outer[i]` the unit

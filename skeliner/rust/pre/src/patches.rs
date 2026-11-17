@@ -1,6 +1,6 @@
 //! `skeliner.pre.find_parallel_patches` and `remove_parallel_patches`
 //! without their shapely steps: axis-aligned face patches at chunk
-//! boundaries that face an opposing patch, their removal, and the strips
+//! boundaries that face an opposing patch, their removal, and the faces
 //! that close what the removal opens.
 //!
 //! The reference's edge maps are rebuilt as it builds them — keyed by each
@@ -13,6 +13,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use mesh::Topology;
 use mesh::components::{face_edge_components, face_edge_components_without};
 use mesh::geometry::{numpy_order, numpy_sum};
+
+use crate::fill::{Loop, border_loops, span};
 use rayon::prelude::*;
 
 type V3 = [f64; 3];
@@ -661,230 +663,378 @@ fn dist(a: V3, b: V3) -> f64 {
     (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
 }
 
-/// `_zip_vertex_loops`: a triangle strip between two vertex sequences,
-/// the shorter bridge first at each step, over every start offset of `lb`;
-/// the cheapest strip wins.  The strip runs `la` forward and `lb`
-/// backward, so the loops come oriented: each against the faces it rims
-/// that the strip should wind with.
-fn zip_vertex_loops(
-    la: &[u32],
-    lb: &[u32],
+/// Whether the triangle `t` spans an area.
+fn spans_area(verts: &[V3], t: [u32; 3]) -> bool {
+    let [p, q, r] = t.map(|v| verts[v as usize]);
+    let u = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
+    let w = [r[0] - p[0], r[1] - p[1], r[2] - p[2]];
+    let x = [
+        u[1] * w[2] - u[2] * w[1],
+        u[2] * w[0] - u[0] * w[2],
+        u[0] * w[1] - u[1] * w[0],
+    ];
+    x[0] * x[0] + x[1] * x[1] + x[2] * x[2] > 0.0
+}
+
+/// A strip from the closed loop `a` to the closed loop `b`: triangles
+/// `[a_i, a_i+1, b_j]` and `[a_i, b_j, b_j-1]`, so it runs `a` forward and
+/// `b` backward, every edge of both once, and every rung — an edge from
+/// `a` to `b` — on two of its triangles. Of the strips over every start on
+/// `b`, the one whose rungs are shortest in all; none with a triangle
+/// spanning no area or a rung `taken` already. None where every strip has
+/// one.
+///
+/// A strip is walked from a rung at `a_0` that the next triangle leaves
+/// along `a` (every strip has one: the last of its rungs at `a_0`), so it
+/// lays a rung twice only by coming back to it: round all of `b` from one
+/// vertex of `a` (a cone, its first rung met again), or round all of `a`
+/// along `b_0`. Neither is walked.
+fn strip(
     verts: &[V3],
-    closed_a: bool,
-    closed_b: bool,
-) -> Vec<[u32; 3]> {
-    let (m, n) = (la.len(), lb.len());
-    if m < 2 || n < 2 {
-        return Vec::new();
-    }
+    a: &[u32],
+    b: &[u32],
+    taken: &dyn Fn(u32, u32) -> bool,
+) -> Option<Vec<[u32; 3]>> {
+    const NONE: u8 = 0;
+    // how a state was reached: along `a` from the free or the anchored
+    // table, or along `b` within its own table
+    const A_FREE: u8 = 1;
+    const A_ANCHORED: u8 = 2;
+    const B: u8 = 3;
+    let (m, n) = (a.len(), b.len());
     let at = |v: u32| verts[v as usize];
-    let walk = |sb: &[u32]| -> (f64, Vec<[u32; 3]>) {
-        let mut tris = Vec::new();
-        let mut cost = 0.0;
-        let (mut i, mut j) = (0, 0);
-        let steps_a = if closed_a { m } else { m - 1 };
-        let steps_b = if closed_b { n } else { n - 1 };
-        while i < steps_a || j < steps_b {
-            let (a_curr, a_next) = (la[i % m], la[(i + 1) % m]);
-            let (t_curr, t_next) = (sb[j % n], sb[(j + 1) % n]);
-            if i >= steps_a {
-                tris.push([a_curr, t_next, t_curr]);
-                cost += dist(at(t_next), at(a_curr));
-                j += 1;
-            } else if j >= steps_b {
-                tris.push([a_curr, a_next, t_curr]);
-                cost += dist(at(a_next), at(t_curr));
-                i += 1;
-            } else {
-                let d_a = dist(at(a_next), at(t_curr));
-                let d_b = dist(at(a_curr), at(t_next));
-                if d_a <= d_b {
-                    tris.push([a_curr, a_next, t_curr]);
-                    cost += d_a;
-                    i += 1;
-                } else {
-                    tris.push([a_curr, t_next, t_curr]);
-                    cost += d_b;
-                    j += 1;
+    let w = n + 1;
+    let mut best: Option<(f64, Vec<[u32; 3]>)> = None;
+    for start in 0..n {
+        let bj = |j: usize| b[(start + j) % n];
+        let ai = |i: usize| a[i % m];
+        if taken(ai(0), bj(0)) {
+            continue;
+        }
+        // `anchored`: the paths along `b_0` from `a_0`, then up along `b`
+        // from where they left it; `free`: every other path
+        let mut free = vec![f64::INFINITY; (m + 1) * w];
+        let mut anchored = vec![f64::INFINITY; (m + 1) * w];
+        let mut free_from = vec![NONE; (m + 1) * w];
+        anchored[0] = 0.0;
+        for i in 1..=m {
+            for j in 0..=n {
+                let k = i * w + j;
+                // back at the first rung before the end: round all of `a`
+                if (i == m && j == 0) || (!(i == m && j == n) && taken(ai(i), bj(j))) {
+                    continue;
+                }
+                let rung = dist(at(ai(i)), at(bj(j)));
+                if spans_area(verts, [ai(i - 1), ai(i), bj(j)]) {
+                    let (f, g) = (free[k - w], anchored[k - w]);
+                    if j == 0 {
+                        anchored[k] = g + rung;
+                    } else if f.min(g) + rung < free[k] {
+                        free[k] = f.min(g) + rung;
+                        free_from[k] = if f <= g { A_FREE } else { A_ANCHORED };
+                    }
+                }
+                if j > 0 && spans_area(verts, [ai(i), bj(j), bj(j - 1)]) {
+                    if free[k - 1] + rung < free[k] {
+                        free[k] = free[k - 1] + rung;
+                        free_from[k] = B;
+                    }
+                    // round all of `b` from `a_i`: its first rung again
+                    if j < n {
+                        anchored[k] = anchored[k].min(anchored[k - 1] + rung);
+                    }
                 }
             }
         }
-        (cost, tris)
-    };
-    let mut best: Option<(f64, Vec<[u32; 3]>)> = None;
-    let shifts = if closed_b { n } else { 1 };
-    for shift in 0..shifts {
-        let shifted: Vec<u32> = lb[shift..].iter().chain(&lb[..shift]).copied().collect();
-        let (cost, tris) = walk(&shifted);
-        if best.as_ref().is_none_or(|(c, _)| cost < *c) {
-            best = Some((cost, tris));
+        let total = free[m * w + n];
+        if total.is_finite() && best.as_ref().is_none_or(|(c, _)| total < *c) {
+            let mut tris = Vec::with_capacity(m + n);
+            let (mut i, mut j, mut in_free) = (m, n, true);
+            while i > 0 || j > 0 {
+                let along_a = if in_free {
+                    let from = free_from[i * w + j];
+                    in_free = from != A_ANCHORED;
+                    from != B
+                } else {
+                    j == 0
+                };
+                if along_a {
+                    tris.push([ai(i - 1), ai(i), bj(j)]);
+                    i -= 1;
+                } else {
+                    tris.push([ai(i), bj(j), bj(j - 1)]);
+                    j -= 1;
+                }
+            }
+            tris.reverse();
+            best = Some((total, tris));
         }
     }
-    best.map(|(_, t)| t).unwrap_or_default()
+    best.map(|(_, t)| t)
 }
 
-/// Whether the faces left along `lp`'s edges run it forward (`lp[i]` to
-/// `lp[i + 1]`) more often than backward.
-fn runs_forward(
-    lp: &[u32],
-    closed: bool,
-    topo: &Topology,
-    gone: &[bool],
-    orig: &[[u32; 3]],
-) -> bool {
-    let n = lp.len();
-    let steps = if closed { n } else { n - 1 };
-    let (mut forward, mut backward) = (0usize, 0usize);
-    for i in 0..steps {
-        let (a, b) = (lp[i], lp[(i + 1) % n]);
-        let Some(e) = topo.edge_id(a, b) else {
-            continue;
+/// The lenses between two loops that touch at vertices, `u` and `d` each
+/// run forward by the faces kept along it: from each vertex they share to
+/// the next along `u`, then back along `d` — which, its faces lying on the
+/// other side, meets the shared vertices in the opposite order. None when
+/// they share fewer than two vertices (touching at one, the two make no
+/// lens: one loop through that vertex twice), or `d` meets them in another
+/// order.
+fn lenses(u: &Loop, d: &Loop) -> Option<Vec<Loop>> {
+    let at_d: HashMap<u32, usize> = d.verts.iter().enumerate().map(|(i, &v)| (v, i)).collect();
+    let shared: Vec<usize> = (0..u.verts.len())
+        .filter(|&i| at_d.contains_key(&u.verts[i]))
+        .collect();
+    let on_u: HashSet<u32> = u.verts.iter().copied().collect();
+    if shared.len() < 2 {
+        return None;
+    }
+    let (nu, nd, k) = (u.verts.len(), d.verts.len(), shared.len());
+    let mut out = Vec::with_capacity(k);
+    for t in 0..k {
+        let (i0, i1) = (shared[t], shared[(t + 1) % k]);
+        let (j0, j1) = (at_d[&u.verts[i0]], at_d[&u.verts[i1]]);
+        let mut lp = Loop {
+            verts: Vec::new(),
+            faces: Vec::new(),
         };
-        for &f in topo.edge_faces(e).iter().filter(|&&f| !gone[f as usize]) {
-            let t = orig[f as usize];
-            if (0..3).any(|k| t[k] == a && t[(k + 1) % 3] == b) {
-                forward += 1;
-            } else {
-                backward += 1;
+        let mut i = i0;
+        loop {
+            lp.verts.push(u.verts[i]);
+            lp.faces.push(u.faces[i]);
+            i = (i + 1) % nu;
+            if i == i1 {
+                break;
             }
         }
+        let mut j = j1;
+        loop {
+            lp.verts.push(d.verts[j]);
+            lp.faces.push(d.faces[j]);
+            j = (j + 1) % nd;
+            if j == j0 {
+                break;
+            }
+            if on_u.contains(&d.verts[j]) {
+                return None;
+            }
+        }
+        out.push(lp);
     }
-    forward > backward
+    (out.iter().map(|l| l.verts.len()).sum::<usize>() == nu + nd).then_some(out)
 }
 
-/// `_stitch_mode_b`: per `(axis, bval)` group of patches with Mode B faces,
-/// trace the rims each removed side leaves, pair up-side with down-side
-/// rims (largest first, nearest centre with overlapping bboxes) and zip
-/// each pair.  `topo` is the mesh's before the removal and `gone` the faces
-/// removed.  Returns the new triangles.
-fn stitch_mode_b(
+/// Close the holes the removal of the parallel faces (`mode_b`) opened:
+/// the loops of the kept faces' border — every face not `gone` with three
+/// distinct vertices; `topo` is the mesh's before the removal — that run
+/// along removed parallel faces only. Each loop is traced through the
+/// kept faces, so loops touching at a vertex stay apart, and wound as
+/// those faces run it ([`border_loops`]).
+///
+/// The two sides of a sandwich each leave a rim: a loop along up faces
+/// only and one along down faces only, the outlines of the two sides, are
+/// joined — those of one `(axis, bval)` group, the larger up loop first,
+/// each with a down loop it touches or else the nearest overlapping it
+/// across the axis: by a strip ([`strip`]) where they run apart all the
+/// way round, lens by lens ([`lenses`]) where they touch (and not at all
+/// where they touch at one vertex alone). Every other loop
+/// — along up and down faces both, where the outlines meet and part, or
+/// with no partner — is closed by its own triangulation ([`span`]). A loop
+/// that also runs along a face the removal did not take was open before
+/// and stays so. No new triangle spans no area or names the vertices of a
+/// face there is, and every edge a closure lays a face on ends with at
+/// most two — the kept faces on it, the closures' — so a loop that cannot
+/// be closed so stays open (one along an edge of three kept faces, say).
+/// Returns the new triangles, wound against the kept faces along each
+/// loop.
+pub fn close_holes(
     verts: &[V3],
     topo: &Topology,
-    gone: &[bool],
     orig: &[[u32; 3]],
+    gone: &[bool],
     mode_b: &HashSet<u32>,
     patches: &[Patch],
 ) -> Vec<[u32; 3]> {
-    // an edge is a rim edge when exactly one face that has it is left
-    let one_left = |(a, b): Edge| {
-        topo.edge_id(a, b).is_some_and(|e| {
-            topo.edge_faces(e)
-                .iter()
-                .filter(|&&f| !gone[f as usize])
-                .count()
-                == 1
-        })
-    };
-    let rim_edges = |side: &HashSet<u32>| -> Vec<Edge> {
-        let mut out = Vec::new();
-        let mut seen = HashSet::new();
-        for &fi in side {
-            let f = orig[fi as usize];
-            for i in 0..3 {
-                let (a, b) = (f[i], f[(i + 1) % 3]);
-                if a == b {
-                    continue;
-                }
-                let e = edge(a, b);
-                if seen.contains(&e) {
-                    continue;
-                }
-                if one_left(e) {
-                    seen.insert(e);
-                    out.push(e);
-                }
-            }
-        }
-        out
-    };
-    let with_b: Vec<Patch> = patches
-        .iter()
-        .filter(|p| p.faces.iter().any(|f| mode_b.contains(f)))
-        .cloned()
+    let nf = orig.len();
+    let kept: Vec<bool> = (0..nf)
+        .map(|f| !gone[f] && !topo.is_degenerate(f))
         .collect();
-    let mut tris_out = Vec::new();
-    for ((axis, _), members) in groups(&with_b) {
-        let mut up_removed = HashSet::new();
-        let mut dn_removed = HashSet::new();
-        for &pi in &members {
-            up_removed.extend(with_b[pi].up.iter().copied().filter(|f| mode_b.contains(f)));
-            dn_removed.extend(
-                with_b[pi]
-                    .down
-                    .iter()
-                    .copied()
-                    .filter(|f| mode_b.contains(f)),
-            );
-        }
-        let (up_rim, dn_rim) = (rim_edges(&up_removed), rim_edges(&dn_removed));
-        if up_rim.is_empty() || dn_rim.is_empty() {
-            continue;
-        }
-        let keep = |(lp, c): &(Vec<u32>, bool)| (*c && lp.len() >= 3) || (!*c && lp.len() >= 2);
-        let up: Vec<(Vec<u32>, bool)> =
-            trace_edge_loops(&up_rim).into_iter().filter(keep).collect();
-        let dn: Vec<(Vec<u32>, bool)> =
-            trace_edge_loops(&dn_rim).into_iter().filter(keep).collect();
-        if up.is_empty() || dn.is_empty() {
-            continue;
-        }
-        // the strip runs an up rim forward and a down rim backward, and
-        // must wind as the faces it joins: those run an up rim backward and
-        // a down rim forward
-        let orient = |(mut lp, closed): (Vec<u32>, bool), forward: bool| {
-            if runs_forward(&lp, closed, topo, gone, orig) != forward {
-                lp.reverse();
-            }
-            (lp, closed)
-        };
-        let up: Vec<(Vec<u32>, bool)> = up.into_iter().map(|l| orient(l, false)).collect();
-        let dn: Vec<(Vec<u32>, bool)> = dn.into_iter().map(|l| orient(l, true)).collect();
-        let [pa, pb] = perp(axis);
-        let info = |lp: &[u32]| {
-            let mut s = [0.0f64; 3];
-            let mut lo = [f64::INFINITY; 2];
-            let mut hi = [f64::NEG_INFINITY; 2];
-            for &v in lp {
-                let x = verts[v as usize];
-                for k in 0..3 {
-                    s[k] += x[k];
-                }
-                for (k, c) in [x[pa], x[pb]].into_iter().enumerate() {
-                    lo[k] = lo[k].min(c);
-                    hi[k] = hi[k].max(c);
+    // each removed parallel face's side (up 1, down -1) and group
+    let grouped = groups(patches);
+    let mut side = vec![0i8; nf];
+    let mut group = vec![usize::MAX; nf];
+    for (g, (_, members)) in grouped.iter().enumerate() {
+        for &pi in members {
+            let p = &patches[pi];
+            for (list, s) in [(&p.up, 1i8), (&p.down, -1i8)] {
+                for &f in list.iter().filter(|f| mode_b.contains(f)) {
+                    side[f as usize] = s;
+                    group[f as usize] = g;
                 }
             }
-            (s.map(|c| c / lp.len() as f64), lo, hi)
-        };
-        let up_info: Vec<_> = up.iter().map(|(lp, _)| info(lp)).collect();
-        let dn_info: Vec<_> = dn.iter().map(|(lp, _)| info(lp)).collect();
-        let mut up_order: Vec<usize> = (0..up.len()).collect();
-        up_order.sort_by_key(|&i| std::cmp::Reverse(up[i].0.len()));
-        let mut dn_used = vec![false; dn.len()];
-        for ui in up_order {
-            let (uc, ulo, uhi) = up_info[ui];
-            let mut best: Option<(usize, f64)> = None;
-            for (di, &(dc, dlo, dhi)) in dn_info.iter().enumerate() {
-                if dn_used[di] {
-                    continue;
-                }
-                let overlap = (0..2).all(|k| uhi[k].min(dhi[k]) > ulo[k].max(dlo[k]));
-                if !overlap {
-                    continue;
-                }
-                let d = dist(uc, dc);
-                if best.is_none_or(|(_, b)| d < b) {
-                    best = Some((di, d));
-                }
-            }
-            let Some((di, _)) = best else { continue };
-            dn_used[di] = true;
-            tris_out.extend(zip_vertex_loops(
-                &up[ui].0, &dn[di].0, verts, up[ui].1, dn[di].1,
-            ));
         }
     }
-    tris_out
+    let loops = border_loops(topo, orig, &kept);
+    // per loop along removed parallel faces only: up, down or both, and
+    // the group of the faces along it
+    let mut pure: Vec<(usize, i8, usize)> = Vec::new();
+    let mut spanned: Vec<usize> = Vec::new();
+    for (li, lp) in loops.iter().enumerate() {
+        let n = lp.verts.len();
+        let (mut up, mut down, mut other, mut g) = (false, false, false, usize::MAX);
+        for i in 0..n {
+            let along: Vec<u32> = topo
+                .edge_id(lp.verts[i], lp.verts[(i + 1) % n])
+                .map(|e| {
+                    topo.edge_faces(e)
+                        .iter()
+                        .copied()
+                        .filter(|&f| gone[f as usize] && side[f as usize] != 0)
+                        .collect()
+                })
+                .unwrap_or_default();
+            other |= along.is_empty();
+            for f in along {
+                up |= side[f as usize] > 0;
+                down |= side[f as usize] < 0;
+                g = g.min(group[f as usize]);
+            }
+        }
+        match (other, up, down) {
+            (false, true, true) => spanned.push(li),
+            (false, true, false) => pure.push((li, 1, g)),
+            (false, false, true) => pure.push((li, -1, g)),
+            _ => {}
+        }
+    }
+    // pair the sides' rims: per group, the larger up loop first, each with
+    // the nearest down loop overlapping it across the axis
+    let extent = |li: usize, axis: usize| {
+        let [pa, pb] = perp(axis);
+        let mut s = [0.0f64; 3];
+        let mut lo = [f64::INFINITY; 2];
+        let mut hi = [f64::NEG_INFINITY; 2];
+        for &v in &loops[li].verts {
+            let x = verts[v as usize];
+            for k in 0..3 {
+                s[k] += x[k];
+            }
+            for (k, c) in [x[pa], x[pb]].into_iter().enumerate() {
+                lo[k] = lo[k].min(c);
+                hi[k] = hi[k].max(c);
+            }
+        }
+        (s.map(|c| c / loops[li].verts.len() as f64), lo, hi)
+    };
+    let mut ups: Vec<usize> = (0..pure.len()).filter(|&k| pure[k].1 > 0).collect();
+    ups.sort_by_key(|&k| std::cmp::Reverse(loops[pure[k].0].verts.len()));
+    let mut paired = vec![false; pure.len()];
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    for k in ups {
+        let (lu, _, g) = pure[k];
+        let axis = grouped[g].0.0;
+        let (uc, ulo, uhi) = extent(lu, axis);
+        // a down loop it touches first, then the nearest overlapping it
+        let mut best: Option<(usize, bool, f64)> = None;
+        for d in 0..pure.len() {
+            let (ld, s, dg) = pure[d];
+            if s > 0 || dg != g || paired[d] {
+                continue;
+            }
+            let touches = loops[ld].verts.iter().any(|v| loops[lu].verts.contains(v));
+            let (dc, dlo, dhi) = extent(ld, axis);
+            if !touches && !(0..2).all(|q| uhi[q].min(dhi[q]) > ulo[q].max(dlo[q])) {
+                continue;
+            }
+            let dd = dist(uc, dc);
+            if best.is_none_or(|(_, bt, b)| (touches, -dd) > (bt, -b)) {
+                best = Some((d, touches, dd));
+            }
+        }
+        let best = best.map(|(d, _, dd)| (d, dd));
+        if let Some((d, _)) = best {
+            paired[k] = true;
+            paired[d] = true;
+            pairs.push((lu, pure[d].0));
+        }
+    }
+    spanned.extend((0..pure.len()).filter(|&k| !paired[k]).map(|k| pure[k].0));
+    spanned.sort_unstable();
+
+    // close them: each new face on edges that end with at most two faces
+    // — the kept ones, those laid before, its closure's own — and no new
+    // face on the vertices of a kept one or of one laid before
+    let mut laid: HashMap<Edge, usize> = HashMap::new();
+    let mut laid_faces: HashSet<[u32; 3]> = HashSet::new();
+    let kept_on = |u: u32, v: u32| {
+        topo.edge_id(u, v).map_or(0, |e| {
+            topo.edge_faces(e)
+                .iter()
+                .filter(|&&f| kept[f as usize])
+                .count()
+        })
+    };
+    let kept_face = |t: [u32; 3]| {
+        topo.edge_id(t[0], t[1]).is_some_and(|e| {
+            topo.edge_faces(e)
+                .iter()
+                .any(|&f| kept[f as usize] && orig[f as usize].contains(&t[2]))
+        })
+    };
+    let sorted = |t: [u32; 3]| {
+        let mut k = t;
+        k.sort_unstable();
+        k
+    };
+    let mut out = Vec::new();
+    let mut place = |tris: Vec<[u32; 3]>,
+                     laid: &mut HashMap<Edge, usize>,
+                     laid_faces: &mut HashSet<[u32; 3]>| {
+        let mut mine: HashMap<Edge, usize> = HashMap::new();
+        for &t in &tris {
+            for e in face_edges(t) {
+                *mine.entry(e).or_default() += 1;
+            }
+        }
+        let crowded = mine
+            .iter()
+            .any(|(e, &k)| kept_on(e.0, e.1) + laid.get(e).copied().unwrap_or(0) + k > 2);
+        let twice = tris
+            .iter()
+            .any(|&t| kept_face(t) || laid_faces.contains(&sorted(t)));
+        if crowded || twice {
+            return;
+        }
+        for (e, k) in mine {
+            *laid.entry(e).or_default() += k;
+        }
+        laid_faces.extend(tris.iter().map(|&t| sorted(t)));
+        out.extend(tris);
+    };
+    for (lu, ld) in pairs {
+        if loops[ld].verts.iter().any(|v| loops[lu].verts.contains(v)) {
+            for lens in lenses(&loops[lu], &loops[ld]).unwrap_or_default() {
+                if let Some(tris) = span(&lens, verts, orig, topo, &kept) {
+                    place(tris, &mut laid, &mut laid_faces);
+                }
+            }
+            continue;
+        }
+        // the kept faces run each loop forward: the strip runs the up loop
+        // forward once it is turned, and the down loop backward
+        let a: Vec<u32> = loops[lu].verts.iter().rev().copied().collect();
+        let b = &loops[ld].verts;
+        let taken = |u: u32, v: u32| kept_on(u, v) > 0 || laid.contains_key(&edge(u, v));
+        if let Some(tris) = strip(verts, &a, b, &taken) {
+            place(tris, &mut laid, &mut laid_faces);
+        }
+    }
+    for li in spanned {
+        if let Some(tris) = span(&loops[li], verts, orig, topo, &kept) {
+            place(tris, &mut laid, &mut laid_faces);
+        }
+    }
+    out
 }
 
 /// What [`remove_parallel_patches`] did.
@@ -900,7 +1050,8 @@ pub struct Removed {
 
 /// `remove_parallel_patches` on already trimmed patches: classify each
 /// (fold or parallel), remove them all, drop pieces the removal cut off
-/// main that border only fold patches, then stitch the parallel sides.
+/// main that border only fold patches, then close the holes the parallel
+/// ones opened ([`close_holes`]).
 /// The loops over every face run on [`threads`]' pool.
 pub fn remove_parallel_patches(m: &PatchMesh<'_>, patches: &[Patch]) -> Removed {
     threads::install(|| remove_patches(m, patches))
@@ -1001,7 +1152,7 @@ fn remove_patches(m: &PatchMesh<'_>, patches: &[Patch]) -> Removed {
     let n_removed = removed.iter().filter(|&&r| r).count();
     let mut n_stitched = 0;
     if !mode_b.is_empty() {
-        let new = stitch_mode_b(m.verts, &topo, &gone, m.faces, &mode_b, patches);
+        let new = close_holes(m.verts, &topo, m.faces, &gone, &mode_b, patches);
         n_stitched = new.len();
         faces.extend(new);
     }
@@ -1161,7 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn zipping_two_squares_consumes_every_rim_edge_once() {
+    fn a_strip_runs_each_loop_once_and_lays_no_taken_rung() {
         let verts = [
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
@@ -1172,26 +1323,203 @@ mod tests {
             [1.0, 1.0, 1.0],
             [0.0, 1.0, 1.0],
         ];
-        let tris = zip_vertex_loops(&[0, 1, 2, 3], &[4, 5, 6, 7], &verts, true, true);
+        let none = |_: u32, _: u32| false;
+        let tris = strip(&verts, &[0, 1, 2, 3], &[4, 5, 6, 7], &none).unwrap();
         assert_eq!(tris.len(), 8);
-        let mut rim: HashMap<Edge, usize> = HashMap::new();
+        let mut uses: HashMap<(u32, u32), usize> = HashMap::new();
         for t in &tris {
-            for e in face_edges(*t) {
-                *rim.entry(e).or_insert(0) += 1;
+            for k in 0..3 {
+                *uses.entry((t[k], t[(k + 1) % 3])).or_insert(0) += 1;
             }
         }
-        for e in [
+        // the first loop run forward, the second backward, each edge once
+        for (a, b) in [
             (0, 1),
             (1, 2),
             (2, 3),
-            (0, 3),
-            (4, 5),
-            (5, 6),
-            (6, 7),
+            (3, 0),
+            (5, 4),
+            (6, 5),
+            (7, 6),
             (4, 7),
         ] {
-            assert_eq!(rim[&e], 1, "{e:?}");
+            assert_eq!(uses.get(&(a, b)), Some(&1), "{a}-{b}");
         }
+        // each rung twice, once each way: the strip is wound as one sheet
+        for (&(a, b), &k) in &uses {
+            if (a < 4) != (b < 4) {
+                assert_eq!(k, 1);
+                assert_eq!(uses.get(&(b, a)), Some(&1));
+            }
+        }
+        // a rung the mesh has already is not laid again
+        let taken = |u: u32, v: u32| (u.min(v), u.max(v)) == (0, 4);
+        let tris = strip(&verts, &[0, 1, 2, 3], &[4, 5, 6, 7], &taken).unwrap();
+        assert!(tris.iter().all(|t| !(t.contains(&0) && t.contains(&4))));
+    }
+
+    #[test]
+    fn a_strip_never_lays_a_rung_twice() {
+        // a small square beside the big one's second corner: the cheapest
+        // way round fans all of it from that corner, which lays the
+        // corner's first rung again — a cone, four faces on one edge
+        let verts = [
+            [0.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [10.0, 10.0, 0.0],
+            [0.0, 10.0, 0.0],
+            [9.4, 0.5, 1.0],
+            [9.5, 0.5, 1.0],
+            [9.5, 0.6, 1.0],
+            [9.4, 0.6, 1.0],
+        ];
+        let none = |_: u32, _: u32| false;
+        let tris = strip(&verts, &[0, 1, 2, 3], &[4, 5, 6, 7], &none).unwrap();
+        assert_eq!(tris.len(), 8);
+        let mut on: HashMap<Edge, usize> = HashMap::new();
+        for t in &tris {
+            for e in face_edges(*t) {
+                *on.entry(e).or_insert(0) += 1;
+            }
+        }
+        for (e, k) in on {
+            let rung = (e.0 < 4) != (e.1 < 4);
+            assert_eq!(k, if rung { 2 } else { 1 }, "{e:?}");
+        }
+    }
+
+    /// Two square tubes along x meeting at the chunk boundary x = 0, each
+    /// closed there by a cap of its own: the left one's (up, facing +x)
+    /// over its square of half-width 1, the right one's (down, facing -x)
+    /// over `right` (its outline at x = 0, from y, z pairs). Every face
+    /// faces out. The vertices of the right outline at a left corner are
+    /// the left tube's. Returns the mesh's vertices and faces and the
+    /// sandwich's patch.
+    fn sandwich(right: &[[f64; 2]]) -> (Vec<V3>, Vec<[u32; 3]>, Patch) {
+        let square = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
+        let mut v: Vec<V3> = Vec::new();
+        for x in [-2.0, 0.0] {
+            for [y, z] in square {
+                v.push([x, y, z]);
+            }
+        }
+        let shared = |p: [f64; 2]| square.iter().position(|q| *q == p).map(|i| 4 + i as u32);
+        let mut ring_r: Vec<u32> = Vec::new();
+        for &p in right {
+            ring_r.push(shared(p).unwrap_or_else(|| {
+                v.push([0.0, p[0], p[1]]);
+                (v.len() - 1) as u32
+            }));
+        }
+        let far_r: Vec<u32> = right
+            .iter()
+            .map(|&[y, z]| {
+                v.push([2.0, y, z]);
+                (v.len() - 1) as u32
+            })
+            .collect();
+        let mut f: Vec<[u32; 3]> = Vec::new();
+        // sides: rings run anticlockwise about +x, so [a, b, d] faces out
+        let band = |f: &mut Vec<[u32; 3]>, lo: &[u32], hi: &[u32]| {
+            let n = lo.len();
+            for i in 0..n {
+                let j = (i + 1) % n;
+                f.push([lo[i], lo[j], hi[j]]);
+                f.push([lo[i], hi[j], hi[i]]);
+            }
+        };
+        band(&mut f, &[0, 1, 2, 3], &[4, 5, 6, 7]);
+        band(&mut f, &ring_r, &far_r);
+        // the far ends, capped facing out
+        f.push([0, 2, 1]);
+        f.push([0, 3, 2]);
+        for i in 1..far_r.len() - 1 {
+            f.push([far_r[0], far_r[i], far_r[i + 1]]);
+        }
+        // the sandwich: the left cap facing +x, the right one facing -x,
+        // fanned from a vertex of its own (a cap sharing an edge with the
+        // left one would be a fold, not a sandwich)
+        let up_from = f.len() as u32;
+        f.push([4, 5, 6]);
+        f.push([4, 6, 7]);
+        let down_from = f.len() as u32;
+        let n = ring_r.len();
+        let o = (0..n)
+            .find(|&i| ring_r[i] > 7)
+            .expect("a vertex of its own");
+        for i in 1..n - 1 {
+            let (a, b) = (ring_r[(o + i) % n], ring_r[(o + i + 1) % n]);
+            f.push([ring_r[o], b, a]);
+        }
+        let up: Vec<u32> = (up_from..down_from).collect();
+        let down: Vec<u32> = (down_from..f.len() as u32).collect();
+        let patch = Patch {
+            axis: 0,
+            bval: 0,
+            faces: up.iter().chain(&down).copied().collect(),
+            up,
+            down,
+        };
+        (v, f, patch)
+    }
+
+    fn removed_and_closed(v: &[V3], f: &[[u32; 3]], patch: Patch) -> (Vec<[u32; 3]>, usize) {
+        let normals: Vec<V3> = f
+            .iter()
+            .map(|t| {
+                let [a, b, c] = t.map(|i| v[i as usize]);
+                let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let w = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+                [
+                    u[1] * w[2] - u[2] * w[1],
+                    u[2] * w[0] - u[0] * w[2],
+                    u[0] * w[1] - u[1] * w[0],
+                ]
+            })
+            .collect();
+        let m = PatchMesh {
+            faces: f,
+            verts: v,
+            normals: &normals,
+        };
+        let done = remove_parallel_patches(&m, &[patch]);
+        (done.faces, done.n_stitched)
+    }
+
+    #[test]
+    fn nested_outlines_are_joined_by_a_strip() {
+        // the right tube wider: its outline runs round the left one's
+        let right = [[-1.5, -1.5], [1.5, -1.5], [1.5, 1.5], [-1.5, 1.5]];
+        let (v, f, patch) = sandwich(&right);
+        let (out, n) = removed_and_closed(&v, &f, patch);
+        assert_eq!(n, 8);
+        let c = mesh::validity::check(&v, &out);
+        assert!(c.is_valid(), "{c:?}");
+        // closed: every edge has two faces
+        let t = Topology::new(&out, v.len());
+        assert!((0..t.n_edges()).all(|e| t.edge_faces(e).len() == 2));
+    }
+
+    #[test]
+    fn outlines_meeting_at_corners_are_closed_lens_by_lens() {
+        // the right outline the left square's corners, bulging out between
+        let right = [
+            [-1.0, -1.0],
+            [0.0, -1.5],
+            [1.0, -1.0],
+            [1.5, 0.0],
+            [1.0, 1.0],
+            [0.0, 1.5],
+            [-1.0, 1.0],
+            [-1.5, 0.0],
+        ];
+        let (v, f, patch) = sandwich(&right);
+        let (out, n) = removed_and_closed(&v, &f, patch);
+        assert_eq!(n, 4);
+        let c = mesh::validity::check(&v, &out);
+        assert!(c.is_valid(), "{c:?}");
+        let t = Topology::new(&out, v.len());
+        assert!((0..t.n_edges()).all(|e| t.edge_faces(e).len() == 2));
     }
 }
 

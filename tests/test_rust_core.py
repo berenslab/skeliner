@@ -465,7 +465,14 @@ class TestFusions:
         assert len(out.vertices) == len(bowtie.vertices) + 1
         assert faces[2].tolist() == [0, 0, 0]
         assert not set(faces[0].tolist()) & set(faces[1].tolist())
-        assert_identical(out.vertices[faces[1]], bowtie.vertices[[0, 3, 4]])
+        assert_identical(out.vertices[faces[1][1:]], bowtie.vertices[[3, 4]])
+        # the copy of vertex 0 a thousandth of its piece's mean edge off the
+        # point, towards the mean of its other vertices, (-1, 0.5, 0)
+        copy = out.vertices[faces[1][0]]
+        reach = (np.sqrt(2.0) + 1.0) / 2.0
+        assert np.isclose(np.linalg.norm(copy), reach / 1000.0, rtol=1e-12)
+        toward = np.array([-1.0, 0.5, 0.0]) / np.linalg.norm([-1.0, 0.5, 0.0])
+        assert np.isclose(copy @ toward, np.linalg.norm(copy), rtol=1e-12)
 
 
 class TestFilterSmallClusters:

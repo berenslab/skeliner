@@ -6,6 +6,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+use std::collections::HashSet;
+
 use crate::common::*;
 
 /// Edge-connected components of the non-degenerate faces.
@@ -117,21 +119,38 @@ fn find_nonmanifold_fusions<'py>(
     }))
 }
 
-/// Relabelled faces, and the vertex each new vertex copies.
-type FacesAndSources<'py> = (Bound<'py, PyArray2<i64>>, Bound<'py, PyArray1<i64>>);
+/// Relabelled faces, each new vertex's point, and the vertex it copies.
+type FacesAndCopies<'py> = (
+    Bound<'py, PyArray2<i64>>,
+    Bound<'py, PyArray2<f64>>,
+    Bound<'py, PyArray1<i64>>,
+);
 
-/// `skeliner.pre._split_fan_vertices` on arrays: `(faces, sources)`, where
-/// `sources[i]` is the vertex that new vertex `n_vertices + i` copies.
-/// `sources` is empty when no fan is split.
+/// A [`::pre::fusions::Split`] as arrays.
+fn split_out<'py>(py: Python<'py>, split: ::pre::fusions::Split) -> FacesAndCopies<'py> {
+    let out: Vec<[i64; 3]> = split.faces.iter().map(|f| f.map(i64::from)).collect();
+    let sources: Array1<i64> = split.sources.into_iter().map(i64::from).collect();
+    (
+        rows_to_array(&out).into_pyarray(py),
+        rows_to_array(&split.points).into_pyarray(py),
+        sources.into_pyarray(py),
+    )
+}
+
+/// `skeliner.pre._split_fan_vertices` on arrays: `(faces, points,
+/// sources)`, where new vertex `len(vertices) + i` sits at `points[i]` and
+/// copies `sources[i]`; a fan piece with no area is dropped (`[0, 0, 0]`).
+/// `points` and `sources` are empty when no fan is split.
 #[pyfunction]
-#[pyo3(signature = (faces, n_vertices, candidates=None))]
+#[pyo3(signature = (faces, vertices, candidates=None))]
 fn split_fan_vertices<'py>(
     py: Python<'py>,
     faces: PyReadonlyArray2<'py, i64>,
-    n_vertices: usize,
+    vertices: PyReadonlyArray2<'py, f64>,
     candidates: Option<numpy::PyReadonlyArray1<'py, i64>>,
-) -> PyResult<FacesAndSources<'py>> {
-    let (tris, n) = checked_faces(&faces, Some(n_vertices))?;
+) -> PyResult<FacesAndCopies<'py>> {
+    let verts = rows3("V", &vertices)?;
+    let (tris, n) = checked_faces(&faces, Some(verts.len()))?;
     let candidates: Option<Vec<u32>> = candidates
         .map(|c| {
             c.as_array()
@@ -147,15 +166,15 @@ fn split_fan_vertices<'py>(
         .transpose()?;
     let split = py.detach(|| {
         let topo = ::mesh::Topology::new(&tris, n);
-        ::pre::fusions::split_fan_vertices(&topo, &tris, candidates.as_deref())
+        ::pre::fusions::split_fan_vertices(&topo, &tris, &verts, candidates.as_deref())
     });
-    let (out, sources) = split.unwrap_or((tris, Vec::new()));
-    let out: Vec<[i64; 3]> = out.iter().map(|f| f.map(i64::from)).collect();
-    let sources: Array1<i64> = sources.into_iter().map(i64::from).collect();
-    Ok((
-        rows_to_array(&out).into_pyarray(py),
-        sources.into_pyarray(py),
-    ))
+    let split = split.unwrap_or(::pre::fusions::Split {
+        faces: tris,
+        points: Vec::new(),
+        sources: Vec::new(),
+        dropped: 0,
+    });
+    Ok(split_out(py, split))
 }
 
 /// `skeliner.pre._outward_dot` on arrays.
@@ -1074,6 +1093,48 @@ fn remove_parallel_patches<'py>(
     ))
 }
 
+/// `remove_parallel_patches`' last step, which the Python path runs here
+/// too: the triangles closing the holes the removed parallel faces leave
+/// (`::pre::patches::close_holes`), given the faces before the removal,
+/// which of them are `gone` (removed, or dropped as cut off), the parallel
+/// faces among them, and the patches.
+#[pyfunction]
+fn close_patch_holes<'py>(
+    py: Python<'py>,
+    faces: PyReadonlyArray2<'py, i64>,
+    vertices: PyReadonlyArray2<'py, f64>,
+    gone: numpy::PyReadonlyArray1<'py, bool>,
+    parallel: Vec<i64>,
+    patches: Vec<PatchTuple>,
+) -> PyResult<Bound<'py, PyArray2<i64>>> {
+    let verts = rows3("V", &vertices)?;
+    let (tris, n) = checked_faces(&faces, Some(verts.len()))?;
+    let gone = gone.as_array().to_vec();
+    if gone.len() != tris.len() {
+        return Err(PyValueError::new_err("gone needs one value per face"));
+    }
+    let nf = tris.len();
+    let parallel: HashSet<u32> = parallel
+        .into_iter()
+        .map(|f| {
+            u32::try_from(f)
+                .ok()
+                .filter(|&f| (f as usize) < nf)
+                .ok_or_else(|| PyValueError::new_err(format!("face index {f} is out of range")))
+        })
+        .collect::<PyResult<_>>()?;
+    let patches: Vec<::pre::patches::Patch> = patches
+        .into_iter()
+        .map(|t| patch_from_tuple(t, nf))
+        .collect::<PyResult<_>>()?;
+    let new = py.detach(|| {
+        let topo = ::mesh::Topology::new(&tris, n);
+        ::pre::patches::close_holes(&verts, &topo, &tris, &gone, &parallel, &patches)
+    });
+    let out: Vec<[i64; 3]> = new.iter().map(|f| f.map(i64::from)).collect();
+    Ok(rows_to_array(&out).into_pyarray(py))
+}
+
 /// What [`remove_gaps`] hands back: new vertices, the rebuilt faces (None
 /// when nothing was stitched), and the bridged, removed and skipped counts.
 type GapsOut<'py> = (
@@ -1096,7 +1157,6 @@ fn remove_gaps<'py>(
     py: Python<'py>,
     faces: PyReadonlyArray2<'py, i64>,
     vertices: PyReadonlyArray2<'py, f64>,
-    face_normals: PyReadonlyArray2<'py, f64>,
     median_edge: f64,
     labels: Option<numpy::PyReadonlyArray1<'py, i64>>,
     gaps: Vec<(Vec<i64>, Vec<i64>)>,
@@ -1105,10 +1165,6 @@ fn remove_gaps<'py>(
     use ::pre::stitch::{GapTips, LoopFit, StitchMesh};
     let verts = rows3("V", &vertices)?;
     let (tris, n) = checked_faces(&faces, Some(verts.len()))?;
-    let normals = rows3("N", &face_normals)?;
-    if normals.len() != tris.len() {
-        return Err(PyValueError::new_err("face_normals needs one row per face"));
-    }
     let labels = labels.map(|l| l.as_array().to_vec());
     if labels.as_ref().is_some_and(|l| l.len() != tris.len()) {
         return Err(PyValueError::new_err("labels needs one value per face"));
@@ -1139,7 +1195,6 @@ fn remove_gaps<'py>(
     let mesh = StitchMesh {
         faces: &tris,
         verts: &verts,
-        face_normals: &normals,
         median_edge,
     };
     let mut call = |ids: &[u32]| -> PyResult<LoopFit> {
@@ -1174,16 +1229,18 @@ fn remove_gaps<'py>(
 }
 
 /// `skeliner.pre.remove_fusions` on arrays: fusion faces degenerate to
-/// `[0, 0, 0]` and the fans they held together split.  Returns the new
-/// faces and, per appended vertex, the vertex it copies.
+/// `[0, 0, 0]` and the fans they held together split, each copy off its
+/// vertex's point. Returns `(faces, points, sources)` as
+/// [`split_fan_vertices`] does.
 #[pyfunction]
 fn remove_fusions<'py>(
     py: Python<'py>,
     faces: PyReadonlyArray2<'py, i64>,
-    n_vertices: usize,
+    vertices: PyReadonlyArray2<'py, f64>,
     fusions: Vec<Vec<i64>>,
-) -> PyResult<FacesAndSources<'py>> {
-    let (tris, n) = checked_faces(&faces, Some(n_vertices))?;
+) -> PyResult<FacesAndCopies<'py>> {
+    let verts = rows3("V", &vertices)?;
+    let (tris, _) = checked_faces(&faces, Some(verts.len()))?;
     let nf = tris.len();
     let fusions: Vec<Vec<u32>> = fusions
         .into_iter()
@@ -1200,13 +1257,8 @@ fn remove_fusions<'py>(
                 .collect()
         })
         .collect::<PyResult<_>>()?;
-    let (out, sources) = py.detach(|| ::pre::fusions::remove_fusions(&tris, n, &fusions));
-    let out: Vec<[i64; 3]> = out.iter().map(|f| f.map(i64::from)).collect();
-    let sources: Array1<i64> = sources.into_iter().map(i64::from).collect();
-    Ok((
-        rows_to_array(&out).into_pyarray(py),
-        sources.into_pyarray(py),
-    ))
+    let split = py.detach(|| ::pre::fusions::remove_fusions(&tris, &verts, &fusions));
+    Ok(split_out(py, split))
 }
 
 /// Pieces from [`break_up_classify`], their kinds, and per face whether it
@@ -1644,6 +1696,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(remove_parallel_patches, m)?)?;
     m.add_function(wrap_pyfunction!(remove_gaps, m)?)?;
     m.add_function(wrap_pyfunction!(remove_fusions, m)?)?;
+    m.add_function(wrap_pyfunction!(close_patch_holes, m)?)?;
     m.add_function(wrap_pyfunction!(break_up_classify, m)?)?;
     m.add_function(wrap_pyfunction!(break_up_severed_walls, m)?)?;
     m.add_function(wrap_pyfunction!(find_soma_ring_cutoff, m)?)?;

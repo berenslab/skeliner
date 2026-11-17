@@ -631,7 +631,6 @@ def _stitch_and_rebuild(
     new_verts, faces = kernels.pre.stitch_and_rebuild(
         np.asarray(mesh.faces, dtype=np.int64),
         verts,
-        np.asarray(mesh.face_normals, dtype=np.float64),
         _median_edge(mesh),
         sel,
         loop_pairs,
@@ -3436,7 +3435,6 @@ def _bridge_gaps(mesh, gaps, labels):
     new_verts, faces, n_bridged, n_removed, n_skipped = kernels.pre.remove_gaps(
         np.asarray(mesh.faces, dtype=np.int64),
         verts,
-        np.asarray(mesh.face_normals, dtype=np.float64),
         _median_edge(mesh),
         None if labels is None else np.asarray(labels, dtype=np.int64),
         [
@@ -4218,8 +4216,10 @@ def _split_fan_vertices(
     """Split vertices whose face fan is disconnected by face-edge adjacency.
 
     At a manifold fusion, two branches share vertices but not face-edges.
-    Duplicating these vertices so each face-edge component gets its own
-    copy disconnects the branches in the vertex graph.
+    Giving each face-edge piece of such a fan but the first its own copy of
+    the vertex disconnects the branches in the vertex graph.  Each copy sits
+    a thousandth of its piece's reach off the point, into the piece, so no
+    two vertices share a point; a piece of faces with no area is dropped.
 
     Returns a new mesh with split vertices (more vertices, same faces).
     """
@@ -4228,13 +4228,13 @@ def _split_fan_vertices(
         if candidate_verts is None
         else np.fromiter(sorted(candidate_verts), dtype=np.int64)
     )
-    faces, sources = kernels.pre.split_fan_vertices(
-        np.asarray(mesh.faces, dtype=np.int64), len(mesh.vertices), candidates
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    faces, points, sources = kernels.pre.split_fan_vertices(
+        np.asarray(mesh.faces, dtype=np.int64), verts, candidates
     )
-    if len(sources) == 0:
+    if len(sources) == 0 and np.array_equal(faces, mesh.faces):
         return mesh
-    verts = np.asarray(mesh.vertices)
-    result = Mesh(np.vstack([verts, verts[sources]]), faces)
+    result = Mesh(np.vstack([verts, points]), faces)
     if verbose:
         print(
             f"[skeliner.pre] Split {len(sources)} fan vertices "
@@ -4261,13 +4261,22 @@ def remove_fusions(
        :func:`find_fusions` (non-manifold edges, duplicate faces).
     2. **Split shared vertices** — vertices whose face fan is
        disconnected by face-edge adjacency, indicating two branches
-       share a vertex without sharing face-edges.
+       share a vertex without sharing face-edges.  The first piece of
+       such a fan with an area keeps the vertex; each later one gets a
+       copy of it, a thousandth of the piece's mean edge off the point,
+       towards the piece's other vertices — far above the eight decimals
+       an OBJ keeps, far below anything the mesh shows — so the cut stays
+       cut where the mesh is read back (:func:`~skeliner.io.load_mesh`
+       merges vertices that share a point along a seam) and no two
+       vertices share a point.  A piece of faces with no area is no
+       surface, debris the cut leaves hanging by a point or an edge: it
+       is dropped.
 
     Parameters
     ----------
     mesh : Mesh
         Input neuron mesh (ideally after organelle removal).
-    fusion_clusters : list[list[int]] or None
+    fusions : list[list[int]] or None
         Pre-computed clusters from :func:`find_fusions`.  If provided,
         detection is skipped and these clusters are used directly.
     radius : float or None
@@ -4275,6 +4284,9 @@ def remove_fusions(
     radius_multiplier : float
         Multiplier for auto radius.
     verbose : bool
+    mesh_stats : MeshStats or None
+        Its outward dots are reused when *fusions* is None; its topology is
+        dropped (the fans are split).
 
     Returns
     -------
@@ -4292,6 +4304,7 @@ def remove_fusions(
             radius=radius,
             radius_multiplier=radius_multiplier,
             verbose=verbose,
+            mesh_stats=mesh_stats,
         )
 
     all_fusions: set[int] = set()
@@ -4300,14 +4313,14 @@ def remove_fusions(
 
     n_verts_before = len(mesh.vertices)
     if all_fusions:
-        faces, sources = kernels.pre.remove_fusions(
+        verts = np.asarray(mesh.vertices, dtype=np.float64)
+        faces, points, _ = kernels.pre.remove_fusions(
             np.asarray(mesh.faces, dtype=np.int64),
-            len(mesh.vertices),
+            verts,
             [list(map(int, c)) for c in fusions],
         )
-        verts = np.asarray(mesh.vertices)
-        if len(sources):
-            verts = np.vstack([verts, verts[sources]])
+        if len(points):
+            verts = np.vstack([verts, points])
         mesh = Mesh(verts, faces)
     n_split = len(mesh.vertices) - n_verts_before
 
@@ -4794,6 +4807,16 @@ def remove_parallel_patches(
     4. For each new component, check which removed patches it borders:
        - borders only Mode A → orphan from fold removal → remove
        - borders any Mode B → real neurite piece → keep (for stitching)
+    5. Close the holes the Mode B faces leave: the loops of the kept
+       faces' border along them.  The outlines the two sides of a
+       sandwich leave (a loop along up faces only, one along down faces
+       only) are joined — by a strip where they run apart all the way
+       round, lens by lens where they touch at two vertices or more; every
+       other loop is closed by its own triangulation (Liepa's, as
+       :func:`fill_holes` lays it, no vertex added).  No new face spans no
+       area or repeats a face, and no edge ends with more than two faces:
+       a loop that cannot be closed so stays open, as does a loop also
+       running along a face the removal did not take.
 
     Parameters
     ----------
@@ -4809,7 +4832,8 @@ def remove_parallel_patches(
     Returns
     -------
     Mesh
-        Mesh with patch artifacts and Mode A orphans removed.
+        Mesh with patch artifacts and Mode A orphans removed, the holes
+        the parallel patches leave closed.
     """
     if verbose:
         print("[skeliner.pre] Removing parallel patches …")
