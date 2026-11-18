@@ -331,7 +331,7 @@ fn find_patches(m: &PatchMesh<'_>, boundaries: &[(usize, Vec<f64>)], p: &FindPar
         .map(|comp| {
             let mut best_axis = 0;
             let mut best_count = 0;
-            for ax in 0..3 {
+            for ax in [0, 1, 2] {
                 let cnt = comp
                     .iter()
                     .filter(|&&f| m.normals[f as usize][ax].abs() > p.normal_thresh)

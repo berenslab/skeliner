@@ -902,10 +902,15 @@ def split_fan_vertices(
     ``len(vertices) + i`` at ``points[i]``, copying ``sources[i]`` — empty
     when no fan of the *candidates* (default all vertices, in order) falls
     apart.  The pieces are found in face order among the faces not dropped
-    yet; where no piece has an area, all are dropped.
+    yet; where no piece has an area, all are dropped.  A dropped face
+    leaves the fans at its other vertices too, which may fall apart there:
+    those vertices are checked next, as they are labelled by then, until a
+    round drops nothing.
 
-    A copy changes no face's neighbours, so every fan is read on the faces
-    as given, and every copy's point on the vertices as given.
+    A copy changes no face's neighbours and a drop takes the face out of
+    every fan, so every fan is read on the faces as given, and every copy's
+    point on the vertices as given; a copy of a copy copies the first
+    vertex.
     """
     verts_in = rows3("V", vertices)
     orig_faces, n_verts = checked_faces(faces, len(verts_in))
@@ -913,7 +918,7 @@ def split_fan_vertices(
     if candidates is not None:
         check = _vertex_ids(candidates, n_verts).tolist()
     else:
-        check = range(n_verts)
+        check = list(range(n_verts))
     _good = non_degenerate(orig_faces)
     vert_to_face: list[list[int]] = [[] for _ in range(n_verts)]
     for fi, f in enumerate(orig_faces):
@@ -926,66 +931,73 @@ def split_fan_vertices(
     out = orig_faces.copy()
     points: list[tuple[float, float, float]] = []
     sources: list[int] = []
-    for vid in check:
-        fan = [
-            fi
-            for fi in vert_to_face[vid]
-            if not (out[fi][0] == out[fi][1] == out[fi][2])
-        ]
-        if len(fan) < 2:
-            continue
-
-        fan_set = set(fan)
-        fan_adj: dict[int, set[int]] = defaultdict(set)
-        for fi in fan:
-            f = faces_list[fi]
-            for i in range(3):
-                a, b = f[i], f[(i + 1) % 3]
-                e = (min(a, b), max(a, b))
-                for nfi in edge_to_face[e]:
-                    if nfi in fan_set and nfi != fi:
-                        fan_adj[fi].add(nfi)
-
-        # connected pieces of the fan, in the order their first face is met
-        vis: set[int] = set()
-        comps: list[set[int]] = []
-        for fi in fan:
-            if fi in vis:
+    while check:
+        # the vertices of the faces this round drops, to check next
+        parted: set[int] = set()
+        for vid in check:
+            # a copy's faces were all its first vertex's
+            base = vid if vid < n_verts else sources[vid - n_verts]
+            fan = [
+                fi
+                for fi in vert_to_face[base]
+                if not (out[fi][0] == out[fi][1] == out[fi][2]) and vid in out[fi]
+            ]
+            if len(fan) < 2:
                 continue
-            comp: set[int] = set()
-            q = deque([fi])
-            while q:
-                curr = q.popleft()
-                if curr in vis:
+
+            fan_set = set(fan)
+            fan_adj: dict[int, set[int]] = defaultdict(set)
+            for fi in fan:
+                f = faces_list[fi]
+                for i in range(3):
+                    a, b = f[i], f[(i + 1) % 3]
+                    e = (min(a, b), max(a, b))
+                    for nfi in edge_to_face[e]:
+                        if nfi in fan_set and nfi != fi:
+                            fan_adj[fi].add(nfi)
+
+            # connected pieces of the fan, in the order their first face is met
+            vis: set[int] = set()
+            comps: list[set[int]] = []
+            for fi in fan:
+                if fi in vis:
                     continue
-                vis.add(curr)
-                comp.add(curr)
-                for nfi in fan_adj[curr]:
-                    if nfi not in vis:
-                        q.append(nfi)
-            comps.append(comp)
-        if len(comps) < 2:
-            continue
+                comp: set[int] = set()
+                q = deque([fi])
+                while q:
+                    curr = q.popleft()
+                    if curr in vis:
+                        continue
+                    vis.add(curr)
+                    comp.add(curr)
+                    for nfi in fan_adj[curr]:
+                        if nfi not in vis:
+                            q.append(nfi)
+                comps.append(comp)
+            if len(comps) < 2:
+                continue
 
-        # the first piece with an area keeps the vertex, each other one with
-        # an area gets a copy, and those with none are dropped
-        has_area = [
-            any(_doubled_area(verts, faces_list[fi]) > 0.0 for fi in comp)
-            for comp in comps
-        ]
-        keeper = has_area.index(True) if any(has_area) else None
-        for i, comp_faces in enumerate(comps):
-            if i == keeper:
-                continue
-            if not has_area[i]:
+            # the first piece with an area keeps the vertex, each other one
+            # with an area gets a copy, and those with none are dropped
+            has_area = [
+                any(_doubled_area(verts, faces_list[fi]) > 0.0 for fi in comp)
+                for comp in comps
+            ]
+            keeper = has_area.index(True) if any(has_area) else None
+            for i, comp_faces in enumerate(comps):
+                if i == keeper:
+                    continue
+                if not has_area[i]:
+                    for fi in comp_faces:
+                        parted.update(int(w) for w in out[fi] if w != vid)
+                        out[fi] = 0
+                    continue
+                new_vid = n_verts + len(sources)
+                points.append(copy_point(verts, faces_list, base, comp_faces))
+                sources.append(base)
                 for fi in comp_faces:
-                    out[fi] = 0
-                continue
-            new_vid = n_verts + len(sources)
-            points.append(copy_point(verts, faces_list, vid, comp_faces))
-            sources.append(vid)
-            for fi in comp_faces:
-                out[fi][out[fi] == vid] = new_vid
+                    out[fi][out[fi] == vid] = new_vid
+        check = sorted(parted)
 
     return (
         out,

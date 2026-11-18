@@ -267,7 +267,12 @@ fn doubled_area(verts: &[V3], f: [u32; 3]) -> f64 {
 /// the copy goes against the piece's normal (into the solid it bounds), and
 /// where that is none, towards its first other vertex.
 pub fn copy_point(verts: &[V3], faces: &[[u32; 3]], v: u32, piece: &[u32]) -> V3 {
-    let p = verts[v as usize];
+    copy_point_at(&|w| verts[w as usize], faces, v, piece)
+}
+
+/// [`copy_point`] with each vertex at `at(vertex)`.
+pub fn copy_point_at(at: &dyn Fn(u32) -> V3, faces: &[[u32; 3]], v: u32, piece: &[u32]) -> V3 {
+    let p = at(v);
     let mut link: Vec<u32> = piece
         .iter()
         .flat_map(|&f| faces[f as usize])
@@ -278,7 +283,7 @@ pub fn copy_point(verts: &[V3], faces: &[[u32; 3]], v: u32, piece: &[u32]) -> V3
     let k = link.len() as f64;
     let (mut c, mut reach) = ([0.0f64; 3], 0.0f64);
     for &w in &link {
-        let q = verts[w as usize];
+        let q = at(w);
         for i in 0..3 {
             c[i] += q[i];
         }
@@ -294,7 +299,7 @@ pub fn copy_point(verts: &[V3], faces: &[[u32; 3]], v: u32, piece: &[u32]) -> V3
         ascending.sort_unstable();
         let mut n = [0.0f64; 3];
         for &f in &ascending {
-            let [a, b, e] = faces[f as usize].map(|w| verts[w as usize]);
+            let [a, b, e] = faces[f as usize].map(at);
             let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
             let w = [e[0] - a[0], e[1] - a[1], e[2] - a[2]];
             n[0] += u[1] * w[2] - u[2] * w[1];
@@ -304,7 +309,7 @@ pub fn copy_point(verts: &[V3], faces: &[[u32; 3]], v: u32, piece: &[u32]) -> V3
         d = n.map(|x| -x);
     }
     if length(d) == 0.0 {
-        let q = verts[link[0] as usize];
+        let q = at(link[0]);
         d = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
     }
     let step = reach / 1000.0 / length(d);
@@ -333,9 +338,13 @@ pub struct Split {
 /// new vertex, numbered on from `n_vertices` in the order split, at
 /// [`copy_point`]; a piece of faces with no area is no surface — debris
 /// the split leaves hanging by a point or an edge — and is dropped, every
-/// one of them where no piece has an area. The pieces are read on
-/// the faces as given (a copy changes no face's neighbours) and the copies'
-/// points from the vertices as given. None when no fan is split.
+/// one of them where no piece has an area. A dropped face leaves the fans
+/// at its other vertices too, which may fall apart there: those vertices
+/// are checked next, as they are labelled by then, until a round drops
+/// nothing. The pieces are read on the faces as given (a copy changes no
+/// face's neighbours, a drop takes the face out of every fan) and the
+/// copies' points from the vertices as given; a copy of a copy copies the
+/// first vertex. None when no fan is split.
 pub fn split_fan_vertices(
     t: &Topology,
     faces: &[[u32; 3]],
@@ -343,83 +352,96 @@ pub fn split_fan_vertices(
     candidates: Option<&[u32]>,
 ) -> Option<Split> {
     let n_vertices = t.n_vertices();
-    let all: Vec<u32>;
-    let check: &[u32] = match candidates {
-        Some(c) => c,
-        None => {
-            all = (0..n_vertices as u32).collect();
-            &all
-        }
-    };
     let gone = |f: &[u32; 3]| f[0] == f[1] && f[1] == f[2];
     let mut out = faces.to_vec();
     let (mut points, mut sources) = (Vec::new(), Vec::new());
     let mut dropped = 0;
-    for &vid in check {
-        let fan: Vec<u32> = t
-            .vertex_faces(vid as usize)
-            .iter()
-            .copied()
-            .filter(|&f| !gone(&out[f as usize]))
-            .collect();
-        if fan.len() < 2 {
-            continue;
-        }
-        let members: BTreeSet<u32> = fan.iter().copied().collect();
-        let mut seen: BTreeSet<u32> = BTreeSet::new();
-        let mut pieces: Vec<Vec<u32>> = Vec::new();
-        for &start in &fan {
-            if seen.contains(&start) {
+    let mut check: Vec<u32> = match candidates {
+        Some(c) => c.to_vec(),
+        None => (0..n_vertices as u32).collect(),
+    };
+    while !check.is_empty() {
+        // the vertices of the faces this round drops, to check next
+        let mut parted: Vec<u32> = Vec::new();
+        for &vid in &check {
+            // a copy's faces were all its first vertex's
+            let base = if (vid as usize) < n_vertices {
+                vid
+            } else {
+                sources[vid as usize - n_vertices]
+            };
+            let fan: Vec<u32> = t
+                .vertex_faces(base as usize)
+                .iter()
+                .copied()
+                .filter(|&f| {
+                    let g = out[f as usize];
+                    !gone(&g) && g.contains(&vid)
+                })
+                .collect();
+            if fan.len() < 2 {
                 continue;
             }
-            let mut piece = Vec::new();
-            let mut queue = VecDeque::from([start]);
-            while let Some(f) = queue.pop_front() {
-                if !seen.insert(f) {
+            let members: BTreeSet<u32> = fan.iter().copied().collect();
+            let mut seen: BTreeSet<u32> = BTreeSet::new();
+            let mut pieces: Vec<Vec<u32>> = Vec::new();
+            for &start in &fan {
+                if seen.contains(&start) {
                     continue;
                 }
-                piece.push(f);
-                for g in t.face_neighbors(f as usize) {
-                    if members.contains(&g) && !seen.contains(&g) {
-                        queue.push_back(g);
+                let mut piece = Vec::new();
+                let mut queue = VecDeque::from([start]);
+                while let Some(f) = queue.pop_front() {
+                    if !seen.insert(f) {
+                        continue;
+                    }
+                    piece.push(f);
+                    for g in t.face_neighbors(f as usize) {
+                        if members.contains(&g) && !seen.contains(&g) {
+                            queue.push_back(g);
+                        }
                     }
                 }
+                pieces.push(piece);
             }
-            pieces.push(piece);
-        }
-        if pieces.len() < 2 {
-            continue;
-        }
-        let has_area: Vec<bool> = pieces
-            .iter()
-            .map(|p| {
-                p.iter()
-                    .any(|&f| doubled_area(verts, faces[f as usize]) > 0.0)
-            })
-            .collect();
-        let keeper = has_area.iter().position(|&a| a);
-        for (i, piece) in pieces.iter().enumerate() {
-            if Some(i) == keeper {
+            if pieces.len() < 2 {
                 continue;
             }
-            if !has_area[i] {
+            let has_area: Vec<bool> = pieces
+                .iter()
+                .map(|p| {
+                    p.iter()
+                        .any(|&f| doubled_area(verts, faces[f as usize]) > 0.0)
+                })
+                .collect();
+            let keeper = has_area.iter().position(|&a| a);
+            for (i, piece) in pieces.iter().enumerate() {
+                if Some(i) == keeper {
+                    continue;
+                }
+                if !has_area[i] {
+                    for &f in piece {
+                        parted.extend(out[f as usize].into_iter().filter(|&w| w != vid));
+                        out[f as usize] = [0, 0, 0];
+                        dropped += 1;
+                    }
+                    continue;
+                }
+                let new_vid = (n_vertices + sources.len()) as u32;
+                points.push(copy_point(verts, faces, base, piece));
+                sources.push(base);
                 for &f in piece {
-                    out[f as usize] = [0, 0, 0];
-                    dropped += 1;
-                }
-                continue;
-            }
-            let new_vid = (n_vertices + sources.len()) as u32;
-            points.push(copy_point(verts, faces, vid, piece));
-            sources.push(vid);
-            for &f in piece {
-                for slot in out[f as usize].iter_mut() {
-                    if *slot == vid {
-                        *slot = new_vid;
+                    for slot in out[f as usize].iter_mut() {
+                        if *slot == vid {
+                            *slot = new_vid;
+                        }
                     }
                 }
             }
         }
+        parted.sort_unstable();
+        parted.dedup();
+        check = parted;
     }
     (!sources.is_empty() || dropped > 0).then_some(Split {
         faces: out,
@@ -568,6 +590,35 @@ mod tests {
         let s = split_fan_vertices(&t, &pair, &line, None).unwrap();
         assert_eq!(s.faces, vec![[0, 0, 0], [0, 0, 0]]);
         assert_eq!(s.dropped, 2);
+    }
+
+    #[test]
+    fn a_drop_that_parts_another_fan_splits_that_one_too() {
+        // at vertex 1, two faces of no area on the line y = z = 0 — a piece
+        // of their own beside [1, 6, 7] — that alone join, at vertex 0, the
+        // faces [0, 4, 2] and [0, 3, 5]: dropped at 1, they leave 0 parted
+        let v: Vec<V3> = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [1.5, -1.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+        ];
+        let faces = vec![[0, 4, 2], [0, 3, 5], [0, 2, 1], [0, 1, 3], [1, 6, 7]];
+        let t = Topology::new(&faces, v.len());
+        let s = split_fan_vertices(&t, &faces, &v, Some(&[1])).unwrap();
+        assert_eq!(
+            s.faces,
+            vec![[0, 4, 2], [8, 3, 5], [0, 0, 0], [0, 0, 0], [1, 6, 7]]
+        );
+        assert_eq!(s.sources, vec![0]);
+        assert_eq!(s.dropped, 2);
+        let mut all = v.clone();
+        all.extend_from_slice(&s.points);
+        assert!(mesh::validity::check(&all, &s.faces).split_fans.is_empty());
     }
 
     #[test]

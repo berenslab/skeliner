@@ -10,6 +10,7 @@ pub mod fill;
 pub mod find_gaps;
 pub mod fusions;
 pub mod gaps;
+pub mod isolate;
 pub mod nucleus;
 pub mod organelles;
 pub mod patches;

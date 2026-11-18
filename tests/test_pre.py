@@ -330,6 +330,23 @@ def _open_edges(faces) -> int:
     return int((n == 1).sum())
 
 
+def _validity(mesh) -> dict:
+    """What breaks a rule of a valid surface in *mesh*."""
+    from skeliner._backend import kernels
+
+    return kernels.mesh.validity(
+        np.asarray(mesh.vertices, dtype=np.float64),
+        np.asarray(mesh.faces, dtype=np.int64),
+    )
+
+
+def _apart(faces, inside) -> bool:
+    """No vertex named both by a face *inside* and by one not."""
+    faces = np.asarray(faces)
+    live = ~(faces == faces[:, :1]).all(axis=1)
+    return not np.intersect1d(faces[inside & live], faces[~inside & live]).size
+
+
 class TestFillHoles:
     def test_a_pocket_mouth_is_patched_on_the_tube(self):
         mesh, org = _tube_with_a_pocket()
@@ -374,6 +391,101 @@ class TestFillHoles:
         filled, _ = pre.preprocess(mesh)
         kept, _ = pre.preprocess(mesh, fill=False)
         assert len(filled.faces) > len(kept.faces) == len(mesh.faces)
+
+    def test_only_the_holes_on_the_pieces_asked_for_are_patched(self):
+        mesh, org = _tube_with_a_pocket()
+        n = len(mesh.faces)
+        assert len(pre.fill_holes(mesh, organelles=org, neurites=[]).faces) == n
+        tube = np.flatnonzero(~org.pocket)
+        out = pre.fill_holes(mesh, organelles=org, neurites=[tube])
+        assert len(out.faces) > n
+
+    def test_preprocess_cuts_the_patched_pocket_free(self, monkeypatch):
+        mesh, org = _tube_with_a_pocket()
+        # the pocket's faces first: a patch over its mouth borders the wall
+        # (lower ids) as well as the tube, and must still be the tube's
+        order = np.r_[np.flatnonzero(org.pocket), np.flatnonzero(~org.pocket)]
+        mesh = Mesh(mesh.vertices, mesh.faces[order])
+        z = np.zeros(len(order), dtype=bool)
+        org = Organelles(pocket=org.pocket[order], isolated=z, expanded=z.copy())
+        monkeypatch.setattr(pre, "find_organelles", lambda *_a, **_k: org)
+        clean, comps = pre.preprocess(mesh, soma=False, compact=True)
+        inside = comps.organelles.mask
+        assert inside.any() and len(clean.faces) > len(mesh.faces)
+        assert _apart(clean.faces, inside)
+        # every rule kept: the mouth's edges have two faces again
+        v = _validity(clean)
+        for rule in ("repeated", "flat", "duplicate", "crowded", "misoriented"):
+            assert not len(v[rule]), rule
+        assert not len(v["split_fans"]) and not len(v["shared_points"])
+        # the patch is the neurite's: every face is the tube's or the pocket's
+        arbor = sum(len(c) for c in comps.neurites) + sum(
+            len(c) for c in comps.discarded
+        )
+        assert arbor + inside.sum() == len(clean.faces)
+
+
+def test_a_step_taking_faces_out_splits_the_fans_they_held():
+    # two triangles meeting at vertex 0, held together by face 2; a step
+    # takes face 2 out, and vertex 0's fan falls apart
+    v = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [-1, 1, 0], [-1, 0, 0]], float)
+    before = np.array([[0, 1, 2], [0, 3, 4], [0, 2, 3]])
+    after = before.copy()
+    after[2] = 0
+    for out in both(pre._settled, sk.Mesh(v, after), before):
+        assert np.asarray(out.faces).tolist() == [[0, 1, 2], [5, 3, 4], [0, 0, 0]]
+        assert len(out.vertices) == 6
+        assert len(_validity(out)["split_fans"]) == 0
+
+
+class TestIsolateOrganelles:
+    def test_a_patched_pocket_comes_off_where_it_was_traced(self):
+        mesh, org = _tube_with_a_pocket()
+        filled = pre.fill_holes(mesh, organelles=org)
+        assert len(_validity(filled)["crowded"]), "the mouth's edges have three"
+        out = pre.isolate_organelles(filled, org, positions=mesh.vertices)
+        inside = np.r_[org.mask, np.zeros(len(out.faces) - len(org.mask), bool)]
+        assert _apart(out.faces, inside)
+        assert not len(_validity(out)["crowded"])
+        # the wall where it was traced, its rim a thousandth of an edge in;
+        # the fill had faired the rim out with the tube
+        wall = np.flatnonzero(org.mask)
+        traced = mesh.vertices[mesh.faces[wall]]
+        assert np.abs(out.vertices[out.faces[wall]] - traced).max() < 1e-2
+        assert np.abs(filled.vertices[filled.faces[wall]] - traced).max() > 0.1
+        # the surface keeps its vertices where the fill put them
+        assert np.array_equal(out.vertices[: len(filled.vertices)], filled.vertices)
+
+    def test_a_soma_vertex_copied_for_its_surface_stays_the_somas(self):
+        # four triangles round vertex 0, surface and organelle in turn: cut
+        # free, the second surface fan takes a copy of 0, which stays a soma
+        # vertex, while the organelles' copies are none
+        verts = np.array(
+            [[0, 0, 0], [1, 0, 0], [0, 1, 0], [-1, 0, 0], [0, -1, 0]], float
+        )
+        faces = np.array([[0, 1, 2], [0, 2, 3], [0, 3, 4], [0, 4, 1]])
+        mesh = Mesh(verts, faces)
+        inside = np.array([False, True, False, True])
+        z = np.zeros(4, dtype=bool)
+        org = Organelles(pocket=inside, isolated=z.copy(), expanded=z.copy())
+        soma = Soma.from_sphere(np.zeros(3), 2.0, verts=np.arange(5))
+        comps = MeshComponents(
+            soma=soma, organelles=org, neurites=Neurites([]), discarded=Discarded([])
+        )
+        out, sources = pre._isolated(mesh, org, None, None)
+        kept = pre._soma_keeps_its_copies(out, comps, sources, len(verts))
+        copies = np.arange(len(verts), len(out.vertices))
+        surface_copy = copies[~np.isin(copies, out.faces[inside])]
+        assert len(surface_copy) == 1 and sources[surface_copy[0] - 5] == 0
+        assert np.array_equal(kept.soma.verts, np.r_[np.arange(5), surface_copy])
+        # both surface faces still the soma's, the organelle faces not
+        mask = pre.soma_face_mask(np.asarray(out.faces), kept.soma.verts)
+        assert mask.tolist() == [True, False, True, False]
+
+    def test_no_organelle_leaves_the_mesh_as_it_is(self):
+        mesh, org = _tube_with_a_pocket()
+        none = Organelles.empty(len(mesh.faces))
+        assert pre.isolate_organelles(mesh, none) is mesh
 
 
 # ── find_fragments / remove_fragments ────────────────────────────────
@@ -2397,6 +2509,21 @@ class TestRealMesh:
     def test_find_disconnected_returns_list(self, reference_mesh):
         comps = pre.find_disconnected(reference_mesh)
         assert isinstance(comps, list)
+
+    def test_preprocess_makes_no_invalid_element(self, reference_mesh, tmp_path):
+        clean, comps = pre.preprocess(reference_mesh, compact=True)
+        out, src = _validity(clean), _validity(reference_mesh)
+        # what the stages make is valid: what is left is the source's
+        for rule in ("misoriented", "split_fans", "shared_points"):
+            assert not len(out[rule]), rule
+        for rule in ("repeated", "flat", "duplicate", "crowded"):
+            assert len(out[rule]) <= len(src[rule]), rule
+        assert _apart(clean.faces, comps.organelles.mask)
+        # and it reads back as written: every id, to the file's decimals
+        sk.io.save_mesh(clean, tmp_path / "clean.obj")
+        back = sk.io.load_mesh(tmp_path / "clean.obj")
+        assert np.array_equal(back.faces, clean.faces)
+        assert np.allclose(back.vertices, clean.vertices, rtol=0, atol=1e-8)
 
     @deprecated
     def test_remove_fragments_preserves_main(self, reference_mesh):

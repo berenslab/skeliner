@@ -1093,6 +1093,70 @@ fn remove_parallel_patches<'py>(
     ))
 }
 
+/// For each face from `n_old` on — the patches `fill_holes` appends — the
+/// `hosts` face (one flag per face before them) its patch hangs from
+/// (`::pre::fill::patch_hosts`), −1 where none. Rust only: the Python path
+/// runs it too.
+#[pyfunction]
+fn patch_hosts<'py>(
+    py: Python<'py>,
+    faces: PyReadonlyArray2<'py, i64>,
+    n_vertices: usize,
+    n_old: usize,
+    hosts: numpy::PyReadonlyArray1<'py, bool>,
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
+    let (tris, n) = checked_faces(&faces, Some(n_vertices))?;
+    if n_old > tris.len() {
+        return Err(PyValueError::new_err("n_old is past the faces"));
+    }
+    let hosts = hosts.as_array().to_vec();
+    if hosts.len() != n_old {
+        return Err(PyValueError::new_err(
+            "hosts needs one flag per face before n_old",
+        ));
+    }
+    let hosts = py.detach(|| ::pre::fill::patch_hosts(&tris, n, n_old, &hosts));
+    let out: Array1<i64> = hosts.into_iter().map(|h| h.map_or(-1, i64::from)).collect();
+    Ok(out.into_pyarray(py))
+}
+
+/// `skeliner.pre.isolate_organelles` on arrays (Rust only: the Python path
+/// runs it too): the organelle faces (`organelle`, one flag per face or
+/// fewer) given copies of the vertices they share with other faces, at
+/// `positions` (where each vertex below its length stood; the rest where
+/// they are) moved a thousandth of a fan's reach into it. Returns
+/// `(faces, points, sources)` as `split_fan_vertices` does.
+#[pyfunction]
+#[pyo3(signature = (faces, vertices, organelle, positions=None))]
+fn isolate_organelles<'py>(
+    py: Python<'py>,
+    faces: PyReadonlyArray2<'py, i64>,
+    vertices: PyReadonlyArray2<'py, f64>,
+    organelle: numpy::PyReadonlyArray1<'py, bool>,
+    positions: Option<PyReadonlyArray2<'py, f64>>,
+) -> PyResult<FacesAndCopies<'py>> {
+    let verts = rows3("V", &vertices)?;
+    let (tris, _) = checked_faces(&faces, Some(verts.len()))?;
+    let organelle = organelle.as_array().to_vec();
+    if organelle.len() > tris.len() {
+        return Err(PyValueError::new_err(
+            "organelle has more flags than there are faces",
+        ));
+    }
+    let positions = match positions {
+        Some(p) => rows3("P", &p)?,
+        None => Vec::new(),
+    };
+    if positions.len() > verts.len() {
+        return Err(PyValueError::new_err(
+            "positions has more rows than there are vertices",
+        ));
+    }
+    let split =
+        py.detach(|| ::pre::isolate::isolate_organelles(&verts, &tris, &organelle, &positions));
+    Ok(split_out(py, split))
+}
+
 /// `remove_parallel_patches`' last step, which the Python path runs here
 /// too: the triangles closing the holes the removed parallel faces leave
 /// (`::pre::patches::close_holes`), given the faces before the removal,
@@ -1611,6 +1675,7 @@ impl PyZScan {
 type FilledOut<'py> = (
     Bound<'py, PyArray2<f64>>,
     Bound<'py, PyArray2<i64>>,
+    Bound<'py, PyArray1<i64>>,
     Bound<'py, PyDict>,
 );
 
@@ -1618,8 +1683,11 @@ type FilledOut<'py> = (
 /// usable faces not `organelle` (one flag per face, or fewer: the faces
 /// after them are none) — patched with triangles about `median_edge` long
 /// and faired with their lips; loops a `soma_verts` vertex touches stay
-/// open.
+/// open, as do those along no `asked` face (one flag per face) when given.
+/// Returns the vertices, the patches' faces, the faces of no area in the
+/// holes they close (to drop) and the tally.
 #[pyfunction]
+#[pyo3(signature = (faces, vertices, organelle, soma_verts, median_edge, asked=None))]
 fn fill_holes<'py>(
     py: Python<'py>,
     faces: PyReadonlyArray2<'py, i64>,
@@ -1627,6 +1695,7 @@ fn fill_holes<'py>(
     organelle: numpy::PyReadonlyArray1<'py, bool>,
     soma_verts: numpy::PyReadonlyArray1<'py, i64>,
     median_edge: f64,
+    asked: Option<numpy::PyReadonlyArray1<'py, bool>>,
 ) -> PyResult<FilledOut<'py>> {
     use ::pre::fill::Decision;
     let verts = rows3("V", &vertices)?;
@@ -1645,7 +1714,20 @@ fn fill_holes<'py>(
             .ok_or_else(|| PyValueError::new_err(format!("vertex index {v} is out of range")))?;
         soma[i] = true;
     }
-    let done = py.detach(|| ::pre::fill::fill_holes(&verts, &tris, &organelle, &soma, median_edge));
+    let asked = asked.map(|a| a.as_array().to_vec());
+    if asked.as_ref().is_some_and(|a| a.len() != tris.len()) {
+        return Err(PyValueError::new_err("asked needs one flag per face"));
+    }
+    let done = py.detach(|| {
+        ::pre::fill::fill_holes(
+            &verts,
+            &tris,
+            &organelle,
+            &soma,
+            asked.as_deref(),
+            median_edge,
+        )
+    });
     let count = |d: Decision| done.holes.iter().filter(|h| h.decision == d).count();
     let tally = counts(
         py,
@@ -1653,6 +1735,7 @@ fn fill_holes<'py>(
             ("loops", done.holes.len()),
             ("filled", count(Decision::Filled)),
             ("off_body", count(Decision::OffBody)),
+            ("not_asked", count(Decision::NotAsked)),
             ("soma", count(Decision::Soma)),
             ("non_manifold", count(Decision::NonManifold)),
             ("tube_end", count(Decision::TubeEnd)),
@@ -1660,12 +1743,15 @@ fn fill_holes<'py>(
             ("new_faces", done.faces.len()),
             ("new_vertices", done.verts.len() - nv),
             ("moved", done.n_moved),
+            ("dropped", done.dropped.len()),
         ],
     )?;
     let out: Vec<[i64; 3]> = done.faces.iter().map(|f| f.map(i64::from)).collect();
+    let dropped: Array1<i64> = done.dropped.iter().map(|&f| i64::from(f)).collect();
     Ok((
         rows_to_array(&done.verts).into_pyarray(py),
         rows_to_array(&out).into_pyarray(py),
+        dropped.into_pyarray(py),
         tally,
     ))
 }
@@ -1697,6 +1783,8 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(remove_gaps, m)?)?;
     m.add_function(wrap_pyfunction!(remove_fusions, m)?)?;
     m.add_function(wrap_pyfunction!(close_patch_holes, m)?)?;
+    m.add_function(wrap_pyfunction!(isolate_organelles, m)?)?;
+    m.add_function(wrap_pyfunction!(patch_hosts, m)?)?;
     m.add_function(wrap_pyfunction!(break_up_classify, m)?)?;
     m.add_function(wrap_pyfunction!(break_up_severed_walls, m)?)?;
     m.add_function(wrap_pyfunction!(find_soma_ring_cutoff, m)?)?;

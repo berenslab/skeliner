@@ -431,6 +431,34 @@ class TestFusions:
                 split += len(rust.vertices) - n_v
         assert split > 10
 
+    def test_a_drop_parting_another_fan_splits_it_on_both_paths(self):
+        # faces 2 and 3 have no area: a piece of their own at vertex 1, beside
+        # face 4, they alone join faces 0 and 1 at vertex 0
+        v = np.array(
+            [
+                [0, 0, 0],
+                [1, 0, 0],
+                [2, 0, 0],
+                [3, 0, 0],
+                [1, 1, 0],
+                [1.5, -1, 0],
+                [1, 0, 1],
+                [1, 1, 1],
+            ],
+            dtype=float,
+        )
+        faces = np.array([[0, 4, 2], [0, 3, 5], [0, 2, 1], [0, 1, 3], [1, 6, 7]])
+        rust, python = both(pre._split_fan_vertices, sk.Mesh(v, faces), {1})
+        assert_parity(np.asarray(rust.vertices), np.asarray(python.vertices))
+        assert_parity(np.asarray(rust.faces), np.asarray(python.faces))
+        assert np.asarray(rust.faces).tolist() == [
+            [0, 4, 2],
+            [8, 3, 5],
+            [0, 0, 0],
+            [0, 0, 0],
+            [1, 6, 7],
+        ]
+
     def test_removing_them_is_the_same_on_both_paths(self, dirty_mesh, reference_mesh):
         from .test_pre import _subdivided_tube
 

@@ -3244,9 +3244,9 @@ def _create_app(
             verbose=True,
         )
 
-        # rederived: the run ends in break_up_mesh, so the components dropped
-        # below are replaced a few lines down rather than left for the user
-        # to rebuild.
+        # rederived: the run returns its components with the mesh, so the
+        # components dropped below are replaced a few lines down rather than
+        # left for the user to rebuild.
         await _apply_new_mesh(new_mesh, rederived=True)
         # _apply_new_mesh drops the caches keyed to the mesh it replaced;
         # these two are keyed to it as well, and the run has already consumed

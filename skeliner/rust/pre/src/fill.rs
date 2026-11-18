@@ -5,10 +5,11 @@
 //! The surface is the usable faces that are no organelle. A hole is a loop
 //! of its border that lies on its mesh component's body (its largest piece,
 //! the one `break_up_mesh` measures the others against), that no soma vertex
-//! touches (the soma is cut out next, along its junctions), and that opens
-//! the side of the surface rather than ending it: the faces along it face
-//! the way the loop spans more than a direction at random would (a mean
-//! `|cos|` over 1/2), where round a tube's cut end they face across it.
+//! touches (the soma's junctions with the arbor stay as drawn), and that
+//! opens the side of the surface rather than ending it: the faces along it
+//! face the way the loop spans more than a direction at random would (a
+//! mean `|cos|` over 1/2), where round a tube's cut end they face across
+//! it.
 //!
 //! Each hole is triangulated from its loop alone with the least folding
 //! (Liepa 2003, after Barequet & Sharir 1995: the largest dihedral angle,
@@ -267,13 +268,16 @@ pub enum Decision {
     Filled,
     /// On a piece other than its mesh component's body.
     OffBody,
+    /// Along no face the caller asked to patch round (no neurite's).
+    NotAsked,
     /// A soma vertex on it.
     Soma,
     /// An edge of it with three or more surface faces.
     NonManifold,
     /// The faces along it face across the way it spans: a tube's end.
     TubeEnd,
-    /// No span, or no triangulation without an edge the surface has.
+    /// No span, or no triangulation without an edge the surface has or
+    /// another patch lays.
     Untriangulable,
 }
 
@@ -297,6 +301,10 @@ pub struct Filled {
     pub verts: Vec<V3>,
     /// The patches' faces, to append to the input's.
     pub faces: Vec<[u32; 3]>,
+    /// The input's faces of no area in the holes the patches close, on a
+    /// patched loop's edge or joined to one there, ascending: debris to
+    /// drop.
+    pub dropped: Vec<u32>,
     /// Every loop of the surface's border, in the order traced.
     pub holes: Vec<Hole>,
     /// The input's vertices that moved.
@@ -311,15 +319,17 @@ pub struct Filled {
 /// not `organelle` (shorter than `faces`: the rest are none) — with
 /// triangles about `med` long, and fair each patch and its lip with the
 /// surface around; `soma` marks the soma's vertices (shorter: the rest are
-/// not).
+/// not), and `asked`, when given, the faces (one flag each) whose holes to
+/// patch: a loop along none of them stays open.
 pub fn fill_holes(
     verts: &[V3],
     faces: &[[u32; 3]],
     organelle: &[bool],
     soma: &[bool],
+    asked: Option<&[bool]>,
     med: f64,
 ) -> Filled {
-    threads::install(|| fill(verts, faces, organelle, soma, med))
+    threads::install(|| fill(verts, faces, organelle, soma, asked, med))
 }
 
 /// A hole's patch: its new vertices, and triangles over the loop's
@@ -329,7 +339,14 @@ struct Patch {
     tris: Vec<[u32; 3]>,
 }
 
-fn fill(verts: &[V3], faces: &[[u32; 3]], organelle: &[bool], soma: &[bool], med: f64) -> Filled {
+fn fill(
+    verts: &[V3],
+    faces: &[[u32; 3]],
+    organelle: &[bool],
+    soma: &[bool],
+    asked: Option<&[bool]>,
+    med: f64,
+) -> Filled {
     let (nv, nf) = (verts.len(), faces.len());
     let clock = std::time::Instant::now();
     let mut times = Vec::new();
@@ -344,6 +361,11 @@ fn fill(verts: &[V3], faces: &[[u32; 3]], organelle: &[bool], soma: &[bool], med
     let usable = usable_faces(verts, faces);
     let surface: Vec<bool> = (0..nf)
         .map(|f| usable[f] && !organelle.get(f).copied().unwrap_or(false))
+        .collect();
+    // the faces whose edges a patch may not lay across its hole: all but
+    // the organelles', which come off the surface after the fill
+    let walls: Vec<bool> = (0..nf)
+        .map(|f| !organelle.get(f).copied().unwrap_or(false))
         .collect();
     let is_soma = |v: u32| soma.get(v as usize).copied().unwrap_or(false);
     let body = on_body(&topo, &usable, &surface);
@@ -366,6 +388,15 @@ fn fill(verts: &[V3], faces: &[[u32; 3]], organelle: &[bool], soma: &[bool], med
             let n = lp.verts.len();
             if !body[lp.faces[0] as usize] {
                 return Decision::OffBody;
+            }
+            // asked for by any face along it: a loop can run along two pieces
+            let is_asked = |a: &[bool]| {
+                lp.faces
+                    .iter()
+                    .any(|&f| a.get(f as usize).copied().unwrap_or(false))
+            };
+            if asked.is_some_and(|a| !is_asked(a)) {
+                return Decision::NotAsked;
             }
             if lp.verts.iter().any(|&v| is_soma(v)) {
                 return Decision::Soma;
@@ -400,16 +431,38 @@ fn fill(verts: &[V3], faces: &[[u32; 3]], organelle: &[bool], soma: &[bool], med
         .collect();
 
     lap("judged", &mut times);
-    let patches: Vec<Option<Patch>> = loops
+    let mut patches: Vec<Option<Patch>> = loops
         .par_iter()
         .zip(&judged)
         .map(|(lp, &d)| {
             if d != Decision::Filled {
                 return None;
             }
-            patch(lp, verts, faces, &topo, &surface, med)
+            patch(lp, verts, faces, &topo, &walls, med)
         })
         .collect();
+    // two loops through the same two vertices can each lay the edge
+    // between them across their hole: the later patch yields
+    let mut chords: HashSet<(u32, u32)> = HashSet::new();
+    for (lp, slot) in loops.iter().zip(patches.iter_mut()) {
+        let Some(p) = slot else { continue };
+        let n = lp.verts.len() as u32;
+        let mine: Vec<(u32, u32)> = p
+            .tris
+            .iter()
+            .flat_map(|t| [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])])
+            .filter(|&(a, b)| a < n && b < n && (a + 1) % n != b && (b + 1) % n != a)
+            .map(|(a, b)| {
+                let (a, b) = (lp.verts[a as usize], lp.verts[b as usize]);
+                (a.min(b), a.max(b))
+            })
+            .collect();
+        if mine.iter().any(|e| chords.contains(e)) {
+            *slot = None;
+        } else {
+            chords.extend(mine);
+        }
+    }
     let decisions: Vec<Decision> = judged
         .iter()
         .zip(&patches)
@@ -422,15 +475,76 @@ fn fill(verts: &[V3], faces: &[[u32; 3]], organelle: &[bool], soma: &[bool], med
         })
         .collect();
 
-    // vertices that stay: the soma's, and those of loops left open
+    // vertices that stay: the soma's, those of loops left open, and those
+    // of loops whose patch has no vertex of its own — nothing for the
+    // fairing to shape, and its triangles make the loop's vertices each
+    // other's neighbours: a loop of three round a cone of three faces is
+    // sealed into a tetrahedron, whose vertices the fairing can only
+    // collapse onto one another
+    let bare: Vec<bool> = patches
+        .iter()
+        .map(|p| p.as_ref().is_some_and(|p| p.new.is_empty()))
+        .collect();
     let mut pinned: Vec<bool> = (0..nv as u32).map(is_soma).collect();
-    for (lp, &d) in loops.iter().zip(&decisions) {
-        if d != Decision::Filled {
+    for ((lp, &d), &bare) in loops.iter().zip(&decisions).zip(&bare) {
+        if d != Decision::Filled || bare {
             for &v in &lp.verts {
                 pinned[v as usize] = true;
             }
         }
     }
+    // the faces of no area in the holes the patches close — on a patched
+    // loop's edge, and the faces of no area joined to them — each touching
+    // the surface along patched loops only: no surface, they would be a
+    // third face on a loop's edge, and the fairing would drag them into
+    // triangles across the patch; one touching the surface elsewhere (a
+    // T-junction's) holds the surface together and stays
+    let mut patched: HashSet<(u32, u32)> = HashSet::new();
+    for (lp, p) in loops.iter().zip(&patches) {
+        if p.is_some() {
+            let n = lp.verts.len();
+            for i in 0..n {
+                let (a, b) = (lp.verts[i], lp.verts[(i + 1) % n]);
+                patched.insert((a.min(b), a.max(b)));
+            }
+        }
+    }
+    let in_hole = |f: u32| {
+        let t = faces[f as usize];
+        [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])]
+            .iter()
+            .all(|&(a, b)| {
+                patched.contains(&(a.min(b), a.max(b)))
+                    || topo
+                        .edge_id(a, b)
+                        .is_none_or(|e| !topo.edge_faces(e).iter().any(|&g| surface[g as usize]))
+            })
+    };
+    let mut dropped: Vec<u32> = Vec::new();
+    for &(a, b) in &patched {
+        if let Some(e) = topo.edge_id(a, b) {
+            dropped.extend(
+                topo.edge_faces(e)
+                    .iter()
+                    .copied()
+                    .filter(|&f| !usable[f as usize] && in_hole(f)),
+            );
+        }
+    }
+    dropped.sort_unstable();
+    dropped.dedup();
+    let mut seen: HashSet<u32> = dropped.iter().copied().collect();
+    let mut walk = dropped.clone();
+    while let Some(f) = walk.pop() {
+        for g in topo.face_neighbors(f as usize) {
+            if !usable[g as usize] && in_hole(g) && seen.insert(g) {
+                dropped.push(g);
+                walk.push(g);
+            }
+        }
+    }
+    dropped.sort_unstable();
+    dropped.dedup();
 
     // the patches' vertices and faces, numbered after the input's
     let mut out_verts = verts.to_vec();
@@ -466,7 +580,8 @@ fn fill(verts: &[V3], faces: &[[u32; 3]], organelle: &[bool], soma: &[bool], med
     lap("patches", &mut times);
     let mut lips: Vec<Option<Vec<u32>>> = decisions
         .iter()
-        .map(|&d| (d != Decision::Filled).then(Vec::new))
+        .zip(&bare)
+        .map(|(&d, &bare)| (d != Decision::Filled || bare).then(Vec::new))
         .collect();
     let mut iterations = 0;
     let mut widest = 2;
@@ -550,11 +665,49 @@ fn fill(verts: &[V3], faces: &[[u32; 3]], organelle: &[bool], soma: &[bool], med
     Filled {
         verts: out_verts,
         faces: out_faces,
+        dropped,
         holes,
         n_moved,
         iterations,
         times,
     }
+}
+
+/// For each face from `n_old` on — a patch's — the face before it that its
+/// patch hangs from: of the `hosts` faces (one flag per face before
+/// `n_old`) sharing an edge with one of its patch (the faces from `n_old`
+/// on joined to it across edges), the lowest; None where there is none. A
+/// patch over a pocket's mouth borders the pocket's wall as well as the
+/// surface round the mouth, until the wall is cut free: only the surface's
+/// faces are hosts.
+pub fn patch_hosts(
+    faces: &[[u32; 3]],
+    n_vertices: usize,
+    n_old: usize,
+    hosts: &[bool],
+) -> Vec<Option<u32>> {
+    let topo = Topology::new(faces, n_vertices);
+    let n = faces.len().saturating_sub(n_old);
+    let sets = LowestRootSets::new(n);
+    let mut host = vec![u32::MAX; n];
+    for (i, h) in host.iter_mut().enumerate() {
+        for g in topo.face_neighbors(n_old + i) {
+            let g = g as usize;
+            if g >= n_old {
+                sets.join(i as u32, (g - n_old) as u32);
+            } else if hosts.get(g).copied().unwrap_or(false) {
+                *h = (*h).min(g as u32);
+            }
+        }
+    }
+    let root = sets.roots();
+    let mut lowest = vec![u32::MAX; n];
+    for (&r, &h) in root.iter().zip(&host) {
+        lowest[r as usize] = lowest[r as usize].min(h);
+    }
+    root.iter()
+        .map(|&r| Some(lowest[r as usize]).filter(|&h| h != u32::MAX))
+        .collect()
 }
 
 /// Unit normals at the vertices `at`, from the surface's faces and the
@@ -591,12 +744,13 @@ fn vertex_normals(
 }
 
 /// What a triangulation of the loop `lp` reads off it: its vertices'
-/// points; the unit normal of the `surface` face along each edge, as the
-/// loop runs; and the surface's own edges between vertices of the loop not
-/// next on it, by their places on the loop.
+/// points; the unit normal of its face along each edge, as the loop runs;
+/// and the edges of `walls` faces between vertices of the loop not next on
+/// it — edges a triangle across the hole may not lay — by their places on
+/// the loop.
 type Frame = (Vec<V3>, Vec<V3>, HashSet<(usize, usize)>);
 
-fn frame(lp: &Loop, verts: &[V3], faces: &[[u32; 3]], topo: &Topology, surface: &[bool]) -> Frame {
+fn frame(lp: &Loop, verts: &[V3], faces: &[[u32; 3]], topo: &Topology, walls: &[bool]) -> Frame {
     let n = lp.verts.len();
     let p: Vec<V3> = lp.verts.iter().map(|&v| verts[v as usize]).collect();
     // the surface's normal along each edge, as the loop runs
@@ -613,12 +767,12 @@ fn frame(lp: &Loop, verts: &[V3], faces: &[[u32; 3]], topo: &Topology, surface: 
             ))
         })
         .collect();
-    // the surface's own edges between vertices of the loop not next on it
+    // the walls' edges between vertices of the loop not next on it
     let at: HashMap<u32, usize> = lp.verts.iter().enumerate().map(|(i, &v)| (v, i)).collect();
     let mut banned: HashSet<(usize, usize)> = HashSet::new();
     for (i, &v) in lp.verts.iter().enumerate() {
         for &f in topo.vertex_faces(v as usize) {
-            if !surface[f as usize] {
+            if !walls[f as usize] {
                 continue;
             }
             for w in faces[f as usize] {
@@ -635,33 +789,33 @@ fn frame(lp: &Loop, verts: &[V3], faces: &[[u32; 3]], topo: &Topology, surface: 
     (p, outer, banned)
 }
 
-/// A hole's patch: Liepa's triangulation of its loop, refined.
+/// A hole's patch: Liepa's triangulation of its loop, refined, laying no
+/// edge of a `walls` face.
 fn patch(
     lp: &Loop,
     verts: &[V3],
     faces: &[[u32; 3]],
     topo: &Topology,
-    surface: &[bool],
+    walls: &[bool],
     med: f64,
 ) -> Option<Patch> {
-    let (p, outer, banned) = frame(lp, verts, faces, topo, surface);
+    let (p, outer, banned) = frame(lp, verts, faces, topo, walls);
     let tris = triangulate(&p, &outer, &banned)?;
     Some(refine(p, tris, &banned, med))
 }
 
 /// Liepa's triangulation of the loop `lp` alone, no vertex added
-/// ([`triangulate`]): triangles over its vertices, wound against the
-/// `surface` faces along it, none spanning no area or laying an edge
-/// between two of its vertices that a surface face has; None where every
-/// way does.
+/// ([`triangulate`]): triangles over its vertices, wound against the faces
+/// along it, none spanning no area or laying an edge between two of its
+/// vertices that a `walls` face has; None where every way does.
 pub fn span(
     lp: &Loop,
     verts: &[V3],
     faces: &[[u32; 3]],
     topo: &Topology,
-    surface: &[bool],
+    walls: &[bool],
 ) -> Option<Vec<[u32; 3]>> {
-    let (p, outer, banned) = frame(lp, verts, faces, topo, surface);
+    let (p, outer, banned) = frame(lp, verts, faces, topo, walls);
     let tris = triangulate(&p, &outer, &banned)?;
     Some(
         tris.into_iter()
@@ -1209,6 +1363,143 @@ fn cgls(members: &[usize], eqs: &[usize], rows: &[Row], start: &[V3]) -> (Vec<V3
 mod tests {
     use super::*;
 
+    /// A tube with a face of no area `[b, a, v]` on the edge a–b of a face
+    /// midway, `v` at the edge's middle, and the faces on its other side
+    /// split at `v`: a T-junction the flat face holds together.
+    fn t_junction() -> (Vec<V3>, Vec<[u32; 3]>) {
+        let (mut verts, mut faces) = tube(16, 8, 3.0, 1.0);
+        let [a, b, _] = faces[faces.len() / 2];
+        let g = (0..faces.len()).find(|&g| runs(faces[g], b, a)).unwrap();
+        let d = third(faces[g], b, a);
+        let v = verts.len() as u32;
+        verts.push(scale(add(verts[a as usize], verts[b as usize]), 0.5));
+        faces[g] = [b, v, d];
+        faces.push([v, a, d]);
+        faces.push([b, a, v]);
+        (verts, faces)
+    }
+
+    #[test]
+    fn a_face_of_no_area_holding_a_t_junction_together_stays() {
+        // no surface, it leaves a crack of no area there: nothing to patch,
+        // and nothing patched beside it
+        let (verts, faces) = t_junction();
+        let done = fill_holes(&verts, &faces, &[], &[], None, 1.0);
+        assert!(done.faces.is_empty());
+        assert!(done.dropped.is_empty());
+    }
+
+    #[test]
+    fn a_sliver_in_a_patched_hole_is_dropped() {
+        let (mut verts, mut faces) = tube(63, 30, 10.0, 1.0);
+        let mut org = window(&verts, &faces, 0.35, 15.0, 3.0);
+        deepen(&mut verts, &faces, &org, 3.0);
+        // on a grid, as a cell's vertices are: a midpoint lies on its edge
+        // exactly, and the sliver below has no area at all
+        for p in &mut verts {
+            *p = p.map(|x| (x * 1024.0).round() / 1024.0);
+        }
+        let topo = Topology::new(&faces, verts.len());
+        // an edge a→b of the window's rim, as the surface face along it runs
+        let (a, b) = (0..faces.len())
+            .filter(|&f| !org[f])
+            .find_map(|f| {
+                let t = faces[f];
+                (0..3).find_map(|i| {
+                    let (a, b) = (t[i], t[(i + 1) % 3]);
+                    let e = topo.edge_id(a, b)?;
+                    topo.edge_faces(e)
+                        .iter()
+                        .any(|&g| org[g as usize])
+                        .then_some((a, b))
+                })
+            })
+            .unwrap();
+        // a face of no area on it, its other two edges bare
+        let v = verts.len() as u32;
+        verts.push(scale(add(verts[a as usize], verts[b as usize]), 0.5));
+        let sliver = faces.len() as u32;
+        faces.push([b, a, v]);
+        org.push(false);
+        let done = fill_holes(&verts, &faces, &org, &[], None, 1.0);
+        let filled = done
+            .holes
+            .iter()
+            .filter(|h| h.decision == Decision::Filled)
+            .count();
+        assert_eq!(filled, 1);
+        assert_eq!(done.dropped, [sliver]);
+    }
+
+    #[test]
+    fn a_hole_is_asked_for_by_any_face_along_it() {
+        let (mut verts, faces) = tube(63, 30, 10.0, 1.0);
+        let org = window(&verts, &faces, 0.35, 15.0, 3.0);
+        deepen(&mut verts, &faces, &org, 3.0);
+        let topo = Topology::new(&faces, verts.len());
+        let rim: Vec<usize> = (0..faces.len())
+            .filter(|&f| !org[f] && topo.face_neighbors(f).into_iter().any(|g| org[g as usize]))
+            .collect();
+        assert!(rim.len() > 3, "{}", rim.len());
+        for &f in &rim {
+            let mut asked = vec![false; faces.len()];
+            asked[f] = true;
+            let done = fill_holes(&verts, &faces, &org, &[], Some(&asked), 1.0);
+            let filled = done
+                .holes
+                .iter()
+                .filter(|h| h.decision == Decision::Filled)
+                .count();
+            assert_eq!(filled, 1, "asked by face {f} alone");
+        }
+    }
+
+    #[test]
+    fn a_patch_with_no_vertex_of_its_own_leaves_its_loop_alone() {
+        // a cone of three faces whose base is a pocket of one face: its
+        // patch, one triangle, seals a tetrahedron, whose vertices faired
+        // free would collapse onto one another
+        let verts: Vec<V3> = vec![
+            [0.0, 0.0, 0.3],
+            [1.0, 0.0, 0.0],
+            [-0.5, 0.866, 0.0],
+            [-0.5, -0.866, 0.0],
+        ];
+        let faces = vec![[0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]];
+        let org = [false, false, false, true];
+        // edges a third of the median: no triangle long enough to refine
+        let done = fill_holes(&verts, &faces, &org, &[], None, 5.0);
+        assert_eq!(done.faces.len(), 1, "{:?}", done.holes);
+        assert_eq!(done.verts.len(), verts.len());
+        assert_eq!(done.n_moved, 0);
+        assert_eq!(done.verts, verts);
+    }
+
+    #[test]
+    fn a_patch_hangs_from_the_lowest_face_along_it() {
+        // two squares of a strip (faces 0..4), and two patches appended:
+        // faces 4, 5 on the first square's edges 1-3 and 0-3, face 6 alone
+        // apart
+        let faces = vec![
+            [0, 1, 3],
+            [0, 3, 2],
+            [2, 3, 5],
+            [2, 5, 4],
+            [1, 6, 3],
+            [6, 0, 3],
+            [8, 9, 10],
+        ];
+        assert_eq!(
+            patch_hosts(&faces, 11, 4, &[true; 4]),
+            vec![Some(0), Some(0), None]
+        );
+        // a face that may not host — a pocket's wall, say — is passed over
+        assert_eq!(
+            patch_hosts(&faces, 11, 4, &[false, true, true, true]),
+            vec![Some(1), Some(1), None]
+        );
+    }
+
     /// A tube round the z axis, `rings` rings of `around` vertices `step`
     /// apart, radius `r`, its faces wound outwards; open at both ends.
     fn tube(around: usize, rings: usize, r: f64, step: f64) -> (Vec<V3>, Vec<[u32; 3]>) {
@@ -1297,7 +1588,7 @@ mod tests {
         let (mut verts, faces) = tube(63, 30, r, 1.0);
         let org = window(&verts, &faces, 0.35, 15.0, 3.0);
         deepen(&mut verts, &faces, &org, 3.0);
-        let done = fill_holes(&verts, &faces, &org, &[], 1.0);
+        let done = fill_holes(&verts, &faces, &org, &[], None, 1.0);
         let kinds: Vec<Decision> = done.holes.iter().map(|h| h.decision).collect();
         assert_eq!(
             kinds.iter().filter(|&&d| d == Decision::Filled).count(),
@@ -1375,7 +1666,7 @@ mod tests {
             let k = 1.0 - pull / rho(p);
             verts[v] = [p[0] * k, p[1] * k, p[2]];
         }
-        let done = fill_holes(&verts, &faces, &org, &[], 1.0);
+        let done = fill_holes(&verts, &faces, &org, &[], None, 1.0);
         let hole = done
             .holes
             .iter()
@@ -1415,7 +1706,7 @@ mod tests {
             .find(|&v| faces.iter().zip(&org).any(|(f, &o)| o && f.contains(&v)))
             .unwrap();
         soma[edge as usize] = true;
-        let done = fill_holes(&verts, &faces, &org, &soma, 1.0);
+        let done = fill_holes(&verts, &faces, &org, &soma, None, 1.0);
         assert!(done.faces.is_empty());
         assert!(done.holes.iter().any(|h| h.decision == Decision::Soma));
         assert_eq!(done.verts, verts);
@@ -1428,7 +1719,7 @@ mod tests {
         let inner = window(&verts, &faces, 0.12, 15.0, 1.2);
         let org: Vec<bool> = wide.iter().zip(&inner).map(|(&w, &i)| w && !i).collect();
         deepen(&mut verts, &faces, &org, 1.0);
-        let done = fill_holes(&verts, &faces, &org, &[], 1.0);
+        let done = fill_holes(&verts, &faces, &org, &[], None, 1.0);
         let kinds: Vec<Decision> = done.holes.iter().map(|h| h.decision).collect();
         assert!(kinds.contains(&Decision::OffBody), "{kinds:?}");
         assert_eq!(

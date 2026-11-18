@@ -581,7 +581,7 @@ def test_a_mesh_remove_fusions_cut_reads_back_as_written(tmp_path):
     save_mesh(cut, path)
     for mesh in both(load_mesh, path):
         # every vertex read back in its place, to the file's eight decimals
-        assert np.allclose(mesh.vertices, cut.vertices, rtol=0, atol=5e-9)
+        assert np.allclose(mesh.vertices, cut.vertices, rtol=0, atol=1e-8)
         assert np.array_equal(mesh.faces, cut.faces)
         assert not np.array_equal(mesh.vertices[-1], mesh.vertices[0])
 

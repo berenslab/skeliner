@@ -44,6 +44,7 @@ __all__ = [
     "find_parallel_patches",
     "find_soma",
     "find_soma_via_ring_cutoff",
+    "isolate_organelles",
     "preprocess",
     "preview_reassignment",
     "remove_fins",
@@ -348,6 +349,7 @@ def fill_holes(
     *,
     organelles: Organelles | None = None,
     soma: Soma | None = None,
+    neurites=None,
     mesh_stats: MeshStats | None = None,
     verbose: bool = False,
 ) -> Mesh:
@@ -357,11 +359,13 @@ def fill_holes(
 
     The surface is the usable faces that are no organelle.  A hole is a
     loop of its border that lies on its mesh component's body (its largest
-    piece), that no soma vertex touches (:func:`break_up_mesh` cuts the soma
-    out along its junctions next), and that opens the side of the surface
-    rather than ending it: the faces along it face the way the loop spans
-    more than a random direction would, where round a tube's cut end they
-    face across it.
+    piece), that no soma vertex touches (the soma's junctions with the arbor
+    stay where :func:`break_up_mesh` drew them), and that opens the side of
+    the surface rather than ending it: the faces along it face the way the
+    loop spans more than a random direction would, where round a tube's cut
+    end they face across it.  :func:`preprocess` fills once the mesh is
+    broken up, with its organelles (walls released, pieces trapped) and its
+    soma, so the holes are those of the surface as settled.
 
     Each hole gets a patch of triangles about as long as the median edge:
     the loop triangulated with the least folding (Liepa 2003: the largest
@@ -375,18 +379,34 @@ def fill_holes(
     band round the hole is faired first, and the rings from the loop out
     that lie below it on average are the lip.
 
-    The patch shares the loop's vertices, and the organelle stays in the
-    mesh behind it.  Rust only: the Python path runs the Rust core here.
+    The patch shares the loop's vertices with the organelle behind it
+    until :func:`isolate_organelles` cuts the organelle free.  A face of
+    no area on a patch's edge lies in the hole the patch closes — no
+    surface, it would be a third face on the edge, and the fairing would
+    drag it into a triangle across the patch — and is dropped
+    (``[0, 0, 0]``), with the faces of no area joined to it there; one
+    touching the surface off the patched loops (a T-junction's) stays.
+    Where a dropped face held a vertex's fan together, the fan is split
+    (:func:`_split_fan_vertices`).
+    Two loops through the same two vertices could each lay the edge
+    between them across their hole: the later one stays open.  Rust only:
+    the Python path runs the Rust core here.
 
     Parameters
     ----------
     mesh : Mesh
         Input mesh.
     organelles : Organelles or None
-        From :func:`find_organelles`; None for none.  Faces appended since
-        (the stitches of :func:`remove_gaps`) are no organelle.
+        From :func:`break_up_mesh` (or :func:`find_organelles`); None for
+        none.  Faces past its masks' length are no organelle.
     soma : Soma or None
-        From :func:`find_soma`; the holes its vertices touch stay open.
+        From :func:`break_up_mesh` (or :func:`find_soma`); the holes its
+        vertices touch stay open.
+    neurites : Neurites or list of face arrays, or None
+        Patch only the holes along these pieces' faces
+        (:func:`break_up_mesh`'s neurites, which the patches are for); None
+        patches those on every piece.  A speck sealed by its patch is
+        faired down to a point.
     mesh_stats : MeshStats or None
         Kept in step: ``outward_dots`` gets a value for each new face (1,
         facing out, as :func:`remove_gaps` gives its stitches) and the
@@ -398,7 +418,10 @@ def fill_holes(
     -------
     Mesh
         The patches' faces appended and the lips' vertices moved; every
-        face and vertex id of *mesh* names what it did.
+        face and vertex id of *mesh* names what it did, but the faces of no
+        area dropped from the holes, now ``[0, 0, 0]``, and the faces given
+        a copy of a vertex where a fan was split (copies after the patches'
+        vertices).
     """
     if verbose:
         print("[skeliner.pre] Filling holes …")
@@ -413,14 +436,22 @@ def fill_holes(
         if soma is None or soma.verts is None
         else np.asarray(soma.verts, dtype=np.int64)
     )
-    verts, new_faces, tally = kernels.pre.fill_holes(
+    asked = None
+    if neurites is not None:
+        asked = np.zeros(len(faces), dtype=bool)
+        for comp in neurites:
+            asked[np.asarray(comp, dtype=np.int64)] = True
+    verts, new_faces, dropped, tally = kernels.pre.fill_holes(
         faces,
         np.asarray(mesh.vertices, dtype=np.float64),
         organelle[: len(faces)],
         soma_verts,
         _median_edge(mesh),
+        asked,
     )
-    out = Mesh(verts, np.vstack([faces, new_faces]))
+    kept = faces.copy()
+    kept[dropped] = 0
+    out = _settled(Mesh(verts, np.vstack([kept, new_faces])), faces)
 
     n_added = len(new_faces)
     if mesh_stats is not None:
@@ -439,13 +470,174 @@ def fill_holes(
         print(
             f"[skeliner.pre] fill_holes: {tally['filled']:,} of "
             f"{tally['loops']:,} loops patched (+{n_added:,}f, "
-            f"+{tally['new_vertices']:,}v, {tally['moved']:,}v moved); "
+            f"+{tally['new_vertices']:,}v, {tally['moved']:,}v moved, "
+            f"{tally['dropped']:,} faces of no area dropped); "
             f"{open_:,} left open: {tally['off_body']:,} off the body, "
+            f"{tally['not_asked']:,} on no neurite, "
             f"{tally['soma']:,} at the soma, {tally['tube_end']:,} tube ends, "
             f"{tally['untriangulable'] + tally['non_manifold']:,} cracks "
             f"({dt:.1f}s)"
         )
     return out
+
+
+def _with_patches(mesh: Mesh, components: MeshComponents, n_old: int):
+    """*components* with the faces :func:`fill_holes` appended to *mesh*
+    after its first *n_old*: each patch in the neurite or discarded piece
+    of the face it hangs from (a face of a piece along its loop), and the
+    organelle masks padded with none for them."""
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    n_new = len(faces) - n_old
+    if n_new <= 0:
+        return components
+    owner = np.full(n_old, -1, dtype=np.int64)
+    for i, comp in enumerate(components.neurites):
+        owner[np.asarray(comp, dtype=np.int64)] = i
+    first_discard = len(components.neurites)
+    for i, comp in enumerate(components.discarded):
+        owner[np.asarray(comp, dtype=np.int64)] = first_discard + i
+    # a patch borders the surface round its hole and, across a pocket's
+    # mouth, the pocket's wall: only a piece's faces host it
+    hosts = kernels.pre.patch_hosts(faces, len(mesh.vertices), n_old, owner >= 0)
+    piece = np.where(hosts >= 0, owner[np.maximum(hosts, 0)], -1)
+    new_ids = np.arange(n_old, len(faces), dtype=np.int64)
+
+    def grown(comps, offset):
+        return [
+            np.concatenate(
+                [np.asarray(c, dtype=np.int64), new_ids[piece == offset + i]]
+            )
+            for i, c in enumerate(comps)
+        ]
+
+    org = components.organelles
+    pad = np.zeros(n_new, dtype=bool)
+    src = components.neurites
+    return MeshComponents(
+        soma=components.soma,
+        organelles=Organelles(
+            pocket=np.concatenate([org.pocket, pad]),
+            isolated=np.concatenate([org.isolated, pad]),
+            expanded=np.concatenate([org.expanded, pad]),
+            manual=np.concatenate([org.manual, pad]),
+        ),
+        neurites=Neurites(
+            grown(src, 0),
+            labels=None if src.labels is None else list(src.labels),
+            swc_types=None if src.swc_types is None else list(src.swc_types),
+        ),
+        discarded=Discarded(grown(components.discarded, first_discard)),
+        record=components.record,
+    )
+
+
+@mesh_args()
+def isolate_organelles(
+    mesh: Mesh,
+    organelles: Organelles,
+    *,
+    positions=None,
+    mesh_stats: MeshStats | None = None,
+    verbose: bool = False,
+) -> Mesh:
+    """Cut the organelles free of the rest of the mesh.
+
+    A pocket is an organelle the cell's surface folds in to trace: its
+    wall shares the mouth's vertices and edges with the surface round it,
+    and once :func:`fill_holes` patches the mouth, every mouth edge has
+    three faces — the surface's, the patch's and the wall's.  Here each
+    vertex an organelle face shares with a face that is none gets, for
+    every fan of organelle faces round it (those joined across edges at
+    the vertex), a copy of its own: every organelle comes off as a piece
+    of the mesh apart, sharing no vertex, and so no edge, with the
+    surface, the soma or the arbor.
+
+    A copy goes where its vertex stood in *positions* — the mesh before
+    :func:`fill_holes` faired the surface round the mouths, which moved
+    the walls' rims with it — and then a thousandth of its fan's reach into
+    the fan (as :func:`remove_fusions` places its copies), so no two
+    vertices share a point.  Faces naming a vertex twice keep theirs.
+
+    Run it after :func:`break_up_mesh`: the pieces it sorts are cut off,
+    walled in or rejoined by the organelles they share edges with.  Rust
+    only: the Python path runs the Rust core here.
+
+    Parameters
+    ----------
+    mesh : Mesh
+    organelles : Organelles
+        From :func:`break_up_mesh` (``components.organelles``); faces past
+        its masks' length are no organelle.
+    positions : (N, 3) array or None
+        Where the first N vertices stood; None for where they are.
+    mesh_stats : MeshStats or None
+        Its topology is dropped: the organelles come apart.
+    verbose : bool, default False
+
+    Returns
+    -------
+    Mesh
+        The copies appended; every face keeps its id, an organelle face
+        naming the copies of the vertices it shared.
+    """
+    if verbose:
+        _t0 = time.perf_counter()
+    out, sources = _isolated(mesh, organelles, positions, mesh_stats)
+    if verbose:
+        dt = time.perf_counter() - _t0
+        print(
+            f"[skeliner.pre] isolate_organelles: {len(sources):,} vertices "
+            f"copied for the fans they parted ({dt:.1f}s)"
+        )
+    return out
+
+
+def _isolated(mesh: Mesh, organelles: Organelles, positions, mesh_stats):
+    """:func:`isolate_organelles`' mesh, and the vertex each appended
+    vertex copies."""
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    mask = np.asarray(organelles.mask, dtype=bool)[: len(faces)]
+    pos = None if positions is None else np.asarray(positions, dtype=np.float64)
+    new_faces, points, sources = kernels.pre.isolate_organelles(
+        faces, verts, np.ascontiguousarray(mask), pos
+    )
+    if len(sources) == 0:
+        return mesh, sources
+    if mesh_stats is not None:
+        mesh_stats.invalidate_topology()
+    return Mesh(np.vstack([verts, points]), new_faces), sources
+
+
+def _soma_keeps_its_copies(
+    mesh: Mesh, components: MeshComponents, sources, n_old: int
+) -> MeshComponents:
+    """*components* with the soma's vertices joined by the copies of them
+    :func:`isolate_organelles` gave to fans that are no organelle's (those
+    numbered from *n_old*, copying *sources*), so a soma face there stays
+    the soma's."""
+    soma = components.soma
+    if soma is None or soma.verts is None or len(sources) == 0:
+        return components
+    faces = np.asarray(mesh.faces)
+    mask = np.zeros(len(faces), dtype=bool)
+    org = np.asarray(components.organelles.mask, dtype=bool)
+    mask[: len(org)] = org[: len(faces)]
+    on_org = np.zeros(len(mesh.vertices), dtype=bool)
+    on_org[faces[mask].ravel()] = True
+    copies = np.arange(n_old, n_old + len(sources))
+    keep = np.isin(sources, soma.verts) & ~on_org[copies]
+    if not keep.any():
+        return components
+    kept = copy.copy(soma)
+    kept.verts = np.union1d(soma.verts, copies[keep])
+    return MeshComponents(
+        soma=kept,
+        organelles=components.organelles,
+        neurites=components.neurites,
+        discarded=components.discarded,
+        record=components.record,
+    )
 
 
 # ── Merge selected faces ────────────────────────────────────────────
@@ -1884,7 +2076,10 @@ def preview_reassignment(
         with none (find_soma found none), makes their largest connected
         piece the soma, its ellipsoid fitted to it; ``'organelle'`` sets them in
         :attr:`~skeliner.dataclass.Organelles.manual`; ``'remainder'``
-        releases them from both, back to the arbor.  A soma whose vertices
+        releases them from both, back to the arbor.  An organelle
+        :func:`preprocess` cut free (:func:`isolate_organelles`) shares no
+        vertex with the arbor, so released it is a piece of its own; one
+        assigned here stays joined to the faces round it.  A soma whose vertices
         change has its ellipsoid refitted to them (:meth:`Soma.fit`, as
         :func:`break_up_mesh` refits it to those it absorbs); released down
         to vertices that span no ellipsoid, there is no soma.
@@ -3325,7 +3520,9 @@ def remove_gaps(
 
     All gap tip faces are removed at once and boundary loops from each
     gap are paired and zipper-stitched, then the mesh is rebuilt once.
-    Vertex indices are preserved.
+    Vertex indices are preserved; where the removal parts a vertex's fan,
+    each piece but the first with an area gets a copy appended, and a
+    piece of no area is dropped (:func:`_split_fan_vertices`).
 
     Parameters
     ----------
@@ -3447,7 +3644,7 @@ def _bridge_gaps(mesh, gaps, labels):
         return None, 0, 0, n_skipped
     if len(new_verts):
         verts = np.vstack([verts, new_verts])
-    result = Mesh(verts, faces)
+    result = _settled(Mesh(verts, faces), mesh.faces)
     return result, n_bridged, n_removed, n_skipped
 
 
@@ -4219,7 +4416,9 @@ def _split_fan_vertices(
     Giving each face-edge piece of such a fan but the first its own copy of
     the vertex disconnects the branches in the vertex graph.  Each copy sits
     a thousandth of its piece's reach off the point, into the piece, so no
-    two vertices share a point; a piece of faces with no area is dropped.
+    two vertices share a point; a piece of faces with no area is dropped,
+    and the fans at its faces' other vertices, which the drop may part,
+    are checked next, until nothing more is dropped.
 
     Returns a new mesh with split vertices (more vertices, same faces).
     """
@@ -4241,6 +4440,22 @@ def _split_fan_vertices(
             f"({len(verts):,} -> {len(result.vertices):,} vertices)"
         )
     return result
+
+
+def _settled(mesh: Mesh, faces_before) -> Mesh:
+    """*mesh* with its fans split where a step took faces out: a face
+    whole in *faces_before* and collapsed in *mesh* (``[v, v, v]``) may
+    have held the fans at its vertices together, so those vertices go to
+    :func:`_split_fan_vertices` — which drops the pieces of no area it
+    finds, and settles what those drops part in turn."""
+    before = np.asarray(faces_before, dtype=np.int64)
+    after = np.asarray(mesh.faces, dtype=np.int64)[: len(before)]
+    gone = (after[:, 0] == after[:, 1]) & (after[:, 1] == after[:, 2])
+    was = (before[:, 0] != before[:, 1]) | (before[:, 1] != before[:, 2])
+    taken = gone & was
+    if not taken.any():
+        return mesh
+    return _split_fan_vertices(mesh, set(np.unique(before[taken]).tolist()))
 
 
 @mesh_args()
@@ -4818,6 +5033,15 @@ def remove_parallel_patches(
        a loop that cannot be closed so stays open, as does a loop also
        running along a face the removal did not take.
 
+    Where the removal leaves the faces round a vertex in more than one fan
+    — two sheets a closure could not join validly meeting at a point, or
+    a face of no area left hanging — the vertex is left as it is: a fusion
+    the later steps read (:func:`find_fusions` finds the pinches, and
+    :func:`find_disconnected` and :func:`find_gaps` split along them;
+    cutting them here loses bridges).  :func:`preprocess` splits them with
+    the fusions, and the rest after them (:func:`_split_fan_vertices` on
+    the vertices of the faces this took out).
+
     Parameters
     ----------
     mesh : Mesh
@@ -5042,9 +5266,12 @@ def preprocess(
       3. find_organelles (unless *organelles* is False)
       4. find_soma (unless *soma* is a Soma or False)
       5. find_fusions → find_disconnected → find_gaps
-      6. remove_gaps → remove_fusions
-      7. fill_holes (unless *fill* is False)
-      8. break_up_mesh
+      6. remove_gaps → remove_fusions, then the pinches step 1 left that no
+         fusion took split (_split_fan_vertices on the vertices of the
+         faces it took out)
+      7. break_up_mesh
+      8. fill_holes (unless *fill* is False), then the organelles cut free
+         (isolate_organelles)
       9. compact_mesh (optional)
 
     Each ``find_*`` step is skipped if it returns nothing.
@@ -5073,17 +5300,18 @@ def preprocess(
         where the data cannot give one.  Its ``verts`` name this mesh's
         vertices, which the step before it (parallel patches) keeps.
     fill : bool, default True
-        Patch the holes in the surface (:func:`fill_holes`) before the mesh
-        is broken up; False leaves them open.
+        Patch the holes in the neurites (:func:`fill_holes`) once the mesh
+        is broken up, each patch joining the neurite it closes; False
+        leaves them open.
     rescued : array-like of int, optional
         Face ids the caller has declared arbor, passed through to
-        :func:`break_up_mesh` in step 8.  The neurite/discarded split is
+        :func:`break_up_mesh` in step 7.  The neurite/discarded split is
         re-derived from scratch here, so an override that is not fed back
         in is undone by the run.
     released : array-like of int, optional
-        Lasso-drawn arbor claims, likewise passed through to step 8.
+        Lasso-drawn arbor claims, likewise passed through to step 7.
     claim_min_faces : int, default 0
-        Passed to :func:`break_up_mesh` in step 8.
+        Passed to :func:`break_up_mesh` in step 7.
     compact : bool, default False
         If True, run :func:`compact_mesh` as a final step to drop
         unreferenced vertices and the faces the removals collapsed (the
@@ -5105,7 +5333,7 @@ def preprocess(
     -------
     mesh : Mesh
         Cleaned mesh (gaps stitched, fusions removed, holes patched,
-        optionally compacted).
+        organelles cut free, optionally compacted).
     components : MeshComponents
         Classified pieces: soma, organelles, neurites, discarded.  Its
         ``record`` says what the run decided on the way — how the soma was
@@ -5150,6 +5378,9 @@ def preprocess(
             }
             for p in patches
         ]
+        # the faces before the removal: the pinches it leaves are split
+        # after the fusions (step 6), once the gaps were found across them
+        before_patches = np.asarray(mesh.faces, dtype=np.int64)
         if patches:
             mesh = remove_parallel_patches(mesh, patches=patches)
 
@@ -5244,23 +5475,20 @@ def preprocess(
         if gaps:
             mesh = remove_gaps(mesh, gaps=gaps, mesh_stats=mesh_stats, fusions=fusions)
 
-    # 6. Fusions
-    with _timed("↳  remove fusions", verbose=verbose):
+    # 6. Fusions, then the pinches the parallel patches' removal left that
+    #    no fusion took: split where the faces it took out held a fan
+    with _timed("↳  remove fusions", verbose=verbose) as log:
         if fusions:
             mesh = remove_fusions(mesh, fusions=fusions, mesh_stats=mesh_stats)
+        settled = _settled(mesh, before_patches)
+        if settled is not mesh:
+            if mesh_stats is not None:
+                mesh_stats.invalidate_topology()
+            log(f"+{len(settled.vertices) - len(mesh.vertices):,} pinch copies")
+            mesh = settled
 
-    # 7. Holes — the organelles' mouths and the mesh's own openings
-    #    patched, so that the neurites cut out next are tubes
-    with _timed("↳  fill holes", verbose=verbose) as log:
-        n_before = len(mesh.faces)
-        if fill:
-            mesh = fill_holes(mesh, organelles=org, soma=soma, mesh_stats=mesh_stats)
-            log(f"+{len(mesh.faces) - n_before:,} faces")
-        else:
-            log("none: fill=False")
-        record["fill"] = {"asked": bool(fill), "faces": len(mesh.faces) - n_before}
-
-    # 8. Break up mesh
+    # 7. Break up mesh: the soma, the organelles (walls released, pieces
+    #    trapped), the neurites and the discards, on the mesh as stitched
     with _timed("↳  break up mesh", verbose=verbose) as log:
         components = break_up_mesh(
             mesh,
@@ -5276,6 +5504,34 @@ def preprocess(
             "released": 0 if released is None else len(released),
         }
         components.record = record
+
+    # 8. Holes — the organelles' mouths and the mesh's own openings in the
+    #    neurites the break-up settled, patched so that they are tubes,
+    #    each patch in the neurite it closes; then the organelles cut
+    #    free of the rest, each wall where it was traced before the fill
+    #    faired the surface round its mouth
+    unfaired = mesh.vertices
+    with _timed("↳  fill holes", verbose=verbose) as log:
+        n_before = len(mesh.faces)
+        if fill:
+            mesh = fill_holes(
+                mesh,
+                organelles=components.organelles,
+                soma=components.soma,
+                neurites=components.neurites,
+                mesh_stats=mesh_stats,
+            )
+            components = _with_patches(mesh, components, n_before)
+            log(f"+{len(mesh.faces) - n_before:,} faces")
+        else:
+            log("none: fill=False")
+        record["fill"] = {"asked": bool(fill), "faces": len(mesh.faces) - n_before}
+    with _timed("↳  cut organelles free", verbose=verbose) as log:
+        n_before = len(mesh.vertices)
+        mesh, sources = _isolated(mesh, components.organelles, unfaired, mesh_stats)
+        components = _soma_keeps_its_copies(mesh, components, sources, n_before)
+        log(f"+{len(sources):,} vertices")
+        record["organelles"]["cut_free"] = len(sources)
 
     # 9. Compact (optional — remaps everything in MeshComponents)
     if compact:
