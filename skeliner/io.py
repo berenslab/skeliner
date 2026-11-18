@@ -436,9 +436,21 @@ def save_skeleton_swc(
 # -----------
 
 
-def load_skeleton_npz(path: str | Path) -> Skeleton:
+def load_skeleton_npz(path: str | Path, *, mesh: bool = True) -> Skeleton:
     """
     Load a Skeleton that was written with `Skeleton.to_npz` / `save_skeleton_npz`.
+
+    Parameters
+    ----------
+    path
+        The ``.npz`` archive.
+    mesh
+        False leaves out what the skeleton keeps of the mesh it was built
+        from, without reading it: ``node2verts`` and ``vert2node`` are
+        None, ``soma.verts`` is None, and ``extra`` is empty (skeletonize
+        keeps the mesh vertices' distances to the centreline there, saved
+        as one object with the rest of ``extra``). The nodes, edges, radii,
+        node types, the soma's ellipsoid and ``meta`` load as saved.
     """
     path = Path(path)
 
@@ -457,25 +469,26 @@ def load_skeleton_npz(path: str | Path) -> Skeleton:
             if len(ntype):
                 ntype[0] = -1  # default to "root"
 
-        # reconstruct ragged node2verts
-        idx = z["node2verts_idx"].astype(np.int64)
-        off = z["node2verts_off"].astype(np.int64)
-        node2verts = [idx[off[i] : off[i + 1]] for i in range(len(off) - 1)]
-
-        vert2node = rebuild_vert2node(node2verts) or {}
+        node2verts = vert2node = soma_verts = None
+        extra = {}
+        if mesh:
+            # reconstruct ragged node2verts
+            idx = z["node2verts_idx"].astype(np.int64)
+            off = z["node2verts_off"].astype(np.int64)
+            node2verts = [idx[off[i] : off[i + 1]] for i in range(len(off) - 1)]
+            vert2node = rebuild_vert2node(node2verts) or {}
+            if "soma_verts" in z:
+                soma_verts = z["soma_verts"].astype(np.int64)
+            if "extra" in z.files:
+                # stored as length-1 object array; .item() unwraps the dict
+                extra = z["extra"].item()
 
         soma = Soma(
             center=z["soma_centre"],
             axes=z["soma_axes"],
             R=z["soma_R"],
-            verts=(z["soma_verts"].astype(np.int64) if "soma_verts" in z else None),
+            verts=soma_verts,
         )
-
-        # ----------- NEW: arbitrary, user-defined metadata ---------------
-        extra = {}
-        if "extra" in z.files:
-            # stored as length-1 object array; .item() unwraps the dict
-            extra = z["extra"].item()
 
         meta = {}
         if "meta" in z.files:
@@ -1249,7 +1262,7 @@ def load_skeleton(path: str | Path, **kwargs) -> "Skeleton":
 
     The format is inferred from the file extension.
     Extra *kwargs* are forwarded to the format-specific
-    loader (e.g. ``scale=`` for SWC).
+    loader (e.g. ``scale=`` for SWC, ``mesh=False`` for npz).
     """
     path = Path(path)
     ext = path.suffix.lower()

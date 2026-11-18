@@ -263,6 +263,42 @@ def test_skeleton_from_swc():
     assert np.array_equal(skel_cls.ntype, skel_func.ntype)
 
 
+def test_a_skeleton_loads_without_what_it_keeps_of_the_mesh(tmp_path):
+    nodes = np.array([[0.0, 0, 0], [1, 0, 0], [2, 0, 0], [2, 1, 0]])
+    skel = Skeleton(
+        soma=Soma.from_sphere(nodes[0], 1.0, verts=np.array([0, 1, 2])),
+        nodes=nodes,
+        radii={"median": np.array([1.0, 0.5, 0.4, 0.3]), "mean": np.full(4, 0.6)},
+        edges=np.array([[0, 1], [1, 2], [2, 3]]),
+        ntype=np.array([1, 3, 3, 3]),
+        node2verts=[
+            np.array([0, 1, 2]),
+            np.array([3, 4]),
+            np.array([5]),
+            np.array([6]),
+        ],
+        meta={"id": 7, "unit": "µm"},
+        extra={"cl_dist_vids": np.arange(7), "node2neurite": np.array([-1, 0, 0, 0])},
+    )
+    path = tmp_path / "skel.npz"
+    sk.io.save_skeleton(skel, path)
+    full = sk.io.load_skeleton(path)
+    light = sk.io.load_skeleton(path, mesh=False)
+
+    assert len(full.node2verts) == 4 and len(full.soma.verts) == 3
+    assert sorted(full.extra) == ["cl_dist_vids", "node2neurite"]
+    assert light.node2verts is None and light.vert2node is None
+    assert light.soma.verts is None and light.extra == {}
+    assert np.array_equal(light.nodes, full.nodes)
+    assert np.array_equal(light.edges, full.edges)
+    assert np.array_equal(light.ntype, full.ntype)
+    assert light.radii.keys() == full.radii.keys()
+    assert all(np.array_equal(light.radii[k], full.radii[k]) for k in full.radii)
+    for part in ("center", "axes", "R"):
+        assert np.array_equal(getattr(light.soma, part), getattr(full.soma, part))
+    assert light.meta == full.meta == {"id": 7, "unit": "µm"}
+
+
 def test_skeleton_from_npz(tmp_path, reference_mesh):
     """Skeleton.from_npz matches load_skeleton_npz."""
     skel = skeletonize(reference_mesh, verbose=False)

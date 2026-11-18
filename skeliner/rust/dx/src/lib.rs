@@ -232,6 +232,160 @@ struct Frustum {
     vox: [(i64, i64); 3],
 }
 
+impl Frustum {
+    /// Whether the point is inside: within the radius at its projection
+    /// onto the edge, or within the larger radius of a degenerate edge's
+    /// start.
+    fn holds(&self, x: f64, y: f64, z: f64) -> bool {
+        let (dx, dy, dz) = (x - self.a[0], y - self.a[1], z - self.a[2]);
+        if self.l2 <= 1e-24 {
+            return dx * dx + dy * dy + dz * dz <= self.rmax * self.rmax;
+        }
+        let v = self.v;
+        let s = (dx * v[0] + dy * v[1] + dz * v[2]) / self.l2;
+        // np.clip, which keeps a NaN
+        let s = if s.is_nan() { s } else { s.clamp(0.0, 1.0) };
+        let (rx, ry, rz) = (dx - s * v[0], dy - s * v[1], dz - s * v[2]);
+        let r = self.r0 + s * (self.r1 - self.r0);
+        rx * rx + ry * ry + rz * rz <= r * r
+    }
+}
+
+impl SomaVoxels {
+    /// Whether the point is inside the ellipsoid.
+    fn holds(&self, x: f64, y: f64, z: f64) -> bool {
+        let (dx, dy, dz) = (x - self.center[0], y - self.center[1], z - self.center[2]);
+        let u = self.rt.map(|r| r[0] * dx + r[1] * dy + r[2] * dz);
+        let a2 = self.axes.map(|a| a * a);
+        (u[0] * u[0]) / a2[0] + (u[1] * u[1]) / a2[1] + (u[2] * u[2]) / a2[2] <= 1.0
+    }
+}
+
+/// `dx.volume`'s voxel union on the grid from `lo` in steps of `h`,
+/// `shape` voxels per axis: the edges' frusta (the radius linear along
+/// each) and the soma's ellipsoid, each with its box of voxels clipped to
+/// `[lo, hi]`. With `include_soma` the soma's voxels are filled; without
+/// it they are carved out of the edges'.
+struct VoxelUnion<'a> {
+    lo: [f64; 3],
+    h: f64,
+    shape: [usize; 3],
+    frusta: Vec<Frustum>,
+    soma: Option<(&'a SomaVoxels, [(i64, i64); 3])>,
+    include_soma: bool,
+}
+
+impl<'a> VoxelUnion<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        nodes: &[[f64; 3]],
+        radii: &[f64],
+        edges: &[[usize; 2]],
+        lo: [f64; 3],
+        hi: [f64; 3],
+        h: f64,
+        shape: [usize; 3],
+        soma: Option<&'a SomaVoxels>,
+        include_soma: bool,
+    ) -> Self {
+        let range = |d: usize, x0: f64, x1: f64| voxel_range(x0, x1, lo[d], h, shape[d]);
+        let mut frusta: Vec<Frustum> = Vec::new();
+        for &[i, j] in edges {
+            let (a, b) = (nodes[i], nodes[j]);
+            let (r0, r1) = (radii[i], radii[j]);
+            let rmax = if r1 > r0 { r1 } else { r0 };
+            if !rmax.is_finite() || rmax < 0.0 {
+                continue;
+            }
+            let lo_e = [0, 1, 2].map(|d| np_max(np_min(a[d], b[d]) - rmax, lo[d]));
+            let hi_e = [0, 1, 2].map(|d| np_min(np_max(a[d], b[d]) + rmax, hi[d]));
+            if (0..3).any(|d| lo_e[d] > hi_e[d]) {
+                continue;
+            }
+            let vox = [0, 1, 2].map(|d| range(d, lo_e[d], hi_e[d]));
+            if vox.iter().any(|&(v0, v1)| v1 < v0) {
+                continue;
+            }
+            let v = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            frusta.push(Frustum {
+                a,
+                v,
+                l2: v[0] * v[0] + v[1] * v[1] + v[2] * v[2],
+                r0,
+                r1,
+                rmax,
+                vox,
+            });
+        }
+        let soma = soma.and_then(|s| {
+            let slo = [0, 1, 2].map(|d| np_max(s.lo[d], lo[d]));
+            let shi = [0, 1, 2].map(|d| np_min(s.hi[d], hi[d]));
+            let vox = [0, 1, 2].map(|d| range(d, slo[d], shi[d]));
+            vox.iter().all(|&(v0, v1)| v1 >= v0).then_some((s, vox))
+        });
+        VoxelUnion {
+            lo,
+            h,
+            shape,
+            frusta,
+            soma,
+            include_soma,
+        }
+    }
+
+    /// The centre of voxel `i` along axis `d`.
+    fn centre(&self, d: usize, i: i64) -> f64 {
+        self.lo[d] + (i as f64 + 0.5) * self.h
+    }
+
+    /// Which voxels of the plane `i` along x the union fills, `ny × nz` by
+    /// rows of y, each tested as `_voxelize_union` tests it, operation for
+    /// operation.
+    fn plane(&self, i: i64) -> Vec<bool> {
+        let [_, ny, nz] = self.shape;
+        let x = self.centre(0, i);
+        let mut occ = vec![false; ny * nz];
+        let soma_here = self.soma.filter(|(_, v)| v[0].0 <= i && i <= v[0].1);
+        if self.include_soma
+            && let Some((s, v)) = soma_here
+        {
+            for j in v[1].0..=v[1].1 {
+                for k in v[2].0..=v[2].1 {
+                    if s.holds(x, self.centre(1, j), self.centre(2, k)) {
+                        occ[j as usize * nz + k as usize] = true;
+                    }
+                }
+            }
+        }
+        for f in self
+            .frusta
+            .iter()
+            .filter(|f| f.vox[0].0 <= i && i <= f.vox[0].1)
+        {
+            for j in f.vox[1].0..=f.vox[1].1 {
+                for k in f.vox[2].0..=f.vox[2].1 {
+                    let at = j as usize * nz + k as usize;
+                    if !occ[at] && f.holds(x, self.centre(1, j), self.centre(2, k)) {
+                        occ[at] = true;
+                    }
+                }
+            }
+        }
+        if !self.include_soma
+            && let Some((s, v)) = soma_here
+        {
+            for j in v[1].0..=v[1].1 {
+                for k in v[2].0..=v[2].1 {
+                    if s.holds(x, self.centre(1, j), self.centre(2, k)) {
+                        occ[j as usize * nz + k as usize] = false;
+                    }
+                }
+            }
+        }
+        occ
+    }
+}
+
 /// `dx.volume`'s voxel union: how many voxels of the grid from `lo` in
 /// steps of `h`, `shape` voxels per axis, have their centre inside an
 /// edge's frustum (the radius linear along it) or, with `include_soma`,
@@ -250,98 +404,55 @@ pub fn voxel_union_count(
     soma: Option<&SomaVoxels>,
     include_soma: bool,
 ) -> u64 {
-    let [nx, ny, nz] = shape;
-    let centre = |d: usize, i: i64| lo[d] + (i as f64 + 0.5) * h;
-    let range = |d: usize, x0: f64, x1: f64| voxel_range(x0, x1, lo[d], h, shape[d]);
+    let union = VoxelUnion::new(nodes, radii, edges, lo, hi, h, shape, soma, include_soma);
+    let filled = |i: i64| union.plane(i).iter().filter(|&&o| o).count() as u64;
+    threads::install(|| (0..shape[0] as i64).into_par_iter().map(filled).sum())
+}
 
-    let mut frusta: Vec<Frustum> = Vec::new();
-    for &[i, j] in edges {
-        let (a, b) = (nodes[i], nodes[j]);
-        let (r0, r1) = (radii[i], radii[j]);
-        let rmax = if r1 > r0 { r1 } else { r0 };
-        if !rmax.is_finite() || rmax < 0.0 {
-            continue;
-        }
-        let lo_e = [0, 1, 2].map(|d| np_max(np_min(a[d], b[d]) - rmax, lo[d]));
-        let hi_e = [0, 1, 2].map(|d| np_min(np_max(a[d], b[d]) + rmax, hi[d]));
-        if (0..3).any(|d| lo_e[d] > hi_e[d]) {
-            continue;
-        }
-        let vox = [0, 1, 2].map(|d| range(d, lo_e[d], hi_e[d]));
-        if vox.iter().any(|&(v0, v1)| v1 < v0) {
-            continue;
-        }
-        let v = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-        frusta.push(Frustum {
-            a,
-            v,
-            l2: v[0] * v[0] + v[1] * v[1] + v[2] * v[2],
-            r0,
-            r1,
-            rmax,
-            vox,
-        });
+/// The voxels `voxel_union_count` counts, counted per layer along z (`nz`)
+/// and per column along z (`nx × ny`, by rows of y): the same grid and the
+/// same voxels, so each sums to its count.
+#[allow(clippy::too_many_arguments)]
+pub fn voxel_union_profiles(
+    nodes: &[[f64; 3]],
+    radii: &[f64],
+    edges: &[[usize; 2]],
+    lo: [f64; 3],
+    hi: [f64; 3],
+    h: f64,
+    shape: [usize; 3],
+    soma: Option<&SomaVoxels>,
+    include_soma: bool,
+) -> (Vec<u64>, Vec<u64>) {
+    let [nx, ny, nz] = shape;
+    let mut columns = vec![0u64; nx * ny];
+    if ny == 0 || nz == 0 {
+        return (vec![0; nz], columns);
     }
-    // the soma's voxel box (clipped to [lo, hi]) and its test
-    let soma_box = soma.and_then(|s| {
-        let slo = [0, 1, 2].map(|d| np_max(s.lo[d], lo[d]));
-        let shi = [0, 1, 2].map(|d| np_min(s.hi[d], hi[d]));
-        let vox = [0, 1, 2].map(|d| range(d, slo[d], shi[d]));
-        vox.iter().all(|&(v0, v1)| v1 >= v0).then_some((s, vox))
+    let union = VoxelUnion::new(nodes, radii, edges, lo, hi, h, shape, soma, include_soma);
+    let layers = threads::install(|| {
+        columns
+            .par_chunks_mut(ny)
+            .enumerate()
+            .map(|(i, row)| {
+                let mut layers = vec![0u64; nz];
+                for (column, filled) in row.iter_mut().zip(union.plane(i as i64).chunks(nz)) {
+                    for (layer, &o) in layers.iter_mut().zip(filled) {
+                        *layer += u64::from(o);
+                    }
+                    *column = filled.iter().map(|&o| u64::from(o)).sum();
+                }
+                layers
+            })
+            .reduce(
+                || vec![0u64; nz],
+                |mut a, b| {
+                    a.iter_mut().zip(b).for_each(|(x, y)| *x += y);
+                    a
+                },
+            )
     });
-    let in_soma = |s: &SomaVoxels, x: f64, y: f64, z: f64| {
-        let (dx, dy, dz) = (x - s.center[0], y - s.center[1], z - s.center[2]);
-        let u = s.rt.map(|r| r[0] * dx + r[1] * dy + r[2] * dz);
-        let a2 = s.axes.map(|a| a * a);
-        (u[0] * u[0]) / a2[0] + (u[1] * u[1]) / a2[1] + (u[2] * u[2]) / a2[2] <= 1.0
-    };
-    let inside = |f: &Frustum, x: f64, y: f64, z: f64| {
-        let (dx, dy, dz) = (x - f.a[0], y - f.a[1], z - f.a[2]);
-        if f.l2 <= 1e-24 {
-            return dx * dx + dy * dy + dz * dz <= f.rmax * f.rmax;
-        }
-        let s = (dx * f.v[0] + dy * f.v[1] + dz * f.v[2]) / f.l2;
-        // np.clip, which keeps a NaN
-        let s = if s.is_nan() { s } else { s.clamp(0.0, 1.0) };
-        let (rx, ry, rz) = (dx - s * f.v[0], dy - s * f.v[1], dz - s * f.v[2]);
-        let r = f.r0 + s * (f.r1 - f.r0);
-        rx * rx + ry * ry + rz * rz <= r * r
-    };
-    let plane = |i: i64| -> u64 {
-        let x = centre(0, i);
-        let mut occ = vec![false; ny * nz];
-        let soma_here = soma_box.filter(|(_, v)| v[0].0 <= i && i <= v[0].1);
-        if include_soma && let Some((s, v)) = soma_here {
-            for j in v[1].0..=v[1].1 {
-                for k in v[2].0..=v[2].1 {
-                    if in_soma(s, x, centre(1, j), centre(2, k)) {
-                        occ[j as usize * nz + k as usize] = true;
-                    }
-                }
-            }
-        }
-        for f in frusta.iter().filter(|f| f.vox[0].0 <= i && i <= f.vox[0].1) {
-            for j in f.vox[1].0..=f.vox[1].1 {
-                for k in f.vox[2].0..=f.vox[2].1 {
-                    let at = j as usize * nz + k as usize;
-                    if !occ[at] && inside(f, x, centre(1, j), centre(2, k)) {
-                        occ[at] = true;
-                    }
-                }
-            }
-        }
-        if !include_soma && let Some((s, v)) = soma_here {
-            for j in v[1].0..=v[1].1 {
-                for k in v[2].0..=v[2].1 {
-                    if in_soma(s, x, centre(1, j), centre(2, k)) {
-                        occ[j as usize * nz + k as usize] = false;
-                    }
-                }
-            }
-        }
-        occ.iter().filter(|&&o| o).count() as u64
-    };
-    threads::install(|| (0..nx as i64).into_par_iter().map(plane).sum())
+    (layers, columns)
 }
 
 /// Python's `min(a, b)`: `b` if `b < a`, else `a`.
@@ -555,5 +666,68 @@ mod tests {
             segment_distances(&pts, &nodes, &[], &[]),
             vec![f64::INFINITY; 3]
         );
+    }
+
+    /// A slanted edge through the soma on a grid of half units: each layer
+    /// and each column of the profiles is what the count gives on a box of
+    /// that layer or column alone, the soma filled or carved out.
+    #[test]
+    fn the_profiles_count_each_layer_and_column_as_a_box_of_it_would() {
+        let nodes = [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [7.0, 4.0, 5.0]];
+        let radii = [0.0, 1.2, 0.7];
+        let edges = [[1, 2]];
+        let soma = SomaVoxels {
+            center: [2.0, 2.0, 2.0],
+            axes: [1.5, 1.0, 1.0],
+            rt: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            lo: [0.5, 1.0, 1.0],
+            hi: [3.5, 3.0, 3.0],
+        };
+        let (lo, hi, h) = ([-1.0, -1.0, -1.0], [9.0, 6.0, 7.0], 0.5);
+        let [nx, ny, nz] = [20, 14, 16];
+        let count = |lo: [f64; 3], hi: [f64; 3], shape: [usize; 3], with: bool| {
+            voxel_union_count(&nodes, &radii, &edges, lo, hi, h, shape, Some(&soma), with)
+        };
+        let mut totals = Vec::new();
+        for with in [true, false] {
+            let total = count(lo, hi, [nx, ny, nz], with);
+            let (layers, columns) = voxel_union_profiles(
+                &nodes,
+                &radii,
+                &edges,
+                lo,
+                hi,
+                h,
+                [nx, ny, nz],
+                Some(&soma),
+                with,
+            );
+            assert_eq!(layers.iter().sum::<u64>(), total);
+            assert_eq!(columns.iter().sum::<u64>(), total);
+            assert!(layers.iter().filter(|&&n| n > 0).count() >= 8);
+            assert!(columns.iter().filter(|&&n| n > 0).count() >= 40);
+            for (k, &n) in layers.iter().enumerate() {
+                let z = lo[2] + k as f64 * h;
+                let layer = count(
+                    [lo[0], lo[1], z],
+                    [hi[0], hi[1], z + 0.75 * h],
+                    [nx, ny, 1],
+                    with,
+                );
+                assert_eq!(n, layer, "layer {k}");
+            }
+            for (at, &n) in columns.iter().enumerate() {
+                let (x, y) = (lo[0] + (at / ny) as f64 * h, lo[1] + (at % ny) as f64 * h);
+                let column = count(
+                    [x, y, lo[2]],
+                    [x + 0.75 * h, y + 0.75 * h, hi[2]],
+                    [1, 1, nz],
+                    with,
+                );
+                assert_eq!(n, column, "column {at}");
+            }
+            totals.push(total);
+        }
+        assert!(totals[0] > totals[1] && totals[1] > 100, "{totals:?}");
     }
 }

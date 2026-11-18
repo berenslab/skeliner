@@ -390,6 +390,35 @@ def test_degree_and_neighbors_match_igraph(skel):
     assert set(dx.neighbors(skel, nid)) == set(g.neighbors(nid))
 
 
+def test_parents_step_each_node_one_hop_nearer_the_root(skel):
+    parent = dx.parents(skel)
+    assert parent.dtype == np.int64 and parent.shape == (len(skel.nodes),)
+    assert np.array_equal(skel.dx.parents(), parent)
+    hops = np.asarray(_igraph(skel).distances(source=0)[0])
+    assert np.isfinite(hops).all() and hops.max() >= 10
+    assert parent[0] == -1
+    child = np.arange(1, len(skel.nodes))
+    assert np.array_equal(hops[parent[child]], hops[child] - 1)
+    for v in child[:: max(1, len(child) // 50)]:
+        assert parent[v] in dx.neighbors(skel, int(v))
+
+
+def test_parents_leave_minus_one_where_the_root_does_not_reach():
+    nodes = np.zeros((5, 3))
+    nodes[:, 0] = np.arange(5)
+    skel = Skeleton(
+        soma=Soma.from_sphere(nodes[0], 0.5, verts=None),
+        nodes=nodes,
+        radii={"median": np.ones(5)},
+        edges=np.array([[0, 1], [1, 2], [3, 4]]),
+        ntype=None,
+    )
+    assert dx.parents(skel).tolist() == [-1, 0, 1, -1, -1]
+    assert dx.parents(skel, root=4).tolist() == [-1, -1, -1, 4, -1]
+    with pytest.raises(ValueError, match="node 5 is not one of 5 nodes"):
+        dx.parents(skel, root=5)
+
+
 def test_nodes_of_degree(skel):
     g = _igraph(skel)
     deg = np.asarray(g.degree())

@@ -1,6 +1,6 @@
 //! `skeliner._rs.dx`: the `dx` crate's kernels for `skeliner.dx`.
 
-use numpy::ndarray::Array1;
+use numpy::ndarray::{Array1, Array2};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -214,6 +214,65 @@ fn voxel_union_count(
             include_soma,
         )
     }))
+}
+
+/// `voxel_union_profiles`' result: the filled voxels per layer along z
+/// `(nz,)` and per column along z `(nx, ny)`.
+type ProfilesOut<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray2<i64>>);
+
+/// The voxels `voxel_union_count` counts, for the same arguments, counted
+/// per layer along z `(nz,)` and per column along z `(nx, ny)`. Rust
+/// only: the Python path runs it here too.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn voxel_union_profiles<'py>(
+    py: Python<'py>,
+    nodes: PyReadonlyArray2<'py, f64>,
+    radii: numpy::PyReadonlyArray1<'py, f64>,
+    edges: PyReadonlyArray2<'py, i64>,
+    lo: [f64; 3],
+    hi: [f64; 3],
+    h: f64,
+    shape: [usize; 3],
+    soma: Option<SomaIn>,
+    include_soma: bool,
+) -> PyResult<ProfilesOut<'py>> {
+    let nodes = rows3("N", &nodes)?;
+    let radii = radii.as_array().to_vec();
+    if radii.len() != nodes.len() {
+        return Err(PyValueError::new_err("one radius per node"));
+    }
+    let edges = node_pairs(&edges, nodes.len())?;
+    if h.is_nan() || h <= 0.0 {
+        return Err(PyValueError::new_err("voxel_size must be positive"));
+    }
+    let soma = soma.map(|(center, axes, rt, lo, hi)| ::dx::SomaVoxels {
+        center,
+        axes,
+        rt,
+        lo,
+        hi,
+    });
+    let (layers, columns) = py.detach(|| {
+        ::dx::voxel_union_profiles(
+            &nodes,
+            &radii,
+            &edges,
+            lo,
+            hi,
+            h,
+            shape,
+            soma.as_ref(),
+            include_soma,
+        )
+    });
+    let signed = |v: Vec<u64>| v.into_iter().map(|n| n as i64).collect::<Vec<_>>();
+    let columns = Array2::from_shape_vec((shape[0], shape[1]), signed(columns))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok((
+        Array1::from(signed(layers)).into_pyarray(py),
+        columns.into_pyarray(py),
+    ))
 }
 
 /// `total_path_length` within a box: the length of the edges `(E, 2)`
@@ -518,6 +577,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(arm_cables, m)?)?;
     m.add_function(wrap_pyfunction!(path_length_in_box, m)?)?;
     m.add_function(wrap_pyfunction!(voxel_union_count, m)?)?;
+    m.add_function(wrap_pyfunction!(voxel_union_profiles, m)?)?;
     m.add_class::<PySkeletonIndex>()?;
     m.add_function(wrap_pyfunction!(segment_distances, m)?)?;
     Ok(())
