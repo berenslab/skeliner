@@ -262,18 +262,19 @@ def read_ctm(path) -> tuple[np.ndarray, np.ndarray] | None:
 
 
 def write_obj(path, vertices, faces) -> None:
-    """Write *vertices* ``(N, 3)`` and *faces* ``(F, 3)`` to *path* as
-    trimesh's ``export_obj`` writes a plain mesh (no normals, colours,
-    texture or name): its header comment, a ``v`` line per vertex with eight
-    decimals, an ``f`` line per face numbered from one, and a blank line to
-    end."""
+    """Write *vertices* ``(N, 3)`` and *faces* ``(F, 3)`` to *path* as the
+    plain OBJ :func:`read_obj` reads: a ``v`` line per vertex, an ``f`` line
+    per face numbered from one, and a blank line to end. Each coordinate is
+    the shortest decimal that reads back as the same number, never in
+    exponent notation (``423318``, ``0.1``, ``-0``; NaN as ``nan``), as
+    Rust's ``{}`` writes it, so the mesh reads back bit for bit."""
     from .mesh import checked_faces, rows3
 
     vertices = rows3("V", vertices)
     faces, _ = checked_faces(faces, len(vertices))
     v = "\nv ".join(
-        " ".join(format(x, ".8f") for x in row) for row in vertices.tolist()
+        " ".join(np.format_float_positional(x, unique=True, trim="-") for x in row)
+        for row in vertices
     )
     f = "\nf ".join(f"{a} {b} {c}" for a, b, c in (faces + 1).tolist())
-    text = "\n".join(["# https://github.com/mikedh/trimesh", f"v {v}\nf {f}", "\n"])
-    Path(path).write_bytes(text.encode())
+    Path(path).write_bytes(f"v {v}\nf {f}\n\n".encode())

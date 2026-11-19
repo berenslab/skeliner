@@ -1530,7 +1530,14 @@ def break_up_mesh(
     below that keeps a stub from being absorbed): where a few trees hold
     95% of the faces, a dendrite cut off at the soma is under both size
     rules.  A piece apart from the soma is not given back this way — it
-    would be tied to the soma by a straight stem.
+    would be tied to the soma by a straight stem.  But a piece holding an
+    organelle is never discarded, whatever its size or place: the piece an
+    organelle shares the most vertices with holds it (a pocket, the surface
+    round its mouth), and one sharing none (closed in the lumen) is held by
+    the piece the rays from its centre along the axes meet first most often
+    (``organelle_hosts``).  A branch cut off from the arbor carries its
+    organelles with it; apart from the soma, it is tied to it by a straight
+    stem.
 
     The soma test is a *boundary* test: it measures what fraction of a
     component's outer edges are shared with soma faces, not how far the
@@ -1753,6 +1760,30 @@ def break_up_mesh(
             n_stood_out = len(stood)
             neurites = sorted(neurites + stood, key=len, reverse=True)
 
+    # --- a piece holding an organelle is never discarded: the cut above
+    # weighs size alone, and a branch cut off from the arbor (at a chunk
+    # boundary, by a fusion) carries its organelles with it.
+    n_held = 0
+    if discarded:
+        pieces = neurites + discarded
+        label = np.full(len(faces), -1, dtype=np.int64)
+        for i, comp in enumerate(pieces):
+            label[np.asarray(comp, dtype=np.int64)] = i
+        held = np.asarray(
+            kernels.pre.organelle_hosts(
+                np.asarray(faces, dtype=np.int64),
+                np.asarray(verts, dtype=np.float64),
+                label,
+                np.asarray(organelles_expanded, dtype=bool),
+                len(pieces),
+            )
+        )[len(neurites) :]
+        if held.any():
+            kept = [c for c, h in zip(discarded, held) if h]
+            n_held = len(kept)
+            discarded = [c for c, h in zip(discarded, held) if not h]
+            neurites = sorted(neurites + kept, key=len, reverse=True)
+
     # --- re-apply the hand overrides the threshold knows nothing about ---
     # Only here do the two claims differ.  Escaping the soma is a
     # judgement about *what the surface is* and holds at any size; being a
@@ -1781,6 +1812,8 @@ def break_up_mesh(
             parts.append(f"{len(discarded)} discarded ({n_disc_faces:,}f)")
         if n_stood_out:
             parts.append(f"{n_stood_out} standing out of the soma kept")
+        if n_held:
+            parts.append(f"{n_held} holding organelles kept")
         if n_claimed:
             parts.append(f"claimed {n_claimed}")
         if n_trapped:
@@ -4479,8 +4512,8 @@ def remove_fusions(
        share a vertex without sharing face-edges.  The first piece of
        such a fan with an area keeps the vertex; each later one gets a
        copy of it, a thousandth of the piece's mean edge off the point,
-       towards the piece's other vertices — far above the eight decimals
-       an OBJ keeps, far below anything the mesh shows — so the cut stays
+       towards the piece's other vertices — far above a coordinate's
+       rounding, far below anything the mesh shows — so the cut stays
        cut where the mesh is read back (:func:`~skeliner.io.load_mesh`
        merges vertices that share a point along a seam) and no two
        vertices share a point.  A piece of faces with no area is no
@@ -5022,20 +5055,19 @@ def remove_parallel_patches(
     4. For each new component, check which removed patches it borders:
        - borders only Mode A → orphan from fold removal → remove
        - borders any Mode B → real neurite piece → keep (for stitching)
-    5. Close the holes the Mode B faces leave: the loops of the kept
-       faces' border along them.  The outlines the two sides of a
-       sandwich leave (a loop along up faces only, one along down faces
-       only) are joined — by a strip where they run apart all the way
-       round, lens by lens where they touch at two vertices or more; every
-       other loop is closed by its own triangulation (Liepa's, as
-       :func:`fill_holes` lays it, no vertex added).  No new face spans no
-       area or repeats a face, and no edge ends with more than two faces:
-       a loop that cannot be closed so stays open, as does a loop also
-       running along a face the removal did not take.
+    5. Seal the outer surface across each boundary: per ``(axis, bval)``
+       the rims the removed up faces leave and those the removed down
+       faces leave are traced into loops, each up loop (the larger first)
+       is paired with the nearest down loop overlapping it across the
+       axis, and the pair is zipped into a strip of triangles.  Where the
+       two rims share a vertex — the two outlines touch — the strip
+       pinches through it; a step that would lay a triangle of no area
+       takes the other step where that one spans some; and no triangle a
+       face left there, or one laid before, already is is laid again.
 
     Where the removal leaves the faces round a vertex in more than one fan
-    — two sheets a closure could not join validly meeting at a point, or
-    a face of no area left hanging — the vertex is left as it is: a fusion
+    — two sheets the strip does not join meeting at a point, or a face of
+    no area left hanging — the vertex is left as it is: a fusion
     the later steps read (:func:`find_fusions` finds the pinches, and
     :func:`find_disconnected` and :func:`find_gaps` split along them;
     cutting them here loses bridges).  :func:`preprocess` splits them with

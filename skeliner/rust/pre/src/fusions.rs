@@ -262,8 +262,8 @@ fn doubled_area(verts: &[V3], f: [u32; 3]) -> f64 {
 /// of their other vertices — into the piece, so that the copies of a cut
 /// vertex never sit at one point (two vertices at one point are no valid
 /// surface, and a reader merging copies along a seam would join the cut
-/// again). A thousandth stays far above the eight decimals an OBJ keeps and
-/// far below anything a mesh shows. Where that mean is the point itself,
+/// again). A thousandth stays far above a coordinate's rounding and far
+/// below anything a mesh shows. Where that mean is the point itself,
 /// the copy goes against the piece's normal (into the solid it bounds), and
 /// where that is none, towards its first other vertex.
 pub fn copy_point(verts: &[V3], faces: &[[u32; 3]], v: u32, piece: &[u32]) -> V3 {

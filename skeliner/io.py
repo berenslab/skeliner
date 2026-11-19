@@ -87,10 +87,9 @@ def load_mesh(filepath: str | Path) -> Mesh:
     only touch — a seam is a chain of edges both sides of it repeat — stay
     apart: :func:`skeliner.pre.remove_fusions` leaves a cut so. Faces keep
     their places, so face ids into the file stay valid. A mesh
-    ``preprocess`` cleaned does not come back exactly from an OBJ: the file
-    keeps eight decimals, and copies of a vertex a patch joins by a sliver
-    are one position there, which the merge joins (a vertex or two, on a
-    few cells); :func:`save_mesh_npz` keeps it exactly.
+    ``preprocess`` cleaned and compacted comes back from the OBJ
+    :func:`save_mesh` wrote exactly: every vertex in its place, every
+    digit.
 
     OBJ files of plain vertices and triangles, the form EyeWire 2, MICrONS
     and FlyWire meshes come in and skeliner's own pipeline writes, are read
@@ -152,8 +151,9 @@ def save_mesh(mesh, path: str | Path) -> None:
     """Write a mesh to disk, the format by the file's suffix.
 
     A :class:`skeliner.Mesh` (or anything with ``vertices`` and ``faces``) goes
-    to OBJ through skeliner's own writer on the active path, as trimesh
-    writes a plain mesh, to ``.npz`` as its arrays (:func:`save_mesh_npz`),
+    to OBJ through skeliner's own writer on the active path, each coordinate
+    the shortest decimal that reads back as the same number, to ``.npz`` as
+    its arrays (:func:`save_mesh_npz`),
     and to every other format (ply, stl, glb, ...) through trimesh, which
     must then be installed. A mesh with an ``export`` of its own — a
     ``trimesh.Trimesh`` — writes itself, but to ``.npz``.
@@ -165,8 +165,9 @@ def save_mesh(mesh, path: str | Path) -> None:
     ids saved beside it — a soma's ``verts`` — would name other vertices.
     Writing such a mesh to OBJ warns; :func:`skeliner.pre.compact_mesh` it
     first, with its components, when vertex ids are saved beside it. An OBJ
-    also keeps eight decimals of each coordinate. An ``.npz`` keeps the
-    mesh exactly: every vertex, every digit.
+    keeps every digit of a coordinate, so a mesh whose vertices are all
+    named by faces, no two at one point, reads back from it bit for bit; an
+    ``.npz`` keeps any mesh exactly, every vertex and every digit.
     """
     path = Path(path)
     if path.suffix.lower() == ".npz":

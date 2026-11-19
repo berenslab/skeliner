@@ -531,7 +531,7 @@ def _obj_files(reference_mesh, tmp_path):
     """OBJ files both readers read."""
     files = [Path(__file__).parent / "data" / "60427.obj"]
     written = tmp_path / "written.obj"
-    save_mesh(reference_mesh, written)  # trimesh's export, with its header
+    save_mesh(reference_mesh, written)  # skeliner's writer, every digit
     files.append(written)
     loose = tmp_path / "loose.obj"  # a vertex no face names, and CRLF
     loose.write_bytes(b"v 0 0 0\r\nv 9 9 9\r\nv 1 0 0\r\nv 0 1 0\r\n\r\nf 1 3 4\r\n")
@@ -616,8 +616,8 @@ def test_a_mesh_remove_fusions_cut_reads_back_as_written(tmp_path):
     path = tmp_path / "cut.obj"
     save_mesh(cut, path)
     for mesh in both(load_mesh, path):
-        # every vertex read back in its place, to the file's eight decimals
-        assert np.allclose(mesh.vertices, cut.vertices, rtol=0, atol=1e-8)
+        # every vertex read back in its place, every digit
+        assert np.array_equal(mesh.vertices, cut.vertices)
         assert np.array_equal(mesh.faces, cut.faces)
         assert not np.array_equal(mesh.vertices[-1], mesh.vertices[0])
 
@@ -637,7 +637,7 @@ def test_saving_a_vertex_no_face_names_warns(tmp_path):
 
 def test_a_mesh_reads_back_from_npz_exactly(reference_mesh, tmp_path):
     # what an OBJ cannot keep, kept: a vertex no face names, the copies
-    # along a seam (reading an OBJ merges them), every digit
+    # along a seam (reading an OBJ merges them)
     v = np.vstack([np.asarray(SEAM_V, dtype=np.float64) / 3.0, [[7.0, 7.0, 7.0]]])
     odd = sk.Mesh(v, SEAM_F)
     with pytest.warns(UserWarning, match="or save it as .npz"):
@@ -962,7 +962,9 @@ def test_a_mesh_is_read_only_and_converts_both_ways(reference_mesh):
     )
 
 
-def test_obj_is_written_as_trimesh_writes_it_on_both_paths(reference_mesh, tmp_path):
+def test_obj_is_written_to_read_back_bit_for_bit_on_both_paths(
+    reference_mesh, tmp_path
+):
     import trimesh
 
     from skeliner import _rs
@@ -974,26 +976,42 @@ def test_obj_is_written_as_trimesh_writes_it_on_both_paths(reference_mesh, tmp_p
         [[np.nan, -0.0, 1e20], [np.inf, -np.inf, 1 / 512]],
     ]
     inside = reference_mesh.faces[(reference_mesh.faces < 200).all(axis=1)][:90]
-    cases = {"reference": reference_mesh, "odd": sk.Mesh(v, inside)}
+    # every digit a float64 has: no fixed count of decimals keeps these
+    noisy = sk.Mesh(
+        reference_mesh.vertices + rng.normal(size=reference_mesh.vertices.shape) / 3,
+        reference_mesh.faces,
+    )
+    cases = {"reference": reference_mesh, "noisy": noisy, "odd": sk.Mesh(v, inside)}
     for name, mesh in cases.items():
-        want = tmp_path / f"{name}_trimesh.obj"
-        trimesh.Trimesh(
-            vertices=mesh.vertices.copy(), faces=mesh.faces.copy(), process=False
-        ).export(str(want))
+        texts = set()
         for path in (_rs.io, python_io):
             got = tmp_path / f"{name}_{path.__name__}.obj"
             path.write_obj(str(got), mesh.vertices, mesh.faces)
-            assert got.read_bytes() == want.read_bytes(), (name, path)
-        # save_mesh on both paths, and what reads it back
+            texts.add(got.read_bytes())
+        # save_mesh on both paths writes that one text
         for path in ("rust", "python"):
             with sk.backend(path):
                 out = tmp_path / f"{name}_save_{path}.obj"
                 # the odd mesh's vertices past the faces are not read back
                 with pytest.warns(UserWarning) if name == "odd" else nullcontext():
                     sk.io.save_mesh(mesh, out)
-                assert out.read_bytes() == want.read_bytes()
-    back = load_mesh(tmp_path / "reference_save_rust.obj")
-    assert np.array_equal(back.faces, reference_mesh.faces)
+                texts.add(out.read_bytes())
+        assert len(texts) == 1, name
+    assert texts.pop().startswith(b"v ")  # no header
+    odd = (tmp_path / "odd_save_rust.obj").read_text().splitlines()
+    assert odd[200:202] == ["v nan -0 100000000000000000000", "v inf -inf 0.001953125"]
+    # read back bit for bit, by both readers and by trimesh
+    for name in ("reference", "noisy"):
+        mesh, path = cases[name], tmp_path / f"{name}_save_rust.obj"
+        reads = [_rs.io.read_obj(str(path)), python_io.read_obj(str(path))]
+        tm = trimesh.load_mesh(path, process=False)
+        reads.append((np.asarray(tm.vertices), np.asarray(tm.faces)))
+        for verts, faces in reads:
+            assert np.array_equal(verts.view(np.uint64), mesh.vertices.view(np.uint64))
+            assert np.array_equal(faces, mesh.faces)
+        back = load_mesh(path)
+        assert np.array_equal(back.vertices, mesh.vertices)
+        assert np.array_equal(back.faces, mesh.faces)
     # a trimesh mesh writes itself, as before
     tm = reference_mesh.to_trimesh()
     sk.io.save_mesh(tm, tmp_path / "self.obj")

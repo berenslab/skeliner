@@ -3934,17 +3934,417 @@ def trace_edge_loops(
     return out
 
 
+def _simple_loops(lp: list[int], closed: bool) -> list[tuple[list[int], bool]]:
+    """A traced rim split where it passes a vertex twice: the vertices
+    between the two passes close a loop of their own (a lobe touching the
+    rest at that vertex), and what is left runs on as before.  Each lobe
+    runs round the other way from the rest, so a strip that went round both
+    in one could be wound right on one only."""
+    out: list[tuple[list[int], bool]] = []
+    rest: list[int] = []
+    at: dict[int, int] = {}
+    for v in lp:
+        if v in at:
+            i = at[v]
+            lobe = rest[i + 1 :]
+            del rest[i + 1 :]
+            for w in lobe:
+                del at[w]
+            out.append(([v, *lobe], True))
+        else:
+            at[v] = len(rest)
+            rest.append(v)
+    out.append((rest, closed))
+    return out
+
+
+def _names_twice(t) -> bool:
+    """Whether the triangle *t* names a vertex twice."""
+    return t[0] == t[1] or t[1] == t[2] or t[0] == t[2]
+
+
+def _flat(verts: np.ndarray, t) -> bool:
+    """Whether the triangle *t*, of three distinct vertices, spans no area."""
+    a, b, c = (verts[v] for v in t)
+    u, w = b - a, c - a
+    return (
+        u[1] * w[2] - u[2] * w[1] == 0
+        and u[2] * w[0] - u[0] * w[2] == 0
+        and u[0] * w[1] - u[1] * w[0] == 0
+    )
+
+
+def zip_vertex_loops(
+    loop_a: list[int],
+    loop_b: list[int],
+    verts: np.ndarray,
+    *,
+    closed_a: bool = True,
+    closed_b: bool = True,
+    taken=None,
+) -> list[tuple[int, int, int]]:
+    """Zip two ordered vertex loops into a strip of triangles.
+
+    Both loops are walked in lock-step with a "shortest diagonal"
+    decision rule: at each step, advance whichever side produces the
+    shorter bridge edge to the other side's current vertex.  Each
+    source edge of loop_a and loop_b is consumed in exactly one new
+    triangle, so the result is manifold by construction (no fans, no
+    duplicate edges).
+
+    Before walking, this tries every starting offset on ``loop_b``, both
+    ways round it, and picks the alignment that minimises the sum of
+    bridge-edge lengths.  This is O((m + n) * n) which is fine for small
+    rim loops.  The strip runs ``loop_a`` forward; the caller winds it.
+
+    The rims of a sandwich lie in one plane and touch where its two
+    outlines meet.  Where they share a vertex the strip pinches through
+    it: the step whose triangle would name the shared vertex twice goes
+    first, so that both walks pass the vertex together, and lays nothing
+    — the triangle before it already has the other rim's edge into the
+    vertex as its rung.  Otherwise a step whose rung is *taken* (an edge
+    faces already have, which the strip's two triangles on it would
+    crowd) gives way to the other, and then a step whose triangle would
+    span no area to the other where that one spans some.
+    """
+    if taken is None:
+
+        def taken(*_):
+            return False
+
+    m = len(loop_a)
+    n = len(loop_b)
+    if m < 2 or n < 2:
+        return []
+
+    def walk(shifted_b: list[int]) -> tuple[float, list[tuple[int, int, int]]]:
+        tris: list[tuple[int, int, int]] = []
+        cost = 0.0
+        i, j = 0, 0
+        # Closed loops walk m + n steps total; open chains walk m-1 + n-1.
+        steps_a = m if closed_a else m - 1
+        steps_b = n if closed_b else n - 1
+        while i < steps_a or j < steps_b:
+            a_curr = loop_a[i % m]
+            a_next = loop_a[(i + 1) % m]
+            t_curr = shifted_b[j % n]
+            t_next = shifted_b[(j + 1) % n]
+            by_a, by_b = (a_curr, a_next, t_curr), (a_curr, t_next, t_curr)
+            d_adv_a = float(np.linalg.norm(verts[a_next] - verts[t_curr]))
+            d_adv_b = float(np.linalg.norm(verts[a_curr] - verts[t_next]))
+            if i >= steps_a:
+                take_a = False
+            elif j >= steps_b:
+                take_a = True
+            elif _names_twice(by_a) != _names_twice(by_b):
+                # the shared vertex first, both walks past it together
+                take_a = _names_twice(by_a)
+            elif _names_twice(by_a):
+                take_a = d_adv_a <= d_adv_b
+            elif taken(a_next, t_curr) != taken(a_curr, t_next):
+                take_a = taken(a_curr, t_next)
+            elif _flat(verts, by_a) != _flat(verts, by_b):
+                take_a = _flat(verts, by_b)
+            else:
+                take_a = d_adv_a <= d_adv_b
+            if take_a:
+                tris.append(by_a)
+                cost += d_adv_a
+                i += 1
+            else:
+                tris.append(by_b)
+                cost += d_adv_b
+                j += 1
+        # where the rims share a vertex the strip pinches through it: the
+        # triangle before already has the other rim's edge as its rung
+        return cost, [t for t in tris if not _names_twice(t)]
+
+    best: tuple[float, list[tuple[int, int, int]]] | None = None
+    # Every starting offset on loop_b (for closed loops); for open chains
+    # only offset 0 is valid.
+    # loop_b either way round: a loop whose direction was misjudged would
+    # twist the strip, its rungs crossing at length
+    for base in (list(loop_b), list(loop_b)[::-1]):
+        for shift in range(n) if closed_b else [0]:
+            shifted = base[shift:] + base[:shift]
+            cost, tris = walk(shifted)
+            if best is None or cost < best[0]:
+                best = (cost, tris)
+
+    return best[1] if best is not None else []
+
+
+def stitch_mode_b(verts, faces, orig_faces, mode_b_faces, patches) -> np.ndarray:
+    """Bridge gaps left by Mode B parallel-patch removal using
+    per-sandwich rim tracing and contour zipping.
+
+    For each ``(axis, bval)`` sandwich group in *patches*, collect the
+    rim edges on each sign side (edges where an up-removed or
+    down-removed face meets a surviving face), trace them into ordered
+    vertex loops, pair up-side loops with down-side loops by spatial
+    proximity, and zip each pair into a manifold triangle strip.
+
+    Bridges are emitted with :func:`zip_vertex_loops`, which consumes
+    each rim edge exactly once in exactly one new triangle — so the
+    result has no fans, no duplicate faces, and no non-manifold edges
+    by construction.  *faces* are the faces after the removal, the
+    triangles appended to them returned.
+    """
+
+    degen = np.all(faces == 0, axis=1)
+
+    # Edge → surviving faces map (excludes degenerates)
+    surv_ef: dict[tuple[int, int], set[int]] = defaultdict(set)
+    for fi in range(len(faces)):
+        if degen[fi]:
+            continue
+        f = faces[fi]
+        a, b, c = int(f[0]), int(f[1]), int(f[2])
+        if a == b or b == c or a == c:
+            continue
+        surv_ef[(min(a, b), max(a, b))].add(fi)
+        surv_ef[(min(b, c), max(b, c))].add(fi)
+        surv_ef[(min(a, c), max(a, c))].add(fi)
+
+    mode_b_set = set(int(fi) for fi in mode_b_faces)
+
+    def rim_edges_for(removed_side: set[int]) -> list[tuple[int, int]]:
+        """Return edges of *orig_faces* in removed_side where the
+        other side of the edge is a surviving face (not a degen or
+        another removed face)."""
+        out: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+        for fi in removed_side:
+            f = orig_faces[fi]
+            for i in range(3):
+                a, b = int(f[i]), int(f[(i + 1) % 3])
+                if a == b:
+                    continue
+                e = (min(a, b), max(a, b))
+                if e in seen:
+                    continue
+                surv = surv_ef.get(e, set())
+                if len(surv) == 1:
+                    seen.add(e)
+                    out.append(e)
+        return out
+
+    # Group Mode-B patches by (axis, bval)
+    groups: dict[tuple[int, int], list[dict]] = defaultdict(list)
+    for p in patches:
+        pf = set(p["faces"])
+        if not (pf & mode_b_set):
+            continue
+        groups[(int(p["axis"]), int(p["bval"]))].append(p)
+
+    if not groups:
+        return faces
+
+    all_new_tris: list[tuple[int, int, int]] = []
+    laid: set[tuple[int, ...]] = set()
+    laid_edges: set[tuple[int, int]] = set()
+    n_pairs = 0
+    n_skipped_loops = 0
+
+    for (_axis, _bval), group in groups.items():
+        up_removed: set[int] = set()
+        dn_removed: set[int] = set()
+        for p in group:
+            up_removed.update(int(f) for f in p["up_faces"] if int(f) in mode_b_set)
+            dn_removed.update(int(f) for f in p["down_faces"] if int(f) in mode_b_set)
+
+        up_rim = rim_edges_for(up_removed)
+        dn_rim = rim_edges_for(dn_removed)
+        if not up_rim or not dn_rim:
+            continue
+
+        up_traces = [
+            s for lp, c in trace_edge_loops(up_rim) for s in _simple_loops(lp, c)
+        ]
+        dn_traces = [
+            s for lp, c in trace_edge_loops(dn_rim) for s in _simple_loops(lp, c)
+        ]
+        # A real contour needs at least 3 vertices (closed) or 2
+        # vertices for a single-edge chain.  Drop anything smaller.
+        up_traces = [
+            (lp, c)
+            for lp, c in up_traces
+            if (c and len(lp) >= 3) or (not c and len(lp) >= 2)
+        ]
+        dn_traces = [
+            (lp, c)
+            for lp, c in dn_traces
+            if (c and len(lp) >= 3) or (not c and len(lp) >= 2)
+        ]
+        if not up_traces or not dn_traces:
+            continue
+
+        # The strip runs an up rim forward and a down rim backward, and must
+        # wind as the faces it joins: those run an up rim backward and a
+        # down rim forward.
+        def runs_forward(lp, closed):
+            n = len(lp)
+            forward = backward = 0
+            for i in range(n if closed else n - 1):
+                a, b = lp[i], lp[(i + 1) % n]
+                for fi in surv_ef.get((min(a, b), max(a, b)), ()):
+                    t = faces[fi]
+                    if any(t[k] == a and t[(k + 1) % 3] == b for k in range(3)):
+                        forward += 1
+                    else:
+                        backward += 1
+            return forward > backward
+
+        def orient(trace, forward):
+            lp, c = trace
+            return (lp[::-1] if runs_forward(lp, c) != forward else lp, c)
+
+        up_traces = [orient(t, False) for t in up_traces]
+        dn_traces = [orient(t, True) for t in dn_traces]
+
+        # Pair loops greedily by centroid distance — largest loops first.
+        # Perpendicular plane of the sandwich axis for bbox overlap check.
+        perp_axes = [i for i in range(3) if i != _axis]
+        up_info = []
+        for lp, c in up_traces:
+            pts = verts[lp]
+            up_info.append(
+                {
+                    "loop": lp,
+                    "closed": c,
+                    "pts": pts,
+                    "center": pts.mean(axis=0),
+                    "bmin": pts[:, perp_axes].min(0),
+                    "bmax": pts[:, perp_axes].max(0),
+                }
+            )
+        dn_info = []
+        for lp, c in dn_traces:
+            pts = verts[lp]
+            dn_info.append(
+                {
+                    "loop": lp,
+                    "closed": c,
+                    "pts": pts,
+                    "center": pts.mean(axis=0),
+                    "bmin": pts[:, perp_axes].min(0),
+                    "bmax": pts[:, perp_axes].max(0),
+                }
+            )
+
+        up_order = sorted(range(len(up_info)), key=lambda i: -len(up_info[i]["loop"]))
+        dn_used: set[int] = set()
+
+        for ui in up_order:
+            u = up_info[ui]
+            # the down loops overlapping it across the axis, nearest first —
+            # without the overlap, a mixed-patch rim whose up and down sides
+            # cover different regions would be zipped into a twisted strip
+            # crossing empty space
+            near = []
+            for di in range(len(dn_info)):
+                if di in dn_used:
+                    continue
+                d_info = dn_info[di]
+                imin = np.maximum(u["bmin"], d_info["bmin"])
+                imax = np.minimum(u["bmax"], d_info["bmax"])
+                if not (imax > imin).all():
+                    continue
+                near.append((float(np.linalg.norm(u["center"] - d_info["center"])), di))
+            near.sort()
+
+            # a rung on an edge a face left there or a strip laid before
+            # already has would give it a third face
+            def taken(p, q):
+                e = (min(p, q), max(p, q))
+                return e in laid_edges or bool(surv_ef.get(e))
+
+            # the first whose strip one winding joins to the faces left on
+            # both rims: two rims whose faces want it wound both ways are no
+            # two sides of one surface (an outline beside an organelle's
+            # wall, facing the other way)
+            chosen = None
+            for _, di in near:
+                d_info = dn_info[di]
+                tris = zip_vertex_loops(
+                    u["loop"],
+                    d_info["loop"],
+                    verts,
+                    closed_a=u["closed"],
+                    closed_b=d_info["closed"],
+                    taken=taken,
+                )
+                on = (set(u["loop"]), set(d_info["loop"]))
+                # the faces left on its edges along each rim: [as the strip
+                # runs the edge, against it], the up rim's and the down's
+                runs = [[0, 0], [0, 0]]
+                for t in tris:
+                    for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])):
+                        if a in on[0] and b in on[0]:
+                            side = 0
+                        elif a in on[1] and b in on[1]:
+                            side = 1
+                        else:
+                            continue
+                        for fi in surv_ef.get((min(a, b), max(a, b)), ()):
+                            g = faces[fi]
+                            with_ = any(
+                                g[k] == a and g[(k + 1) % 3] == b for k in range(3)
+                            )
+                            runs[side][0 if with_ else 1] += 1
+                wants = [r[0] > r[1] if r[0] + r[1] else None for r in runs]
+                if None not in wants and wants[0] != wants[1]:
+                    continue
+                flip = wants[0] if wants[0] is not None else bool(wants[1])
+                chosen = (di, tris, flip)
+                break
+            if chosen is None:
+                n_skipped_loops += 1
+                continue
+            best_dn, tris, flip = chosen
+            dn_used.add(best_dn)
+            if flip:
+                tris = [(t[0], t[2], t[1]) for t in tris]
+            # a triangle a face left there already is, or one laid before,
+            # is not laid again
+            fresh = []
+            for t in tris:
+                key = tuple(sorted(t))
+                left = any(
+                    t[2] in faces[fi]
+                    for fi in surv_ef.get((min(t[0], t[1]), max(t[0], t[1])), ())
+                )
+                if not left and key not in laid:
+                    laid.add(key)
+                    laid_edges.update(
+                        (min(a, b), max(a, b))
+                        for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0]))
+                    )
+                    fresh.append(t)
+            tris = fresh
+            if tris:
+                all_new_tris.extend(tris)
+                n_pairs += 1
+            else:
+                n_skipped_loops += 1
+
+        n_skipped_loops += len(dn_info) - len(dn_used)
+
+    if not all_new_tris:
+        return faces
+    return np.vstack([faces, np.array(all_new_tris, dtype=np.int64)])
+
+
 def remove_parallel_patches(
     faces, vertices, normals, patches
 ) -> tuple[np.ndarray, int, int, int, int, int]:
     """Remove the trimmed parallel *patches* (``(axis, bval, faces, up,
-    down)`` each), drop the pieces that only fold patches cut off, and close
-    the holes the parallel ones leave (the Rust core's
-    ``pre::patches::close_holes``, on this path too): ``(faces, n_removed,
-    n_fold, n_parallel, n_orphan, n_stitched)``.  A patch with both sides,
-    or without a fold (an up face edge to edge with a down face), is a
-    parallel patch whose holes are closed; one with a fold and one side is
-    a fold patch, removed only."""
+    down)`` each), drop the pieces that only fold patches cut off, and zip
+    the sandwiches' rims together: ``(faces, n_removed, n_fold,
+    n_parallel, n_orphan, n_stitched)``.  A patch with both sides, or
+    without a fold (an up face edge to edge with a down face), is a
+    parallel patch whose rims are zipped; one with a fold and one side is a
+    fold patch, removed only."""
     verts = rows3("V", vertices)
     faces, n_vertices = checked_faces(faces, len(verts))
     normals = rows3("N", normals)
@@ -4072,28 +4472,10 @@ def remove_parallel_patches(
             result[~keep_mask2] = 0
     n_orphan = len(orphan_remove) if newly_disconnected else 0
 
-    # ── Step 5: close the holes the parallel faces leave ──────────
-    # new code since the Rust core: the Python path runs it in Rust
+    # ── Step 5: stitch Mode B gaps ───────────────────────────────
     n_before = len(result)
     if mode_b_faces:
-        from skeliner import _rs
-
-        gone = np.zeros(len(faces), dtype=bool)
-        gone[list(all_removed)] = True
-        if newly_disconnected:
-            gone[list(orphan_remove)] = True
-        new = _rs.pre.close_patch_holes(
-            faces,
-            verts,
-            gone,
-            sorted(mode_b_faces),
-            [
-                (p["axis"], p["bval"], p["faces"], p["up_faces"], p["down_faces"])
-                for p in patches
-            ],
-        )
-        if len(new):
-            result = np.vstack([result, new])
+        result = stitch_mode_b(verts, result, faces, mode_b_faces, patches)
     n_stitched = len(result) - n_before
     return result, len(all_removed), n_a, n_b, n_orphan, n_stitched
 

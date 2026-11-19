@@ -397,21 +397,21 @@ pub fn read_ctm<E>(
     }))
 }
 
-/// An OBJ of `vertices` and `faces` as trimesh's `export_obj` writes a
-/// plain mesh (no normals, colours, texture or name): its header comment,
-/// a `v` line per vertex with eight decimals (Python's `{:.8f}`, which
-/// rounds half to even as Rust's does; NaN as `nan`), an `f` line per face
-/// numbered from one, and a blank line to end.
+/// An OBJ of `vertices` and `faces`, the plain form [`read_obj`] reads: a
+/// `v` line per vertex, an `f` line per face numbered from one, and a blank
+/// line to end. Each coordinate is the shortest decimal that reads back as
+/// the same number (Rust's `{}`: `423318`, `0.1`, `-0`, never an exponent;
+/// NaN as `nan`), so the mesh reads back bit for bit.
 pub fn write_obj(vertices: &[[f64; 3]], faces: &[[u32; 3]]) -> Vec<u8> {
     use std::fmt::Write;
 
-    let mut out = String::with_capacity(36 + vertices.len() * 52 + faces.len() * 24);
-    out.push_str("# https://github.com/mikedh/trimesh\nv ");
+    let mut out = String::with_capacity(4 + vertices.len() * 60 + faces.len() * 24);
+    out.push_str("v ");
     let coord = |out: &mut String, x: f64| {
         if x.is_nan() {
             out.push_str("nan");
         } else {
-            write!(out, "{x:.8}").expect("writing to a string");
+            write!(out, "{x}").expect("writing to a string");
         }
     };
     for (i, v) in vertices.iter().enumerate() {
@@ -438,23 +438,29 @@ pub fn write_obj(vertices: &[[f64; 3]], faces: &[[u32; 3]]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn an_obj_is_written_as_trimesh_writes_it() {
+    fn an_obj_is_written_in_the_shortest_digits_that_read_back() {
         let v = [[331737.0, -0.0, 1.0 / 512.0], [f64::NAN, 2.5, 1e20]];
         let text = String::from_utf8(write_obj(&v, &[[0, 1, 1]])).expect("utf-8");
         assert_eq!(
             text,
-            "# https://github.com/mikedh/trimesh\n\
-             v 331737.00000000 -0.00000000 0.00195312\n\
-             v nan 2.50000000 100000000000000000000.00000000\n\
+            "v 331737 -0 0.001953125\n\
+             v nan 2.5 100000000000000000000\n\
              f 1 2 2\n\n"
         );
         let empty = String::from_utf8(write_obj(&[], &[])).expect("utf-8");
-        assert_eq!(empty, "# https://github.com/mikedh/trimesh\nv \nf \n\n");
-        // read back as written; the empty one has a bare `f` line, which the
-        // reader leaves to trimesh
-        let tri = [[331737.0, 0.5, 2.25], [1.0, 2.0, 3.0], [-4.0, 0.125, 9.0]];
+        assert_eq!(empty, "v \nf \n\n");
+        // read back bit for bit, digits past any fixed count included; the
+        // empty one has a bare `f` line, which the reader leaves to trimesh
+        let tri = [
+            [565974.3326594823, 0.1 + 0.2, -1.0 / 3.0],
+            [1.0, 2.0, 3.0],
+            [-4.0, 5e-324, f64::MAX],
+        ];
         let m = read_obj(&write_obj(&tri, &[[0, 1, 2]])).expect("plain OBJ");
-        assert_eq!((m.vertices, m.faces), (tri.to_vec(), vec![[0, 1, 2]]));
+        let bits =
+            |vs: &[[f64; 3]]| -> Vec<[u64; 3]> { vs.iter().map(|p| p.map(f64::to_bits)).collect() };
+        assert_eq!(bits(&m.vertices), bits(&tri));
+        assert_eq!(m.faces, vec![[0, 1, 2]]);
         assert!(read_obj(&write_obj(&[], &[])).is_none());
     }
 

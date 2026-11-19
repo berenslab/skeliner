@@ -2467,6 +2467,33 @@ class TestRescued:
         assert [len(x) for x in given.neurites] == [len(x) for x in empty.neurites]
         assert np.array_equal(given.soma.verts, empty.soma.verts)
 
+    def test_a_piece_holding_an_organelle_is_never_discarded(self):
+        # a big ball, and apart from it a small box with a closed organelle
+        # in its lumen: by size alone the box is discarded
+        ball = trimesh.creation.icosphere(subdivisions=3, radius=5.0)
+        box = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+        box.apply_translation((20.0, 0.0, 0.0))
+        org = trimesh.creation.icosphere(subdivisions=0, radius=0.3)
+        org.apply_translation((20.1, 0.05, 0.02))
+        parts = [ball, box, org]
+        v = np.vstack([p.vertices for p in parts])
+        offsets = np.cumsum([0] + [len(p.vertices) for p in parts[:-1]])
+        f = np.vstack([p.faces + o for p, o in zip(parts, offsets)])
+        mesh = sk.Mesh(v, f)
+        n_ball, n_box = len(ball.faces), len(box.faces)
+        isolated = np.zeros(len(f), dtype=bool)
+        isolated[n_ball + n_box :] = True
+        z = np.zeros(len(f), dtype=bool)
+        organelles = Organelles(pocket=z, isolated=isolated, expanded=z.copy())
+        comps = pre.break_up_mesh(mesh, None, organelles)
+        box_faces = set(range(n_ball, n_ball + n_box))
+        assert any(set(np.asarray(n).tolist()) == box_faces for n in comps.neurites)
+        assert not comps.discarded.components
+        # fixture: without the organelle the size cut drops the box
+        bare = pre.break_up_mesh(mesh, None, Organelles.empty(len(f)))
+        dropped = [set(np.asarray(d).tolist()) for d in bare.discarded]
+        assert box_faces in dropped
+
 
 # ── Smoke test on real data ──────────────────────────────────────────
 
@@ -2519,11 +2546,14 @@ class TestRealMesh:
         for rule in ("repeated", "flat", "duplicate", "crowded"):
             assert len(out[rule]) <= len(src[rule]), rule
         assert _apart(clean.faces, comps.organelles.mask)
-        # and it reads back as written: every id, to the file's decimals
+        # and it reads back as written: every id, every digit of the
+        # vertices the stages computed
+        computed = np.round(clean.vertices, 8) != clean.vertices
+        assert computed.any(), "fixture: digits past eight decimals"
         sk.io.save_mesh(clean, tmp_path / "clean.obj")
         back = sk.io.load_mesh(tmp_path / "clean.obj")
         assert np.array_equal(back.faces, clean.faces)
-        assert np.allclose(back.vertices, clean.vertices, rtol=0, atol=1e-8)
+        assert np.array_equal(back.vertices, clean.vertices)
 
     @deprecated
     def test_remove_fragments_preserves_main(self, reference_mesh):

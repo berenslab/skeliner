@@ -6,8 +6,6 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use std::collections::HashSet;
-
 use crate::common::*;
 
 /// Edge-connected components of the non-degenerate faces.
@@ -1120,6 +1118,44 @@ fn patch_hosts<'py>(
     Ok(out.into_pyarray(py))
 }
 
+/// Which of `n_pieces` pieces hold an organelle
+/// (`::pre::breakup::organelle_hosts`), given the piece each face is in
+/// (`label`, −1 for none) and the organelle faces (`organelle`, one flag
+/// per face or fewer). Rust only: the Python path runs it too.
+#[pyfunction]
+fn organelle_hosts<'py>(
+    py: Python<'py>,
+    faces: PyReadonlyArray2<'py, i64>,
+    vertices: PyReadonlyArray2<'py, f64>,
+    label: numpy::PyReadonlyArray1<'py, i64>,
+    organelle: numpy::PyReadonlyArray1<'py, bool>,
+    n_pieces: usize,
+) -> PyResult<Bound<'py, PyArray1<bool>>> {
+    let verts = rows3("V", &vertices)?;
+    let (tris, _) = checked_faces(&faces, Some(verts.len()))?;
+    let label = label.as_array();
+    if label.len() != tris.len() {
+        return Err(PyValueError::new_err("label needs one value per face"));
+    }
+    let label: Vec<u32> = label
+        .iter()
+        .map(|&l| {
+            if l < 0 {
+                Ok(u32::MAX)
+            } else {
+                u32::try_from(l)
+                    .ok()
+                    .filter(|&l| (l as usize) < n_pieces)
+                    .ok_or_else(|| PyValueError::new_err(format!("piece {l} is out of range")))
+            }
+        })
+        .collect::<PyResult<_>>()?;
+    let organelle = organelle.as_array().to_vec();
+    let held =
+        py.detach(|| ::pre::breakup::organelle_hosts(&verts, &tris, &label, &organelle, n_pieces));
+    Ok(Array1::from(held).into_pyarray(py))
+}
+
 /// `skeliner.pre.isolate_organelles` on arrays (Rust only: the Python path
 /// runs it too): the organelle faces (`organelle`, one flag per face or
 /// fewer) given copies of the vertices they share with other faces, at
@@ -1155,48 +1191,6 @@ fn isolate_organelles<'py>(
     let split =
         py.detach(|| ::pre::isolate::isolate_organelles(&verts, &tris, &organelle, &positions));
     Ok(split_out(py, split))
-}
-
-/// `remove_parallel_patches`' last step, which the Python path runs here
-/// too: the triangles closing the holes the removed parallel faces leave
-/// (`::pre::patches::close_holes`), given the faces before the removal,
-/// which of them are `gone` (removed, or dropped as cut off), the parallel
-/// faces among them, and the patches.
-#[pyfunction]
-fn close_patch_holes<'py>(
-    py: Python<'py>,
-    faces: PyReadonlyArray2<'py, i64>,
-    vertices: PyReadonlyArray2<'py, f64>,
-    gone: numpy::PyReadonlyArray1<'py, bool>,
-    parallel: Vec<i64>,
-    patches: Vec<PatchTuple>,
-) -> PyResult<Bound<'py, PyArray2<i64>>> {
-    let verts = rows3("V", &vertices)?;
-    let (tris, n) = checked_faces(&faces, Some(verts.len()))?;
-    let gone = gone.as_array().to_vec();
-    if gone.len() != tris.len() {
-        return Err(PyValueError::new_err("gone needs one value per face"));
-    }
-    let nf = tris.len();
-    let parallel: HashSet<u32> = parallel
-        .into_iter()
-        .map(|f| {
-            u32::try_from(f)
-                .ok()
-                .filter(|&f| (f as usize) < nf)
-                .ok_or_else(|| PyValueError::new_err(format!("face index {f} is out of range")))
-        })
-        .collect::<PyResult<_>>()?;
-    let patches: Vec<::pre::patches::Patch> = patches
-        .into_iter()
-        .map(|t| patch_from_tuple(t, nf))
-        .collect::<PyResult<_>>()?;
-    let new = py.detach(|| {
-        let topo = ::mesh::Topology::new(&tris, n);
-        ::pre::patches::close_holes(&verts, &topo, &tris, &gone, &parallel, &patches)
-    });
-    let out: Vec<[i64; 3]> = new.iter().map(|f| f.map(i64::from)).collect();
-    Ok(rows_to_array(&out).into_pyarray(py))
 }
 
 /// What [`remove_gaps`] hands back: new vertices, the rebuilt faces (None
@@ -1782,9 +1776,9 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(remove_parallel_patches, m)?)?;
     m.add_function(wrap_pyfunction!(remove_gaps, m)?)?;
     m.add_function(wrap_pyfunction!(remove_fusions, m)?)?;
-    m.add_function(wrap_pyfunction!(close_patch_holes, m)?)?;
     m.add_function(wrap_pyfunction!(isolate_organelles, m)?)?;
     m.add_function(wrap_pyfunction!(patch_hosts, m)?)?;
+    m.add_function(wrap_pyfunction!(organelle_hosts, m)?)?;
     m.add_function(wrap_pyfunction!(break_up_classify, m)?)?;
     m.add_function(wrap_pyfunction!(break_up_severed_walls, m)?)?;
     m.add_function(wrap_pyfunction!(find_soma_ring_cutoff, m)?)?;

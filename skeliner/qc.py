@@ -72,8 +72,8 @@ MEASURES: dict[str, str] = {
     "discarded_share": "share of the faces discarded",
     "discarded_soma_share": "the largest discarded piece at the soma "
     "(share of the faces)",
-    "discarded_organelle_share": "the largest discarded piece cut off by "
-    "organelles (share of the faces)",
+    "discarded_organelle_share": "the largest discarded piece at an organelle "
+    "or holding one (share of the faces)",
     "discarded_reach_share": "the largest loose discarded piece within "
     "bridging reach of the arbor (share of the faces)",
     "stem_longest": "the longest jump from the soma to a neurite",
@@ -83,7 +83,8 @@ MEASURES: dict[str, str] = {
 FLAGS: dict[str, str] = {
     "no_soma": "no soma found",
     "no_soma_at_point": "no soma at the point given",
-    "discarded_neurite": "a neurite at the soma discarded for its size — rescue it?",
+    "discarded_neurite": "a neurite discarded — at the soma standing out of it, "
+    "or holding organelles — rescue it?",
     "skeleton_forest": "the skeleton is more than one tree",
     "skeleton_loops": "the skeleton has loops",
 }
@@ -325,12 +326,14 @@ def _surface(
     mesh, faces, verts, me, components, skeleton, summary, flags, sites
 ) -> None:
     """The organelles' share, and the discarded pieces in three kinds: cut
-    off at the soma (touching it), cut off by organelles (touching one, not
-    the soma), and loose (touching neither: a piece of the mesh left
+    off at the soma (touching it), at organelles (touching one or holding
+    one, not at the soma), and loose (neither: a piece of the mesh left
     unbridged), the last with how far from the arbor against the reach it
     would be bridged across.  A piece at the soma that stands out of it like
     a neurite — :func:`~skeliner.pre.break_up_mesh`'s own test for keeping
-    a stub out of the soma — was dropped for its size alone: a fact."""
+    a stub out of the soma — was dropped for its size alone, and one
+    holding an organelle — the test that keeps such a piece — should not
+    have been dropped at all: either is a discarded neurite, a fact."""
     from .pre import (
         _bridge_reach,
         _out_of_soma,
@@ -358,6 +361,7 @@ def _surface(
     summary["discarded_at_soma"] = 0
     summary["discarded_neurites"] = 0 if components.soma is not None else None
     summary["discarded_at_organelle"] = 0
+    summary["discarded_holding_organelles"] = 0
     summary["discarded_within_reach"] = None
     if not pieces:
         return
@@ -381,7 +385,26 @@ def _surface(
     org_v = np.zeros(n_v, dtype=bool)
     org_v[faces[org].ravel()] = True
     at_soma = touching(soma_v)
-    at_org = touching(org_v) & ~at_soma
+    # holding an organelle (break_up_mesh's own test, which keeps such a
+    # piece): cut free of the surface, an organelle touches no piece, so
+    # this, not touching, finds the pieces organelles belong to
+    from ._backend import kernels
+
+    label = np.full(n_f, -1, dtype=np.int64)
+    for i, p in enumerate(neurites + pieces):
+        label[p] = i
+    held = np.asarray(
+        kernels.pre.organelle_hosts(
+            np.asarray(faces, dtype=np.int64),
+            np.asarray(verts, dtype=np.float64),
+            label,
+            org,
+            len(neurites) + len(pieces),
+        ),
+        dtype=bool,
+    )[len(neurites) :]
+    summary["discarded_holding_organelles"] = int(held.sum())
+    at_org = (touching(org_v) | held) & ~at_soma
     loose = ~at_soma & ~at_org
     summary["discarded_at_soma"] = int(at_soma.sum())
     summary["discarded_at_organelle"] = int(at_org.sum())
@@ -396,7 +419,8 @@ def _surface(
         for i in np.flatnonzero(at_soma).tolist():
             out_of[i] = _out_of_soma(faces[pieces[i]], verts, soma, keys)
     neurite = np.array([out_of.get(i, (False,))[0] for i in range(len(pieces))])
-    if soma is not None:
+    neurite |= held
+    if soma is not None or held.any():
         summary["discarded_neurites"] = int(neurite.sum())
         largest("neurite", neurite)
     if neurite.any():
