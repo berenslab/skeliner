@@ -3982,8 +3982,9 @@ def zip_vertex_loops(
     closed_a: bool = True,
     closed_b: bool = True,
     taken=None,
-) -> list[tuple[int, int, int]]:
-    """Zip two ordered vertex loops into a strip of triangles.
+) -> list[tuple[float, list[tuple[int, int, int]]]]:
+    """Zip two ordered vertex loops into a strip of triangles: for each way
+    round ``loop_b``, the cheapest strip and its cost, the cheaper first.
 
     Both loops are walked in lock-step with a "shortest diagonal"
     decision rule: at each step, advance whichever side produces the
@@ -3992,10 +3993,13 @@ def zip_vertex_loops(
     triangle, so the result is manifold by construction (no fans, no
     duplicate edges).
 
-    Before walking, this tries every starting offset on ``loop_b``, both
-    ways round it, and picks the alignment that minimises the sum of
-    bridge-edge lengths.  This is O((m + n) * n) which is fine for small
-    rim loops.  The strip runs ``loop_a`` forward; the caller winds it.
+    Each way round ``loop_b``, this tries every starting offset and keeps
+    the alignment that minimises the sum of bridge-edge lengths.  This is
+    O((m + n) * n) which is fine for small rim loops.  Each strip runs
+    ``loop_a`` forward; the caller takes one and winds it: a loop whose
+    direction was misjudged would twist the strip, its rungs crossing at
+    length, but the cheaper way can also be the one no winding joins to the
+    faces on both rims.
 
     The rims of a sandwich lie in one plane and touch where its two
     outlines meet.  Where they share a vertex the strip pinches through
@@ -4059,22 +4063,26 @@ def zip_vertex_loops(
         # triangle before already has the other rim's edge as its rung
         return cost, [t for t in tris if not _names_twice(t)]
 
-    best: tuple[float, list[tuple[int, int, int]]] | None = None
     # Every starting offset on loop_b (for closed loops); for open chains
     # only offset 0 is valid.
-    # loop_b either way round: a loop whose direction was misjudged would
-    # twist the strip, its rungs crossing at length
+    ways: list[tuple[float, list[tuple[int, int, int]]]] = []
     for base in (list(loop_b), list(loop_b)[::-1]):
+        best: tuple[float, list[tuple[int, int, int]]] | None = None
         for shift in range(n) if closed_b else [0]:
             shifted = base[shift:] + base[:shift]
             cost, tris = walk(shifted)
             if best is None or cost < best[0]:
                 best = (cost, tris)
+        if best is not None:
+            ways.append(best)
+    # stable: on a tie the way loop_b runs comes first
+    ways.sort(key=lambda w: w[0])
+    return ways
 
-    return best[1] if best is not None else []
 
-
-def stitch_mode_b(verts, faces, orig_faces, mode_b_faces, patches) -> np.ndarray:
+def stitch_mode_b(
+    verts, faces, orig_faces, mode_b_faces, patches, open_rims=()
+) -> np.ndarray:
     """Bridge gaps left by Mode B parallel-patch removal using
     per-sandwich rim tracing and contour zipping.
 
@@ -4082,7 +4090,10 @@ def stitch_mode_b(verts, faces, orig_faces, mode_b_faces, patches) -> np.ndarray
     rim edges on each sign side (edges where an up-removed or
     down-removed face meets a surviving face), trace them into ordered
     vertex loops, pair up-side loops with down-side loops by spatial
-    proximity, and zip each pair into a manifold triangle strip.
+    proximity, and zip each pair into a manifold triangle strip.  The
+    *open_rims* (:func:`open_ends_on_seams`) join their group's loops: one
+    below the plane as the rim an up cap would leave, one above as a down
+    cap's.
 
     Bridges are emitted with :func:`zip_vertex_loops`, which consumes
     each rim edge exactly once in exactly one new triangle — so the
@@ -4143,9 +4154,39 @@ def stitch_mode_b(verts, faces, orig_faces, mode_b_faces, patches) -> np.ndarray
     all_new_tris: list[tuple[int, int, int]] = []
     laid: set[tuple[int, ...]] = set()
     laid_edges: set[tuple[int, int]] = set()
-    n_pairs = 0
-    n_skipped_loops = 0
 
+    # the pieces the removal leaves, joined as the strips are laid
+    piece, _ = face_edge_components(faces)
+    joined = list(range(int(piece.max()) + 1 if len(piece) else 0))
+
+    def root(a):
+        while joined[a] != a:
+            joined[a] = joined[joined[a]]
+            a = joined[a]
+        return a
+
+    def join(pieces):
+        for a, b in zip(pieces, pieces[1:]):
+            ra, rb = root(a), root(b)
+            joined[max(ra, rb)] = min(ra, rb)
+
+    def apart(a, b):
+        ra = {root(p) for p in a}
+        return all(root(p) not in ra for p in b)
+
+    def pieces_along(lp, closed):
+        """The pieces of the faces left along a loop's edges."""
+        out: set[int] = set()
+        for i in range(len(lp) if closed else len(lp) - 1):
+            a, b = lp[i], lp[(i + 1) % len(lp)]
+            out.update(
+                int(piece[fi])
+                for fi in surv_ef.get((min(a, b), max(a, b)), ())
+                if piece[fi] >= 0
+            )
+        return sorted(out)
+
+    prepared: list[dict] = []
     for (_axis, _bval), group in groups.items():
         up_removed: set[int] = set()
         dn_removed: set[int] = set()
@@ -4155,8 +4196,6 @@ def stitch_mode_b(verts, faces, orig_faces, mode_b_faces, patches) -> np.ndarray
 
         up_rim = rim_edges_for(up_removed)
         dn_rim = rim_edges_for(dn_removed)
-        if not up_rim or not dn_rim:
-            continue
 
         up_traces = [
             s for lp, c in trace_edge_loops(up_rim) for s in _simple_loops(lp, c)
@@ -4176,6 +4215,9 @@ def stitch_mode_b(verts, faces, orig_faces, mode_b_faces, patches) -> np.ndarray
             for lp, c in dn_traces
             if (c and len(lp) >= 3) or (not c and len(lp) >= 2)
         ]
+        for r in open_rims:
+            if r["axis"] == _axis and r["bval"] == _bval:
+                (up_traces if r["below"] else dn_traces).append((list(r["loop"]), True))
         if not up_traces or not dn_traces:
             continue
 
@@ -4232,49 +4274,80 @@ def stitch_mode_b(verts, faces, orig_faces, mode_b_faces, patches) -> np.ndarray
                 }
             )
 
-        up_order = sorted(range(len(up_info)), key=lambda i: -len(up_info[i]["loop"]))
-        dn_used: set[int] = set()
+        # the area a closed loop, run as the faces left on it want, encloses
+        # across the axis, signed by the way it turns (an open one none):
+        # two sides of one surface turn alike, an outline and the wall of an
+        # organelle beside it, facing the other way, do not
+        pa, pb = perp_axes
 
-        for ui in up_order:
-            u = up_info[ui]
-            # the down loops overlapping it across the axis, nearest first —
-            # without the overlap, a mixed-patch rim whose up and down sides
-            # cover different regions would be zipped into a twisted strip
-            # crossing empty space
-            near = []
-            for di in range(len(dn_info)):
-                if di in dn_used:
+        def turning(info):
+            area = 0.0
+            if info["closed"]:
+                lp, o = info["loop"], verts[info["loop"][0]]
+                for k in range(len(lp)):
+                    p, q = verts[lp[k]], verts[lp[(k + 1) % len(lp)]]
+                    area += (p[pa] - o[pa]) * (q[pb] - o[pb]) - (q[pa] - o[pa]) * (
+                        p[pb] - o[pb]
+                    )
+            return area
+
+        for info in up_info + dn_info:
+            info["turn"] = turning(info)
+            info["pieces"] = pieces_along(info["loop"], info["closed"])
+        order = sorted(range(len(up_info)), key=lambda i: -len(up_info[i]["loop"]))
+        prepared.append({"up": up_info, "dn": dn_info, "used": set(), "order": order})
+
+    def pair_rim(g, ui, second):
+        """The pairing of up rim *ui* of group *g*, in the first pass or the
+        *second*; whether a strip was laid."""
+        u = g["up"][ui]
+        # the down loops overlapping it across the axis, nearest first — without
+        # the overlap, a mixed-patch rim whose up and down sides cover different
+        # regions would be zipped into a twisted strip crossing empty space
+        near = []
+        for di, d_info in enumerate(g["dn"]):
+            if di in g["used"]:
+                continue
+            imin = np.maximum(u["bmin"], d_info["bmin"])
+            imax = np.minimum(u["bmax"], d_info["bmax"])
+            if not (imax > imin).all():
+                continue
+            near.append((float(np.linalg.norm(u["center"] - d_info["center"])), di))
+        near.sort()
+
+        # a rung on an edge a face left there or a strip laid before already
+        # has would give it a third face
+        def taken(p, q):
+            e = (min(p, q), max(p, q))
+            return e in laid_edges or bool(surv_ef.get(e))
+
+        # the first whose strip the cheaper way round the down rim one winding
+        # joins to the faces left on both rims: two rims whose faces want it
+        # wound both ways are no two sides of one surface (an outline beside an
+        # organelle's wall, facing the other way).  Two outlines far apart for
+        # their size can make the twisted way the cheaper, so an up rim left
+        # over then takes the dearer way to a closed down rim turning alike —
+        # only to join two pieces no strip has joined: within one piece the
+        # hole is the fill's.
+        chosen = None
+        for _, di in near:
+            d_info = g["dn"][di]
+            if second:
+                a, b = u["turn"], d_info["turn"]
+                if not ((a > 0.0 and b > 0.0) or (a < 0.0 and b < 0.0)):
                     continue
-                d_info = dn_info[di]
-                imin = np.maximum(u["bmin"], d_info["bmin"])
-                imax = np.minimum(u["bmax"], d_info["bmax"])
-                if not (imax > imin).all():
+                if not apart(u["pieces"], d_info["pieces"]):
                     continue
-                near.append((float(np.linalg.norm(u["center"] - d_info["center"])), di))
-            near.sort()
-
-            # a rung on an edge a face left there or a strip laid before
-            # already has would give it a third face
-            def taken(p, q):
-                e = (min(p, q), max(p, q))
-                return e in laid_edges or bool(surv_ef.get(e))
-
-            # the first whose strip one winding joins to the faces left on
-            # both rims: two rims whose faces want it wound both ways are no
-            # two sides of one surface (an outline beside an organelle's
-            # wall, facing the other way)
-            chosen = None
-            for _, di in near:
-                d_info = dn_info[di]
-                tris = zip_vertex_loops(
-                    u["loop"],
-                    d_info["loop"],
-                    verts,
-                    closed_a=u["closed"],
-                    closed_b=d_info["closed"],
-                    taken=taken,
-                )
-                on = (set(u["loop"]), set(d_info["loop"]))
+            on = (set(u["loop"]), set(d_info["loop"]))
+            ways = zip_vertex_loops(
+                u["loop"],
+                d_info["loop"],
+                verts,
+                closed_a=u["closed"],
+                closed_b=d_info["closed"],
+                taken=taken,
+            )
+            for way, (_, tris) in enumerate(ways if second else ways[:1]):
                 # the faces left on its edges along each rim: [as the strip
                 # runs the edge, against it], the up rim's and the down's
                 runs = [[0, 0], [0, 0]]
@@ -4287,9 +4360,9 @@ def stitch_mode_b(verts, faces, orig_faces, mode_b_faces, patches) -> np.ndarray
                         else:
                             continue
                         for fi in surv_ef.get((min(a, b), max(a, b)), ()):
-                            g = faces[fi]
+                            g_ = faces[fi]
                             with_ = any(
-                                g[k] == a and g[(k + 1) % 3] == b for k in range(3)
+                                g_[k] == a and g_[(k + 1) % 3] == b for k in range(3)
                             )
                             runs[side][0 if with_ else 1] += 1
                 wants = [r[0] > r[1] if r[0] + r[1] else None for r in runs]
@@ -4298,53 +4371,227 @@ def stitch_mode_b(verts, faces, orig_faces, mode_b_faces, patches) -> np.ndarray
                 flip = wants[0] if wants[0] is not None else bool(wants[1])
                 chosen = (di, tris, flip)
                 break
-            if chosen is None:
-                n_skipped_loops += 1
-                continue
-            best_dn, tris, flip = chosen
-            dn_used.add(best_dn)
-            if flip:
-                tris = [(t[0], t[2], t[1]) for t in tris]
-            # a triangle a face left there already is, or one laid before,
-            # is not laid again
-            fresh = []
-            for t in tris:
-                key = tuple(sorted(t))
-                left = any(
-                    t[2] in faces[fi]
-                    for fi in surv_ef.get((min(t[0], t[1]), max(t[0], t[1])), ())
+            if chosen is not None:
+                break
+        if chosen is None:
+            return False
+        best_dn, tris, flip = chosen
+        g["used"].add(best_dn)
+        join(u["pieces"] + g["dn"][best_dn]["pieces"])
+        if flip:
+            tris = [(t[0], t[2], t[1]) for t in tris]
+        # a triangle a face left there already is, or one laid before, is not
+        # laid again
+        for t in tris:
+            key = tuple(sorted(t))
+            left = any(
+                t[2] in faces[fi]
+                for fi in surv_ef.get((min(t[0], t[1]), max(t[0], t[1])), ())
+            )
+            if not left and key not in laid:
+                laid.add(key)
+                laid_edges.update(
+                    (min(a, b), max(a, b))
+                    for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0]))
                 )
-                if not left and key not in laid:
-                    laid.add(key)
-                    laid_edges.update(
-                        (min(a, b), max(a, b))
-                        for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0]))
-                    )
-                    fresh.append(t)
-            tris = fresh
-            if tris:
-                all_new_tris.extend(tris)
-                n_pairs += 1
-            else:
-                n_skipped_loops += 1
+                all_new_tris.append(t)
+        return True
 
-        n_skipped_loops += len(dn_info) - len(dn_used)
+    # every group's up rims the cheaper way round first, then those left over
+    # the dearer way round
+    for second in (False, True):
+        for g in prepared:
+            order, g["order"] = g["order"], []
+            for ui in order:
+                if not pair_rim(g, ui, second) and not second:
+                    g["order"].append(ui)
 
     if not all_new_tris:
         return faces
     return np.vstack([faces, np.array(all_new_tris, dtype=np.int64)])
 
 
+def _inside_ring(px, py, ring) -> np.ndarray:
+    """Whether each point (*px*, *py*) lies inside the polygon *ring*
+    (even-odd crossings)."""
+    inside = np.zeros(len(px), dtype=bool)
+    n = len(ring)
+    for i in range(n):
+        ax, ay = ring[i]
+        bx, by = ring[(i + 1) % n]
+        cross = (ay > py) != (by > py)
+        if not cross.any():
+            continue
+        with np.errstate(divide="ignore", invalid="ignore"):
+            x = ax + (py - ay) / (by - ay) * (bx - ax)
+        inside ^= cross & (px < x)
+    return inside
+
+
+def open_ends_on_seams(
+    verts, faces, normals, labels, removed, boundaries, boundary_dist, normal_thresh
+) -> tuple[list[dict], list[dict]]:
+    """The open ends on the seams that a cap of another piece faces across
+    the plane — ``{"axis", "bval", "loop", "below"}`` each — and those caps
+    as patches of one side, each piece's its own.
+
+    Marching cubes run chunk by chunk closes a piece crossing a chunk's
+    face with a cap there, or leaves it open; the other chunk's piece meets
+    it across the plane.  An open end (a closed loop of edges one face has,
+    that face not *removed*) is on a plane of *boundaries* when most of its
+    vertices lie within *boundary_dist* of it — the first such plane — and
+    on the side most of the faces along its edges on the plane are.  A cap
+    facing it: faces of another piece (*labels*), not *removed*, whose
+    centroids lie within *boundary_dist* of the plane and inside the loop's
+    outline across the axis, their normals along the axis over
+    *normal_thresh* toward the loop's side, of a piece across the plane:
+    where the sheet of its caps there turns off the plane, most faces lie on
+    the far side (an organelle inside the open piece, a cavity wound into
+    itself, can have a face there facing the open end, its walls rising on
+    the open end's side)."""
+    planes = [(int(ax), float(b)) for ax, bvals in boundaries for b in bvals]
+    found: list[dict] = []
+    rims: list[dict] = []
+    fi = np.flatnonzero(non_degenerate(faces))
+    ends = np.concatenate(
+        [faces[fi][:, [0, 1]], faces[fi][:, [1, 2]], faces[fi][:, [2, 0]]]
+    )
+    owner = np.concatenate([fi, fi, fi])
+    ends.sort(axis=1)
+    if len(ends):
+        _, inv, counts = np.unique(
+            ends, axis=0, return_inverse=True, return_counts=True
+        )
+        inv = inv.ravel()
+        one = counts[inv] == 1
+    else:
+        inv = counts = np.zeros(0, dtype=np.int64)
+        one = np.zeros(0, dtype=bool)
+    # the faces on each edge, and each face's edges
+    by_edge = np.argsort(inv, kind="stable")
+    starts = np.concatenate([[0], np.cumsum(counts)])
+    slot = np.full(len(faces), -1, dtype=np.int64)
+    slot[fi] = np.arange(len(fi))
+
+    def neighbours(f):
+        j = slot[f]
+        if j < 0:
+            return []
+        out = []
+        for e in inv[[j, j + len(fi), j + 2 * len(fi)]]:
+            out.extend(owner[by_edge[starts[e] : starts[e + 1]]].tolist())
+        return out
+
+    face_of = {(int(a), int(b)): int(f) for (a, b), f in zip(ends[one], owner[one])}
+    open_edges = [e for e, f in face_of.items() if not removed[f]]
+    if not planes or not open_edges:
+        return found, rims
+    cent = verts[faces].mean(axis=1)
+    perp = {0: [1, 2], 1: [0, 2], 2: [0, 1]}
+    caps_on: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+    def caps_at(pi):
+        axis, b = planes[pi]
+        on = ~removed & (labels >= 0) & (np.abs(cent[:, axis] - b) < boundary_dist)
+        n = normals[:, axis]
+        return (
+            np.flatnonzero(on & (n > normal_thresh)),
+            np.flatnonzero(on & (n < -normal_thresh)),
+        )
+
+    def across(start, is_cap, axis, b, below):
+        # where the sheet of the caps turns off the plane, its faces run
+        # away from the open end
+        sheet = set(start)
+        walls: set[int] = set()
+        stack = list(start)
+        far = near = 0
+        while stack:
+            f = stack.pop()
+            for g in neighbours(f):
+                if removed[g] or g in sheet:
+                    continue
+                if is_cap[g]:
+                    sheet.add(g)
+                    stack.append(g)
+                elif g not in walls:
+                    walls.add(g)
+                    off = float(cent[g, axis]) - b
+                    under, over = off < 0.0, off > 0.0
+                    far += over if below else under
+                    near += under if below else over
+        return far > near
+
+    taken = np.zeros(len(faces), dtype=bool)
+    traced = [s for lp, c in trace_edge_loops(open_edges) for s in _simple_loops(lp, c)]
+    for lp, closed in traced:
+        n = len(lp)
+        if not closed or n < 3:
+            continue
+        along = [
+            face_of[(min(lp[i], lp[(i + 1) % n]), max(lp[i], lp[(i + 1) % n]))]
+            for i in range(n)
+        ]
+        own = labels[along[0]]
+        for pi, (axis, b) in enumerate(planes):
+            near = [abs(float(verts[v, axis]) - b) < boundary_dist for v in lp]
+            if 2 * sum(near) <= n:
+                continue
+            above = under = 0
+            for i, f in enumerate(along):
+                if near[i] and near[(i + 1) % n]:
+                    off = float(cent[f, axis]) - b
+                    above += off > 0.0
+                    under += off < 0.0
+            if above == under:
+                continue
+            below = under > above
+            p, q = perp[axis]
+            ring = [(float(verts[v, p]), float(verts[v, q])) for v in lp]
+            if pi not in caps_on:
+                caps_on[pi] = caps_at(pi)
+            cand = caps_on[pi][int(below)]
+            cand = cand[~taken[cand] & (labels[cand] != own)]
+            cand = cand[_inside_ring(cent[cand, p], cent[cand, q], ring)]
+            is_cap = np.zeros(len(faces), dtype=bool)
+            is_cap[caps_on[pi][int(below)]] = True
+            pieces = []
+            for lab in sorted(set(labels[cand].tolist())):
+                caps = cand[labels[cand] == lab].tolist()
+                if across(caps, is_cap, axis, b, below):
+                    pieces.append(caps)
+            if not pieces:
+                continue
+            bval = round(b)
+            for caps in pieces:
+                taken[caps] = True
+                found.append(
+                    {
+                        "axis": axis,
+                        "bval": bval,
+                        "faces": caps,
+                        "up_faces": [] if below else caps,
+                        "down_faces": caps if below else [],
+                    }
+                )
+            rims.append({"axis": axis, "bval": bval, "loop": list(lp), "below": below})
+            break
+    return found, rims
+
+
 def remove_parallel_patches(
-    faces, vertices, normals, patches
-) -> tuple[np.ndarray, int, int, int, int, int]:
+    faces, vertices, normals, patches, boundaries, boundary_dist, normal_thresh
+) -> tuple[np.ndarray, int, int, int, int, int, int]:
     """Remove the trimmed parallel *patches* (``(axis, bval, faces, up,
     down)`` each), drop the pieces that only fold patches cut off, and zip
     the sandwiches' rims together: ``(faces, n_removed, n_fold,
-    n_parallel, n_orphan, n_stitched)``.  A patch with both sides, or
-    without a fold (an up face edge to edge with a down face), is a
+    n_parallel, n_orphan, n_stitched, n_open)``.  A patch with both sides,
+    or without a fold (an up face edge to edge with a down face), is a
     parallel patch whose rims are zipped; one with a fold and one side is a
-    fold patch, removed only."""
+    fold patch, removed only.  The caps facing an open end on a seam of
+    *boundaries* (:func:`open_ends_on_seams`) are taken out with them and
+    zipped to it, *n_open* of them; those whose rim no strip joins are put
+    back."""
     verts = rows3("V", vertices)
     faces, n_vertices = checked_faces(faces, len(verts))
     normals = rows3("N", normals)
@@ -4364,7 +4611,24 @@ def remove_parallel_patches(
                 "down_faces": down,
             }
         )
-    patches = checked
+    if any(int(ax) > 2 for ax, _ in boundaries):
+        raise ValueError("boundary axes are 0, 1 or 2")
+    labels_before, main_before = face_edge_components(faces, n_vertices)
+    in_patch = np.zeros(len(faces), dtype=bool)
+    for patch in checked:
+        in_patch[patch["faces"]] = True
+    caps, open_rims = open_ends_on_seams(
+        verts,
+        faces,
+        normals,
+        labels_before,
+        in_patch,
+        boundaries,
+        float(boundary_dist),
+        float(normal_thresh),
+    )
+    n_given = len(checked)
+    patches = checked + caps
 
     # ── Step 1: classify patches ──────────────────────────────────
     mode_a_faces: set[int] = set()  # fold patches
@@ -4405,7 +4669,6 @@ def remove_parallel_patches(
     # ── Step 3: find NEWLY disconnected components ─────────────────
     # Only consider faces that were in the main component before
     # removal but ended up in a non-main component after.
-    labels_before, main_before = face_edge_components(faces, n_vertices)
     was_main = set(int(i) for i in np.where(labels_before == main_before)[0])
 
     labels_after, main_after = face_edge_components(result, n_vertices)
@@ -4474,10 +4737,36 @@ def remove_parallel_patches(
 
     # ── Step 5: stitch Mode B gaps ───────────────────────────────
     n_before = len(result)
+    n_open = 0
     if mode_b_faces:
-        result = stitch_mode_b(verts, result, faces, mode_b_faces, patches)
+        stitched = stitch_mode_b(verts, result, faces, mode_b_faces, patches, open_rims)
+        # a cap whose rim no strip joins is put back: the open end it faces
+        # stays as it was, and so does the piece it closes
+        laid = {
+            (min(a, b), max(a, b))
+            for t in stitched[n_before:].tolist()
+            for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0]))
+        }
+        left: Counter = Counter()
+        for t in result[non_degenerate(result)].tolist():
+            for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])):
+                left[(min(a, b), max(a, b))] += 1
+        for patch in patches[n_given:]:
+            rim = {
+                (min(a, b), max(a, b))
+                for t in faces[patch["faces"]].tolist()
+                for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0]))
+                if a != b and left[(min(a, b), max(a, b))] == 1
+            }
+            if rim & laid:
+                n_open += 1
+            else:
+                stitched[patch["faces"]] = faces[patch["faces"]]
+                all_removed.difference_update(patch["faces"])
+                n_b -= 1
+        result = stitched
     n_stitched = len(result) - n_before
-    return result, len(all_removed), n_a, n_b, n_orphan, n_stitched
+    return result, len(all_removed), n_a, n_b, n_orphan, n_stitched, n_open
 
 
 def build_edge_to_faces(faces, mask) -> dict[tuple[int, int], list[int]]:

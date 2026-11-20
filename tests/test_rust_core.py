@@ -1415,6 +1415,135 @@ def _sandwich():
     return trimesh.Trimesh(np.vstack(verts), np.vstack(faces), process=False)
 
 
+def _caps_facing_an_open_end(left, right, cavity=None):
+    """Square tubes along x either side of the chunk boundary x = 0, every
+    face facing out, each closed at its far end: on the left one per
+    ``(centre, half-width)`` of *left*, capped facing +x at x = -10 (12
+    faces each, the cap the last two); on the right one of half-width
+    *right*, left open at x = 10; with *cavity* (a centre), a box inside the
+    right one by its open end, wound into itself."""
+    verts, faces = [], []
+
+    def ring(x, c, h):
+        at = len(verts)
+        corners = ((-h, -h), (h, -h), (h, h), (-h, h))
+        verts.extend([x, c[0] + y, c[1] + z] for y, z in corners)
+        return list(range(at, at + 4))
+
+    def band(lo, hi, out):
+        for i in range(4):
+            j = (i + 1) % 4
+            out += [[lo[i], lo[j], hi[j]], [lo[i], hi[j], hi[i]]]
+
+    for c, h in left:
+        far, near = ring(-400.0, c, h), ring(-10.0, c, h)
+        band(far, near, faces)
+        faces += [[far[0], far[2], far[1]], [far[0], far[3], far[2]]]
+        faces += [[near[0], near[1], near[2]], [near[0], near[2], near[3]]]
+    opening, far = ring(10.0, (0.0, 0.0), right), ring(400.0, (0.0, 0.0), right)
+    band(opening, far, faces)
+    faces += [[far[0], far[1], far[2]], [far[0], far[2], far[3]]]
+    if cavity is not None:
+        near, far = ring(5.0, cavity, 50.0), ring(200.0, cavity, 50.0)
+        box: list[list[int]] = []
+        band(near, far, box)
+        box += [[far[0], far[1], far[2]], [far[0], far[2], far[3]]]
+        box += [[near[0], near[2], near[1]], [near[0], near[3], near[2]]]
+        faces += [[a, c, b] for a, b, c in box]
+    return trimesh.Trimesh(np.array(verts), np.array(faces), process=False)
+
+
+def _caps_over_an_organelle(left, outer, organelle):
+    """Square tubes along x either side of the chunk boundary x = 0, every
+    face facing out: on the left one per ``(centre, half-width)`` of *left*,
+    capped facing +x at x = -10 (12 faces each, the cap the last two); on
+    the right one round *outer*, its end at x = 10 an annulus facing -x
+    round the mouth of an organelle running into it, square round
+    *organelle*, its walls facing into it — one surface, the marching-cubes
+    cap of a piece holding an organelle across a chunk face.  Returns the
+    vertices, the faces, the kernel's patch of the caps across x = 0, and
+    the first faces of the right tube's walls and of the organelle's."""
+    verts, faces = [], []
+
+    def ring(x, c, h):
+        at = len(verts)
+        corners = ((-h, -h), (h, -h), (h, h), (-h, h))
+        verts.extend([x, c[0] + y, c[1] + z] for y, z in corners)
+        return list(range(at, at + 4))
+
+    def band(lo, hi, out):
+        for i in range(4):
+            j = (i + 1) % 4
+            out += [[lo[i], lo[j], hi[j]], [lo[i], hi[j], hi[i]]]
+
+    up = []
+    for c, h in left:
+        far, near = ring(-400.0, c, h), ring(-10.0, c, h)
+        band(far, near, faces)
+        faces += [[far[0], far[2], far[1]], [far[0], far[3], far[2]]]
+        up += [len(faces), len(faces) + 1]
+        faces += [[near[0], near[1], near[2]], [near[0], near[2], near[3]]]
+    rim, end = ring(10.0, *outer), ring(400.0, *outer)
+    walls = len(faces)
+    band(rim, end, faces)
+    faces += [[end[0], end[1], end[2]], [end[0], end[2], end[3]]]
+    mouth, deep = ring(10.0, *organelle), ring(300.0, *organelle)
+    down = []
+    for i in range(4):
+        j = (i + 1) % 4
+        down += [len(faces), len(faces) + 1]
+        faces += [[rim[i], mouth[j], rim[j]], [rim[i], mouth[i], mouth[j]]]
+    inside = len(faces)
+    into: list[list[int]] = []
+    band(mouth, deep, into)
+    faces += [[a, c, b] for a, b, c in into]
+    faces += [[deep[0], deep[2], deep[1]], [deep[0], deep[3], deep[2]]]
+    patch = (0, 0, up + down, up, down)
+    return np.array(verts), np.array(faces), patch, walls, inside
+
+
+def _turned_sandwich(bridged):
+    """Two square tubes along x meeting at x = 0, each capped there: the
+    left's square (half-width 1) facing +x, the right's long thin outline,
+    turned and off to one side, facing -x — the cheaper strip round it
+    twists against the faces on one rim.  With *bridged*, a band also joins
+    the tubes' far ends: one piece.  Returns the vertices, the faces and
+    the kernel's patch of the caps."""
+    square = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+    right = [
+        (0.9 + 2.0 * np.cos(a), 0.6 * np.sin(a))
+        for a in (np.pi / 2 * k + 1.3 for k in range(4))
+    ]
+    verts = [[x, y, z] for x in (-2.0, 0.0) for y, z in square]
+    ring = []
+    for y, z in right:
+        ring.append(len(verts))
+        verts.append([0.0, y, z])
+    far = []
+    for y, z in right:
+        far.append(len(verts))
+        verts.append([2.0, y, z])
+    faces = []
+
+    def band(lo, hi):
+        for i in range(len(lo)):
+            j = (i + 1) % len(lo)
+            faces.extend([[lo[i], lo[j], hi[j]], [lo[i], hi[j], hi[i]]])
+
+    band([0, 1, 2, 3], [4, 5, 6, 7])
+    band(ring, far)
+    faces += [[0, 2, 1], [0, 3, 2]]
+    faces += [[far[0], far[i], far[i + 1]] for i in range(1, len(far) - 1)]
+    up = [len(faces), len(faces) + 1]
+    faces += [[4, 5, 6], [4, 6, 7]]
+    down = list(range(len(faces), len(faces) + len(ring) - 2))
+    faces += [[ring[0], ring[i + 1], ring[i]] for i in range(1, len(ring) - 1)]
+    if bridged:
+        faces += [[0, 1, far[0]], [1, far[1], far[0]]]
+    patch = (0, 0, up + down, up, down)
+    return np.array(verts), np.array(faces), patch
+
+
 def _has_fold(mesh, patch) -> bool:
     """Does an up face of *patch* share an edge with a down face?"""
     up, down = set(patch["up_faces"]), set(patch["down_faces"])
@@ -1449,6 +1578,134 @@ class TestParallelPatches:
         f = f[(f[:, 0] != f[:, 1]) & (f[:, 1] != f[:, 2]) & (f[:, 0] != f[:, 2])]
         runs = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]])
         assert len(np.unique(runs, axis=0)) == len(runs)
+
+    def test_a_cap_facing_an_open_end_is_zipped_to_it_on_both_paths(self):
+        """One tube capped at the boundary, the other left open there round
+        it: no patch pairs them, and the cap is taken out and its rim zipped
+        to the open end."""
+        va, fa = _capped_tube_x(-3000.0, -10.0, +1)
+        vb, fb = _capped_tube_x(10.0, 3000.0, +1)
+        mesh = trimesh.Trimesh(
+            np.vstack([va, vb]), np.vstack([fa, fb + len(va)]), process=False
+        )
+        b = {0: np.array([0])}
+        patches, python = both(pre.find_parallel_patches, mesh, boundaries=b)
+        assert patches == python == [], "fixture: no cap faces the cap"
+        out, python = both(
+            pre.remove_parallel_patches, mesh, patches=patches, boundaries=b
+        )
+        assert_parity(np.asarray(out.faces), np.asarray(python.faces))
+        labels, _ = pre._face_edge_components(out)
+        assert len(set(labels.tolist()) - {-2}) == 1
+        # the disk is out: no face left facing +x at the boundary
+        f = np.asarray(out.faces)
+        f = f[(f[:, 0] != f[:, 1]) & (f[:, 1] != f[:, 2]) & (f[:, 0] != f[:, 2])]
+        v = np.asarray(mesh.vertices)
+        assert not np.all(np.abs(v[f][:, :, 0] + 10.0) < 1.0, axis=1).any()
+        # wound as the tubes are, the zip included
+        runs = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]])
+        assert len(np.unique(runs, axis=0)) == len(runs)
+        # with the boundary elsewhere the mesh is left as it was
+        far = {0: np.array([500])}
+        same = pre.remove_parallel_patches(mesh, patches=[], boundaries=far)
+        assert np.array_equal(np.asarray(same.faces), np.asarray(mesh.faces))
+
+    def test_one_cap_of_several_takes_the_open_end_on_both_paths(self):
+        """Two pieces capped inside one open end: the larger cap is zipped
+        to it, the smaller put back."""
+        left = [((-150.0, 0.0), 100.0), ((170.0, 0.0), 60.0)]
+        mesh = _caps_facing_an_open_end(left, 300.0)
+        n = len(mesh.faces)
+        out, python = both(
+            pre.remove_parallel_patches,
+            mesh,
+            patches=[],
+            boundaries={0: np.array([0])},
+        )
+        assert_parity(np.asarray(out.faces), np.asarray(python.faces))
+        f, given = np.asarray(out.faces), np.asarray(mesh.faces)
+        assert (f[10:12] == 0).all(), "the larger cap is out"
+        assert np.array_equal(f[12:n], given[12:n]), "the rest as it was"
+        assert len(f) == n + 8
+        labels, _ = pre._face_edge_components(out)
+        assert len(set(labels.tolist()) - {-2}) == 2
+
+    def test_a_cavity_by_an_open_end_is_no_cap_on_both_paths(self):
+        """An organelle in the open piece by its open end, wound into
+        itself: its face at the boundary faces the open end from inside the
+        outline, but its walls rise on the open end's side — no cap."""
+        mesh = _caps_facing_an_open_end([], 150.0, cavity=(0.0, 0.0))
+        # fixture: the cavity's end at x = 5 faces +x, toward the open end
+        at = np.all(np.abs(mesh.vertices[mesh.faces][:, :, 0] - 5.0) < 1e-9, axis=1)
+        assert at.sum() == 2 and (mesh.face_normals[at, 0] > 0.99).all()
+        out, python = both(
+            pre.remove_parallel_patches,
+            mesh,
+            patches=[],
+            boundaries={0: np.array([0])},
+        )
+        assert_parity(np.asarray(out.faces), np.asarray(python.faces))
+        assert np.array_equal(np.asarray(out.faces), np.asarray(mesh.faces))
+
+    @staticmethod
+    def _removed_on_both_paths(left, outer, organelle):
+        """The kernel on both paths on :func:`_caps_over_an_organelle`'s
+        mesh and patch, untrimmed: the result, the faces' components after,
+        and the first faces of the right tube's walls and the organelle's."""
+        from skeliner.python import pre as python_pre
+
+        v, f, patch, walls, inside = _caps_over_an_organelle(left, outer, organelle)
+        n = np.cross(v[f[:, 1]] - v[f[:, 0]], v[f[:, 2]] - v[f[:, 0]])
+        n /= np.linalg.norm(n, axis=1)[:, None]
+        args = (f, v, n, [patch], [(0, [0.0])], 30.0, 0.99)
+        rust = _rs.pre.remove_parallel_patches(*args)
+        assert_parity(rust, python_pre.remove_parallel_patches(*args))
+        labels, _ = pre._face_edge_components(
+            trimesh.Trimesh(v, rust[0], process=False)
+        )
+        return rust, labels, walls, inside
+
+    def test_a_rim_turning_the_other_way_gives_way_on_both_paths(self):
+        """The organelle's mouth, nearer the left rim than the right tube's
+        outline, turns the other way: the cheaper strip to it twists against
+        the faces on one rim, and the outline, the cheaper way round, joins
+        the tubes."""
+        (out, n_removed, *_, n_stitched, _), labels, walls, inside = (
+            self._removed_on_both_paths(
+                [((0.0, 0.0), 100.0)], ((40.0, 0.0), 150.0), ((0.0, 0.0), 30.0)
+            )
+        )
+        assert (n_removed, n_stitched) == (10, 8)
+        assert labels[0] == labels[walls], "the tubes are one surface"
+        assert labels[0] != labels[inside], "the organelle is apart"
+
+    def test_the_dearer_way_round_joins_pieces_only_on_both_paths(self):
+        """The cheaper strip between the two sides twists against a rim: the
+        dearer way round joins the tubes; with the tubes also joined at their
+        far ends (one piece) it is not laid, and the hole is left."""
+        from skeliner.python import pre as python_pre
+
+        for bridged, stitched in ((False, 8), (True, 0)):
+            v, f, patch = _turned_sandwich(bridged)
+            n = np.cross(v[f[:, 1]] - v[f[:, 0]], v[f[:, 2]] - v[f[:, 0]])
+            n /= np.linalg.norm(n, axis=1)[:, None]
+            args = (f, v, n, [patch], [(0, [0.0])], 30.0, 0.99)
+            rust = _rs.pre.remove_parallel_patches(*args)
+            assert_parity(rust, python_pre.remove_parallel_patches(*args))
+            assert (rust[1], rust[5]) == (4, stitched)
+
+    def test_a_rim_left_over_takes_none_turning_the_other_way_on_both_paths(self):
+        """A second left tube in the organelle's mouth, the outline taken by
+        the first: the dearer way round to the mouth winds as the faces on
+        both want, but the two turn apart, and no strip is laid."""
+        left = [((-150.0, 0.0), 100.0), ((60.0, 0.0), 20.0)]
+        (out, n_removed, *_, n_stitched, _), labels, walls, inside = (
+            self._removed_on_both_paths(left, ((0.0, 0.0), 300.0), ((60.0, 0.0), 30.0))
+        )
+        assert (n_removed, n_stitched) == (12, 8)
+        assert labels[0] == labels[walls], "the first tube joined"
+        assert labels[12] != labels[inside], "the second not to the organelle"
+        assert labels[12] != labels[0]
 
 
 class TestPythonPath:

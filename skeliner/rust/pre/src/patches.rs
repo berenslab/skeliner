@@ -8,7 +8,7 @@
 //! because neighbour counts read those lists directly.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use mesh::Topology;
 use mesh::components::{face_edge_components, face_edge_components_without};
@@ -706,10 +706,13 @@ fn flat(verts: &[V3], t: [u32; 3]) -> bool {
     x == [0.0; 3]
 }
 
-/// `_zip_vertex_loops`: a triangle strip between two vertex sequences,
-/// the shorter bridge first at each step, over every start offset of `lb`
-/// and both ways round it; the cheapest strip wins.  The strip runs `la`
-/// forward; the caller winds it.
+/// `_zip_vertex_loops`: for each way round `lb`, the cheapest triangle
+/// strip between two vertex sequences over every start offset of `lb` (the
+/// shorter bridge first at each step), with its cost — the cheaper way
+/// first.  Each runs `la` forward; the caller takes one and winds it: a
+/// loop whose direction was misjudged would twist the strip, its rungs
+/// crossing at length, but the cheaper way can also be the one no winding
+/// joins to the faces on both rims.
 ///
 /// The rims of a sandwich lie in one plane and touch where its two
 /// outlines meet. Where they share a vertex the strip pinches through it:
@@ -727,7 +730,7 @@ fn zip_vertex_loops(
     closed_a: bool,
     closed_b: bool,
     taken: &dyn Fn(u32, u32) -> bool,
-) -> Vec<[u32; 3]> {
+) -> Vec<(f64, Vec<[u32; 3]>)> {
     let (m, n) = (la.len(), lb.len());
     if m < 2 || n < 2 {
         return Vec::new();
@@ -771,12 +774,11 @@ fn zip_vertex_loops(
         tris.retain(|&t| !names_twice(t));
         (cost, tris)
     };
-    // `lb` either way round: a loop whose direction was misjudged would
-    // twist the strip, its rungs crossing at length
-    let mut best: Option<(f64, Vec<[u32; 3]>)> = None;
     let shifts = if closed_b { n } else { 1 };
     let back: Vec<u32> = lb.iter().rev().copied().collect();
+    let mut ways: Vec<(f64, Vec<[u32; 3]>)> = Vec::new();
     for way in [lb, &back[..]] {
+        let mut best: Option<(f64, Vec<[u32; 3]>)> = None;
         for shift in 0..shifts {
             let shifted: Vec<u32> = way[shift..].iter().chain(&way[..shift]).copied().collect();
             let (cost, tris) = walk(&shifted);
@@ -784,8 +786,11 @@ fn zip_vertex_loops(
                 best = Some((cost, tris));
             }
         }
+        ways.extend(best);
     }
-    best.map(|(_, t)| t).unwrap_or_default()
+    // stable: on a tie the way `lb` runs comes first
+    ways.sort_by(|x, y| x.0.total_cmp(&y.0));
+    ways
 }
 
 /// Whether the faces left along `lp`'s edges run it forward (`lp[i]` to
@@ -817,11 +822,71 @@ fn runs_forward(
     forward > backward
 }
 
+/// One `(axis, bval)` group's rims as [`stitch_mode_b`] pairs them: the
+/// loops (oriented as the faces left on them want), per loop its centre
+/// and its box across the axis, the signed area it encloses there (none
+/// for an open one), and the pieces of the faces left along it.
+struct Rims {
+    up: Vec<(Vec<u32>, bool)>,
+    dn: Vec<(Vec<u32>, bool)>,
+    up_info: Vec<(V3, [f64; 2], [f64; 2])>,
+    dn_info: Vec<(V3, [f64; 2], [f64; 2])>,
+    up_turn: Vec<f64>,
+    dn_turn: Vec<f64>,
+    up_pieces: Vec<Vec<usize>>,
+    dn_pieces: Vec<Vec<usize>>,
+    dn_used: Vec<bool>,
+    /// The up rims to pair, largest first; after the first pass, those it
+    /// left over.
+    order: Vec<usize>,
+}
+
+/// The pieces the removal leaves, joined as the strips are laid.
+struct Joined(Vec<usize>);
+
+impl Joined {
+    fn root(&mut self, mut a: usize) -> usize {
+        while self.0[a] != a {
+            self.0[a] = self.0[self.0[a]];
+            a = self.0[a];
+        }
+        a
+    }
+
+    fn join(&mut self, pieces: &[usize]) {
+        for w in pieces.windows(2) {
+            let (a, b) = (self.root(w[0]), self.root(w[1]));
+            self.0[a.max(b)] = a.min(b);
+        }
+    }
+
+    fn apart(&mut self, a: &[usize], b: &[usize]) -> bool {
+        let ra: Vec<usize> = a.iter().map(|&p| self.root(p)).collect();
+        b.iter().all(|&p| {
+            let r = self.root(p);
+            !ra.contains(&r)
+        })
+    }
+}
+
+/// What [`stitch_mode_b`] has laid so far.
+struct Laid {
+    tris: Vec<[u32; 3]>,
+    keys: HashSet<[u32; 3]>,
+    edges: HashSet<Edge>,
+    n_turned: usize,
+    joined: Joined,
+}
+
 /// `_stitch_mode_b`: per `(axis, bval)` group of patches with Mode B faces,
 /// trace the rims each removed side leaves, pair up-side with down-side
 /// rims (largest first, nearest centre with overlapping bboxes) and zip
-/// each pair.  `topo` is the mesh's before the removal and `gone` the faces
-/// removed.  Returns the new triangles.
+/// each pair: in every group first the strip the cheaper way round, wound
+/// as the faces on both rims want; then an up rim left over the dearer way
+/// round to a closed down rim turning alike, only where the strip joins
+/// two pieces no strip has joined.  `topo` is the mesh's before the removal
+/// and `gone` the faces removed.  Returns the new triangles and how many
+/// were laid the dearer way round.
 fn stitch_mode_b(
     verts: &[V3],
     topo: &Topology,
@@ -829,48 +894,34 @@ fn stitch_mode_b(
     orig: &[[u32; 3]],
     mode_b: &HashSet<u32>,
     patches: &[Patch],
-) -> Vec<[u32; 3]> {
-    // an edge is a rim edge when exactly one face that has it is left
-    let one_left = |(a, b): Edge| {
-        topo.edge_id(a, b).is_some_and(|e| {
-            topo.edge_faces(e)
-                .iter()
-                .filter(|&&f| !gone[f as usize])
-                .count()
-                == 1
-        })
-    };
+    open: &[OpenRim],
+) -> (Vec<[u32; 3]>, usize) {
     let rim_edges = |side: &HashSet<u32>| -> Vec<Edge> {
-        let mut out = Vec::new();
-        let mut seen = HashSet::new();
-        for &fi in side {
-            let f = orig[fi as usize];
-            for i in 0..3 {
-                let (a, b) = (f[i], f[(i + 1) % 3]);
-                if a == b {
-                    continue;
-                }
-                let e = edge(a, b);
-                if seen.contains(&e) {
-                    continue;
-                }
-                if one_left(e) {
-                    seen.insert(e);
-                    out.push(e);
-                }
-            }
-        }
-        out
+        let side: Vec<u32> = side.iter().copied().collect();
+        rim_left(topo, gone, orig, &side)
     };
     let with_b: Vec<Patch> = patches
         .iter()
         .filter(|p| p.faces.iter().any(|f| mode_b.contains(f)))
         .cloned()
         .collect();
-    let mut tris_out = Vec::new();
-    let mut laid: HashSet<[u32; 3]> = HashSet::new();
-    let mut laid_edges: HashSet<Edge> = HashSet::new();
-    for ((axis, _), members) in groups(&with_b) {
+    let (piece, _) = face_edge_components_without(topo, gone);
+    let n_pieces = piece.iter().max().map_or(0, |&p| (p + 1).max(0) as usize);
+    // the pieces of the faces left along a loop's edges
+    let pieces_along = |(lp, closed): &(Vec<u32>, bool)| -> Vec<usize> {
+        let steps = if *closed { lp.len() } else { lp.len() - 1 };
+        let mut out: Vec<usize> = (0..steps)
+            .filter_map(|i| topo.edge_id(lp[i], lp[(i + 1) % lp.len()]))
+            .flat_map(|e| topo.edge_faces(e).iter().copied())
+            .filter(|&f| !gone[f as usize] && piece[f as usize] >= 0)
+            .map(|f| piece[f as usize] as usize)
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    };
+    let mut rims: Vec<Rims> = Vec::new();
+    for ((axis, bval), members) in groups(&with_b) {
         let mut up_removed = HashSet::new();
         let mut dn_removed = HashSet::new();
         for &pi in &members {
@@ -884,9 +935,6 @@ fn stitch_mode_b(
             );
         }
         let (up_rim, dn_rim) = (rim_edges(&up_removed), rim_edges(&dn_removed));
-        if up_rim.is_empty() || dn_rim.is_empty() {
-            continue;
-        }
         let keep = |(lp, c): &(Vec<u32>, bool)| (*c && lp.len() >= 3) || (!*c && lp.len() >= 2);
         let traced = |rim: &[Edge]| -> Vec<(Vec<u32>, bool)> {
             trace_edge_loops(rim)
@@ -895,7 +943,12 @@ fn stitch_mode_b(
                 .filter(keep)
                 .collect()
         };
-        let (up, dn) = (traced(&up_rim), traced(&dn_rim));
+        let (mut up, mut dn) = (traced(&up_rim), traced(&dn_rim));
+        // an open end below the plane is the rim an up cap would leave
+        for r in open.iter().filter(|r| r.axis == axis && r.bval == bval) {
+            let side = if r.below { &mut up } else { &mut dn };
+            side.push((r.lp.clone(), true));
+        }
         if up.is_empty() || dn.is_empty() {
             continue;
         }
@@ -911,7 +964,7 @@ fn stitch_mode_b(
         let up: Vec<(Vec<u32>, bool)> = up.into_iter().map(|l| orient(l, false)).collect();
         let dn: Vec<(Vec<u32>, bool)> = dn.into_iter().map(|l| orient(l, true)).collect();
         let [pa, pb] = perp(axis);
-        let info = |lp: &[u32]| {
+        let info = |(lp, _): &(Vec<u32>, bool)| {
             let mut s = [0.0f64; 3];
             let mut lo = [f64::INFINITY; 2];
             let mut hi = [f64::NEG_INFINITY; 2];
@@ -927,95 +980,173 @@ fn stitch_mode_b(
             }
             (s.map(|c| c / lp.len() as f64), lo, hi)
         };
-        let up_info: Vec<_> = up.iter().map(|(lp, _)| info(lp)).collect();
-        let dn_info: Vec<_> = dn.iter().map(|(lp, _)| info(lp)).collect();
-        let mut up_order: Vec<usize> = (0..up.len()).collect();
-        up_order.sort_by_key(|&i| std::cmp::Reverse(up[i].0.len()));
-        let mut dn_used = vec![false; dn.len()];
-        for ui in up_order {
-            let (uc, ulo, uhi) = up_info[ui];
-            // the down loops overlapping it across the axis, nearest first
-            let mut near: Vec<(usize, f64)> = dn_info
-                .iter()
-                .enumerate()
-                .filter(|&(di, &(_, dlo, dhi))| {
-                    !dn_used[di] && (0..2).all(|k| uhi[k].min(dhi[k]) > ulo[k].max(dlo[k]))
-                })
-                .map(|(di, &(dc, _, _))| (di, dist(uc, dc)))
-                .collect();
-            near.sort_by(|x, y| x.1.total_cmp(&y.1));
-            // a rung on an edge a face left there or a strip laid before
-            // already has would give it a third face
-            let taken = |u: u32, v: u32| {
-                laid_edges.contains(&edge(u, v))
-                    || topo
-                        .edge_id(u, v)
-                        .is_some_and(|e| topo.edge_faces(e).iter().any(|&f| !gone[f as usize]))
-            };
-            // the first whose strip one winding joins to the faces left on
-            // both rims: two rims whose faces want it wound both ways are
-            // no two sides of one surface (an outline beside an organelle's
-            // wall, facing the other way)
-            let mut chosen = None;
-            for (di, _) in near {
-                let strip =
-                    zip_vertex_loops(&up[ui].0, &dn[di].0, verts, up[ui].1, dn[di].1, &taken);
-                let (on_up, on_dn) = (&up[ui].0, &dn[di].0);
-                // the faces left on its edges along each rim: [as the strip
-                // runs the edge, against it], the up rim's and the down's
-                let mut runs = [[0usize; 2]; 2];
-                for t in &strip {
-                    for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                        let side = if on_up.contains(&a) && on_up.contains(&b) {
-                            0
-                        } else if on_dn.contains(&a) && on_dn.contains(&b) {
-                            1
-                        } else {
-                            continue;
-                        };
-                        let Some(e) = topo.edge_id(a, b) else {
-                            continue;
-                        };
-                        for &f in topo.edge_faces(e).iter().filter(|&&f| !gone[f as usize]) {
-                            let g = orig[f as usize];
-                            let with = (0..3).any(|k| g[k] == a && g[(k + 1) % 3] == b);
-                            runs[side][usize::from(!with)] += 1;
-                        }
-                    }
-                }
-                let wants =
-                    |[with, against]: [usize; 2]| (with + against > 0).then_some(with > against);
-                match (wants(runs[0]), wants(runs[1])) {
-                    (Some(u), Some(d)) if u != d => continue,
-                    (u, d) => {
-                        chosen = Some((di, strip, u.or(d).unwrap_or(false)));
-                        break;
-                    }
+        // the area a closed loop, run as the faces left on it want, encloses
+        // across the axis, signed by the way it turns (an open one none):
+        // two sides of one surface turn alike, an outline and the wall of
+        // an organelle beside it, facing the other way, do not
+        let turning = |(lp, closed): &(Vec<u32>, bool)| -> f64 {
+            let mut area = 0.0;
+            if *closed {
+                let o = verts[lp[0] as usize];
+                for k in 0..lp.len() {
+                    let p = verts[lp[k] as usize];
+                    let q = verts[lp[(k + 1) % lp.len()] as usize];
+                    area += (p[pa] - o[pa]) * (q[pb] - o[pb]) - (q[pa] - o[pa]) * (p[pb] - o[pb]);
                 }
             }
-            let Some((di, strip, flip)) = chosen else {
-                continue;
-            };
-            dn_used[di] = true;
-            // a triangle a face left there already is, or one laid before,
-            // is not laid again
-            for t in strip {
-                let t = if flip { [t[0], t[2], t[1]] } else { t };
-                let mut key = t;
-                key.sort_unstable();
-                let left = topo.edge_id(t[0], t[1]).is_some_and(|e| {
-                    topo.edge_faces(e)
-                        .iter()
-                        .any(|&f| !gone[f as usize] && orig[f as usize].contains(&t[2]))
-                });
-                if !left && laid.insert(key) {
-                    laid_edges.extend(face_edges(t));
-                    tris_out.push(t);
+            area
+        };
+        let mut order: Vec<usize> = (0..up.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(up[i].0.len()));
+        rims.push(Rims {
+            up_info: up.iter().map(info).collect(),
+            dn_info: dn.iter().map(info).collect(),
+            up_turn: up.iter().map(turning).collect(),
+            dn_turn: dn.iter().map(turning).collect(),
+            up_pieces: up.iter().map(pieces_along).collect(),
+            dn_pieces: dn.iter().map(pieces_along).collect(),
+            dn_used: vec![false; dn.len()],
+            order,
+            up,
+            dn,
+        });
+    }
+    let mut laid = Laid {
+        tris: Vec::new(),
+        keys: HashSet::new(),
+        edges: HashSet::new(),
+        n_turned: 0,
+        joined: Joined((0..n_pieces).collect()),
+    };
+    for second in [false, true] {
+        for g in &mut rims {
+            let order = std::mem::take(&mut g.order);
+            for ui in order {
+                if !pair_rim(verts, topo, gone, orig, g, ui, second, &mut laid) && !second {
+                    g.order.push(ui);
                 }
             }
         }
     }
-    tris_out
+    (laid.tris, laid.n_turned)
+}
+
+/// [`stitch_mode_b`]'s pairing of up rim `ui` of group `g`, in the first
+/// pass or the `second`; whether a strip was laid.
+#[allow(clippy::too_many_arguments)]
+fn pair_rim(
+    verts: &[V3],
+    topo: &Topology,
+    gone: &[bool],
+    orig: &[[u32; 3]],
+    g: &mut Rims,
+    ui: usize,
+    second: bool,
+    laid: &mut Laid,
+) -> bool {
+    let (uc, ulo, uhi) = g.up_info[ui];
+    // the down loops overlapping it across the axis, nearest first
+    let mut near: Vec<(usize, f64)> = g
+        .dn_info
+        .iter()
+        .enumerate()
+        .filter(|&(di, &(_, dlo, dhi))| {
+            !g.dn_used[di] && (0..2).all(|k| uhi[k].min(dhi[k]) > ulo[k].max(dlo[k]))
+        })
+        .map(|(di, &(dc, _, _))| (di, dist(uc, dc)))
+        .collect();
+    near.sort_by(|x, y| x.1.total_cmp(&y.1));
+    // a rung on an edge a face left there or a strip laid before already
+    // has would give it a third face
+    let edges = &laid.edges;
+    let taken = |u: u32, v: u32| {
+        edges.contains(&edge(u, v))
+            || topo
+                .edge_id(u, v)
+                .is_some_and(|e| topo.edge_faces(e).iter().any(|&f| !gone[f as usize]))
+    };
+    // the first whose strip the cheaper way round the down rim one winding
+    // joins to the faces left on both rims: two rims whose faces want it
+    // wound both ways are no two sides of one surface (an outline beside an
+    // organelle's wall, facing the other way). Two outlines far apart for
+    // their size can make the twisted way the cheaper, so an up rim left
+    // over then takes the dearer way to a closed down rim turning alike —
+    // only to join two pieces no strip has joined: within one piece the
+    // hole is the fill's.
+    let mut chosen = None;
+    'near: for (di, _) in near {
+        if second {
+            let (u, d) = (g.up_turn[ui], g.dn_turn[di]);
+            let alike = (u > 0.0 && d > 0.0) || (u < 0.0 && d < 0.0);
+            if !alike || !laid.joined.apart(&g.up_pieces[ui], &g.dn_pieces[di]) {
+                continue;
+            }
+        }
+        let (on_up, on_dn) = (&g.up[ui].0, &g.dn[di].0);
+        let ways = zip_vertex_loops(on_up, on_dn, verts, g.up[ui].1, g.dn[di].1, &taken);
+        let tried = if second { ways.len() } else { 1 };
+        for (way, (_, strip)) in ways.into_iter().enumerate().take(tried) {
+            // the faces left on its edges along each rim: [as the strip runs
+            // the edge, against it], the up rim's and the down's
+            let mut runs = [[0usize; 2]; 2];
+            for t in &strip {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let side = if on_up.contains(&a) && on_up.contains(&b) {
+                        0
+                    } else if on_dn.contains(&a) && on_dn.contains(&b) {
+                        1
+                    } else {
+                        continue;
+                    };
+                    let Some(e) = topo.edge_id(a, b) else {
+                        continue;
+                    };
+                    for &f in topo.edge_faces(e).iter().filter(|&&f| !gone[f as usize]) {
+                        let t = orig[f as usize];
+                        let with = (0..3).any(|k| t[k] == a && t[(k + 1) % 3] == b);
+                        runs[side][usize::from(!with)] += 1;
+                    }
+                }
+            }
+            let wants =
+                |[with, against]: [usize; 2]| (with + against > 0).then_some(with > against);
+            match (wants(runs[0]), wants(runs[1])) {
+                (Some(u), Some(d)) if u != d => continue,
+                (u, d) => {
+                    chosen = Some((di, strip, u.or(d).unwrap_or(false), way > 0));
+                    break 'near;
+                }
+            }
+        }
+    }
+    let Some((di, strip, flip, turned)) = chosen else {
+        return false;
+    };
+    g.dn_used[di] = true;
+    laid.n_turned += usize::from(turned);
+    let both: Vec<usize> = g.up_pieces[ui]
+        .iter()
+        .chain(&g.dn_pieces[di])
+        .copied()
+        .collect();
+    laid.joined.join(&both);
+    // a triangle a face left there already is, or one laid before, is not
+    // laid again
+    for t in strip {
+        let t = if flip { [t[0], t[2], t[1]] } else { t };
+        let mut key = t;
+        key.sort_unstable();
+        let left = topo.edge_id(t[0], t[1]).is_some_and(|e| {
+            topo.edge_faces(e)
+                .iter()
+                .any(|&f| !gone[f as usize] && orig[f as usize].contains(&t[2]))
+        });
+        if !left && laid.keys.insert(key) {
+            laid.edges.extend(face_edges(t));
+            laid.tris.push(t);
+        }
+    }
+    true
 }
 
 /// What [`remove_parallel_patches`] did.
@@ -1027,19 +1158,258 @@ pub struct Removed {
     pub n_parallel: usize,
     pub n_orphan: usize,
     pub n_stitched: usize,
+    /// Strips laid round the dearer way, the cheaper one wound against
+    /// the faces on a rim.
+    pub n_turned: usize,
+    /// Caps facing an open end across a seam, taken out and their rims
+    /// zipped to it.
+    pub n_open: usize,
+}
+
+/// The chunk planes, and what makes a face a cap on one, as
+/// [`find_parallel_patches`] reads them: its centroid within
+/// `boundary_dist` of the plane, its normal's component along the axis
+/// over `normal_thresh`.
+#[derive(Debug, Clone, Copy)]
+pub struct Seam<'a> {
+    pub boundaries: &'a [(usize, Vec<f64>)],
+    pub boundary_dist: f64,
+    pub normal_thresh: f64,
 }
 
 /// `remove_parallel_patches` on already trimmed patches: classify each
 /// (fold or parallel), remove them all, drop pieces the removal cut off
-/// main that border only fold patches, then stitch the parallel sides.
-/// The loops over every face run on [`threads`]' pool.
-pub fn remove_parallel_patches(m: &PatchMesh<'_>, patches: &[Patch]) -> Removed {
-    threads::install(|| remove_patches(m, patches))
+/// main that border only fold patches, then stitch the parallel sides —
+/// and the caps facing an open end across a seam ([`open_ends_on_seams`])
+/// with them.  The loops over every face run on [`threads`]' pool.
+pub fn remove_parallel_patches(m: &PatchMesh<'_>, patches: &[Patch], seam: &Seam<'_>) -> Removed {
+    threads::install(|| remove_patches(m, patches, seam))
 }
 
-fn remove_patches(m: &PatchMesh<'_>, patches: &[Patch]) -> Removed {
+/// An open end of the mesh on a seam, to be zipped like the rim a removed
+/// cap leaves; `bval` is the plane's rounded as a patch's is.
+pub struct OpenRim {
+    pub axis: usize,
+    pub bval: i64,
+    pub lp: Vec<u32>,
+    /// Its faces lie below the plane: the side whose caps face up.
+    pub below: bool,
+}
+
+/// The open ends on the seams that a cap of another piece faces across
+/// the plane, and those caps as patches of one side.
+///
+/// Marching cubes run chunk by chunk closes a piece crossing a chunk's
+/// face with a cap there, or leaves it open; the other chunk's piece
+/// meets it across the plane. Where a cap faces a cap the two are a
+/// parallel patch; where it faces an open end, the open end is the other
+/// side, and nothing pairs them. An open end is on a plane when most of
+/// its loop's vertices lie within `boundary_dist` of it (a ragged end may
+/// leave the plane along part of its rim) — the first such plane, as
+/// `seam.boundaries` lists them — and is on the side most of the faces
+/// along its edges on the plane are. A cap facing it: faces of
+/// another piece (`label`: face-edge components of the mesh before the
+/// removal), not `removed`, whose centroids lie within `boundary_dist` of
+/// the plane and inside the loop's outline across the axis, their normals
+/// along the axis over `normal_thresh` toward the loop's side — only the
+/// part of a flat sheet the open end covers, so a sheet that carries the
+/// surface beyond it stays — of a piece across the plane: where the sheet
+/// of its caps there turns off the plane, most faces lie on the far side.
+/// (An organelle inside the open piece, a cavity wound into itself, can
+/// have a face there facing the open end, its walls rising on the open
+/// end's side.) Each piece's caps are a patch of their own.
+pub fn open_ends_on_seams(
+    m: &PatchMesh<'_>,
+    topo: &Topology,
+    label: &[i64],
+    removed: &[bool],
+    seam: &Seam<'_>,
+) -> (Vec<Patch>, Vec<OpenRim>) {
+    let planes: Vec<(usize, f64)> = seam
+        .boundaries
+        .iter()
+        .flat_map(|(axis, values)| values.iter().map(move |&b| (*axis, b)))
+        .collect();
+    let mut found: (Vec<Patch>, Vec<OpenRim>) = (Vec::new(), Vec::new());
+    let open: Vec<Edge> = (0..topo.n_edges())
+        .filter(|&e| {
+            let fs = topo.edge_faces(e);
+            fs.len() == 1 && !removed[fs[0] as usize]
+        })
+        .map(|e| {
+            let [a, b] = topo.edges()[e];
+            (a, b)
+        })
+        .collect();
+    if planes.is_empty() || open.is_empty() {
+        return found;
+    }
+    let cent = centroids(m);
+    // per plane, the faces that could cap it, facing up and facing down:
+    // found for a plane when an open end first lies on it
+    let mut caps_on: HashMap<usize, [Vec<u32>; 2]> = HashMap::new();
+    let caps_at = |pi: usize| -> [Vec<u32>; 2] {
+        let (axis, b) = planes[pi];
+        let mut by = [Vec::new(), Vec::new()];
+        for f in 0..m.faces.len() {
+            let on = (cent[f][axis] - b).abs() < seam.boundary_dist;
+            if removed[f] || label[f] < 0 || !on {
+                continue;
+            }
+            let n = m.normals[f][axis];
+            if n > seam.normal_thresh {
+                by[0].push(f as u32);
+            } else if n < -seam.normal_thresh {
+                by[1].push(f as u32);
+            }
+        }
+        by
+    };
+    let mut taken = vec![false; m.faces.len()];
+    for (lp, closed) in trace_edge_loops(&open)
+        .into_iter()
+        .flat_map(|(lp, closed)| simple_loops(&lp, closed))
+    {
+        let n = lp.len();
+        if !closed || n < 3 {
+            continue;
+        }
+        // each edge's one face
+        let along: Vec<(usize, u32)> = (0..n)
+            .filter_map(|i| {
+                topo.edge_id(lp[i], lp[(i + 1) % n])
+                    .map(|e| (i, topo.edge_faces(e)[0]))
+            })
+            .collect();
+        let Some(&(_, first)) = along.first() else {
+            continue;
+        };
+        let own = label[first as usize];
+        for (pi, &(axis, b)) in planes.iter().enumerate() {
+            let near = |v: u32| (m.verts[v as usize][axis] - b).abs() < seam.boundary_dist;
+            if 2 * lp.iter().filter(|&&v| near(v)).count() <= n {
+                continue;
+            }
+            let (mut above, mut under) = (0usize, 0usize);
+            for &(i, f) in &along {
+                if near(lp[i]) && near(lp[(i + 1) % n]) {
+                    let off = cent[f as usize][axis] - b;
+                    above += usize::from(off > 0.0);
+                    under += usize::from(off < 0.0);
+                }
+            }
+            if above == under {
+                continue;
+            }
+            let below = under > above;
+            let [p, q] = perp(axis);
+            let ring: Vec<[f64; 2]> = lp
+                .iter()
+                .map(|&v| [m.verts[v as usize][p], m.verts[v as usize][q]])
+                .collect();
+            // the caps facing it: up when it is above, down when below
+            let mut by_piece: BTreeMap<i64, Vec<u32>> = BTreeMap::new();
+            let dir = usize::from(below);
+            let caps: &[Vec<u32>; 2] = caps_on.entry(pi).or_insert_with(|| caps_at(pi));
+            for &f in &caps[dir] {
+                let fu = f as usize;
+                if !taken[fu] && label[fu] != own && inside_ring([cent[fu][p], cent[fu][q]], &ring)
+                {
+                    by_piece.entry(label[fu]).or_default().push(f);
+                }
+            }
+            // a piece across the plane: where the sheet of its caps there
+            // turns off the plane, its faces run away from the open end
+            let across = |start: &[u32]| -> bool {
+                let mut sheet: HashSet<u32> = start.iter().copied().collect();
+                let mut walls: HashSet<u32> = HashSet::new();
+                let mut stack = start.to_vec();
+                let (mut far, mut near) = (0usize, 0usize);
+                while let Some(f) = stack.pop() {
+                    for e in topo.face_edges(f as usize).into_iter().flatten() {
+                        for &g in topo.edge_faces(e as usize) {
+                            if removed[g as usize] || sheet.contains(&g) {
+                                continue;
+                            }
+                            if caps[dir].binary_search(&g).is_ok() {
+                                sheet.insert(g);
+                                stack.push(g);
+                            } else if walls.insert(g) {
+                                let off = cent[g as usize][axis] - b;
+                                let (under, over) = (off < 0.0, off > 0.0);
+                                far += usize::from(if below { over } else { under });
+                                near += usize::from(if below { under } else { over });
+                            }
+                        }
+                    }
+                }
+                far > near
+            };
+            by_piece.retain(|_, fs| across(fs));
+            if by_piece.is_empty() {
+                continue;
+            }
+            let bval = round_i64(b);
+            for caps in by_piece.into_values() {
+                for &f in &caps {
+                    taken[f as usize] = true;
+                }
+                let (up, down) = if below {
+                    (Vec::new(), caps.clone())
+                } else {
+                    (caps.clone(), Vec::new())
+                };
+                found.0.push(Patch {
+                    axis,
+                    bval,
+                    faces: caps,
+                    up,
+                    down,
+                });
+            }
+            found.1.push(OpenRim {
+                axis,
+                bval,
+                lp: lp.clone(),
+                below,
+            });
+            break;
+        }
+    }
+    found
+}
+
+/// Whether `pt` lies inside the polygon `ring` (even-odd crossings).
+fn inside_ring(pt: [f64; 2], ring: &[[f64; 2]]) -> bool {
+    let mut inside = false;
+    let n = ring.len();
+    for i in 0..n {
+        let (a, b) = (ring[i], ring[(i + 1) % n]);
+        if (a[1] > pt[1]) != (b[1] > pt[1]) {
+            let x = a[0] + (pt[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0]);
+            if pt[0] < x {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+fn remove_patches(m: &PatchMesh<'_>, patches: &[Patch], seam: &Seam) -> Removed {
     let nf = m.faces.len();
     let nv = m.verts.len();
+    let topo = Topology::new(m.faces, nv);
+    let (before, main_before) = face_edge_components(&topo);
+    let mut in_patch = vec![false; nf];
+    for p in patches {
+        for &f in &p.faces {
+            in_patch[f as usize] = true;
+        }
+    }
+    let (caps, open) = open_ends_on_seams(m, &topo, &before, &in_patch, seam);
+    let n_given = patches.len();
+    let patches: Vec<Patch> = patches.iter().cloned().chain(caps).collect();
+    let patches = &patches[..];
     let mut mode_a: HashSet<u32> = HashSet::new();
     let mut mode_b: HashSet<u32> = HashSet::new();
     let mut removed = vec![false; nf];
@@ -1072,8 +1442,6 @@ fn remove_patches(m: &PatchMesh<'_>, patches: &[Patch]) -> Removed {
 
     // the removed faces are collapsed to [0, 0, 0], so the mesh after has
     // the topology before without them
-    let topo = Topology::new(m.faces, nv);
-    let (before, main_before) = face_edge_components(&topo);
     let (after, main_after) = face_edge_components_without(&topo, &removed);
     let main_before = main_before as i64;
     let main_after = main_after as i64;
@@ -1129,13 +1497,31 @@ fn remove_patches(m: &PatchMesh<'_>, patches: &[Patch]) -> Removed {
             faces = rebuild(&gone);
         }
     }
-    let n_removed = removed.iter().filter(|&&r| r).count();
     let mut n_stitched = 0;
+    let mut n_turned = 0;
+    let mut n_open = 0;
     if !mode_b.is_empty() {
-        let new = stitch_mode_b(m.verts, &topo, &gone, m.faces, &mode_b, patches);
+        let (new, turned) = stitch_mode_b(m.verts, &topo, &gone, m.faces, &mode_b, patches, &open);
+        // a cap whose rim no strip joins is put back: the open end it
+        // faces stays as it was, and so does the piece it closes
+        let laid: HashSet<Edge> = new.iter().flat_map(|&t| face_edges(t)).collect();
+        for p in &patches[n_given..] {
+            let rim = rim_left(&topo, &gone, m.faces, &p.faces);
+            if rim.iter().any(|e| laid.contains(e)) {
+                n_open += 1;
+            } else {
+                for &f in &p.faces {
+                    removed[f as usize] = false;
+                    faces[f as usize] = m.faces[f as usize];
+                }
+                n_b -= 1;
+            }
+        }
         n_stitched = new.len();
+        n_turned = turned;
         faces.extend(new);
     }
+    let n_removed = removed.iter().filter(|&&r| r).count();
     Removed {
         faces,
         n_removed,
@@ -1143,7 +1529,35 @@ fn remove_patches(m: &PatchMesh<'_>, patches: &[Patch]) -> Removed {
         n_parallel: n_b,
         n_orphan,
         n_stitched,
+        n_turned,
+        n_open,
     }
+}
+
+/// The edges of `side`'s faces that exactly one face not `gone` has: the
+/// rim their removal leaves.
+fn rim_left(topo: &Topology, gone: &[bool], orig: &[[u32; 3]], side: &[u32]) -> Vec<Edge> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for &fi in side {
+        let f = orig[fi as usize];
+        for i in 0..3 {
+            let (a, b) = (f[i], f[(i + 1) % 3]);
+            if a == b || !seen.insert(edge(a, b)) {
+                continue;
+            }
+            let left = topo.edge_id(a, b).map_or(0, |e| {
+                topo.edge_faces(e)
+                    .iter()
+                    .filter(|&&f| !gone[f as usize])
+                    .count()
+            });
+            if left == 1 {
+                out.push(edge(a, b));
+            }
+        }
+    }
+    out
 }
 
 /// One axis' chunk boundaries: the coordinates, and at each the vertex
@@ -1327,9 +1741,13 @@ mod tests {
             [1.0, 1.0, 1.0],
             [0.0, 1.0, 1.0],
         ];
-        let tris = zip_vertex_loops(&[0, 1, 2, 3], &[4, 5, 6, 7], &verts, true, true, &|_, _| {
+        let ways = zip_vertex_loops(&[0, 1, 2, 3], &[4, 5, 6, 7], &verts, true, true, &|_, _| {
             false
         });
+        // both ways round, the cheaper (the loops alike, unturned) first
+        assert_eq!(ways.len(), 2);
+        assert!(ways[0].0 < ways[1].0);
+        let tris = ways[0].1.clone();
         assert_eq!(tris.len(), 8);
         let mut rim: HashMap<Edge, usize> = HashMap::new();
         for t in &tris {
@@ -1432,17 +1850,35 @@ mod boundary_tests {
     }
 
     fn removed_and_closed(v: &[V3], f: &[[u32; 3]], patch: Patch) -> (Vec<[u32; 3]>, usize) {
+        let done = removed(v, f, patch);
+        (done.faces, done.n_stitched)
+    }
+
+    fn removed(v: &[V3], f: &[[u32; 3]], patch: Patch) -> Removed {
+        removed_on(v, f, &[patch], &[])
+    }
+
+    /// The removal with the chunk planes `boundaries`, a cap a face within
+    /// 30 of one whose unit normal along it is over 0.99.
+    fn removed_on(
+        v: &[V3],
+        f: &[[u32; 3]],
+        patches: &[Patch],
+        boundaries: &[(usize, Vec<f64>)],
+    ) -> Removed {
         let normals: Vec<V3> = f
             .iter()
             .map(|t| {
                 let [a, b, c] = t.map(|i| v[i as usize]);
                 let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
                 let w = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-                [
+                let n = [
                     u[1] * w[2] - u[2] * w[1],
                     u[2] * w[0] - u[0] * w[2],
                     u[0] * w[1] - u[1] * w[0],
-                ]
+                ];
+                let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                n.map(|x| x / l)
             })
             .collect();
         let m = PatchMesh {
@@ -1450,8 +1886,120 @@ mod boundary_tests {
             verts: v,
             normals: &normals,
         };
-        let done = remove_parallel_patches(&m, &[patch]);
-        (done.faces, done.n_stitched)
+        let seam = Seam {
+            boundaries,
+            boundary_dist: 30.0,
+            normal_thresh: 0.99,
+        };
+        remove_parallel_patches(&m, patches, &seam)
+    }
+
+    /// Square tubes along x either side of the chunk boundary x = 0, every
+    /// face facing out, each closed at its far end: on the left one per
+    /// `(centre, half-width)` of `left`, capped facing +x at x = -10; on
+    /// the right one of half-width `right` round the axis, left open at
+    /// x = 10.
+    fn caps_facing_an_open_end(left: &[([f64; 2], f64)], right: f64) -> (Vec<V3>, Vec<[u32; 3]>) {
+        let mut v: Vec<V3> = Vec::new();
+        let mut f: Vec<[u32; 3]> = Vec::new();
+        // a ring running anticlockwise about +x
+        let ring = |v: &mut Vec<V3>, x: f64, c: [f64; 2], h: f64| -> [u32; 4] {
+            let at = v.len() as u32;
+            for [y, z] in [[-h, -h], [h, -h], [h, h], [-h, h]] {
+                v.push([x, c[0] + y, c[1] + z]);
+            }
+            [at, at + 1, at + 2, at + 3]
+        };
+        let band = |f: &mut Vec<[u32; 3]>, lo: [u32; 4], hi: [u32; 4]| {
+            for i in 0..4 {
+                let j = (i + 1) % 4;
+                f.push([lo[i], lo[j], hi[j]]);
+                f.push([lo[i], hi[j], hi[i]]);
+            }
+        };
+        for &(c, h) in left {
+            let (far, near) = (ring(&mut v, -400.0, c, h), ring(&mut v, -10.0, c, h));
+            band(&mut f, far, near);
+            f.push([far[0], far[2], far[1]]);
+            f.push([far[0], far[3], far[2]]);
+            f.push([near[0], near[1], near[2]]);
+            f.push([near[0], near[2], near[3]]);
+        }
+        let open = ring(&mut v, 10.0, [0.0, 0.0], right);
+        let far = ring(&mut v, 400.0, [0.0, 0.0], right);
+        band(&mut f, open, far);
+        f.push([far[0], far[1], far[2]]);
+        f.push([far[0], far[2], far[3]]);
+        (v, f)
+    }
+
+    fn closed(v: &[V3], f: &[[u32; 3]]) -> bool {
+        let t = Topology::new(f, v.len());
+        (0..t.n_edges()).all(|e| t.edge_faces(e).len() == 2)
+    }
+
+    #[test]
+    fn a_cap_facing_an_open_end_across_the_seam_is_zipped_to_it() {
+        // the left tube capped at the boundary, the right one left open
+        // there round it: no patch pairs them, the cap and the open end do
+        let (v, f) = caps_facing_an_open_end(&[([0.0, 0.0], 100.0)], 150.0);
+        assert!(!closed(&v, &f), "fixture: the right tube is open");
+        let done = removed_on(&v, &f, &[], &[(0, vec![0.0])]);
+        assert_eq!((done.n_open, done.n_removed, done.n_stitched), (1, 2, 8));
+        assert_eq!(done.faces[10..12], [[0, 0, 0]; 2], "the cap is out");
+        let c = mesh::validity::check(&v, &done.faces);
+        assert!(c.is_valid(), "{c:?}");
+        assert!(closed(&v, &done.faces));
+        // without the plane there is no seam to zip across
+        let none = removed_on(&v, &f, &[], &[(0, vec![500.0])]);
+        assert_eq!((none.n_open, none.n_removed), (0, 0));
+        assert_eq!(none.faces, f);
+    }
+
+    #[test]
+    fn a_cavity_inside_the_open_piece_is_no_cap() {
+        // an organelle in the right tube by its open end, wound into itself:
+        // its face at the boundary faces the open end from inside the
+        // outline, but its walls run on the open end's side of the plane
+        let (mut v, mut f) = caps_facing_an_open_end(&[], 150.0);
+        let at = v.len() as u32;
+        for x in [5.0, 200.0] {
+            for [y, z] in [[-50.0, -50.0], [50.0, -50.0], [50.0, 50.0], [-50.0, 50.0]] {
+                v.push([x, y, z]);
+            }
+        }
+        let (near, far) = (
+            [at, at + 1, at + 2, at + 3],
+            [at + 4, at + 5, at + 6, at + 7],
+        );
+        let mut out = Vec::new();
+        for i in 0..4 {
+            let j = (i + 1) % 4;
+            out.push([near[i], near[j], far[j]]);
+            out.push([near[i], far[j], far[i]]);
+        }
+        out.extend([[far[0], far[1], far[2]], [far[0], far[2], far[3]]]);
+        out.extend([[near[0], near[2], near[1]], [near[0], near[3], near[2]]]);
+        f.extend(out.iter().map(|t| [t[0], t[2], t[1]]));
+        let done = removed_on(&v, &f, &[], &[(0, vec![0.0])]);
+        assert_eq!((done.n_open, done.n_removed), (0, 0));
+        assert_eq!(done.faces, f);
+    }
+
+    #[test]
+    fn a_cap_whose_rim_no_strip_joins_is_put_back() {
+        // two pieces capped inside the one open end: the larger one's rim
+        // takes it, and the other's cap stays where it was
+        let left = [([-150.0, 0.0], 100.0), ([170.0, 0.0], 60.0)];
+        let (v, f) = caps_facing_an_open_end(&left, 300.0);
+        let done = removed_on(&v, &f, &[], &[(0, vec![0.0])]);
+        assert_eq!((done.n_open, done.n_removed, done.n_stitched), (1, 2, 8));
+        assert_eq!(done.n_parallel, 1);
+        assert_eq!(done.faces[10..12], [[0, 0, 0]; 2]);
+        assert_eq!(done.faces[22..24], f[22..24], "the smaller cap is back");
+        let c = mesh::validity::check(&v, &done.faces);
+        assert!(c.is_valid(), "{c:?}");
+        assert!(closed(&v, &done.faces));
     }
 
     #[test]
@@ -1467,6 +2015,154 @@ mod boundary_tests {
         // closed: every edge has two faces
         let t = Topology::new(&out, v.len());
         assert!((0..t.n_edges()).all(|e| t.edge_faces(e).len() == 2));
+    }
+
+    #[test]
+    fn a_strip_the_cheaper_way_round_against_a_rim_is_laid_the_other_way() {
+        // the right outline long and thin, off to one side and turned: the
+        // cheaper strip round it twists against the faces on one rim, the
+        // other way round joins both, and the two sides close
+        let right: Vec<[f64; 2]> = (0..4)
+            .map(|k| {
+                let a = std::f64::consts::FRAC_PI_2 * f64::from(k) + 1.3;
+                [0.9 + 2.0 * a.cos(), 0.6 * a.sin()]
+            })
+            .collect();
+        let (v, f, patch) = sandwich(&right);
+        let done = removed(&v, &f, patch);
+        assert_eq!(
+            done.n_turned, 1,
+            "fixture: the cheaper way is wound against a rim"
+        );
+        assert_eq!(done.n_stitched, 8);
+        let c = mesh::validity::check(&v, &done.faces);
+        assert!(c.is_valid(), "{c:?}");
+        let t = Topology::new(&done.faces, v.len());
+        assert!((0..t.n_edges()).all(|e| t.edge_faces(e).len() == 2));
+    }
+
+    #[test]
+    fn the_dearer_way_round_joins_pieces_and_leaves_a_hole_in_one_alone() {
+        // the same two sides, the tubes also joined at their far ends: one
+        // piece, and the twisted way round is not laid to close a hole
+        let right: Vec<[f64; 2]> = (0..4)
+            .map(|k| {
+                let a = std::f64::consts::FRAC_PI_2 * f64::from(k) + 1.3;
+                [0.9 + 2.0 * a.cos(), 0.6 * a.sin()]
+            })
+            .collect();
+        let (v, mut f, patch) = sandwich(&right);
+        let far = (v.len() - 4) as u32;
+        f.extend([[0, 1, far], [1, far + 1, far]]);
+        let (label, _) = face_edge_components(&Topology::new(&f, v.len()));
+        assert_eq!(label[0], label[f.len() - 7], "fixture: one piece");
+        let done = removed(&v, &f, patch);
+        assert_eq!((done.n_removed, done.n_turned, done.n_stitched), (4, 0, 0));
+    }
+
+    /// Square tubes along x either side of the chunk boundary x = 0, every
+    /// face facing out: on the left one per `(centre, half-width)` of
+    /// `left`, capped facing +x at x = -10 (12 faces each, the cap the last
+    /// two); on the right one round `outer`, its end at x = 10 an annulus
+    /// facing -x round the mouth of an organelle running into it, square
+    /// round `organelle`, its walls facing into it — one surface, the
+    /// marching-cubes cap of a piece holding an organelle across a chunk
+    /// face. Returns the vertices, the faces, the patch of the caps across
+    /// x = 0, and the first faces of the right tube's walls and of the
+    /// organelle's.
+    fn caps_over_an_organelle(
+        left: &[([f64; 2], f64)],
+        outer: ([f64; 2], f64),
+        organelle: ([f64; 2], f64),
+    ) -> (Vec<V3>, Vec<[u32; 3]>, Patch, usize, usize) {
+        let mut v: Vec<V3> = Vec::new();
+        let mut f: Vec<[u32; 3]> = Vec::new();
+        // a ring running anticlockwise about +x
+        let ring = |v: &mut Vec<V3>, x: f64, (c, h): ([f64; 2], f64)| -> [u32; 4] {
+            let at = v.len() as u32;
+            for [y, z] in [[-h, -h], [h, -h], [h, h], [-h, h]] {
+                v.push([x, c[0] + y, c[1] + z]);
+            }
+            [at, at + 1, at + 2, at + 3]
+        };
+        // walls from ring `lo` to ring `hi` along +x, facing out
+        let band = |f: &mut Vec<[u32; 3]>, lo: [u32; 4], hi: [u32; 4]| {
+            for i in 0..4 {
+                let j = (i + 1) % 4;
+                f.push([lo[i], lo[j], hi[j]]);
+                f.push([lo[i], hi[j], hi[i]]);
+            }
+        };
+        let mut up = Vec::new();
+        for &tube in left {
+            let (far, near) = (ring(&mut v, -400.0, tube), ring(&mut v, -10.0, tube));
+            band(&mut f, far, near);
+            f.extend([[far[0], far[2], far[1]], [far[0], far[3], far[2]]]);
+            up.extend([f.len() as u32, f.len() as u32 + 1]);
+            f.extend([[near[0], near[1], near[2]], [near[0], near[2], near[3]]]);
+        }
+        let (rim, end) = (ring(&mut v, 10.0, outer), ring(&mut v, 400.0, outer));
+        let walls = f.len();
+        band(&mut f, rim, end);
+        f.extend([[end[0], end[1], end[2]], [end[0], end[2], end[3]]]);
+        let (mouth, deep) = (
+            ring(&mut v, 10.0, organelle),
+            ring(&mut v, 300.0, organelle),
+        );
+        let mut down = Vec::new();
+        for i in 0..4 {
+            let j = (i + 1) % 4;
+            down.extend([f.len() as u32, f.len() as u32 + 1]);
+            f.extend([[rim[i], mouth[j], rim[j]], [rim[i], mouth[i], mouth[j]]]);
+        }
+        let inside = f.len();
+        let mut into = Vec::new();
+        band(&mut into, mouth, deep);
+        f.extend(into.iter().map(|t| [t[0], t[2], t[1]]));
+        f.extend([[deep[0], deep[2], deep[1]], [deep[0], deep[3], deep[2]]]);
+        let patch = Patch {
+            axis: 0,
+            bval: 0,
+            faces: up.iter().chain(&down).copied().collect(),
+            up,
+            down,
+        };
+        (v, f, patch, walls, inside)
+    }
+
+    #[test]
+    fn a_rim_turning_the_other_way_leaves_the_up_rim_to_one_turning_alike() {
+        // the organelle's mouth, nearer the left rim than the right tube's
+        // outline, turns the other way: the cheaper strip to it twists
+        // against the faces on one rim, and the outline, the cheaper way
+        // round, joins the tubes
+        let (v, f, patch, walls, inside) = caps_over_an_organelle(
+            &[([0.0, 0.0], 100.0)],
+            ([40.0, 0.0], 150.0),
+            ([0.0, 0.0], 30.0),
+        );
+        assert!(closed(&v, &f), "fixture: every piece closed");
+        let done = removed(&v, &f, patch);
+        assert_eq!((done.n_removed, done.n_turned, done.n_stitched), (10, 0, 8));
+        let (label, _) = face_edge_components(&Topology::new(&done.faces, v.len()));
+        assert_eq!(label[0], label[walls], "the tubes are one surface");
+        assert_ne!(label[0], label[inside], "the organelle is apart");
+    }
+
+    #[test]
+    fn a_rim_left_over_takes_no_rim_turning_the_other_way() {
+        // a second left tube in the organelle's mouth, the outline taken by
+        // the first: the dearer way round to the mouth winds as the faces
+        // on both want, but the two turn apart, and no strip is laid
+        let left = [([-150.0, 0.0], 100.0), ([60.0, 0.0], 20.0)];
+        let (v, f, patch, walls, inside) =
+            caps_over_an_organelle(&left, ([0.0, 0.0], 300.0), ([60.0, 0.0], 30.0));
+        let done = removed(&v, &f, patch);
+        assert_eq!((done.n_removed, done.n_turned, done.n_stitched), (12, 0, 8));
+        let (label, _) = face_edge_components(&Topology::new(&done.faces, v.len()));
+        assert_eq!(label[0], label[walls], "the first tube joined");
+        assert_ne!(label[12], label[inside], "the second not to the organelle");
+        assert_ne!(label[12], label[0]);
     }
 
     #[test]

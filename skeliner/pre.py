@@ -1519,7 +1519,8 @@ def break_up_mesh(
     round a fold's mouth rather than down into it — leave the organelles
     (an organelle drawn by hand stays), and the pieces are found again, so
     it is the body's arbor once more rather than a discard or a neurite of
-    its own.
+    its own — and again while a wall goes, for a piece severed behind
+    another touches the body only once that one has joined it.
 
     The discard threshold is auto-inferred: components are sorted by
     size descending; once the cumulative face count reaches 95% of
@@ -1530,14 +1531,8 @@ def break_up_mesh(
     below that keeps a stub from being absorbed): where a few trees hold
     95% of the faces, a dendrite cut off at the soma is under both size
     rules.  A piece apart from the soma is not given back this way — it
-    would be tied to the soma by a straight stem.  But a piece holding an
-    organelle is never discarded, whatever its size or place: the piece an
-    organelle shares the most vertices with holds it (a pocket, the surface
-    round its mouth), and one sharing none (closed in the lumen) is held by
-    the piece the rays from its centre along the axes meet first most often
-    (``organelle_hosts``).  A branch cut off from the arbor carries its
-    organelles with it; apart from the soma, it is tied to it by a straight
-    stem.
+    would be tied to the soma by a straight stem; a piece of arbor cut off
+    is bridged back by :func:`preprocess` before the break-up.
 
     The soma test is a *boundary* test: it measures what fraction of a
     component's outer edges are shared with soma faces, not how far the
@@ -1663,26 +1658,31 @@ def break_up_mesh(
     # Arbor a ring of folds severed — cut off from its mesh component's
     # body, yet bigger than the organelles walling it and looking out of
     # the cell — is joined back across its walls that touch the body; an
-    # organelle drawn by hand stays one.
-    walls = kernels.pre.break_up_severed_walls(
-        np.asarray(faces, dtype=np.int64),
-        len(verts),
-        usable,
-        organelles.mask,
-        claimed_face,
-        np.asarray(organelles.manual, dtype=bool),
-        components,
-        np.asarray(kinds, dtype=np.uint8),
-        np.asarray(body, dtype=bool),
-    )
-    if len(walls):
+    # organelle drawn by hand stays one.  A piece severed behind another is
+    # joined once that one is: again while a round gives a wall back.
+    n_walls = 0
+    while True:
+        walls = kernels.pre.break_up_severed_walls(
+            np.asarray(faces, dtype=np.int64),
+            len(verts),
+            usable,
+            organelles.mask,
+            claimed_face,
+            np.asarray(organelles.manual, dtype=bool),
+            components,
+            np.asarray(kinds, dtype=np.uint8),
+            np.asarray(body, dtype=bool),
+        )
+        if not len(walls):
+            break
+        n_walls += len(walls)
         organelles = Organelles(
             pocket=_cleared(organelles.pocket, walls),
             isolated=_cleared(organelles.isolated, walls),
             expanded=_cleared(organelles.expanded, walls),
             manual=organelles.manual,
         )
-        components, kinds, _ = pieces()
+        components, kinds, body = pieces()
     if soma is not None:
         kinds = _neurites_left_out(
             components, kinds, faces, verts, soma, usable & soma_face
@@ -1760,30 +1760,6 @@ def break_up_mesh(
             n_stood_out = len(stood)
             neurites = sorted(neurites + stood, key=len, reverse=True)
 
-    # --- a piece holding an organelle is never discarded: the cut above
-    # weighs size alone, and a branch cut off from the arbor (at a chunk
-    # boundary, by a fusion) carries its organelles with it.
-    n_held = 0
-    if discarded:
-        pieces = neurites + discarded
-        label = np.full(len(faces), -1, dtype=np.int64)
-        for i, comp in enumerate(pieces):
-            label[np.asarray(comp, dtype=np.int64)] = i
-        held = np.asarray(
-            kernels.pre.organelle_hosts(
-                np.asarray(faces, dtype=np.int64),
-                np.asarray(verts, dtype=np.float64),
-                label,
-                np.asarray(organelles_expanded, dtype=bool),
-                len(pieces),
-            )
-        )[len(neurites) :]
-        if held.any():
-            kept = [c for c, h in zip(discarded, held) if h]
-            n_held = len(kept)
-            discarded = [c for c, h in zip(discarded, held) if not h]
-            neurites = sorted(neurites + kept, key=len, reverse=True)
-
     # --- re-apply the hand overrides the threshold knows nothing about ---
     # Only here do the two claims differ.  Escaping the soma is a
     # judgement about *what the surface is* and holds at any size; being a
@@ -1812,14 +1788,12 @@ def break_up_mesh(
             parts.append(f"{len(discarded)} discarded ({n_disc_faces:,}f)")
         if n_stood_out:
             parts.append(f"{n_stood_out} standing out of the soma kept")
-        if n_held:
-            parts.append(f"{n_held} holding organelles kept")
         if n_claimed:
             parts.append(f"claimed {n_claimed}")
         if n_trapped:
             parts.append(f"trapped +{n_trapped:,}f")
-        if len(walls):
-            parts.append(f"rejoined across {len(walls):,} organelle faces")
+        if n_walls:
+            parts.append(f"rejoined across {n_walls:,} organelle faces")
         if n_soma_absorbed:
             parts.append(f"soma +{n_soma_absorbed:,}f")
         print(f"[skeliner.pre] break_up_mesh: {', '.join(parts)} ({dt:.1f}s)")
@@ -3340,6 +3314,7 @@ def find_gaps(
     kiss_penalty: float = 10.0,
     relay_min_faces: int = 100,
     repair_stranded: bool = True,
+    tips_off=None,
 ) -> list[tuple[list[int], list[int], float]]:
     """Detect gaps between disconnected components and the main mesh.
 
@@ -3420,6 +3395,9 @@ def find_gaps(
         acceptable edge disconnected.  Set ``False`` to keep only the
         bridges Prim's itself chose: fewer pieces are reconnected, and
         pieces that should stay separate are less likely to be joined.
+    tips_off : array-like of int or None
+        Faces of the main mesh no tip may be on: a tube stitched to them
+        goes where they go — an organelle's, cut out at the break-up.
 
     Notes
     -----
@@ -3466,6 +3444,10 @@ def find_gaps(
     elif soma is None and disconnected is None:
         soma = find_soma(mesh, organelles=organelles, mesh_stats=mesh_stats)
     main = _main_component(mesh, labels, main, soma)
+    if tips_off is not None and len(tips_off):
+        # a label of their own: no longer the main mesh's faces
+        labels = np.array(labels, dtype=np.int64)
+        labels[np.asarray(tips_off, dtype=np.int64)] = int(labels.max()) + 1
 
     # Get disconnected components (reuse filtering logic)
     if disconnected is not None:
@@ -5043,6 +5025,8 @@ def remove_parallel_patches(
     *,
     patches: list[dict] | None = None,
     boundaries: dict[int, np.ndarray] | None = None,
+    normal_thresh: float = 0.99,
+    boundary_dist: float = 30.0,
     verbose: bool = False,
     mesh_stats: MeshStats | None = None,
 ) -> Mesh:
@@ -5064,6 +5048,13 @@ def remove_parallel_patches(
        pinches through it; a step that would lay a triangle of no area
        takes the other step where that one spans some; and no triangle a
        face left there, or one laid before, already is is laid again.
+    6. Where a piece crossing a chunk's face was left open there and the
+       piece across the plane capped, the cap faces the open end and
+       nothing pairs them: an open end with most of its rim within
+       *boundary_dist* of a plane, and the axis-aligned faces of another
+       piece facing it inside its outline there, are a patch of one side
+       and its partner's rim — the faces taken out and zipped to the open
+       end with the rest.  Caps whose rim no strip joins are put back.
 
     Where the removal leaves the faces round a vertex in more than one fan
     — two sheets the strip does not join meeting at a point, or a face of
@@ -5081,7 +5072,11 @@ def remove_parallel_patches(
     patches : list[dict] or None
         Output of :func:`find_parallel_patches`.  Computed if *None*.
     boundaries : dict or None
-        Passed through to :func:`find_parallel_patches` if *patches* is None.
+        Output of :func:`find_chunk_boundaries`, the seams the patches and
+        the open ends lie on.  Computed if *None*.
+    normal_thresh, boundary_dist : float
+        What makes a face a cap on a seam, as for
+        :func:`find_parallel_patches`.
     verbose : bool
         Print summary.
 
@@ -5095,11 +5090,16 @@ def remove_parallel_patches(
         print("[skeliner.pre] Removing parallel patches …")
         _t0 = time.perf_counter()
 
+    if boundaries is None:
+        boundaries = find_chunk_boundaries(mesh)
     if patches is None:
-        patches = find_parallel_patches(mesh, boundaries=boundaries, verbose=verbose)
-
-    if not patches:
-        return mesh
+        patches = find_parallel_patches(
+            mesh,
+            boundaries=boundaries,
+            normal_thresh=normal_thresh,
+            boundary_dist=boundary_dist,
+            verbose=verbose,
+        )
 
     # ── Step 0: trim patches to overlap with opposing partner ─────
     # Only the portion of a parallel patch that sits above an opposing
@@ -5110,10 +5110,8 @@ def remove_parallel_patches(
     n_faces_before_trim = sum(len(p["faces"]) for p in patches)
     patches = _trim_patches_to_overlap(mesh, patches)
     n_faces_after_trim = sum(len(p["faces"]) for p in patches)
-    if not patches:
-        return mesh
 
-    faces_out, n_removed, n_a, n_b, n_orphan, n_stitched = (
+    faces_out, n_removed, n_a, n_b, n_orphan, n_stitched, n_open = (
         kernels.pre.remove_parallel_patches(
             np.asarray(mesh.faces, dtype=np.int64),
             np.asarray(mesh.vertices, dtype=np.float64),
@@ -5122,8 +5120,13 @@ def remove_parallel_patches(
                 (p["axis"], p["bval"], p["faces"], p["up_faces"], p["down_faces"])
                 for p in patches
             ],
+            [(int(ax), [float(b) for b in bvals]) for ax, bvals in boundaries.items()],
+            boundary_dist,
+            normal_thresh,
         )
     )
+    if not n_removed:
+        return mesh
     result = Mesh(mesh.vertices, faces_out)
     n_trimmed = n_faces_before_trim - n_faces_after_trim
 
@@ -5153,6 +5156,8 @@ def remove_parallel_patches(
             parts.append(f"+{n_orphan:,}f orphans removed")
         if n_stitched:
             parts.append(f"+{n_stitched:,}f stitched")
+        if n_open:
+            parts.append(f"{n_open} caps zipped to the open end they face")
         dt = time.perf_counter() - _t0
         print(f"[skeliner.pre] remove_parallel_patches: {'; '.join(parts)} ({dt:.1f}s)")
 
@@ -5275,6 +5280,91 @@ def compact_mesh(
 # -----------------------------------------------------------------------------
 
 
+def _rejoin_holding(mesh: Mesh, soma, organelles: Organelles, fusions, mesh_stats):
+    """Bridge back the pieces the gaps left apart that hold an organelle.
+
+    A piece cut off from the arbor that holds an organelle (one it surrounds,
+    ``organelle_hosts``) is arbor, whatever its size: :func:`find_gaps`'
+    one proposal for it can fail — a tip on a flap whose peel strands the
+    piece, a bridge another one's footprint displaces, a gap capped by the
+    piece's size.  Its gap is found again from its faces of no organelle to
+    the main mesh's (a tube on an organelle face would go with it at the
+    break-up), the size cap lifted, and bridged; again while a round joins
+    one.  A round that leaves as many faces apart as before — a peel on the
+    arbor's side can cut off more than its bridge joins — is undone.
+    *soma* is False for a cell with none; *mesh_stats*, when given, follows
+    the faces the bridges append.  Returns the mesh and the bridges as
+    :func:`preprocess` records them.
+    """
+    bridges: list[dict] = []
+    n_before = len(mesh.faces)
+    last = None  # the mesh and bridges before the last round, its faces apart
+    while True:
+        n_f = len(mesh.faces)
+        pad = np.zeros(max(0, n_f - len(organelles.pocket)), dtype=bool)
+        org = Organelles(
+            pocket=np.concatenate([organelles.pocket, pad])[:n_f],
+            isolated=np.concatenate([organelles.isolated, pad])[:n_f],
+            expanded=np.concatenate([organelles.expanded, pad])[:n_f],
+            manual=np.concatenate([organelles.manual, pad])[:n_f],
+        )
+        left = find_disconnected(mesh, soma=soma, organelles=org, fusions=fusions)
+        apart = sum(len(c) for c in left)
+        if last is not None and apart >= last[2]:
+            mesh, bridges = last[0], last[1]
+            break
+        if not left:
+            break
+        faces = np.asarray(mesh.faces, dtype=np.int64)
+        on = np.asarray(org.mask, dtype=bool)
+        own = [c[~on[c]] for c in (np.asarray(c, dtype=np.int64) for c in left)]
+        label = np.full(n_f, -1, dtype=np.int64)
+        for i, c in enumerate(own):
+            label[c] = i
+        held = np.asarray(
+            kernels.pre.organelle_hosts(
+                faces,
+                np.asarray(mesh.vertices, dtype=np.float64),
+                label,
+                np.asarray(org.mask, dtype=bool),
+                len(own),
+            ),
+            dtype=bool,
+        )
+        holding = [c.tolist() for c, h in zip(own, held) if h and len(c)]
+        if not holding:
+            break
+        gaps = find_gaps(
+            mesh,
+            soma=soma,
+            disconnected=holding,
+            fusions=fusions,
+            max_bridge_ratio=float("inf"),
+            tips_off=np.flatnonzero(org.mask),
+        )
+        if not gaps:
+            break
+        bridged = remove_gaps(mesh, gaps=gaps, fusions=fusions)
+        if bridged is mesh:
+            break
+        last = (mesh, list(bridges), apart)
+        bridges.extend(_bridge_record(mesh, g, holding) for g in gaps)
+        mesh = bridged
+    n_added = len(mesh.faces) - n_before
+    if mesh_stats is not None and n_added > 0:
+        # as remove_gaps keeps them: the appended faces look out, and the
+        # components are found again
+        if mesh_stats.outward_dots is not None:
+            mesh_stats.outward_dots = np.concatenate(
+                [
+                    mesh_stats.outward_dots,
+                    np.ones(n_added, dtype=mesh_stats.outward_dots.dtype),
+                ]
+            )
+        mesh_stats.invalidate_topology()
+    return mesh, bridges
+
+
 @mesh_args()
 def preprocess(
     mesh: Mesh,
@@ -5298,7 +5388,9 @@ def preprocess(
       3. find_organelles (unless *organelles* is False)
       4. find_soma (unless *soma* is a Soma or False)
       5. find_fusions → find_disconnected → find_gaps
-      6. remove_gaps → remove_fusions, then the pinches step 1 left that no
+      6. remove_gaps, and again for the pieces left apart that hold an
+         organelle (from their own faces, the size cap lifted: arbor, not
+         debris) → remove_fusions, then the pinches step 1 left that no
          fusion took split (_split_fan_vertices on the vertices of the
          faces it took out)
       7. break_up_mesh
@@ -5400,6 +5492,8 @@ def preprocess(
 
     # 1. Parallel patches
     with _timed("↳  find & remove parallel patches", verbose=verbose):
+        if chunk_boundaries is None:
+            chunk_boundaries = find_chunk_boundaries(mesh)
         patches = find_parallel_patches(mesh, boundaries=chunk_boundaries)
         record["parallel_patches"] = [
             {
@@ -5413,8 +5507,9 @@ def preprocess(
         # the faces before the removal: the pinches it leaves are split
         # after the fusions (step 6), once the gaps were found across them
         before_patches = np.asarray(mesh.faces, dtype=np.int64)
-        if patches:
-            mesh = remove_parallel_patches(mesh, patches=patches)
+        mesh = remove_parallel_patches(
+            mesh, patches=patches, boundaries=chunk_boundaries
+        )
 
     # 2. Mesh stats — outward dots and components, which the later steps
     #    read whether or not organelles are looked for
@@ -5506,6 +5601,12 @@ def preprocess(
         record["bridges"] = [_bridge_record(mesh, g, disconnected) for g in gaps]
         if gaps:
             mesh = remove_gaps(mesh, gaps=gaps, mesh_stats=mesh_stats, fusions=fusions)
+        # pieces holding an organelle the bridges missed: arbor, bridged again
+        if organelles and disconnected:
+            mesh, more = _rejoin_holding(mesh, settled, org, fusions, mesh_stats)
+            if more:
+                record["bridges"].extend(more)
+                log(f"{len(more)} more for pieces holding organelles")
 
     # 6. Fusions, then the pinches the parallel patches' removal left that
     #    no fusion took: split where the faces it took out held a fan

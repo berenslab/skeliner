@@ -2095,6 +2095,26 @@ class TestSomaAbsorption:
         assert np.array_equal(kept.organelles.mask, org.mask)
         assert sorted(len(x) for x in kept.neurites) == sorted(len(x) for x in pieces)
 
+    def test_a_neurite_severed_behind_another_is_joined_back_too(self):
+        # two thin bands: the piece beyond the far one touches only the
+        # piece between them, which the near band severs from the body —
+        # joined once the one between is
+        mesh, near = _tube_cut_by_an_organelle_band(-350.0, -300.0)
+        _, far = _tube_cut_by_an_organelle_band(300.0, 450.0)
+        org = Organelles(
+            pocket=near.pocket | far.pocket,
+            isolated=near.isolated,
+            expanded=near.expanded,
+        )
+        pieces = _arbor_pieces(mesh, None, org)
+        assert len(pieces) == 3, "fixture: each band closes"
+        bands = (int(near.mask.sum()), int(far.mask.sum()))
+        assert len(pieces[1]) > sum(bands) and len(pieces[2]) > bands[1]
+        c = pre.break_up_mesh(mesh, None, org)
+        assert not c.organelles.mask.any()
+        (neurite,) = c.neurites
+        assert len(neurite) == len(mesh.faces)
+
 
 # ── rescuing a discarded fragment ────────────────────────────────────
 
@@ -2467,32 +2487,43 @@ class TestRescued:
         assert [len(x) for x in given.neurites] == [len(x) for x in empty.neurites]
         assert np.array_equal(given.soma.verts, empty.soma.verts)
 
-    def test_a_piece_holding_an_organelle_is_never_discarded(self):
-        # a big ball, and apart from it a small box with a closed organelle
-        # in its lumen: by size alone the box is discarded
-        ball = trimesh.creation.icosphere(subdivisions=3, radius=5.0)
-        box = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
-        box.apply_translation((20.0, 0.0, 0.0))
-        org = trimesh.creation.icosphere(subdivisions=0, radius=0.3)
-        org.apply_translation((20.1, 0.05, 0.02))
-        parts = [ball, box, org]
-        v = np.vstack([p.vertices for p in parts])
-        offsets = np.cumsum([0] + [len(p.vertices) for p in parts[:-1]])
-        f = np.vstack([p.faces + o for p, o in zip(parts, offsets)])
-        mesh = sk.Mesh(v, f)
-        n_ball, n_box = len(ball.faces), len(box.faces)
-        isolated = np.zeros(len(f), dtype=bool)
-        isolated[n_ball + n_box :] = True
-        z = np.zeros(len(f), dtype=bool)
-        organelles = Organelles(pocket=z, isolated=isolated, expanded=z.copy())
-        comps = pre.break_up_mesh(mesh, None, organelles)
-        box_faces = set(range(n_ball, n_ball + n_box))
-        assert any(set(np.asarray(n).tolist()) == box_faces for n in comps.neurites)
+    def test_a_piece_holding_an_organelle_is_bridged_back(self, monkeypatch):
+        # a tube, and past its end a short one with a closed organelle in
+        # its lumen, farther off than find_gaps bridges a piece of its size
+        tube = trimesh.creation.cylinder(radius=50.0, height=2000.0, sections=24)
+        piece = trimesh.creation.cylinder(radius=50.0, height=400.0, sections=24)
+        piece.vertices[:, 2] += 1800.0
+        inside = trimesh.creation.icosphere(subdivisions=2, radius=20.0)
+        inside.vertices[:, 2] += 1800.0
+        parts = [tube.subdivide().subdivide(), piece.subdivide().subdivide(), inside]
+        n_tube, n_piece = len(parts[0].faces), len(parts[1].faces)
+        piece_faces = set(range(n_tube, n_tube + n_piece))
+
+        def run(holding):
+            mesh = _combine(parts if holding else parts[:2])
+            isolated = np.zeros(len(mesh.faces), dtype=bool)
+            isolated[n_tube + n_piece :] = True
+            z = np.zeros(len(mesh.faces), dtype=bool)
+            found = Organelles(pocket=z, isolated=isolated, expanded=z.copy())
+            monkeypatch.setattr(pre, "find_organelles", lambda *_a, **_k: found)
+            _, comps = pre.preprocess(mesh, soma=False)
+            return comps
+
+        comps = run(holding=True)
+        (neurite,) = comps.neurites
+        joined = set(np.asarray(neurite).tolist())
+        # a few faces of the tip are peeled for the tube
+        assert len(piece_faces & joined) > 0.9 * n_piece
+        assert len(joined) > n_tube + n_piece
         assert not comps.discarded.components
-        # fixture: without the organelle the size cut drops the box
-        bare = pre.break_up_mesh(mesh, None, Organelles.empty(len(f)))
-        dropped = [set(np.asarray(d).tolist()) for d in bare.discarded]
-        assert box_faces in dropped
+        assert len(comps.record["bridges"]) == 1
+        # fixture: without the organelle no bridge is made, the piece apart
+        bare = run(holding=False)
+        assert bare.record["bridges"] == []
+        assert not any(
+            piece_faces & set(np.asarray(n).tolist()) and len(n) > n_piece
+            for n in bare.neurites
+        )
 
 
 # ── Smoke test on real data ──────────────────────────────────────────

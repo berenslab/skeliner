@@ -1055,19 +1055,37 @@ fn find_parallel_patches<'py>(
 }
 
 /// What [`remove_parallel_patches`] hands back: the faces, then the
-/// removed, fold, parallel, orphan and stitched counts.
-type PatchesRemovedOut<'py> = (Bound<'py, PyArray2<i64>>, usize, usize, usize, usize, usize);
+/// removed, fold, parallel, orphan, stitched and open-end counts.
+type PatchesRemovedOut<'py> = (
+    Bound<'py, PyArray2<i64>>,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+);
 
-/// `skeliner.pre.remove_parallel_patches` on already trimmed patches.
+/// `skeliner.pre.remove_parallel_patches` on already trimmed patches; the
+/// seams are the chunk `boundaries`, and a cap a face within
+/// `boundary_dist` of one whose normal along it is over `normal_thresh`,
+/// as `find_parallel_patches` reads them.
 #[pyfunction]
+#[allow(clippy::too_many_arguments)]
 fn remove_parallel_patches<'py>(
     py: Python<'py>,
     faces: PyReadonlyArray2<'py, i64>,
     vertices: PyReadonlyArray2<'py, f64>,
     normals: PyReadonlyArray2<'py, f64>,
     patches: Vec<PatchTuple>,
+    boundaries: Vec<(usize, Vec<f64>)>,
+    boundary_dist: f64,
+    normal_thresh: f64,
 ) -> PyResult<PatchesRemovedOut<'py>> {
     let (tris, verts, normals) = patch_mesh_inputs(&faces, &vertices, &normals)?;
+    if boundaries.iter().any(|(a, _)| *a > 2) {
+        return Err(PyValueError::new_err("boundary axes are 0, 1 or 2"));
+    }
     let patches: Vec<::pre::patches::Patch> = patches
         .into_iter()
         .map(|t| patch_from_tuple(t, tris.len()))
@@ -1078,7 +1096,12 @@ fn remove_parallel_patches<'py>(
             verts: &verts,
             normals: &normals,
         };
-        ::pre::patches::remove_parallel_patches(&m, &patches)
+        let seam = ::pre::patches::Seam {
+            boundaries: &boundaries,
+            boundary_dist,
+            normal_thresh,
+        };
+        ::pre::patches::remove_parallel_patches(&m, &patches, &seam)
     });
     let out: Vec<[i64; 3]> = done.faces.iter().map(|f| f.map(i64::from)).collect();
     Ok((
@@ -1088,6 +1111,7 @@ fn remove_parallel_patches<'py>(
         done.n_parallel,
         done.n_orphan,
         done.n_stitched,
+        done.n_open,
     ))
 }
 

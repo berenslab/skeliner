@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use mesh::Topology;
-use mesh::components::listed_face_components;
+use mesh::components::{LowestRootSets, listed_face_components};
 use rayon::prelude::*;
 
 use crate::organelles::Inside;
@@ -377,17 +377,18 @@ pub fn usable_faces(verts: &[[f64; 3]], faces: &[[u32; 3]]) -> Vec<bool> {
         (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt() > 0.0
     })
 }
-
 /// Which pieces hold an organelle. `label` names the piece each face is in
-/// (`u32::MAX` for none: a soma face, an organelle's, one of no area), and
-/// an organelle is a set of `organelle` faces joined at their vertices. One
-/// that shares vertices with pieces is held by the piece it shares the most
-/// with — a pocket by the surface round its mouth, not by a sliver on its
-/// wall. One that shares none (a closed organelle in the lumen, or any once
-/// organelles are cut free) is held by the piece the six rays from its
-/// centre along the axes meet first most often, among the faces of no
-/// organelle; where those rays meet the soma or nothing most often, no
-/// piece holds it. Returns a flag per piece, `n_pieces` of them.
+/// (`u32::MAX` for none: a soma face, an organelle's), and an organelle is a
+/// set of `organelle` faces that span an area, joined at their vertices. A
+/// piece holds an organelle it surrounds: of the six rays from the
+/// organelle's centre along the axes, most meet that piece first, among the
+/// faces of no organelle that span an area, and the organelle lies within
+/// the piece's bounds (the box of its vertices) on every axis. A flat piece
+/// — a sliver on an organelle's wall, a fragment beside it — meets one ray
+/// of each opposite pair at most, half of them; a piece closed round the
+/// organelle meets all six, the surface round a pocket all but those
+/// leaving through its mouth. Where most meet the soma's faces, or none
+/// does, no piece holds it. Returns a flag per piece, `n_pieces` of them.
 pub fn organelle_hosts(
     verts: &[[f64; 3]],
     faces: &[[u32; 3]],
@@ -397,91 +398,10 @@ pub fn organelle_hosts(
 ) -> Vec<bool> {
     let mut held = vec![false; n_pieces];
     let in_organelle = |f: usize| organelle.get(f).copied().unwrap_or(false);
-    // the organelles: their faces' vertices joined
-    let mut low: HashMap<u32, u32> = HashMap::new();
-    fn find(low: &mut HashMap<u32, u32>, v: u32) -> u32 {
-        let mut r = v;
-        while let Some(&p) = low.get(&r).filter(|&&p| p != r) {
-            r = p;
-        }
-        let mut x = v;
-        while let Some(&p) = low.get(&x).filter(|&&p| p != x) {
-            low.insert(x, r);
-            x = p;
-        }
-        r
-    }
-    for (fi, f) in faces.iter().enumerate() {
-        if !in_organelle(fi) {
-            continue;
-        }
-        for &v in f {
-            low.entry(v).or_insert(v);
-        }
-        let r0 = find(&mut low, f[0]);
-        for &v in &f[1..] {
-            let r = find(&mut low, v);
-            if r != r0 {
-                let (a, b) = (r.min(r0), r.max(r0));
-                low.insert(b, a);
-            }
-        }
-    }
-    if low.is_empty() || n_pieces == 0 {
+    if n_pieces == 0 || !(0..faces.len()).any(in_organelle) {
         return held;
     }
-    let mut members: HashMap<u32, Vec<u32>> = HashMap::new();
-    let verts_in: Vec<u32> = low.keys().copied().collect();
-    for v in verts_in {
-        let r = find(&mut low, v);
-        members.entry(r).or_default().push(v);
-    }
-    // the pieces at each organelle vertex
-    let mut at: HashMap<u32, Vec<u32>> = HashMap::new();
-    for (fi, f) in faces.iter().enumerate() {
-        let l = label.get(fi).copied().unwrap_or(u32::MAX);
-        if l == u32::MAX || (l as usize) >= n_pieces {
-            continue;
-        }
-        for &v in f {
-            if low.contains_key(&v) {
-                let ls = at.entry(v).or_default();
-                if !ls.contains(&l) {
-                    ls.push(l);
-                }
-            }
-        }
-    }
-    let mut roots: Vec<u32> = members.keys().copied().collect();
-    roots.sort_unstable();
-    let mut loose: Vec<u32> = Vec::new();
-    for &r in &roots {
-        let mut shared: HashMap<u32, usize> = HashMap::new();
-        for v in &members[&r] {
-            for &l in at.get(v).map_or(&[][..], Vec::as_slice) {
-                *shared.entry(l).or_default() += 1;
-            }
-        }
-        match shared
-            .into_iter()
-            .max_by_key(|&(l, k)| (k, std::cmp::Reverse(l)))
-        {
-            Some((l, _)) => held[l as usize] = true,
-            None => loose.push(r),
-        }
-    }
-    if loose.is_empty() {
-        return held;
-    }
-    // rays from each loose organelle's centre, against every face of no
-    // organelle that spans an area
-    let mut tris: Vec<[[f64; 3]; 3]> = Vec::new();
-    let mut normals: Vec<[f64; 3]> = Vec::new();
-    let mut whose: Vec<u32> = Vec::new();
-    for (fi, f) in faces.iter().enumerate() {
-        if in_organelle(fi) {
-            continue;
-        }
+    let unit_normal = |f: &[u32; 3]| -> Option<[f64; 3]> {
         let t = f.map(|v| verts[v as usize]);
         let u = [t[1][0] - t[0][0], t[1][1] - t[0][1], t[1][2] - t[0][2]];
         let w = [t[2][0] - t[0][0], t[2][1] - t[0][1], t[2][2] - t[0][2]];
@@ -491,10 +411,55 @@ pub fn organelle_hosts(
             u[0] * w[1] - u[1] * w[0],
         ];
         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-        if len > 0.0 {
+        (len > 0.0).then(|| n.map(|x| x / len))
+    };
+    // the organelles: their faces' vertices joined
+    let sets = LowestRootSets::new(verts.len());
+    let mut on = vec![false; verts.len()];
+    for (fi, f) in faces.iter().enumerate() {
+        if in_organelle(fi) && unit_normal(f).is_some() {
+            sets.join(f[0], f[1]);
+            sets.join(f[0], f[2]);
+            for &v in f {
+                on[v as usize] = true;
+            }
+        }
+    }
+    let mut members: HashMap<u32, Vec<u32>> = HashMap::new();
+    for v in (0..verts.len()).filter(|&v| on[v]) {
+        members
+            .entry(sets.root(v as u32))
+            .or_default()
+            .push(v as u32);
+    }
+    // each piece's bounds, and the faces of no organelle that span an area
+    let mut lo = vec![[f64::INFINITY; 3]; n_pieces];
+    let mut hi = vec![[f64::NEG_INFINITY; 3]; n_pieces];
+    let mut tris: Vec<[[f64; 3]; 3]> = Vec::new();
+    let mut normals: Vec<[f64; 3]> = Vec::new();
+    let mut whose: Vec<u32> = Vec::new();
+    for (fi, f) in faces.iter().enumerate() {
+        if in_organelle(fi) {
+            continue;
+        }
+        let l = label
+            .get(fi)
+            .copied()
+            .filter(|&l| (l as usize) < n_pieces)
+            .unwrap_or(u32::MAX);
+        let t = f.map(|v| verts[v as usize]);
+        if l != u32::MAX {
+            for p in t {
+                for k in 0..3 {
+                    lo[l as usize][k] = lo[l as usize][k].min(p[k]);
+                    hi[l as usize][k] = hi[l as usize][k].max(p[k]);
+                }
+            }
+        }
+        if let Some(n) = unit_normal(f) {
             tris.push(t);
-            normals.push(n.map(|x| x / len));
-            whose.push(label.get(fi).copied().unwrap_or(u32::MAX));
+            normals.push(n);
+            whose.push(l);
         }
     }
     if tris.is_empty() {
@@ -509,8 +474,7 @@ pub fn organelle_hosts(
         [0.0, 0.0, 1.0],
         [0.0, 0.0, -1.0],
     ];
-    for r in loose {
-        let vs = &members[&r];
+    for vs in members.values() {
         let mut c = [0.0f64; 3];
         for &v in vs {
             for k in 0..3 {
@@ -524,12 +488,17 @@ pub fn organelle_hosts(
                 *votes.entry(whose[ti]).or_default() += 1;
             }
         }
-        let top = votes
-            .into_iter()
-            .max_by_key(|&(l, k)| (k, std::cmp::Reverse(l)));
-        if let Some((l, _)) = top
-            && (l as usize) < n_pieces
-        {
+        let Some((&l, _)) = votes.iter().find(|&(_, &k)| 2 * k > AXES.len()) else {
+            continue;
+        };
+        if l == u32::MAX {
+            continue;
+        }
+        let (lo, hi) = (lo[l as usize], hi[l as usize]);
+        if vs.iter().all(|&v| {
+            let p = verts[v as usize];
+            (0..3).all(|k| lo[k] <= p[k] && p[k] <= hi[k])
+        }) {
             held[l as usize] = true;
         }
     }
@@ -598,25 +567,94 @@ mod tests {
         );
     }
 
+    /// The cube of [`cube_round_organelle`] (vertices 1–8, faces 0–11) with
+    /// a pocket folding in from one of its edges (faces 12 and 14, its floor
+    /// vertices 0 and 11) and a face touching the floor at 0 (face 13, out
+    /// to vertices 9 and 10 at `reach`).
+    fn pocket_in_cube(reach: [[f64; 3]; 2]) -> (Vec<[f64; 3]>, Vec<[u32; 3]>) {
+        let (cube_v, cube_f) = cube_round_organelle();
+        let mut v = vec![[-0.5, 0.0, 0.5]];
+        v.extend_from_slice(&cube_v[..8]);
+        v.extend_from_slice(&reach);
+        v.push([-0.6, 0.4, 0.6]);
+        let mut f: Vec<[u32; 3]> = cube_f[..12].iter().map(|t| t.map(|i| i + 1)).collect();
+        f.extend([[8, 0, 5], [0, 9, 10], [8, 11, 0]]);
+        (v, f)
+    }
+
     #[test]
     fn a_pocket_is_held_by_the_piece_round_its_mouth() {
-        // piece 0 rims the pocket at two of its vertices, a sliver of piece
-        // 1 touches its wall at one
-        let v = vec![
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.5, 0.5, -1.0],
-            [2.0, 2.0, 2.0],
-            [3.0, 2.0, 2.0],
-        ];
-        let f = vec![[0, 1, 2], [3, 4, 5], [0, 1, 3]];
-        let label = [0, 1, u32::MAX];
-        let organelle = [false, false, true];
+        // piece 0 round the pocket, a sliver of piece 1 on its floor
+        let (v, f) = pocket_in_cube([[-0.4, 0.1, 0.45], [-0.45, -0.1, 0.4]]);
+        let mut label = vec![0; 15];
+        label[12] = u32::MAX;
+        label[13] = 1;
+        label[14] = u32::MAX;
+        let organelle: Vec<bool> = (0..15).map(|i| i == 12 || i == 14).collect();
         assert_eq!(
             organelle_hosts(&v, &f, &label, &organelle, 2),
             vec![true, false]
         );
+        // the soma's faces round it, and a piece on its floor spanning it:
+        // the soma's
+        let (v, f) = pocket_in_cube([[-1.2, -1.2, 1.2], [-1.2, 1.2, 0.4]]);
+        let mut label = vec![u32::MAX; 15];
+        label[13] = 0;
+        assert_eq!(organelle_hosts(&v, &f, &label, &organelle, 1), vec![false]);
+    }
+
+    #[test]
+    fn organelle_faces_of_no_area_are_no_organelle() {
+        // in the cube, faces of no area marked organelle at one point and
+        // along one line: nothing to hold
+        let (v, mut f) = cube_round_organelle();
+        f.truncate(12);
+        f.extend([[8, 8, 8], [8, 9, 9]]);
+        let organelle: Vec<bool> = (0..14).map(|i| i >= 12).collect();
+        let mut label = vec![0; 14];
+        label[12..].fill(u32::MAX);
+        assert_eq!(organelle_hosts(&v, &f, &label, &organelle, 1), vec![false]);
+        // fixture: one face there with an area is held
+        f.push([8, 9, 10]);
+        label.push(u32::MAX);
+        let organelle: Vec<bool> = (0..15).map(|i| i >= 12).collect();
+        assert_eq!(organelle_hosts(&v, &f, &label, &organelle, 1), vec![true]);
+    }
+
+    #[test]
+    fn a_fragment_beside_an_organelle_does_not_hold_it() {
+        let (mut v, mut f) = cube_round_organelle();
+        let mut organelle: Vec<bool> = (0..16).map(|i| i >= 12).collect();
+        organelle.push(false);
+        let mut label = vec![u32::MAX; 17];
+        label[16] = 0;
+        // touching it: the only piece it shares a vertex with, the soma
+        // round both
+        let mut touching = v.clone();
+        touching.extend([[0.3, 0.05, 0.0], [0.25, -0.05, 0.05]]);
+        let mut with_sliver = f.clone();
+        with_sliver.push([8, 12, 13]);
+        assert_eq!(
+            organelle_hosts(&touching, &with_sliver, &label, &organelle, 1),
+            vec![false]
+        );
+        // a sheet across it, spanning it, meeting three of the rays from
+        // its centre: with the soma round both, which meets the other three
+        let c = [0.0025, 0.0275, 0.075];
+        for d in [[0.9, -0.2, -0.2], [-0.2, 0.9, -0.2], [-0.2, -0.2, 0.9]] {
+            v.push([c[0] + d[0], c[1] + d[1], c[2] + d[2]]);
+        }
+        f.push([12, 13, 14]);
+        assert_eq!(organelle_hosts(&v, &f, &label, &organelle, 1), vec![false]);
+        // and with nothing round them, the other three meeting nothing
+        let alone: Vec<[u32; 3]> = f[12..].to_vec();
+        assert_eq!(
+            organelle_hosts(&v, &alone, &label[12..], &organelle[12..], 1),
+            vec![false]
+        );
+        // the sheet round it as the soma is: one piece
+        label[..12].fill(0);
+        assert_eq!(organelle_hosts(&v, &f, &label, &organelle, 1), vec![true]);
     }
 
     /// A strip of quads: faces 2k, 2k+1 make quad k.

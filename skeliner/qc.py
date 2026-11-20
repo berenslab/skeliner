@@ -464,16 +464,15 @@ def _surface(
             "faces": int(sizes[i]),
             "at_soma": bool(at_soma[i]),
             "at_organelle": bool(at_org[i]),
+            "holds_organelle": bool(held[i]),
+            # a discarded neurite: standing out of the soma, or holding organelles
+            "neurite": bool(neurite[i]),
             "arbor_distance": None if far is None else float(far[i]),
             "reach": None if reach is None else float(reach[i]),
         }
         if i in out_of:
             # how far it stands out of the soma, and its junction's radius
-            site.update(
-                neurite=bool(out_of[i][0]),
-                out_of_soma=out_of[i][1],
-                junction=out_of[i][2],
-            )
+            site.update(out_of_soma=out_of[i][1], junction=out_of[i][2])
         sites.append(site)
 
 
@@ -646,11 +645,13 @@ def plot(
     the viewer.
 
     The cell in three views (xy, xz, zy): the arbor grey, the soma magenta
-    with its ellipsoid's outline, every discarded piece red; a neurite
-    discarded at the soma (a fact of the report) circled and numbered as in
-    the report, bridges ringed orange, the skeleton as lines.  Below, one
-    row of the same three views for each discarded neurite, largest first,
-    zoomed on the piece and the soma it was cut from.  A view is an image of
+    with its ellipsoid's outline, every discarded piece red; a discarded
+    neurite (a fact of the report: at the soma standing out of it, or
+    holding organelles) circled and numbered as in the report, bridges
+    ringed orange, the skeleton as lines.  Below, one row of the same three
+    views for each discarded neurite, largest first, zoomed on the piece and
+    the soma it was cut from — or, cut off apart from the soma, the arbor
+    round it.  A view is an image of
     the pixels the mesh's vertices fall in, painted in that order, so a
     cell of millions of faces draws in a second or two.
 
@@ -778,11 +779,15 @@ def plot(
     for sub, s in zip(subs[1:], lost):
         piece = verts[np.unique(faces[pieces[s["index"]]])]
         blo, bhi = piece.min(axis=0), piece.max(axis=0)
-        if soma is not None:
+        if soma is not None and s["at_soma"]:
+            # the soma it was cut from
             reach = float(np.max(soma.axes))
             blo = np.minimum(blo, soma.center - reach)
             bhi = np.maximum(bhi, soma.center + reach)
-        pad = 0.1 * float(np.max(bhi - blo))
+            pad = 0.1 * float(np.max(bhi - blo))
+        else:
+            # the arbor round it, where it was cut from
+            pad = 0.5 * float(np.max(bhi - blo))
         blo, bhi = blo - pad, bhi + pad
         # this piece red, the other discarded ones pale
         this_v = np.zeros(len(verts), dtype=bool)
@@ -797,10 +802,20 @@ def plot(
             ix, iy = _view_axes(view)
             ax.set_xlim(blo[ix], bhi[ix])
             ax.set_ylim(blo[iy], bhi[iy])
+        why = []
+        if "out_of_soma" in s and s["out_of_soma"] is not None:
+            why.append(
+                f"standing {_short(s['out_of_soma'])} out of the soma (its "
+                f"junction's radius {_short(s['junction'])})"
+            )
+        if s.get("holds_organelle"):
+            gap = s.get("arbor_distance")
+            why.append(
+                "holding organelles"
+                + ("" if gap is None else f", {_short(gap)} from the arbor")
+            )
         sub.suptitle(
-            f"discarded piece {s['index']}: {s['faces']:,} faces, standing "
-            f"{_short(s['out_of_soma'])} out of the soma (its junction's radius "
-            f"{_short(s['junction'])})",
+            f"discarded piece {s['index']}: {s['faces']:,} faces, " + "; ".join(why),
             fontsize=10,
         )
     if path is not None:
