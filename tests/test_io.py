@@ -29,6 +29,7 @@ from skeliner.io import (
     save_mesh_stats_npz,
     load_mesh_stats_npz,
     save_mesh,
+    save_skeleton_npz,
 )
 
 SAMPLES_DIR = Path(__file__).parent / "data"
@@ -247,6 +248,48 @@ def test_soma_npz_nucleus_none(tmp_path):
 
     loaded = load_soma_npz(path)
     assert loaded.nucleus is None
+
+
+def test_skeleton_npz_keeps_the_soma_nucleus(tmp_path, reference_mesh):
+    """A skeleton's soma keeps its nucleus through NPZ, as the components'
+    soma does, also when what the skeleton keeps of the mesh is left out;
+    one without a nucleus reads back without one."""
+    skel = skeletonize(reference_mesh, verbose=False)
+    path = tmp_path / "skel.npz"
+    skel.soma.nucleus = None
+    save_skeleton_npz(skel, path)
+    assert load_skeleton_npz(path).soma.nucleus is None
+
+    nucleus = {
+        "center": np.array([100.0, 200.0, 300.0]),
+        "peak_r": 1500.0,
+        "z_range": (280.0, 340.0),
+        "slices": np.array([[280, 101, 201, 1200], [340, 98, 198, 1000]], float),
+    }
+    skel.soma.nucleus = nucleus
+    save_skeleton_npz(skel, path)
+    for mesh in (True, False):
+        back = load_skeleton_npz(path, mesh=mesh).soma.nucleus
+        assert np.array_equal(back["center"], nucleus["center"])
+        assert back["peak_r"] == nucleus["peak_r"]
+        assert back["z_range"] == nucleus["z_range"]
+        assert np.array_equal(back["slices"], nucleus["slices"])
+
+
+def test_skeleton_npz_keeps_a_soma_without_vertices(tmp_path, reference_mesh):
+    """A soma without vertices (``verts=None``: the placeholder of a cell
+    whose soma was not found) reads back with None, not an empty array; one
+    with vertices reads them back."""
+    skel = skeletonize(reference_mesh, verbose=False)
+    path = tmp_path / "skel.npz"
+    verts = skel.soma.verts
+    assert verts is not None and len(verts)
+    save_skeleton_npz(skel, path)
+    assert np.array_equal(load_skeleton_npz(path).soma.verts, verts)
+
+    skel.soma.verts = None
+    save_skeleton_npz(skel, path)
+    assert load_skeleton_npz(path).soma.verts is None
 
 
 # ------------------------------------------------------------------------

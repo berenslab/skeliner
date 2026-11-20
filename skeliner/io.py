@@ -437,6 +437,30 @@ def save_skeleton_swc(
 # -----------
 
 
+def _nucleus_arrays(nucleus: dict) -> dict[str, np.ndarray]:
+    """A soma's ``nucleus`` as the arrays a skeleton's or components' NPZ
+    stores it in."""
+    return {
+        "soma_nucleus_center": np.asarray(nucleus["center"], dtype=np.float64),
+        "soma_nucleus_peak_r": np.array(nucleus["peak_r"], dtype=np.float64),
+        "soma_nucleus_z_range": np.array(nucleus["z_range"], dtype=np.float64),
+        "soma_nucleus_slices": np.asarray(nucleus["slices"], dtype=np.float64),
+    }
+
+
+def _nucleus_of(z) -> dict | None:
+    """The nucleus :func:`_nucleus_arrays` stored in the open NPZ *z*; None
+    where it holds none."""
+    if "soma_nucleus_center" not in z:
+        return None
+    return {
+        "center": z["soma_nucleus_center"].astype(np.float64),
+        "peak_r": float(z["soma_nucleus_peak_r"]),
+        "z_range": tuple(z["soma_nucleus_z_range"].astype(np.float64)),
+        "slices": z["soma_nucleus_slices"].astype(np.float64),
+    }
+
+
 def load_skeleton_npz(path: str | Path, *, mesh: bool = True) -> Skeleton:
     """
     Load a Skeleton that was written with `Skeleton.to_npz` / `save_skeleton_npz`.
@@ -451,7 +475,8 @@ def load_skeleton_npz(path: str | Path, *, mesh: bool = True) -> Skeleton:
         None, ``soma.verts`` is None, and ``extra`` is empty (skeletonize
         keeps the mesh vertices' distances to the centreline there, saved
         as one object with the rest of ``extra``). The nodes, edges, radii,
-        node types, the soma's ellipsoid and ``meta`` load as saved.
+        node types, the soma's ellipsoid and nucleus and ``meta`` load as
+        saved.
     """
     path = Path(path)
 
@@ -489,6 +514,7 @@ def load_skeleton_npz(path: str | Path, *, mesh: bool = True) -> Skeleton:
             axes=z["soma_axes"],
             R=z["soma_R"],
             verts=soma_verts,
+            nucleus=_nucleus_of(z),
         )
 
         meta = {}
@@ -616,6 +642,12 @@ def save_skeleton_npz(
         tree_payload["neighbors_idx"] = data.astype(np.int64, copy=False)
         tree_payload["neighbors_off"] = offsets.astype(np.int64, copy=False)
 
+    # soma.verts is written only when it is not None, so None reads back as None
+    soma = skeleton.soma
+    soma_payload = {} if soma.verts is None else {"soma_verts": soma.verts}
+    if soma.nucleus is not None:
+        soma_payload.update(_nucleus_arrays(soma.nucleus))
+
     save_fun = np.savez_compressed if compress else np.savez
 
     save_fun(
@@ -626,11 +658,9 @@ def save_skeleton_npz(
         if skeleton.ntype is not None
         else np.array([], dtype=np.int8),
         soma_centre=skeleton.nodes[0],
-        soma_axes=skeleton.soma.axes,
-        soma_R=skeleton.soma.R,
-        soma_verts=skeleton.soma.verts
-        if skeleton.soma.verts is not None
-        else np.array([], dtype=np.int64),
+        soma_axes=soma.axes,
+        soma_R=soma.R,
+        **soma_payload,
         node2verts_idx=n2v_idx,
         node2verts_off=n2v_off,
         **radii_flat,
@@ -915,11 +945,7 @@ def save_components_npz(
         if s.verts is not None:
             payload["soma_verts"] = s.verts.astype(np.int64, copy=False)
         if s.nucleus is not None:
-            nuc = s.nucleus
-            payload["soma_nucleus_center"] = np.asarray(nuc["center"], dtype=np.float64)
-            payload["soma_nucleus_peak_r"] = np.array(nuc["peak_r"], dtype=np.float64)
-            payload["soma_nucleus_z_range"] = np.array(nuc["z_range"], dtype=np.float64)
-            payload["soma_nucleus_slices"] = np.asarray(nuc["slices"], dtype=np.float64)
+            payload.update(_nucleus_arrays(s.nucleus))
 
     # Organelles
     organelles = components.organelles
@@ -958,20 +984,12 @@ def load_components_npz(path: str | Path) -> MeshComponents:
     with np.load(path, allow_pickle=False) as z:
         # Soma
         if "soma_center" in z:
-            nucleus = None
-            if "soma_nucleus_center" in z:
-                nucleus = {
-                    "center": z["soma_nucleus_center"].astype(np.float64),
-                    "peak_r": float(z["soma_nucleus_peak_r"]),
-                    "z_range": tuple(z["soma_nucleus_z_range"].astype(np.float64)),
-                    "slices": z["soma_nucleus_slices"].astype(np.float64),
-                }
             soma = Soma(
                 center=z["soma_center"].astype(np.float64),
                 axes=z["soma_axes"].astype(np.float64),
                 R=z["soma_R"].astype(np.float64),
                 verts=z["soma_verts"].astype(np.int64) if "soma_verts" in z else None,
-                nucleus=nucleus,
+                nucleus=_nucleus_of(z),
             )
         else:
             soma = None
