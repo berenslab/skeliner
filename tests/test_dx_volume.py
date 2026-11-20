@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 import skeliner as sk
+from skeliner._backend import PATHS
 from skeliner.dataclass import Skeleton, Soma
 
 # ======================== analytic helpers ========================
@@ -647,3 +648,112 @@ def test_cone_limit_r1_zero_matches_analytic():
     V_est = sk.dx.volume(skel, include_soma=False, voxel_size=h, radius_metric="median")
     rel_err = abs(V_est - V_true) / V_true
     assert rel_err <= 0.008
+
+
+# ======================== tests: profiles ========================
+
+
+def skel_tilted_tree() -> Skeleton:
+    """A branched tree climbing through z out of a rotated ellipsoid soma,
+    so layers and columns both cut through overlaps."""
+    nodes = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.5, 0.5, 0.5],
+            [6.0, 2.0, 3.0],
+            [10.0, -1.0, 5.0],
+            [7.0, 6.0, 1.5],
+        ]
+    )
+    r = np.array([0.0, 0.9, 0.7, 0.4, 0.5])
+    soma = Soma(
+        center=np.zeros(3),
+        axes=np.array([2.5, 1.8, 1.2]),
+        R=rotation_matrix_xyz(0.3, -0.2, 0.5),
+    )
+    return Skeleton(
+        soma=soma,
+        nodes=nodes,
+        radii={"median": r.copy(), "mean": r * 1.1},
+        edges=np.array([[0, 1], [1, 2], [2, 3], [2, 4]], dtype=np.int64),
+        ntype=None,
+    )
+
+
+@pytest.mark.parametrize("include_soma", [True, False])
+@pytest.mark.parametrize("path", PATHS)
+def test_profiles_count_the_voxels_volume_fills(include_soma, path):
+    skel = skel_tilted_tree()
+    with sk.backend(path):
+        _, grid = sk.dx.volume(
+            skel, include_soma=include_soma, voxel_size=0.25, return_details=True
+        )
+        prof = sk.dx.volume_profiles(skel, include_soma=include_soma, voxel_size=0.25)
+    assert prof["voxel_size"] == grid["voxel_size"]
+    assert prof["grid_shape"] == grid["grid_shape"]
+    assert np.array_equal(prof["bbox_lo"], grid["bbox_lo"])
+    assert np.array_equal(prof["bbox_hi"], grid["bbox_hi"])
+    nx, ny, nz = grid["grid_shape"]
+    per_z, per_xy = prof["filled_per_z"], prof["filled_per_xy"]
+    assert per_z.shape == (nz,) and per_xy.shape == (nx, ny)
+    assert prof["filled_voxels"] == grid["filled_voxels"]
+    assert per_z.sum() == per_xy.sum() == grid["filled_voxels"]
+    assert (per_z > 0).sum() >= 20 and (per_xy > 0).sum() >= 200
+
+
+@pytest.mark.parametrize("include_soma", [True, False])
+def test_each_layer_and_column_is_what_volume_finds_in_a_box_of_it(include_soma):
+    skel = skel_tilted_tree()
+    h = 0.25
+    prof = sk.dx.volume_profiles(
+        skel,
+        bbox=([-4.0, -4.0, -3.0], [12.0, 9.0, 7.0]),
+        include_soma=include_soma,
+        voxel_size=h,
+    )
+    lo = prof["bbox_lo"]
+    nx, ny, nz = prof["grid_shape"]
+
+    def in_box(start, count):
+        blo = lo + np.asarray(start) * h
+        bhi = blo + (np.asarray(count) - 0.25) * h
+        _, d = sk.dx.volume(
+            skel,
+            bbox=(blo, bhi),
+            include_soma=include_soma,
+            voxel_size=h,
+            return_details=True,
+        )
+        assert d["grid_shape"] == tuple(count)
+        return d["filled_voxels"]
+
+    layers = [in_box((0, 0, k), (nx, ny, 1)) for k in range(nz)]
+    assert prof["filled_per_z"].tolist() == layers
+    per_xy = prof["filled_per_xy"]
+    columns = np.argwhere(per_xy > 0)
+    assert len(columns) >= 200
+    for i, j in [*columns[:: len(columns) // 30], (0, 0), (nx - 1, ny - 1)]:
+        assert per_xy[i, j] == in_box((i, j, 0), (1, 1, nz)), (i, j)
+
+
+def test_an_explicit_voxel_size_is_used_as_given():
+    skel = skel_capsule(L=5.0, r0=0.5, r1=0.5)
+    box = (np.full(3, -50.0), np.full(3, 50.0))
+    _, given = sk.dx.volume(
+        skel,
+        bbox=box,
+        voxel_size=0.2,
+        include_soma=False,
+        radius_metric="median",
+        return_details=True,
+    )
+    assert given["voxel_size"] == 0.2 and given["grid_shape"] == (500, 500, 500)
+    _, chosen = sk.dx.volume(
+        skel,
+        bbox=box,
+        include_soma=False,
+        radius_metric="median",
+        return_details=True,
+    )
+    assert chosen["voxel_size"] > 0.2 and np.prod(chosen["grid_shape"]) < 1.02e8
+    assert given["filled_voxels"] > 400

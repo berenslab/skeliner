@@ -117,21 +117,38 @@ fn find_nonmanifold_fusions<'py>(
     }))
 }
 
-/// Relabelled faces, and the vertex each new vertex copies.
-type FacesAndSources<'py> = (Bound<'py, PyArray2<i64>>, Bound<'py, PyArray1<i64>>);
+/// Relabelled faces, each new vertex's point, and the vertex it copies.
+type FacesAndCopies<'py> = (
+    Bound<'py, PyArray2<i64>>,
+    Bound<'py, PyArray2<f64>>,
+    Bound<'py, PyArray1<i64>>,
+);
 
-/// `skeliner.pre._split_fan_vertices` on arrays: `(faces, sources)`, where
-/// `sources[i]` is the vertex that new vertex `n_vertices + i` copies.
-/// `sources` is empty when no fan is split.
+/// A [`::pre::fusions::Split`] as arrays.
+fn split_out<'py>(py: Python<'py>, split: ::pre::fusions::Split) -> FacesAndCopies<'py> {
+    let out: Vec<[i64; 3]> = split.faces.iter().map(|f| f.map(i64::from)).collect();
+    let sources: Array1<i64> = split.sources.into_iter().map(i64::from).collect();
+    (
+        rows_to_array(&out).into_pyarray(py),
+        rows_to_array(&split.points).into_pyarray(py),
+        sources.into_pyarray(py),
+    )
+}
+
+/// `skeliner.pre._split_fan_vertices` on arrays: `(faces, points,
+/// sources)`, where new vertex `len(vertices) + i` sits at `points[i]` and
+/// copies `sources[i]`; a fan piece with no area is dropped (`[0, 0, 0]`).
+/// `points` and `sources` are empty when no fan is split.
 #[pyfunction]
-#[pyo3(signature = (faces, n_vertices, candidates=None))]
+#[pyo3(signature = (faces, vertices, candidates=None))]
 fn split_fan_vertices<'py>(
     py: Python<'py>,
     faces: PyReadonlyArray2<'py, i64>,
-    n_vertices: usize,
+    vertices: PyReadonlyArray2<'py, f64>,
     candidates: Option<numpy::PyReadonlyArray1<'py, i64>>,
-) -> PyResult<FacesAndSources<'py>> {
-    let (tris, n) = checked_faces(&faces, Some(n_vertices))?;
+) -> PyResult<FacesAndCopies<'py>> {
+    let verts = rows3("V", &vertices)?;
+    let (tris, n) = checked_faces(&faces, Some(verts.len()))?;
     let candidates: Option<Vec<u32>> = candidates
         .map(|c| {
             c.as_array()
@@ -147,15 +164,15 @@ fn split_fan_vertices<'py>(
         .transpose()?;
     let split = py.detach(|| {
         let topo = ::mesh::Topology::new(&tris, n);
-        ::pre::fusions::split_fan_vertices(&topo, &tris, candidates.as_deref())
+        ::pre::fusions::split_fan_vertices(&topo, &tris, &verts, candidates.as_deref())
     });
-    let (out, sources) = split.unwrap_or((tris, Vec::new()));
-    let out: Vec<[i64; 3]> = out.iter().map(|f| f.map(i64::from)).collect();
-    let sources: Array1<i64> = sources.into_iter().map(i64::from).collect();
-    Ok((
-        rows_to_array(&out).into_pyarray(py),
-        sources.into_pyarray(py),
-    ))
+    let split = split.unwrap_or(::pre::fusions::Split {
+        faces: tris,
+        points: Vec::new(),
+        sources: Vec::new(),
+        dropped: 0,
+    });
+    Ok(split_out(py, split))
 }
 
 /// `skeliner.pre._outward_dot` on arrays.
@@ -1038,19 +1055,37 @@ fn find_parallel_patches<'py>(
 }
 
 /// What [`remove_parallel_patches`] hands back: the faces, then the
-/// removed, fold, parallel, orphan and stitched counts.
-type PatchesRemovedOut<'py> = (Bound<'py, PyArray2<i64>>, usize, usize, usize, usize, usize);
+/// removed, fold, parallel, orphan, stitched and open-end counts.
+type PatchesRemovedOut<'py> = (
+    Bound<'py, PyArray2<i64>>,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+);
 
-/// `skeliner.pre.remove_parallel_patches` on already trimmed patches.
+/// `skeliner.pre.remove_parallel_patches` on already trimmed patches; the
+/// seams are the chunk `boundaries`, and a cap a face within
+/// `boundary_dist` of one whose normal along it is over `normal_thresh`,
+/// as `find_parallel_patches` reads them.
 #[pyfunction]
+#[allow(clippy::too_many_arguments)]
 fn remove_parallel_patches<'py>(
     py: Python<'py>,
     faces: PyReadonlyArray2<'py, i64>,
     vertices: PyReadonlyArray2<'py, f64>,
     normals: PyReadonlyArray2<'py, f64>,
     patches: Vec<PatchTuple>,
+    boundaries: Vec<(usize, Vec<f64>)>,
+    boundary_dist: f64,
+    normal_thresh: f64,
 ) -> PyResult<PatchesRemovedOut<'py>> {
     let (tris, verts, normals) = patch_mesh_inputs(&faces, &vertices, &normals)?;
+    if boundaries.iter().any(|(a, _)| *a > 2) {
+        return Err(PyValueError::new_err("boundary axes are 0, 1 or 2"));
+    }
     let patches: Vec<::pre::patches::Patch> = patches
         .into_iter()
         .map(|t| patch_from_tuple(t, tris.len()))
@@ -1061,7 +1096,12 @@ fn remove_parallel_patches<'py>(
             verts: &verts,
             normals: &normals,
         };
-        ::pre::patches::remove_parallel_patches(&m, &patches)
+        let seam = ::pre::patches::Seam {
+            boundaries: &boundaries,
+            boundary_dist,
+            normal_thresh,
+        };
+        ::pre::patches::remove_parallel_patches(&m, &patches, &seam)
     });
     let out: Vec<[i64; 3]> = done.faces.iter().map(|f| f.map(i64::from)).collect();
     Ok((
@@ -1071,7 +1111,110 @@ fn remove_parallel_patches<'py>(
         done.n_parallel,
         done.n_orphan,
         done.n_stitched,
+        done.n_open,
     ))
+}
+
+/// For each face from `n_old` on — the patches `fill_holes` appends — the
+/// `hosts` face (one flag per face before them) its patch hangs from
+/// (`::pre::fill::patch_hosts`), −1 where none. Rust only: the Python path
+/// runs it too.
+#[pyfunction]
+fn patch_hosts<'py>(
+    py: Python<'py>,
+    faces: PyReadonlyArray2<'py, i64>,
+    n_vertices: usize,
+    n_old: usize,
+    hosts: numpy::PyReadonlyArray1<'py, bool>,
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
+    let (tris, n) = checked_faces(&faces, Some(n_vertices))?;
+    if n_old > tris.len() {
+        return Err(PyValueError::new_err("n_old is past the faces"));
+    }
+    let hosts = hosts.as_array().to_vec();
+    if hosts.len() != n_old {
+        return Err(PyValueError::new_err(
+            "hosts needs one flag per face before n_old",
+        ));
+    }
+    let hosts = py.detach(|| ::pre::fill::patch_hosts(&tris, n, n_old, &hosts));
+    let out: Array1<i64> = hosts.into_iter().map(|h| h.map_or(-1, i64::from)).collect();
+    Ok(out.into_pyarray(py))
+}
+
+/// Which of `n_pieces` pieces hold an organelle
+/// (`::pre::breakup::organelle_hosts`), given the piece each face is in
+/// (`label`, −1 for none) and the organelle faces (`organelle`, one flag
+/// per face or fewer). Rust only: the Python path runs it too.
+#[pyfunction]
+fn organelle_hosts<'py>(
+    py: Python<'py>,
+    faces: PyReadonlyArray2<'py, i64>,
+    vertices: PyReadonlyArray2<'py, f64>,
+    label: numpy::PyReadonlyArray1<'py, i64>,
+    organelle: numpy::PyReadonlyArray1<'py, bool>,
+    n_pieces: usize,
+) -> PyResult<Bound<'py, PyArray1<bool>>> {
+    let verts = rows3("V", &vertices)?;
+    let (tris, _) = checked_faces(&faces, Some(verts.len()))?;
+    let label = label.as_array();
+    if label.len() != tris.len() {
+        return Err(PyValueError::new_err("label needs one value per face"));
+    }
+    let label: Vec<u32> = label
+        .iter()
+        .map(|&l| {
+            if l < 0 {
+                Ok(u32::MAX)
+            } else {
+                u32::try_from(l)
+                    .ok()
+                    .filter(|&l| (l as usize) < n_pieces)
+                    .ok_or_else(|| PyValueError::new_err(format!("piece {l} is out of range")))
+            }
+        })
+        .collect::<PyResult<_>>()?;
+    let organelle = organelle.as_array().to_vec();
+    let held =
+        py.detach(|| ::pre::breakup::organelle_hosts(&verts, &tris, &label, &organelle, n_pieces));
+    Ok(Array1::from(held).into_pyarray(py))
+}
+
+/// `skeliner.pre.isolate_organelles` on arrays (Rust only: the Python path
+/// runs it too): the organelle faces (`organelle`, one flag per face or
+/// fewer) given copies of the vertices they share with other faces, at
+/// `positions` (where each vertex below its length stood; the rest where
+/// they are) moved a thousandth of a fan's reach into it. Returns
+/// `(faces, points, sources)` as `split_fan_vertices` does.
+#[pyfunction]
+#[pyo3(signature = (faces, vertices, organelle, positions=None))]
+fn isolate_organelles<'py>(
+    py: Python<'py>,
+    faces: PyReadonlyArray2<'py, i64>,
+    vertices: PyReadonlyArray2<'py, f64>,
+    organelle: numpy::PyReadonlyArray1<'py, bool>,
+    positions: Option<PyReadonlyArray2<'py, f64>>,
+) -> PyResult<FacesAndCopies<'py>> {
+    let verts = rows3("V", &vertices)?;
+    let (tris, _) = checked_faces(&faces, Some(verts.len()))?;
+    let organelle = organelle.as_array().to_vec();
+    if organelle.len() > tris.len() {
+        return Err(PyValueError::new_err(
+            "organelle has more flags than there are faces",
+        ));
+    }
+    let positions = match positions {
+        Some(p) => rows3("P", &p)?,
+        None => Vec::new(),
+    };
+    if positions.len() > verts.len() {
+        return Err(PyValueError::new_err(
+            "positions has more rows than there are vertices",
+        ));
+    }
+    let split =
+        py.detach(|| ::pre::isolate::isolate_organelles(&verts, &tris, &organelle, &positions));
+    Ok(split_out(py, split))
 }
 
 /// What [`remove_gaps`] hands back: new vertices, the rebuilt faces (None
@@ -1096,7 +1239,6 @@ fn remove_gaps<'py>(
     py: Python<'py>,
     faces: PyReadonlyArray2<'py, i64>,
     vertices: PyReadonlyArray2<'py, f64>,
-    face_normals: PyReadonlyArray2<'py, f64>,
     median_edge: f64,
     labels: Option<numpy::PyReadonlyArray1<'py, i64>>,
     gaps: Vec<(Vec<i64>, Vec<i64>)>,
@@ -1105,10 +1247,6 @@ fn remove_gaps<'py>(
     use ::pre::stitch::{GapTips, LoopFit, StitchMesh};
     let verts = rows3("V", &vertices)?;
     let (tris, n) = checked_faces(&faces, Some(verts.len()))?;
-    let normals = rows3("N", &face_normals)?;
-    if normals.len() != tris.len() {
-        return Err(PyValueError::new_err("face_normals needs one row per face"));
-    }
     let labels = labels.map(|l| l.as_array().to_vec());
     if labels.as_ref().is_some_and(|l| l.len() != tris.len()) {
         return Err(PyValueError::new_err("labels needs one value per face"));
@@ -1139,7 +1277,6 @@ fn remove_gaps<'py>(
     let mesh = StitchMesh {
         faces: &tris,
         verts: &verts,
-        face_normals: &normals,
         median_edge,
     };
     let mut call = |ids: &[u32]| -> PyResult<LoopFit> {
@@ -1174,16 +1311,18 @@ fn remove_gaps<'py>(
 }
 
 /// `skeliner.pre.remove_fusions` on arrays: fusion faces degenerate to
-/// `[0, 0, 0]` and the fans they held together split.  Returns the new
-/// faces and, per appended vertex, the vertex it copies.
+/// `[0, 0, 0]` and the fans they held together split, each copy off its
+/// vertex's point. Returns `(faces, points, sources)` as
+/// [`split_fan_vertices`] does.
 #[pyfunction]
 fn remove_fusions<'py>(
     py: Python<'py>,
     faces: PyReadonlyArray2<'py, i64>,
-    n_vertices: usize,
+    vertices: PyReadonlyArray2<'py, f64>,
     fusions: Vec<Vec<i64>>,
-) -> PyResult<FacesAndSources<'py>> {
-    let (tris, n) = checked_faces(&faces, Some(n_vertices))?;
+) -> PyResult<FacesAndCopies<'py>> {
+    let verts = rows3("V", &vertices)?;
+    let (tris, _) = checked_faces(&faces, Some(verts.len()))?;
     let nf = tris.len();
     let fusions: Vec<Vec<u32>> = fusions
         .into_iter()
@@ -1200,13 +1339,8 @@ fn remove_fusions<'py>(
                 .collect()
         })
         .collect::<PyResult<_>>()?;
-    let (out, sources) = py.detach(|| ::pre::fusions::remove_fusions(&tris, n, &fusions));
-    let out: Vec<[i64; 3]> = out.iter().map(|f| f.map(i64::from)).collect();
-    let sources: Array1<i64> = sources.into_iter().map(i64::from).collect();
-    Ok((
-        rows_to_array(&out).into_pyarray(py),
-        sources.into_pyarray(py),
-    ))
+    let split = py.detach(|| ::pre::fusions::remove_fusions(&tris, &verts, &fusions));
+    Ok(split_out(py, split))
 }
 
 /// Pieces from [`break_up_classify`], their kinds, and per face whether it
@@ -1559,6 +1693,7 @@ impl PyZScan {
 type FilledOut<'py> = (
     Bound<'py, PyArray2<f64>>,
     Bound<'py, PyArray2<i64>>,
+    Bound<'py, PyArray1<i64>>,
     Bound<'py, PyDict>,
 );
 
@@ -1566,8 +1701,11 @@ type FilledOut<'py> = (
 /// usable faces not `organelle` (one flag per face, or fewer: the faces
 /// after them are none) — patched with triangles about `median_edge` long
 /// and faired with their lips; loops a `soma_verts` vertex touches stay
-/// open.
+/// open, as do those along no `asked` face (one flag per face) when given.
+/// Returns the vertices, the patches' faces, the faces of no area in the
+/// holes they close (to drop) and the tally.
 #[pyfunction]
+#[pyo3(signature = (faces, vertices, organelle, soma_verts, median_edge, asked=None))]
 fn fill_holes<'py>(
     py: Python<'py>,
     faces: PyReadonlyArray2<'py, i64>,
@@ -1575,6 +1713,7 @@ fn fill_holes<'py>(
     organelle: numpy::PyReadonlyArray1<'py, bool>,
     soma_verts: numpy::PyReadonlyArray1<'py, i64>,
     median_edge: f64,
+    asked: Option<numpy::PyReadonlyArray1<'py, bool>>,
 ) -> PyResult<FilledOut<'py>> {
     use ::pre::fill::Decision;
     let verts = rows3("V", &vertices)?;
@@ -1593,7 +1732,20 @@ fn fill_holes<'py>(
             .ok_or_else(|| PyValueError::new_err(format!("vertex index {v} is out of range")))?;
         soma[i] = true;
     }
-    let done = py.detach(|| ::pre::fill::fill_holes(&verts, &tris, &organelle, &soma, median_edge));
+    let asked = asked.map(|a| a.as_array().to_vec());
+    if asked.as_ref().is_some_and(|a| a.len() != tris.len()) {
+        return Err(PyValueError::new_err("asked needs one flag per face"));
+    }
+    let done = py.detach(|| {
+        ::pre::fill::fill_holes(
+            &verts,
+            &tris,
+            &organelle,
+            &soma,
+            asked.as_deref(),
+            median_edge,
+        )
+    });
     let count = |d: Decision| done.holes.iter().filter(|h| h.decision == d).count();
     let tally = counts(
         py,
@@ -1601,6 +1753,7 @@ fn fill_holes<'py>(
             ("loops", done.holes.len()),
             ("filled", count(Decision::Filled)),
             ("off_body", count(Decision::OffBody)),
+            ("not_asked", count(Decision::NotAsked)),
             ("soma", count(Decision::Soma)),
             ("non_manifold", count(Decision::NonManifold)),
             ("tube_end", count(Decision::TubeEnd)),
@@ -1608,12 +1761,15 @@ fn fill_holes<'py>(
             ("new_faces", done.faces.len()),
             ("new_vertices", done.verts.len() - nv),
             ("moved", done.n_moved),
+            ("dropped", done.dropped.len()),
         ],
     )?;
     let out: Vec<[i64; 3]> = done.faces.iter().map(|f| f.map(i64::from)).collect();
+    let dropped: Array1<i64> = done.dropped.iter().map(|&f| i64::from(f)).collect();
     Ok((
         rows_to_array(&done.verts).into_pyarray(py),
         rows_to_array(&out).into_pyarray(py),
+        dropped.into_pyarray(py),
         tally,
     ))
 }
@@ -1644,6 +1800,9 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(remove_parallel_patches, m)?)?;
     m.add_function(wrap_pyfunction!(remove_gaps, m)?)?;
     m.add_function(wrap_pyfunction!(remove_fusions, m)?)?;
+    m.add_function(wrap_pyfunction!(isolate_organelles, m)?)?;
+    m.add_function(wrap_pyfunction!(patch_hosts, m)?)?;
+    m.add_function(wrap_pyfunction!(organelle_hosts, m)?)?;
     m.add_function(wrap_pyfunction!(break_up_classify, m)?)?;
     m.add_function(wrap_pyfunction!(break_up_severed_walls, m)?)?;
     m.add_function(wrap_pyfunction!(find_soma_ring_cutoff, m)?)?;

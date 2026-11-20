@@ -194,6 +194,51 @@ def test_a_neurite_discarded_at_the_soma_is_a_fact():
             assert qc.triage(qc.collect([rep])) == []
 
 
+def test_a_discarded_piece_holding_an_organelle_is_a_neurite():
+    """A discarded piece round a closed organelle — a branch cut off from
+    the arbor carries its organelles with it — is a discarded neurite, a
+    fact; a fragment beside an organelle the arbor holds is none."""
+    ball = trimesh.creation.icosphere(subdivisions=3, radius=5.0)
+    box = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    box.apply_translation((20.0, 0.0, 0.0))
+    in_box = trimesh.creation.icosphere(subdivisions=0, radius=0.3)
+    in_box.apply_translation((20.1, 0.05, 0.02))
+    in_ball = trimesh.creation.icosphere(subdivisions=0, radius=0.3)
+    in_ball.apply_translation((1.0, 0.05, 0.02))
+    beside = trimesh.creation.box(extents=(0.5, 0.5, 0.5))
+    beside.apply_translation((1.6, 0.0, 0.0))
+    parts = [ball, box, beside, in_box, in_ball]
+    mesh = _combine(parts)
+    ends = np.cumsum([len(p.faces) for p in parts])
+    piece = [np.arange(a, b) for a, b in zip([0, *ends[:-1]], ends)]
+    isolated = np.zeros(len(mesh.faces), dtype=bool)
+    isolated[ends[2] :] = True
+    z = np.zeros(len(mesh.faces), dtype=bool)
+    comps = MeshComponents(
+        soma=None,
+        organelles=Organelles(pocket=z, isolated=isolated, expanded=z.copy()),
+        neurites=Neurites([piece[0]]),
+        discarded=Discarded([piece[1], piece[2]]),
+    )
+    rep = qc.report(mesh, comps)
+    s = rep["summary"]
+    assert s["discarded_holding_organelles"] == 1
+    assert s["discarded_neurites"] == 1
+    assert s["discarded_neurite_largest"] == len(box.faces)
+    assert "discarded_neurite" in rep["flags"]
+    # the site says which piece: the box, cut off apart from the soma
+    held = [x for x in _sites(rep, "discarded") if x["holds_organelle"]]
+    assert [x["index"] for x in held] == [0]
+    assert held[0]["neurite"] and not held[0]["at_soma"]
+    # drawn and zoomed on like a neurite discarded at the soma
+    fig = qc.plot(mesh, comps, report=rep)
+    assert len(fig.axes) == 4 + 3
+    assert "holding organelles" in fig.subfigs[1]._suptitle.get_text()
+    # fixture: the fragment stands in one of the rays from its organelle
+    hit = trimesh.ray.ray_triangle.RayMeshIntersector(beside)
+    assert hit.intersects_any([in_ball.vertices.mean(0)], [[1.0, 0.0, 0.0]])[0]
+
+
 def _stub_components(height):
     mesh, soma, org = _ball_with_stub(height=height)
     (stub,) = _arbor_pieces(mesh, soma, org)

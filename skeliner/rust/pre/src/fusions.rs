@@ -238,81 +238,224 @@ pub fn find_fusions(
     clusters
 }
 
+type V3 = [f64; 3];
+
+/// Twice the area of face `f`, as [`crate::breakup::usable_faces`] reads it.
+fn doubled_area(verts: &[V3], f: [u32; 3]) -> f64 {
+    let (p, q, r) = (
+        verts[f[0] as usize],
+        verts[f[1] as usize],
+        verts[f[2] as usize],
+    );
+    let u = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
+    let w = [r[0] - p[0], r[1] - p[1], r[2] - p[2]];
+    let x = [
+        u[1] * w[2] - u[2] * w[1],
+        u[2] * w[0] - u[0] * w[2],
+        u[0] * w[1] - u[1] * w[0],
+    ];
+    (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt()
+}
+
+/// Where the copy of vertex `v` that the faces `piece` take goes: off `v`'s
+/// point by a thousandth of their mean distance from it, towards the mean
+/// of their other vertices — into the piece, so that the copies of a cut
+/// vertex never sit at one point (two vertices at one point are no valid
+/// surface, and a reader merging copies along a seam would join the cut
+/// again). A thousandth stays far above a coordinate's rounding and far
+/// below anything a mesh shows. Where that mean is the point itself,
+/// the copy goes against the piece's normal (into the solid it bounds), and
+/// where that is none, towards its first other vertex.
+pub fn copy_point(verts: &[V3], faces: &[[u32; 3]], v: u32, piece: &[u32]) -> V3 {
+    copy_point_at(&|w| verts[w as usize], faces, v, piece)
+}
+
+/// [`copy_point`] with each vertex at `at(vertex)`.
+pub fn copy_point_at(at: &dyn Fn(u32) -> V3, faces: &[[u32; 3]], v: u32, piece: &[u32]) -> V3 {
+    let p = at(v);
+    let mut link: Vec<u32> = piece
+        .iter()
+        .flat_map(|&f| faces[f as usize])
+        .filter(|&w| w != v)
+        .collect();
+    link.sort_unstable();
+    link.dedup();
+    let k = link.len() as f64;
+    let (mut c, mut reach) = ([0.0f64; 3], 0.0f64);
+    for &w in &link {
+        let q = at(w);
+        for i in 0..3 {
+            c[i] += q[i];
+        }
+        let d = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
+        reach += (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    }
+    let c = c.map(|x| x / k);
+    let reach = reach / k;
+    let length = |d: V3| (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    let mut d = [c[0] - p[0], c[1] - p[1], c[2] - p[2]];
+    if length(d) == 0.0 {
+        let mut ascending = piece.to_vec();
+        ascending.sort_unstable();
+        let mut n = [0.0f64; 3];
+        for &f in &ascending {
+            let [a, b, e] = faces[f as usize].map(at);
+            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let w = [e[0] - a[0], e[1] - a[1], e[2] - a[2]];
+            n[0] += u[1] * w[2] - u[2] * w[1];
+            n[1] += u[2] * w[0] - u[0] * w[2];
+            n[2] += u[0] * w[1] - u[1] * w[0];
+        }
+        d = n.map(|x| -x);
+    }
+    if length(d) == 0.0 {
+        let q = at(link[0]);
+        d = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
+    }
+    let step = reach / 1000.0 / length(d);
+    [p[0] + d[0] * step, p[1] + d[1] * step, p[2] + d[2] * step]
+}
+
+/// What [`split_fan_vertices`] made of a mesh's faces.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Split {
+    /// The faces relabelled, the dropped ones `[0, 0, 0]`.
+    pub faces: Vec<[u32; 3]>,
+    /// Per new vertex, numbered on from the mesh's: its point
+    /// ([`copy_point`]) and the vertex it copies.
+    pub points: Vec<V3>,
+    pub sources: Vec<u32>,
+    /// The faces dropped: pieces of a split fan with no area.
+    pub dropped: usize,
+}
+
 /// `skeliner.pre._split_fan_vertices`: give each extra edge-connected piece
-/// of a vertex's fan its own copy of the vertex.
+/// of a vertex's fan its own copy of the vertex, off its point.
 ///
 /// `candidates` (ascending) are the vertices to check, all of them when
-/// `None`.  Pieces are found in face order; the first keeps the vertex and
-/// each later one gets a new vertex, numbered on from `n_vertices` in the
-/// order split.  Returns the relabelled faces and, per new vertex, the
-/// vertex it copies; nothing when no fan is split.
+/// `None`. Pieces are found in face order, among the faces not dropped yet.
+/// The first piece with an area keeps the vertex and each later one gets a
+/// new vertex, numbered on from `n_vertices` in the order split, at
+/// [`copy_point`]; a piece of faces with no area is no surface — debris
+/// the split leaves hanging by a point or an edge — and is dropped, every
+/// one of them where no piece has an area. A dropped face leaves the fans
+/// at its other vertices too, which may fall apart there: those vertices
+/// are checked next, as they are labelled by then, until a round drops
+/// nothing. The pieces are read on the faces as given (a copy changes no
+/// face's neighbours, a drop takes the face out of every fan) and the
+/// copies' points from the vertices as given; a copy of a copy copies the
+/// first vertex. None when no fan is split.
 pub fn split_fan_vertices(
     t: &Topology,
     faces: &[[u32; 3]],
+    verts: &[V3],
     candidates: Option<&[u32]>,
-) -> Option<(Vec<[u32; 3]>, Vec<u32>)> {
+) -> Option<Split> {
     let n_vertices = t.n_vertices();
-    let all: Vec<u32>;
-    let check: &[u32] = match candidates {
-        Some(c) => c,
-        None => {
-            all = (0..n_vertices as u32).collect();
-            &all
-        }
-    };
+    let gone = |f: &[u32; 3]| f[0] == f[1] && f[1] == f[2];
     let mut out = faces.to_vec();
-    let mut sources = Vec::new();
-    for &vid in check {
-        let fan = t.vertex_faces(vid as usize);
-        if fan.len() < 2 {
-            continue;
-        }
-        let members: BTreeSet<u32> = fan.iter().copied().collect();
-        let mut seen: BTreeSet<u32> = BTreeSet::new();
-        let mut pieces: Vec<Vec<u32>> = Vec::new();
-        for &start in fan {
-            if seen.contains(&start) {
+    let (mut points, mut sources) = (Vec::new(), Vec::new());
+    let mut dropped = 0;
+    let mut check: Vec<u32> = match candidates {
+        Some(c) => c.to_vec(),
+        None => (0..n_vertices as u32).collect(),
+    };
+    while !check.is_empty() {
+        // the vertices of the faces this round drops, to check next
+        let mut parted: Vec<u32> = Vec::new();
+        for &vid in &check {
+            // a copy's faces were all its first vertex's
+            let base = if (vid as usize) < n_vertices {
+                vid
+            } else {
+                sources[vid as usize - n_vertices]
+            };
+            let fan: Vec<u32> = t
+                .vertex_faces(base as usize)
+                .iter()
+                .copied()
+                .filter(|&f| {
+                    let g = out[f as usize];
+                    !gone(&g) && g.contains(&vid)
+                })
+                .collect();
+            if fan.len() < 2 {
                 continue;
             }
-            let mut piece = Vec::new();
-            let mut queue = VecDeque::from([start]);
-            while let Some(f) = queue.pop_front() {
-                if !seen.insert(f) {
+            let members: BTreeSet<u32> = fan.iter().copied().collect();
+            let mut seen: BTreeSet<u32> = BTreeSet::new();
+            let mut pieces: Vec<Vec<u32>> = Vec::new();
+            for &start in &fan {
+                if seen.contains(&start) {
                     continue;
                 }
-                piece.push(f);
-                for g in t.face_neighbors(f as usize) {
-                    if members.contains(&g) && !seen.contains(&g) {
-                        queue.push_back(g);
+                let mut piece = Vec::new();
+                let mut queue = VecDeque::from([start]);
+                while let Some(f) = queue.pop_front() {
+                    if !seen.insert(f) {
+                        continue;
+                    }
+                    piece.push(f);
+                    for g in t.face_neighbors(f as usize) {
+                        if members.contains(&g) && !seen.contains(&g) {
+                            queue.push_back(g);
+                        }
+                    }
+                }
+                pieces.push(piece);
+            }
+            if pieces.len() < 2 {
+                continue;
+            }
+            let has_area: Vec<bool> = pieces
+                .iter()
+                .map(|p| {
+                    p.iter()
+                        .any(|&f| doubled_area(verts, faces[f as usize]) > 0.0)
+                })
+                .collect();
+            let keeper = has_area.iter().position(|&a| a);
+            for (i, piece) in pieces.iter().enumerate() {
+                if Some(i) == keeper {
+                    continue;
+                }
+                if !has_area[i] {
+                    for &f in piece {
+                        parted.extend(out[f as usize].into_iter().filter(|&w| w != vid));
+                        out[f as usize] = [0, 0, 0];
+                        dropped += 1;
+                    }
+                    continue;
+                }
+                let new_vid = (n_vertices + sources.len()) as u32;
+                points.push(copy_point(verts, faces, base, piece));
+                sources.push(base);
+                for &f in piece {
+                    for slot in out[f as usize].iter_mut() {
+                        if *slot == vid {
+                            *slot = new_vid;
+                        }
                     }
                 }
             }
-            pieces.push(piece);
         }
-        for piece in pieces.iter().skip(1) {
-            let new_vid = (n_vertices + sources.len()) as u32;
-            sources.push(vid);
-            for &f in piece {
-                for slot in out[f as usize].iter_mut() {
-                    if *slot == vid {
-                        *slot = new_vid;
-                    }
-                }
-            }
-        }
+        parted.sort_unstable();
+        parted.dedup();
+        check = parted;
     }
-    (!sources.is_empty()).then_some((out, sources))
+    (!sources.is_empty() || dropped > 0).then_some(Split {
+        faces: out,
+        points,
+        sources,
+        dropped,
+    })
 }
 
 /// `skeliner.pre.remove_fusions` on face arrays: the fusion faces become
 /// `[0, 0, 0]`, so no index moves, then the fans of the vertices they
-/// touched are split ([`split_fan_vertices`]).  Returns the new faces and
-/// the vertex each appended vertex copies.
-pub fn remove_fusions(
-    faces: &[[u32; 3]],
-    n_vertices: usize,
-    fusions: &[Vec<u32>],
-) -> (Vec<[u32; 3]>, Vec<u32>) {
+/// touched are split ([`split_fan_vertices`]).
+pub fn remove_fusions(faces: &[[u32; 3]], verts: &[V3], fusions: &[Vec<u32>]) -> Split {
+    let n_vertices = verts.len();
     let mut out = faces.to_vec();
     let mut touched = vec![false; n_vertices];
     for &f in fusions.iter().flatten() {
@@ -325,10 +468,12 @@ pub fn remove_fusions(
         .filter(|&v| touched[v as usize])
         .collect();
     let topo = Topology::new(&out, n_vertices);
-    match split_fan_vertices(&topo, &out, Some(&candidates)) {
-        Some(split) => split,
-        None => (out, Vec::new()),
-    }
+    split_fan_vertices(&topo, &out, verts, Some(&candidates)).unwrap_or(Split {
+        faces: out,
+        points: Vec::new(),
+        sources: Vec::new(),
+        dropped: 0,
+    })
 }
 
 #[cfg(test)]
@@ -370,22 +515,170 @@ mod tests {
         assert_eq!(fusions, vec![vec![0, 1, 2]]);
     }
 
+    /// The bow-tie's vertices: the first triangle and the third below the
+    /// x axis, the second above it.
+    fn bowtie_verts() -> Vec<V3> {
+        vec![
+            [0.0, 0.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ]
+    }
+
     #[test]
     fn splitting_the_bowtie_gives_the_second_piece_a_new_vertex() {
         let faces = bowtie();
+        let v = bowtie_verts();
         let t = Topology::new(&faces, 6);
-        let (out, sources) = split_fan_vertices(&t, &faces, None).unwrap();
+        let s = split_fan_vertices(&t, &faces, &v, None).unwrap();
         // fan of vertex 2 is faces 0, 1, 2; faces 0 and 2 share edge (0, 2),
         // face 1 is the second piece and gets vertex 6
-        assert_eq!(out, vec![[0, 1, 2], [6, 3, 4], [0, 2, 5]]);
-        assert_eq!(sources, vec![2]);
+        assert_eq!(s.faces, vec![[0, 1, 2], [6, 3, 4], [0, 2, 5]]);
+        assert_eq!(s.sources, vec![2]);
+        assert_eq!(s.dropped, 0);
+        // the copy sits off vertex 2, a thousandth of the way its piece's
+        // other vertices lie, towards them
+        let p = v[2];
+        let c = s.points[0];
+        let d = [c[0] - p[0], c[1] - p[1], c[2] - p[2]];
+        let moved = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        let reach = (2f64.sqrt() + 1.0) / 2.0;
+        assert!((moved - reach / 1000.0).abs() < 1e-15, "{moved}");
+        // towards (1.5, 1), the mean of vertices 3 and 4
+        let toward = [0.5, 1.0, 0.0];
+        let cos = (d[0] * toward[0] + d[1] * toward[1]) / (moved * 1.25f64.sqrt());
+        assert!((cos - 1.0).abs() < 1e-12, "{cos}");
     }
 
     #[test]
     fn only_the_candidates_are_split() {
         let faces = bowtie();
         let t = Topology::new(&faces, 6);
-        assert_eq!(split_fan_vertices(&t, &faces, Some(&[0, 1])), None);
+        assert_eq!(
+            split_fan_vertices(&t, &faces, &bowtie_verts(), Some(&[0, 1])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_piece_with_no_area_is_dropped_not_copied() {
+        // the bow-tie's second triangle flattened onto a line through
+        // vertex 2: it is no surface, so the split drops it
+        let faces = bowtie();
+        let mut v = bowtie_verts();
+        v[3] = [2.0, 0.0, 0.0];
+        v[4] = [3.0, 0.0, 0.0];
+        let t = Topology::new(&faces, 6);
+        let s = split_fan_vertices(&t, &faces, &v, None).unwrap();
+        assert_eq!(s.faces, vec![[0, 1, 2], [0, 0, 0], [0, 2, 5]]);
+        assert!(s.sources.is_empty() && s.points.is_empty());
+        assert_eq!(s.dropped, 1);
+        // flattened first, the area piece after it keeps the vertex
+        let first = vec![[2, 3, 4], [0, 1, 2], [0, 2, 5]];
+        let t = Topology::new(&first, 6);
+        let s = split_fan_vertices(&t, &first, &v, None).unwrap();
+        assert_eq!(s.faces, vec![[0, 0, 0], [0, 1, 2], [0, 2, 5]]);
+        // two flat pieces and nothing else at the vertex: both go
+        let mut line = v.clone();
+        line[0] = [-1.0, 0.0, 0.0];
+        line[1] = [0.0, 0.0, 0.0];
+        let pair = vec![[0, 1, 2], [2, 3, 4]];
+        let t = Topology::new(&pair, 6);
+        let s = split_fan_vertices(&t, &pair, &line, None).unwrap();
+        assert_eq!(s.faces, vec![[0, 0, 0], [0, 0, 0]]);
+        assert_eq!(s.dropped, 2);
+    }
+
+    #[test]
+    fn a_drop_that_parts_another_fan_splits_that_one_too() {
+        // at vertex 1, two faces of no area on the line y = z = 0 — a piece
+        // of their own beside [1, 6, 7] — that alone join, at vertex 0, the
+        // faces [0, 4, 2] and [0, 3, 5]: dropped at 1, they leave 0 parted
+        let v: Vec<V3> = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [1.5, -1.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+        ];
+        let faces = vec![[0, 4, 2], [0, 3, 5], [0, 2, 1], [0, 1, 3], [1, 6, 7]];
+        let t = Topology::new(&faces, v.len());
+        let s = split_fan_vertices(&t, &faces, &v, Some(&[1])).unwrap();
+        assert_eq!(
+            s.faces,
+            vec![[0, 4, 2], [8, 3, 5], [0, 0, 0], [0, 0, 0], [1, 6, 7]]
+        );
+        assert_eq!(s.sources, vec![0]);
+        assert_eq!(s.dropped, 2);
+        let mut all = v.clone();
+        all.extend_from_slice(&s.points);
+        assert!(mesh::validity::check(&all, &s.faces).split_fans.is_empty());
+    }
+
+    #[test]
+    fn a_flat_full_fan_moves_its_copy_against_its_normal() {
+        // two square fans round vertex 0, one in z = 0 and one in x = 0,
+        // meeting only at vertex 0: each piece's other vertices lie round
+        // the point, so the second's copy goes against its normal
+        let v: Vec<V3> = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [0.0, 0.0, -1.0],
+            [0.0, -1.0, -1.0],
+        ];
+        let faces = vec![
+            [0, 1, 2],
+            [0, 2, 3],
+            [0, 3, 4],
+            [0, 4, 1],
+            [0, 5, 6],
+            [0, 6, 7],
+            [0, 7, 8],
+            [0, 8, 5],
+        ];
+        let t = Topology::new(&faces, 9);
+        let s = split_fan_vertices(&t, &faces, &v, None).unwrap();
+        assert_eq!(s.sources, vec![0]);
+        let c = s.points[0];
+        // the second fan, in x = 0, is wound with its normal along -x: the
+        // copy goes to +x
+        assert!(c[0] > 0.0 && c[1] == 0.0 && c[2] == 0.0, "{c:?}");
+    }
+
+    #[test]
+    fn copies_of_one_vertex_never_share_a_point() {
+        // three triangles meeting only at vertex 0
+        let v: Vec<V3> = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [-1.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ];
+        let faces = vec![[0, 1, 2], [0, 3, 4], [0, 5, 6]];
+        let t = Topology::new(&faces, 7);
+        let s = split_fan_vertices(&t, &faces, &v, None).unwrap();
+        assert_eq!(s.sources, vec![0, 0]);
+        let mut all = vec![v[0]];
+        all.extend(&s.points);
+        for i in 0..all.len() {
+            for j in 0..i {
+                assert_ne!(all[i], all[j]);
+            }
+        }
     }
 
     #[test]
@@ -393,7 +686,14 @@ mod tests {
         let faces = vec![[0, 1, 2], [1, 3, 2], [2, 3, 4]];
         let t = Topology::new(&faces, 5);
         assert!(find_nonmanifold_fusions(&t, &faces, &[1.0; 3], &[-1.0; 3], 20, 5).is_empty());
-        assert_eq!(split_fan_vertices(&t, &faces, None), None);
+        let v = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 2.0, 0.0],
+        ];
+        assert_eq!(split_fan_vertices(&t, &faces, &v, None), None);
     }
 
     #[test]
@@ -409,13 +709,21 @@ mod tests {
     fn removing_a_fusion_face_splits_the_fan_it_held_together() {
         // two triangles meeting at vertex 0, joined by fusion face 2
         let faces = [[0, 1, 2], [0, 3, 4], [0, 2, 3]];
-        let (out, sources) = remove_fusions(&faces, 5, &[vec![2]]);
-        assert_eq!(out[2], [0, 0, 0]);
-        assert_eq!(sources, vec![0]);
-        assert_eq!(out[0], [0, 1, 2]);
-        assert_eq!(out[1], [5, 3, 4]);
-        let (same, none) = remove_fusions(&faces, 5, &[]);
-        assert_eq!(same, faces.to_vec());
-        assert!(none.is_empty());
+        let v: Vec<V3> = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        let s = remove_fusions(&faces, &v, &[vec![2]]);
+        assert_eq!(s.faces[2], [0, 0, 0]);
+        assert_eq!(s.sources, vec![0]);
+        assert_eq!(s.faces[0], [0, 1, 2]);
+        assert_eq!(s.faces[1], [5, 3, 4]);
+        assert_ne!(s.points[0], v[0]);
+        let same = remove_fusions(&faces, &v, &[]);
+        assert_eq!(same.faces, faces.to_vec());
+        assert!(same.sources.is_empty() && same.points.is_empty());
     }
 }

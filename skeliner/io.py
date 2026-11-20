@@ -87,10 +87,9 @@ def load_mesh(filepath: str | Path) -> Mesh:
     only touch — a seam is a chain of edges both sides of it repeat — stay
     apart: :func:`skeliner.pre.remove_fusions` leaves a cut so. Faces keep
     their places, so face ids into the file stay valid. A mesh
-    ``preprocess`` cleaned does not come back exactly from an OBJ: the file
-    keeps eight decimals, and copies of a vertex a patch joins by a sliver
-    are one position there, which the merge joins (a vertex or two, on a
-    few cells); :func:`save_mesh_npz` keeps it exactly.
+    ``preprocess`` cleaned and compacted comes back from the OBJ
+    :func:`save_mesh` wrote exactly: every vertex in its place, every
+    digit.
 
     OBJ files of plain vertices and triangles, the form EyeWire 2, MICrONS
     and FlyWire meshes come in and skeliner's own pipeline writes, are read
@@ -152,8 +151,9 @@ def save_mesh(mesh, path: str | Path) -> None:
     """Write a mesh to disk, the format by the file's suffix.
 
     A :class:`skeliner.Mesh` (or anything with ``vertices`` and ``faces``) goes
-    to OBJ through skeliner's own writer on the active path, as trimesh
-    writes a plain mesh, to ``.npz`` as its arrays (:func:`save_mesh_npz`),
+    to OBJ through skeliner's own writer on the active path, each coordinate
+    the shortest decimal that reads back as the same number, to ``.npz`` as
+    its arrays (:func:`save_mesh_npz`),
     and to every other format (ply, stl, glb, ...) through trimesh, which
     must then be installed. A mesh with an ``export`` of its own — a
     ``trimesh.Trimesh`` — writes itself, but to ``.npz``.
@@ -165,8 +165,9 @@ def save_mesh(mesh, path: str | Path) -> None:
     ids saved beside it — a soma's ``verts`` — would name other vertices.
     Writing such a mesh to OBJ warns; :func:`skeliner.pre.compact_mesh` it
     first, with its components, when vertex ids are saved beside it. An OBJ
-    also keeps eight decimals of each coordinate. An ``.npz`` keeps the
-    mesh exactly: every vertex, every digit.
+    keeps every digit of a coordinate, so a mesh whose vertices are all
+    named by faces, no two at one point, reads back from it bit for bit; an
+    ``.npz`` keeps any mesh exactly, every vertex and every digit.
     """
     path = Path(path)
     if path.suffix.lower() == ".npz":
@@ -436,9 +437,46 @@ def save_skeleton_swc(
 # -----------
 
 
-def load_skeleton_npz(path: str | Path) -> Skeleton:
+def _nucleus_arrays(nucleus: dict) -> dict[str, np.ndarray]:
+    """A soma's ``nucleus`` as the arrays a skeleton's or components' NPZ
+    stores it in."""
+    return {
+        "soma_nucleus_center": np.asarray(nucleus["center"], dtype=np.float64),
+        "soma_nucleus_peak_r": np.array(nucleus["peak_r"], dtype=np.float64),
+        "soma_nucleus_z_range": np.array(nucleus["z_range"], dtype=np.float64),
+        "soma_nucleus_slices": np.asarray(nucleus["slices"], dtype=np.float64),
+    }
+
+
+def _nucleus_of(z) -> dict | None:
+    """The nucleus :func:`_nucleus_arrays` stored in the open NPZ *z*; None
+    where it holds none."""
+    if "soma_nucleus_center" not in z:
+        return None
+    return {
+        "center": z["soma_nucleus_center"].astype(np.float64),
+        "peak_r": float(z["soma_nucleus_peak_r"]),
+        "z_range": tuple(z["soma_nucleus_z_range"].astype(np.float64)),
+        "slices": z["soma_nucleus_slices"].astype(np.float64),
+    }
+
+
+def load_skeleton_npz(path: str | Path, *, mesh: bool = True) -> Skeleton:
     """
     Load a Skeleton that was written with `Skeleton.to_npz` / `save_skeleton_npz`.
+
+    Parameters
+    ----------
+    path
+        The ``.npz`` archive.
+    mesh
+        False leaves out what the skeleton keeps of the mesh it was built
+        from, without reading it: ``node2verts`` and ``vert2node`` are
+        None, ``soma.verts`` is None, and ``extra`` is empty (skeletonize
+        keeps the mesh vertices' distances to the centreline there, saved
+        as one object with the rest of ``extra``). The nodes, edges, radii,
+        node types, the soma's ellipsoid and nucleus and ``meta`` load as
+        saved.
     """
     path = Path(path)
 
@@ -457,25 +495,27 @@ def load_skeleton_npz(path: str | Path) -> Skeleton:
             if len(ntype):
                 ntype[0] = -1  # default to "root"
 
-        # reconstruct ragged node2verts
-        idx = z["node2verts_idx"].astype(np.int64)
-        off = z["node2verts_off"].astype(np.int64)
-        node2verts = [idx[off[i] : off[i + 1]] for i in range(len(off) - 1)]
-
-        vert2node = rebuild_vert2node(node2verts) or {}
+        node2verts = vert2node = soma_verts = None
+        extra = {}
+        if mesh:
+            # reconstruct ragged node2verts
+            idx = z["node2verts_idx"].astype(np.int64)
+            off = z["node2verts_off"].astype(np.int64)
+            node2verts = [idx[off[i] : off[i + 1]] for i in range(len(off) - 1)]
+            vert2node = rebuild_vert2node(node2verts) or {}
+            if "soma_verts" in z:
+                soma_verts = z["soma_verts"].astype(np.int64)
+            if "extra" in z.files:
+                # stored as length-1 object array; .item() unwraps the dict
+                extra = z["extra"].item()
 
         soma = Soma(
             center=z["soma_centre"],
             axes=z["soma_axes"],
             R=z["soma_R"],
-            verts=(z["soma_verts"].astype(np.int64) if "soma_verts" in z else None),
+            verts=soma_verts,
+            nucleus=_nucleus_of(z),
         )
-
-        # ----------- NEW: arbitrary, user-defined metadata ---------------
-        extra = {}
-        if "extra" in z.files:
-            # stored as length-1 object array; .item() unwraps the dict
-            extra = z["extra"].item()
 
         meta = {}
         if "meta" in z.files:
@@ -602,6 +642,12 @@ def save_skeleton_npz(
         tree_payload["neighbors_idx"] = data.astype(np.int64, copy=False)
         tree_payload["neighbors_off"] = offsets.astype(np.int64, copy=False)
 
+    # soma.verts is written only when it is not None, so None reads back as None
+    soma = skeleton.soma
+    soma_payload = {} if soma.verts is None else {"soma_verts": soma.verts}
+    if soma.nucleus is not None:
+        soma_payload.update(_nucleus_arrays(soma.nucleus))
+
     save_fun = np.savez_compressed if compress else np.savez
 
     save_fun(
@@ -612,11 +658,9 @@ def save_skeleton_npz(
         if skeleton.ntype is not None
         else np.array([], dtype=np.int8),
         soma_centre=skeleton.nodes[0],
-        soma_axes=skeleton.soma.axes,
-        soma_R=skeleton.soma.R,
-        soma_verts=skeleton.soma.verts
-        if skeleton.soma.verts is not None
-        else np.array([], dtype=np.int64),
+        soma_axes=soma.axes,
+        soma_R=soma.R,
+        **soma_payload,
         node2verts_idx=n2v_idx,
         node2verts_off=n2v_off,
         **radii_flat,
@@ -901,11 +945,7 @@ def save_components_npz(
         if s.verts is not None:
             payload["soma_verts"] = s.verts.astype(np.int64, copy=False)
         if s.nucleus is not None:
-            nuc = s.nucleus
-            payload["soma_nucleus_center"] = np.asarray(nuc["center"], dtype=np.float64)
-            payload["soma_nucleus_peak_r"] = np.array(nuc["peak_r"], dtype=np.float64)
-            payload["soma_nucleus_z_range"] = np.array(nuc["z_range"], dtype=np.float64)
-            payload["soma_nucleus_slices"] = np.asarray(nuc["slices"], dtype=np.float64)
+            payload.update(_nucleus_arrays(s.nucleus))
 
     # Organelles
     organelles = components.organelles
@@ -944,20 +984,12 @@ def load_components_npz(path: str | Path) -> MeshComponents:
     with np.load(path, allow_pickle=False) as z:
         # Soma
         if "soma_center" in z:
-            nucleus = None
-            if "soma_nucleus_center" in z:
-                nucleus = {
-                    "center": z["soma_nucleus_center"].astype(np.float64),
-                    "peak_r": float(z["soma_nucleus_peak_r"]),
-                    "z_range": tuple(z["soma_nucleus_z_range"].astype(np.float64)),
-                    "slices": z["soma_nucleus_slices"].astype(np.float64),
-                }
             soma = Soma(
                 center=z["soma_center"].astype(np.float64),
                 axes=z["soma_axes"].astype(np.float64),
                 R=z["soma_R"].astype(np.float64),
                 verts=z["soma_verts"].astype(np.int64) if "soma_verts" in z else None,
-                nucleus=nucleus,
+                nucleus=_nucleus_of(z),
             )
         else:
             soma = None
@@ -1249,7 +1281,7 @@ def load_skeleton(path: str | Path, **kwargs) -> "Skeleton":
 
     The format is inferred from the file extension.
     Extra *kwargs* are forwarded to the format-specific
-    loader (e.g. ``scale=`` for SWC).
+    loader (e.g. ``scale=`` for SWC, ``mesh=False`` for npz).
     """
     path = Path(path)
     ext = path.suffix.lower()

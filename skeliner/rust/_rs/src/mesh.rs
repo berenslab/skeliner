@@ -468,6 +468,35 @@ fn face_crosses<'py>(
     Ok(rows_to_array(&out).into_pyarray(py))
 }
 
+/// What breaks a rule of a valid surface in `faces` `(F, 3)`
+/// (`mesh::validity::check`), as a dict: `repeated`, `flat`, `duplicate`
+/// (face ids), `crowded`, `misoriented` (edges, `(E, 2)`), `split_fans`,
+/// `shared_points` (vertex ids), and the counts `collapsed` (faces
+/// `[v, v, v]`) and `unnamed` (vertices no face names).
+#[pyfunction]
+fn validity<'py>(
+    py: Python<'py>,
+    vertices: PyReadonlyArray2<'py, f64>,
+    faces: PyReadonlyArray2<'py, i64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (verts, tris) = mesh_in(&vertices, &faces)?;
+    let c = py.detach(|| ::mesh::validity::check(&verts, &tris));
+    let ids = |v: &[u32]| -> Bound<'py, PyArray1<i64>> {
+        Array1::from_iter(v.iter().map(|&x| i64::from(x))).into_pyarray(py)
+    };
+    let out = PyDict::new(py);
+    out.set_item("repeated", ids(&c.repeated))?;
+    out.set_item("flat", ids(&c.flat))?;
+    out.set_item("duplicate", ids(&c.duplicate))?;
+    out.set_item("crowded", pairs_out(py, &c.crowded))?;
+    out.set_item("misoriented", pairs_out(py, &c.misoriented))?;
+    out.set_item("split_fans", ids(&c.split_fans))?;
+    out.set_item("shared_points", ids(&c.shared_points))?;
+    out.set_item("collapsed", c.collapsed)?;
+    out.set_item("unnamed", c.unnamed)?;
+    Ok(out)
+}
+
 /// `merge_coincident_vertices`' output: the faces (None when no vertex is
 /// merged), the vertices merged, the faces collapsed.
 type MergedOut<'py> = (Option<Bound<'py, PyArray2<i64>>>, usize, usize);
@@ -626,6 +655,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(face_crosses, m)?)?;
     m.add_function(wrap_pyfunction!(face_normals, m)?)?;
     m.add_function(wrap_pyfunction!(merge_coincident_vertices, m)?)?;
+    m.add_function(wrap_pyfunction!(validity, m)?)?;
     m.add_function(wrap_pyfunction!(face_areas, m)?)?;
     m.add_function(wrap_pyfunction!(face_centers, m)?)?;
     m.add_function(wrap_pyfunction!(adjacent_faces, m)?)?;

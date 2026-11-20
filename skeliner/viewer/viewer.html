@@ -695,7 +695,7 @@
                 >
                 <button
                     id="preprocessBtn"
-                    title="Run pre.preprocess(): parallel patches → organelles → soma → fusions → disconnected → gaps → fill holes → break up mesh.&#10;Keeps rescued fragments. Leaves the mesh uncompacted — press Compact (Steps) after if you want it."
+                    title="Run pre.preprocess(): parallel patches → organelles → soma → fusions → disconnected → gaps → break up mesh → fill holes → organelles cut free.&#10;Keeps rescued fragments. Leaves the mesh uncompacted — press Compact (Steps) after if you want it."
                 >
                     Run
                 </button>
@@ -722,7 +722,7 @@
                 ><button id="somaPinClear" title="Forget the soma point" style="display: none">×</button>
                 <label
                     class="run-opt"
-                    title="Patch the holes in the surface (fill_holes) before the mesh is broken up: the organelles' mouths and the mesh's own openings, so each neurite is a tube again. Off leaves them open."
+                    title="Patch the neurites' holes (fill_holes) once the mesh is broken up: the organelles' mouths and the mesh's own openings, so each neurite is a tube again. Off leaves them open. Either way the organelles are cut free of the surface after."
                 >
                     <input type="checkbox" id="runFill" checked /> fill holes
                 </label>
@@ -731,7 +731,7 @@
                  was found (Findings), remove it.  One row a defect, in the
                  order Run takes them. -->
             <details id="stepsDetails">
-                <summary title="Run's steps one at a time — detect, look at the findings, remove">Steps</summary>
+                <summary title="Run's steps one at a time — detect, look at the findings, remove — up to Break up; filling the holes and cutting the organelles free after it are Run's alone">Steps</summary>
                 <div class="steps">
                     <span class="step-name">parallel patches</span>
                     <button id="detectParallelBtn">Detect</button>
@@ -832,10 +832,15 @@
             <div id="ctxComponents" class="ctx-row" style="display: none">
                 <span class="row-label" title="Which component the selected faces belong to — previewed, then applied">Assign:</span>
                 <button id="reassignSomaBtn">→ Soma</button>
-                <button id="reassignOrganelleBtn">→ Organelle</button>
+                <button
+                    id="reassignOrganelleBtn"
+                    title="Make the faces an organelle (Organelles.manual). Only Run cuts organelles free of the surface: assigned after a Run, they stay joined to the faces round them."
+                >
+                    → Organelle
+                </button>
                 <button
                     id="reassignRemainderBtn"
-                    title="Release from soma and organelles — connectivity decides which neurite it joins.&#10;The claim is recorded, so later re-derives will not absorb the faces back. Select the whole protrusion: the claim is honoured per connected piece, but only the faces you release stop being soma."
+                    title="Release from soma and organelles — connectivity decides which neurite it joins.&#10;The claim is recorded, so later re-derives will not absorb the faces back. Select the whole protrusion: the claim is honoured per connected piece, but only the faces you release stop being soma.&#10;A Run cuts the organelles free of the surface: an organelle released after it shares no vertex with the arbor and is a piece of its own."
                 >
                     → Neurites
                 </button>

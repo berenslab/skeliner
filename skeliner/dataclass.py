@@ -1360,6 +1360,7 @@ class Skeleton:
         acyclicity = _dx_mod.acyclicity
         degree = _dx_mod.degree
         neighbors = _dx_mod.neighbors
+        parents = _dx_mod.parents
         nodes_of_degree = _dx_mod.nodes_of_degree
         branches_of_length = _dx_mod.branches_of_length
         twigs_of_length = _dx_mod.twigs_of_length
@@ -1369,6 +1370,7 @@ class Skeleton:
         extract_neurites = _dx_mod.extract_neurites
         neurites_out_of_bounds = _dx_mod.neurites_out_of_bounds
         volume = _dx_mod.volume
+        volume_profiles = _dx_mod.volume_profiles
         total_path_length = _dx_mod.total_path_length
 
         # post-processing

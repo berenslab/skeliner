@@ -29,8 +29,6 @@ pub struct LoopFit {
 pub struct StitchMesh<'a> {
     pub faces: &'a [[u32; 3]],
     pub verts: &'a [V3],
-    /// trimesh's face normals, for orienting the tube.
-    pub face_normals: &'a [V3],
     /// Median unique-edge length, which sets the tube's ring count.
     pub median_edge: f64,
 }
@@ -229,8 +227,52 @@ fn weld_map(pos: &Positions<'_>, ring: &[u32], lp: &[u32]) -> Vec<(u32, u32)> {
     out
 }
 
+/// Twice the vector area of the loop through `pts` round `center`: the
+/// way the loop opens, by the right hand along it.
+fn opening(pts: &[V3], center: V3) -> V3 {
+    let n = pts.len();
+    let mut total = [0.0; 3];
+    for i in 0..n {
+        let c = cross(sub(pts[i], center), sub(pts[(i + 1) % n], center));
+        total = [total[0] + c[0], total[1] + c[1], total[2] + c[2]];
+    }
+    total
+}
+
+/// Which way the kept faces along `lp` run it: those running an edge
+/// `lp[i]` to `lp[i + 1]` less those running it back.
+fn kept_along(m: &StitchMesh<'_>, kept: &KeptFaces, lp: &[u32]) -> i64 {
+    let n = lp.len();
+    let mut along = 0i64;
+    for i in 0..n {
+        let (u, v) = (lp[i], lp[(i + 1) % n]);
+        for f in kept.at(u) {
+            let t = m.faces[f as usize];
+            for k in 0..3 {
+                let e = (t[k], t[(k + 1) % 3]);
+                if e == (u, v) {
+                    along += 1;
+                } else if e == (v, u) {
+                    along -= 1;
+                }
+            }
+        }
+    }
+    along
+}
+
 /// `_zipper_stitch`: a tube from loop `la` to loop `lb`, its rings
 /// appended to `new_verts`; returns the tube's triangles.
+///
+/// The tube runs `la` forward and `lb` backward, so each loop is first
+/// walked the way that has the faces kept along it run its edges against
+/// the tube (as most of them do). The tube leaves each loop the way the
+/// loop then opens — along its vector area, the right hand along `la` and
+/// against `lb` — so its rings turn as the loops do and weld onto them in
+/// order, never twisted half a turn. A welded triangle naming a loop
+/// vertex twice — where the ring has more vertices than the loop — has no
+/// area and is left out: its neighbours along the ring meet across the
+/// edge it would have spanned.
 fn zipper_stitch<E>(
     m: &StitchMesh<'_>,
     la: &[u32],
@@ -241,18 +283,34 @@ fn zipper_stitch<E>(
 ) -> Result<Vec<[u32; 3]>, E> {
     let a = fit(la)?;
     let b = fit(lb)?;
+    // walk the loops so the kept faces run them against the tube
+    let mut la = la.to_vec();
+    let mut lb = lb.to_vec();
+    if kept_along(m, kept, &la) > 0 {
+        la.reverse();
+    }
+    if kept_along(m, kept, &lb) < 0 {
+        lb.reverse();
+    }
+    let pts_a: Vec<V3> = la.iter().map(|&v| m.verts[v as usize]).collect();
+    let pts_b: Vec<V3> = lb.iter().map(|&v| m.verts[v as usize]).collect();
     let direction = sub(b.center, a.center);
     let gap_dist = norm(direction);
-    let na = if dot(a.normal, direction) < 0.0 {
-        a.normal.map(|c| -c)
-    } else {
-        a.normal
+    // leave each loop the way it opens; a loop spanning no area along the
+    // fitted plane's normal, turned towards the other loop
+    let leave = |pts: &[V3], center: V3, fitted: V3| {
+        let o = opening(pts, center);
+        let l = norm(o);
+        if l > 0.0 {
+            o.map(|c| c / l)
+        } else if dot(fitted, direction) < 0.0 {
+            fitted.map(|c| -c)
+        } else {
+            fitted
+        }
     };
-    let nb = if dot(b.normal, direction) < 0.0 {
-        b.normal.map(|c| -c)
-    } else {
-        b.normal
-    };
+    let na = leave(&pts_a, a.center, a.normal);
+    let nb = leave(&pts_b, b.center, b.normal);
     let n_rings = ((gap_dist / m.median_edge).round_ties_even() as i64 - 1).max(1) as usize;
     let n_stations = n_rings + 2;
     let centers = hermite(
@@ -300,10 +358,8 @@ fn zipper_stitch<E>(
         });
     }
 
-    let pts_a: Vec<V3> = la.iter().map(|&v| m.verts[v as usize]).collect();
-    let pts_b: Vec<V3> = lb.iter().map(|&v| m.verts[v as usize]).collect();
-    let (ang_a, rad_a) = polar(&pts_a, centers[0], tangents[0], up[0]);
     let last = n_stations - 1;
+    let (ang_a, rad_a) = polar(&pts_a, centers[0], tangents[0], up[0]);
     let (ang_b, rad_b) = polar(&pts_b, centers[last], tangents[last], up[last]);
     let (target, profile_a) = resample(&ang_a, &rad_a, n_ring_pts);
     let (_, profile_b) = resample(&ang_b, &rad_b, n_ring_pts);
@@ -381,8 +437,8 @@ fn zipper_stitch<E>(
 
     // weld the end rings onto the boundary loops
     let mut weld: HashMap<u32, u32> = HashMap::new();
-    weld.extend(weld_map(&pos, &ring_ids[0], la));
-    weld.extend(weld_map(&pos, &ring_ids[last], lb));
+    weld.extend(weld_map(&pos, &ring_ids[0], &la));
+    weld.extend(weld_map(&pos, &ring_ids[last], &lb));
     for t in &mut tris {
         for v in t.iter_mut() {
             if let Some(&w) = weld.get(v) {
@@ -390,39 +446,7 @@ fn zipper_stitch<E>(
             }
         }
     }
-
-    // orient the tube like the faces around the first loop
-    let mut ref_fis: Vec<u32> = Vec::new();
-    for &vi in la.iter().take(5) {
-        ref_fis.extend(kept.at(vi).take(5));
-    }
-    if !ref_fis.is_empty() {
-        let mean = |vs: &mut dyn Iterator<Item = V3>, k: usize| {
-            let mut s = [0.0f64; 3];
-            for v in vs {
-                for c in 0..3 {
-                    s[c] += v[c];
-                }
-            }
-            s.map(|c| c / k as f64)
-        };
-        let ref_n = mean(
-            &mut ref_fis.iter().map(|&f| m.face_normals[f as usize]),
-            ref_fis.len(),
-        );
-        let tri_n = mean(
-            &mut tris.iter().map(|t| {
-                let p0 = pos.at(t[0]);
-                cross(sub(pos.at(t[1]), p0), sub(pos.at(t[2]), p0))
-            }),
-            tris.len(),
-        );
-        if dot(tri_n, ref_n) < 0.0 {
-            for t in &mut tris {
-                t.swap(1, 2);
-            }
-        }
-    }
+    tris.retain(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2]);
     Ok(tris)
 }
 
@@ -669,12 +693,16 @@ fn seams(p: &Planned) -> Vec<Vec<[u32; 2]>> {
 /// Which of the `planned` bridges can all be stitched.  Decided gap by
 /// gap, a bridge can be left with nothing to meet: every face along one
 /// of its loops taken by other bridges' patches, so its tube or fan would
-/// end on nothing — two bridges landing side by side on one surface.  Only
-/// bridges whose footprints — the vertices of the faces each takes away
-/// and of its loops — meet can do that to each other; those are kept one
-/// by one, the one winning back more faces (`rescue`, by index) first,
-/// ties to the earlier gap, each unless it or one kept would be left so.
-/// A bridge meeting none is kept.
+/// end on nothing — two bridges landing side by side on one surface.  Or
+/// two bridges land on one loop, and the edges they share would carry
+/// both their tubes and the face kept beside them.  Only bridges whose
+/// footprints — the vertices of the faces each takes away and of its
+/// loops — meet can do that to each other; those are kept one by one, the
+/// one winning back more faces (`rescue`, by index) first, ties to the
+/// earlier gap, each unless it or one kept would be left so, or a loop
+/// edge would end with more than two faces: the new faces of the bridges
+/// meeting it and the faces they leave on it.  A bridge meeting none is
+/// kept.
 fn compatible(
     topo: &Topology,
     faces: &[[u32; 3]],
@@ -714,26 +742,40 @@ fn compatible(
         .map(|i| (rescue(i), i))
         .collect();
     order.sort_by_key(|&(won, i)| (std::cmp::Reverse(won), i));
-    // the faces the kept bridges take, and their loops
+    // the faces the kept bridges take, their loops, and how many of their
+    // tubes or fans meet each loop edge
     let mut gone: BTreeSet<u32> = BTreeSet::new();
     let mut kept_loops: Vec<Vec<[u32; 2]>> = Vec::new();
+    let mut seamed: HashMap<[u32; 2], usize> = HashMap::new();
     for (_, i) in order {
         let mine = seams(&planned[i]);
         let taking = &planned[i].removed;
-        // a loop no face is left along
-        let bare = |lp: &Vec<[u32; 2]>| {
-            lp.iter().all(|e| {
-                topo.edge_id(e[0], e[1]).is_none_or(|id| {
-                    topo.edge_faces(id)
-                        .iter()
-                        .all(|f| gone.contains(f) || taking.contains(f))
-                })
+        let left = |e: &[u32; 2]| {
+            topo.edge_id(e[0], e[1]).map_or(0, |id| {
+                topo.edge_faces(id)
+                    .iter()
+                    .filter(|f| !gone.contains(f) && !taking.contains(f))
+                    .count()
             })
         };
-        if mine.iter().any(bare) || kept_loops.iter().any(bare) {
+        // a loop no face is left along
+        let bare = |lp: &Vec<[u32; 2]>| lp.iter().all(|e| left(e) == 0);
+        // an edge the new faces of more bridges would meet than the faces
+        // left on it make room for
+        let mut mine_on: HashMap<[u32; 2], usize> = HashMap::new();
+        for &e in mine.iter().flatten() {
+            *mine_on.entry(e).or_default() += 1;
+        }
+        let crowded = mine_on
+            .iter()
+            .any(|(e, &n)| seamed.get(e).copied().unwrap_or(0) + n + left(e) > 2);
+        if crowded || mine.iter().any(bare) || kept_loops.iter().any(bare) {
             keep[i] = false;
         } else {
             gone.extend(taking);
+            for (e, n) in mine_on {
+                *seamed.entry(e).or_default() += n;
+            }
             kept_loops.extend(mine);
         }
     }
@@ -899,11 +941,9 @@ mod tests {
             })
             .collect();
         let verts = vec![[0.0; 3]; 3000];
-        let normals = vec![[0.0, 0.0, 1.0]; faces.len()];
         let m = StitchMesh {
             faces: &faces,
             verts: &verts,
-            face_normals: &normals,
             median_edge: 1.0,
         };
         let sel: BTreeSet<u32> = (0..faces.len() as u32).filter(|_| next(10) == 0).collect();
@@ -942,11 +982,9 @@ mod tests {
                 faces.push([a, c, d]);
             }
         }
-        let normals = vec![[0.0, 0.0, 1.0]; faces.len()];
         let m = StitchMesh {
             faces: &faces,
             verts: &verts,
-            face_normals: &normals,
             median_edge: 1.0,
         };
         let removed: BTreeSet<u32> = [8, 9].into_iter().collect();
@@ -1081,6 +1119,180 @@ mod tests {
         let apart = [fan(1, 1), fan(4, 4)];
         let keep = compatible(&t, &faces, &apart, &mut |_| unreachable!());
         assert_eq!(keep, [true, true]);
+        // two bridges on one loop: its edges would carry both fans and the
+        // face kept outside, so the one winning back less yields
+        let keep = compatible(&t, &faces, &[fan(2, 2), fan(2, 2)], &mut |i| [5, 9][i]);
+        assert_eq!(keep, [false, true]);
+    }
+
+    /// Two open tubes of radius 1 along z, wound with their normals out:
+    /// `na` vertices a ring at z = 0 and 1, `nb` at z = 4 and 5; and the
+    /// loops facing each other across the gap, at z = 1 and z = 4.
+    fn two_tubes(na: u32, nb: u32) -> (Vec<V3>, Vec<[u32; 3]>, Vec<u32>, Vec<u32>) {
+        let mut v = Vec::new();
+        for (n, z) in [(na, 0.0), (na, 1.0), (nb, 4.0), (nb, 5.0)] {
+            for i in 0..n {
+                let a = 2.0 * std::f64::consts::PI * f64::from(i) / f64::from(n);
+                v.push([a.cos(), a.sin(), z]);
+            }
+        }
+        let mut f = Vec::new();
+        for (lo, hi, n) in [(0, na, na), (2 * na, 2 * na + nb, nb)] {
+            for i in 0..n {
+                let j = (i + 1) % n;
+                let (a, b, c, d) = (lo + i, lo + j, hi + i, hi + j);
+                f.push([a, b, d]);
+                f.push([a, d, c]);
+            }
+        }
+        (
+            v,
+            f,
+            (na..2 * na).collect(),
+            (2 * na..2 * na + nb).collect(),
+        )
+    }
+
+    /// `_fit_loop_circle`: the loop's centroid, mean radius, and the
+    /// direction it varies least in (its covariance's least eigenvector).
+    fn pca_fit(verts: &[V3], ids: &[u32]) -> LoopFit {
+        let n = ids.len() as f64;
+        let mut c = [0.0; 3];
+        for &i in ids {
+            c = [0, 1, 2].map(|k| c[k] + verts[i as usize][k]);
+        }
+        let c = c.map(|x| x / n);
+        let mut cov = [[0.0; 3]; 3];
+        for &i in ids {
+            let d = sub(verts[i as usize], c);
+            for (r, row) in cov.iter_mut().enumerate() {
+                for (q, x) in row.iter_mut().enumerate() {
+                    *x += d[r] * d[q] / (n - 1.0);
+                }
+            }
+        }
+        let (vals, vecs) = mesh::geometry::jacobi(cov);
+        let k = (0..3).min_by(|&x, &y| vals[x].total_cmp(&vals[y])).unwrap();
+        let radius = ids
+            .iter()
+            .map(|&i| norm(sub(verts[i as usize], c)))
+            .sum::<f64>()
+            / n;
+        LoopFit {
+            center: c,
+            radius,
+            normal: [vecs[0][k], vecs[1][k], vecs[2][k]],
+        }
+    }
+
+    #[test]
+    fn a_tube_leaves_a_crowned_loop_the_way_it_opens() {
+        // tube A's open end is a crown, its vertices alternating 1 and 3
+        // high round a unit circle: it varies least sideways, not along
+        // the axis it opens on; tube B lies above, its open end at z = 8
+        let around = 8u32;
+        let mut verts = Vec::new();
+        for (ring, z) in [0.0, 0.0, 8.0, 9.0].into_iter().enumerate() {
+            for i in 0..around {
+                let a = 2.0 * std::f64::consts::PI * f64::from(i) / f64::from(around);
+                let h = if ring == 1 {
+                    [1.0, 3.0][i as usize % 2]
+                } else {
+                    z
+                };
+                verts.push([a.cos(), a.sin(), h]);
+            }
+        }
+        let mut faces = Vec::new();
+        for (lo, hi) in [(0, around), (2 * around, 3 * around)] {
+            for i in 0..around {
+                let j = (i + 1) % around;
+                let (a, b, c, d) = (lo + i, lo + j, hi + i, hi + j);
+                faces.push([a, b, d]);
+                faces.push([a, d, c]);
+            }
+        }
+        let la: Vec<u32> = (around..2 * around).collect();
+        let lb: Vec<u32> = (2 * around..3 * around).collect();
+        let sideways = pca_fit(&verts, &la).normal;
+        assert!(sideways[2].abs() < 0.5, "{sideways:?}");
+        let m = StitchMesh {
+            faces: &faces,
+            verts: &verts,
+            median_edge: 0.8,
+        };
+        let mut fit = |ids: &[u32]| -> Result<LoopFit, ()> { Ok(pca_fit(&verts, ids)) };
+        let (new, out) =
+            stitch_and_rebuild(&m, &BTreeSet::new(), &[(la, lb)], &[], &mut fit).unwrap();
+        let all: Vec<V3> = verts.iter().chain(&new).copied().collect();
+        let c = mesh::validity::check(&all, &out);
+        assert!(c.is_valid(), "{c:?}");
+        // the rings between the ends look out of the tube
+        let first_ring = verts.len() as u32 + around;
+        for t in out[faces.len()..]
+            .iter()
+            .filter(|t| t.iter().all(|&v| v >= first_ring))
+        {
+            let [p, q, r] = t.map(|i| all[i as usize]);
+            let n = cross(sub(q, p), sub(r, p));
+            let mid = [0, 1, 2].map(|k| (p[k] + q[k] + r[k]) / 3.0);
+            assert!(n[0] * mid[0] + n[1] * mid[1] > 0.0, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn a_tube_welds_untwisted_and_wound_with_the_surface_however_its_loops_run() {
+        for (na, nb) in [(8, 8), (8, 12), (12, 8)] {
+            let (verts, faces, la, lb) = two_tubes(na, nb);
+            let m = StitchMesh {
+                faces: &faces,
+                verts: &verts,
+                median_edge: 0.8,
+            };
+            for (ra, rb) in [(false, false), (true, false), (false, true), (true, true)] {
+                let (mut a, mut b) = (la.clone(), lb.clone());
+                if ra {
+                    a.reverse();
+                }
+                if rb {
+                    b.reverse();
+                }
+                // a circle round the z axis: centroid, mean radius, the axis
+                let mut fit = |ids: &[u32]| -> Result<LoopFit, ()> {
+                    let n = ids.len() as f64;
+                    let mut c = [0.0; 3];
+                    for &i in ids {
+                        c = [0, 1, 2].map(|k| c[k] + verts[i as usize][k]);
+                    }
+                    let c = c.map(|x| x / n);
+                    let r = ids
+                        .iter()
+                        .map(|&i| norm(sub(verts[i as usize], c)))
+                        .sum::<f64>()
+                        / n;
+                    Ok(LoopFit {
+                        center: c,
+                        radius: r,
+                        normal: [0.0, 0.0, 1.0],
+                    })
+                };
+                let (new, out) =
+                    stitch_and_rebuild(&m, &BTreeSet::new(), &[(a, b)], &[], &mut fit).unwrap();
+                let all: Vec<V3> = verts.iter().chain(&new).copied().collect();
+                let c = mesh::validity::check(&all, &out);
+                let case = format!("{na}/{nb}, reversed {ra}/{rb}: {c:?}");
+                assert!(c.is_valid(), "{case}");
+                // one tube, no border but the two far ends
+                assert!(out.len() > faces.len(), "{case}");
+                // every tube face looks out of the tube
+                for t in &out[faces.len()..] {
+                    let [p, q, r] = t.map(|i| all[i as usize]);
+                    let n = cross(sub(q, p), sub(r, p));
+                    let mid = [0, 1, 2].map(|k| (p[k] + q[k] + r[k]) / 3.0);
+                    assert!(n[0] * mid[0] + n[1] * mid[1] > 0.0, "{case}: {t:?}");
+                }
+            }
+        }
     }
 
     #[test]

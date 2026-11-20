@@ -22,6 +22,7 @@ __skeleton__ = [
     "bin_faces",
     "degree",
     "neighbors",
+    "parents",
     "nodes_of_degree",
     "branches_of_length",
     "twigs_of_length",
@@ -34,6 +35,7 @@ __skeleton__ = [
     "neurite_nodes",
     "neurites_out_of_bounds",
     "volume",
+    "volume_profiles",
     "total_path_length",
 ]
 
@@ -533,6 +535,22 @@ def neighbors(skel, node_id: int) -> List[int]:
     e = _edges(skel)
     nb = np.concatenate([e[e[:, 0] == v, 1], e[e[:, 1] == v, 0]])
     return np.sort(nb, kind="stable").tolist()
+
+
+def parents(skel, root: int = 0) -> np.ndarray:
+    """
+    Each node's parent in the tree rooted at *root* (the soma, node 0, by
+    default): ``(N,)`` int64, -1 for the root and for every node it does
+    not reach.
+
+    A skeleton from :func:`skeliner.skeletonize` is a tree, so each node
+    has one parent. On a graph with cycles the tree is the breadth-first
+    one from *root*, a node's neighbours taken in the order the edges name
+    them.
+    """
+    return kernels.skeletonize.bfs_parents(
+        _edges(skel), len(skel.nodes), _node(skel, root)
+    )
 
 
 def _point_segment_distance(
@@ -1463,13 +1481,61 @@ def _choose_voxel_size(
     n_est = np.ceil(span / base).astype(int)
     est_total = float(n_est[0] * n_est[1] * n_est[2])
 
-    if est_total > target_voxels:
+    if user_voxel is None and est_total > target_voxels:
         scale = (est_total / target_voxels) ** (1.0 / 3.0)
         base *= scale
         n_est = np.ceil(span / base).astype(int)
 
     n_est = np.maximum(n_est, 1)
     return float(base), (int(n_est[0]), int(n_est[1]), int(n_est[2]))
+
+
+def _union_box(
+    skel, bbox, radius_metric: str | None, include_soma: bool
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The radii `volume` measures the union with, and the box it fills:
+    *bbox*, or the box round the edges' radii and the soma included."""
+    if radius_metric is None:
+        radius_metric = skel.recommend_radius()[0]
+    radii = np.asarray(skel.radii[radius_metric], dtype=np.float64).reshape(-1)
+    if radii.shape[0] != skel.nodes.shape[0]:
+        raise ValueError("radius_metric array length must match number of nodes")
+
+    lo_hi = _parse_bbox(bbox)
+    if lo_hi is not None:
+        return radii, *lo_hi
+    lo = (skel.nodes - radii[:, None]).min(axis=0)
+    hi = (skel.nodes + radii[:, None]).max(axis=0)
+    if include_soma and skel.soma is not None:
+        slo, shi = _ellipsoid_aabb(skel.soma)
+        lo, hi = np.minimum(lo, slo), np.maximum(hi, shi)
+    return radii, lo, hi
+
+
+def _union_args(skel, radii, lo, hi, h, shape, include_soma) -> tuple:
+    """The voxel kernels' arguments: the skeleton's arrays, the grid and the
+    soma's ellipsoid ``(center, axes, R.T, lo, hi)`` (None without one)."""
+    soma = None
+    if getattr(skel, "soma", None) is not None:
+        slo, shi = _ellipsoid_aabb(skel.soma)
+        soma = (
+            [float(c) for c in skel.soma.center],
+            [float(a) for a in skel.soma.axes],
+            np.ascontiguousarray(skel.soma.R.T, dtype=np.float64).tolist(),
+            [float(c) for c in slo],
+            [float(c) for c in shi],
+        )
+    return (
+        skel.nodes.astype(np.float64, copy=False),
+        np.asarray(radii, dtype=np.float64),
+        skel.edges.astype(np.int64, copy=False).reshape(-1, 2),
+        [float(c) for c in lo],
+        [float(c) for c in hi],
+        float(h),
+        [int(n) for n in shape],
+        soma,
+        bool(include_soma),
+    )
 
 
 def _voxelize_union(
@@ -1485,29 +1551,11 @@ def _voxelize_union(
     How many voxels inside [lo, hi] the union of edge frusta and (optionally)
     soma fills.  Returns (count, h, (nx,ny,nz), lo, hi).
     """
-    h, (nx, ny, nz) = _choose_voxel_size(radii, lo, hi, user_voxel=voxel_size)
-    soma = None
-    if getattr(skel, "soma", None) is not None:
-        slo, shi = _ellipsoid_aabb(skel.soma)
-        soma = (
-            [float(c) for c in skel.soma.center],
-            [float(a) for a in skel.soma.axes],
-            np.ascontiguousarray(skel.soma.R.T, dtype=np.float64).tolist(),
-            [float(c) for c in slo],
-            [float(c) for c in shi],
-        )
+    h, shape = _choose_voxel_size(radii, lo, hi, user_voxel=voxel_size)
     count = kernels.dx.voxel_union_count(
-        skel.nodes.astype(np.float64, copy=False),
-        np.asarray(radii, dtype=np.float64),
-        skel.edges.astype(np.int64, copy=False).reshape(-1, 2),
-        [float(c) for c in lo],
-        [float(c) for c in hi],
-        float(h),
-        [nx, ny, nz],
-        soma,
-        bool(include_soma),
+        *_union_args(skel, radii, lo, hi, h, shape, include_soma)
     )
-    return int(count), float(h), (int(nx), int(ny), int(nz)), lo, hi
+    return int(count), float(h), shape, lo, hi
 
 
 def volume(
@@ -1522,11 +1570,10 @@ def volume(
     """
     Estimate the morphology volume, optionally restricted to an axis-aligned bbox.
 
-    Robust union via voxelization inside the bbox: fills voxels that lie
-    inside any edge frustum or the soma ellipsoid. Correctly handles
-    branch overlaps and bbox clipping. Accuracy controlled by `voxel_size`
-    (defaults to ~1/3 of a thin-branch radius, auto-scaled to keep the grid
-    under ~60M voxels unless you pass voxel_size explicitly).
+    The union of the edges' frusta (the radius linear along each edge) and
+    the soma's ellipsoid, voxelized inside the bbox: a voxel is filled when
+    its centre lies inside any of them, so overlaps at branches and with
+    the soma count once, and the bbox clips exactly.
 
     Parameters
     ----------
@@ -1536,10 +1583,13 @@ def volume(
         Which `skel.radii[metric]` column to use; defaults to the
         choice from `skel.recommend_radius()`.
     voxel_size
-        Edge length of voxels. If None, a size is chosen
-        from radii and capped so the grid stays reasonably small.
+        Edge length of the voxels, used as given. If None, a third of the
+        25th-percentile radius (at most a 24th of the 10th-percentile
+        diameter), coarsened to a grid of about 1e8 voxels if it would
+        hold more.
     include_soma
-        Whether to include the soma ellipsoid in the volume.
+        Whether to include the soma ellipsoid in the volume; without it the
+        soma's voxels are carved out of the edges'.
     return_details
         If True, returns (V, details_dict) with diagnostic info for debugging.
 
@@ -1547,37 +1597,15 @@ def volume(
     -------
     float or (float, dict)
         Estimated volume (in the cube of your skeleton units). If
-        `return_details=True`, also returns a small diagnostics dict.
+        `return_details=True`, also the grid (``voxel_size``,
+        ``grid_shape`` ``(nx, ny, nz)``, ``bbox_lo``, ``bbox_hi``) and
+        ``filled_voxels``.
 
-    Notes
-    -----
-    * 'frustum' is blazing-fast and good for whole-cell summaries. It trims
-      soma overlap on edges but **does not** de-overlap at branch junctions.
-    * 'voxel' is the accurate union (no double counting) and is recommended
-      whenever `bbox` is used or precise union is important.
+    See Also
+    --------
+    volume_profiles : the same voxels per layer along z and per column.
     """
-    if radius_metric is None:
-        radius_metric = skel.recommend_radius()[0]
-    radii = np.asarray(skel.radii[radius_metric], dtype=np.float64).reshape(-1)
-    if radii.shape[0] != skel.nodes.shape[0]:
-        raise ValueError("radius_metric array length must match number of nodes")
-
-    # dispatch
-    lo_hi = _parse_bbox(bbox)
-
-    if lo_hi is None:
-        # Auto bbox that tightly encloses neuron + radii + soma extents
-        lo_nodes = (skel.nodes - radii[:, None]).min(axis=0)
-        hi_nodes = (skel.nodes + radii[:, None]).max(axis=0)
-        if include_soma and skel.soma is not None:
-            slo, shi = _ellipsoid_aabb(skel.soma)
-            lo = np.minimum(lo_nodes, slo)
-            hi = np.maximum(hi_nodes, shi)
-        else:
-            lo, hi = lo_nodes, hi_nodes
-    else:
-        lo, hi = lo_hi
-
+    radii, lo, hi = _union_box(skel, bbox, radius_metric, include_soma)
     count, h, (nx, ny, nz), lo, hi = _voxelize_union(
         skel, radii, lo, hi, voxel_size=voxel_size, include_soma=include_soma
     )
@@ -1590,6 +1618,57 @@ def volume(
         "bbox_lo": lo,
         "bbox_hi": hi,
         "filled_voxels": count,
+    }
+
+
+def volume_profiles(
+    skel,
+    bbox: list[float] | tuple[Sequence[float], Sequence[float]] | None = None,
+    *,
+    radius_metric: str | None = None,
+    voxel_size: float | None = None,
+    include_soma: bool = True,
+) -> Dict[str, Any]:
+    """
+    The voxels :func:`volume` fills, counted per layer along z and per
+    column along z, from one voxelization.
+
+    The grid is the one `volume` builds for the same arguments, so
+    ``filled_voxels`` is its ``filled_voxels`` and both profiles sum to it.
+    Multiply a count by ``voxel_size ** 3`` for its volume.
+
+    Parameters
+    ----------
+    bbox, radius_metric, voxel_size, include_soma
+        As for :func:`volume`.
+
+    Returns
+    -------
+    dict
+        The grid: ``voxel_size``, ``grid_shape`` ``(nx, ny, nz)``,
+        ``bbox_lo`` (the corner the voxels start from), ``bbox_hi``; and
+        the counts: ``filled_voxels``, ``filled_per_z`` ``(nz,)`` (each
+        layer of voxels along z), ``filled_per_xy`` ``(nx, ny)`` (each
+        column of voxels along z). Voxel ``(i, j, k)`` has its centre at
+        ``bbox_lo + (i + 0.5, j + 0.5, k + 0.5) * voxel_size``.
+
+    Notes
+    -----
+    Rust only: the Python path runs the Rust core here.
+    """
+    radii, lo, hi = _union_box(skel, bbox, radius_metric, include_soma)
+    h, shape = _choose_voxel_size(radii, lo, hi, user_voxel=voxel_size)
+    per_z, per_xy = kernels.dx.voxel_union_profiles(
+        *_union_args(skel, radii, lo, hi, h, shape, include_soma)
+    )
+    return {
+        "voxel_size": h,
+        "grid_shape": shape,
+        "bbox_lo": lo,
+        "bbox_hi": hi,
+        "filled_voxels": int(per_z.sum()),
+        "filled_per_z": per_z,
+        "filled_per_xy": per_xy,
     }
 
 

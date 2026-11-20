@@ -17,6 +17,7 @@ pub mod raster;
 pub mod ray;
 pub mod spatial;
 pub mod topology;
+pub mod validity;
 
 use std::fmt;
 
